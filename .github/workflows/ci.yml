@@ -30,6 +30,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
         run: |
           set -euo pipefail
 
@@ -58,6 +59,11 @@ jobs:
               exit "$non_documentation_status"
               ;;
           esac
+
+          if [[ "$PR_AUTHOR_LOGIN" == 'dependabot[bot]' ]]; then
+            echo "DCO sign-off skipped: pull request author is dependabot[bot]."
+            exit 0
+          fi
 
           commits=$(git rev-list --reverse "$BASE_SHA..$HEAD_SHA")
           invalid=0
