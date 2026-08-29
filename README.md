@@ -13,7 +13,7 @@
   <br>
   <a href="https://www.npmjs.com/package/elepha"><img src="https://img.shields.io/npm/v/elepha?color=2ab7d4" alt="npm version"></a>
   <a href="https://github.com/elepha-app/elepha/actions/workflows/ci.yml"><img src="https://github.com/elepha-app/elepha/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20WSL-2ab7d4" alt="platform">
+  <a href="#supported-tools-and-platforms"><img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20WSL-2ab7d4" alt="platform"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MPL--2.0-2ab7d4" alt="License: MPL-2.0"></a>
 </p>
 
