@@ -60,6 +60,7 @@ jobs:
         if: steps.pending.outputs.found == 'true'
         shell: bash
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_BRANCH: changeset-release/main
         run: |
           set -euo pipefail
