@@ -2,18 +2,6 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/elepha-light.svg" width="340" alt="elepha">
     <img src="docs/assets/elepha-dark.svg" width="340" alt="elepha">
-    <!--
-       <img
-      src="https://raw.githubusercontent.com/elepha-app/elepha/main/docs/assets/elepha-light.png#gh-dark-mode-only"
-      width="340"
-      alt="elepha"
-    >
-    <img
-      src="https://raw.githubusercontent.com/elepha-app/elepha/main/docs/assets/elepha-dark.png#gh-light-mode-only"
-      width="340"
-      alt="elepha"
-    >
-    -->
   </picture>
 </p>
 
@@ -23,12 +11,10 @@
 <p align="center">
   <img src="https://img.shields.io/badge/supported%20tools-Claude%20Code%20(CLI%20%C2%B7%20Desktop)%20%C2%B7%20Codex%20(CLI%20%C2%B7%20Desktop)-2ab7d4" alt="supported tools: Claude Code (CLI, Desktop), Codex (CLI, Desktop)">
   <br>
+  <a href="https://www.npmjs.com/package/elepha"><img src="https://img.shields.io/npm/v/elepha?color=2ab7d4" alt="npm version"></a>
+  <a href="https://github.com/elepha-app/elepha/actions/workflows/ci.yml"><img src="https://github.com/elepha-app/elepha/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20Linux%20%C2%B7%20WSL-2ab7d4" alt="platform">
-  <img src="https://img.shields.io/badge/license-MPL--2.0-2ab7d4" alt="License: MPL-2.0">
-  <!-- Enable once CI (GitHub Actions) and the npm package are live:
-  <img src="https://github.com/elepha-app/elepha/actions/workflows/ci.yml/badge.svg" alt="CI">
-  <img src="https://img.shields.io/npm/v/elepha" alt="npm">
-  -->
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MPL--2.0-2ab7d4" alt="License: MPL-2.0"></a>
 </p>
 
 <!-- Header demo placeholder: record a short terminal cast of a cross-tool handoff from Claude Code to Codex. -->
