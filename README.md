@@ -9,7 +9,7 @@
 <p align="center">Turn local AI coding transcripts into searchable memory you can recall in any supported tool.</p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/supported%20tools-Claude%20Code%20(CLI%20%C2%B7%20Desktop)%20%C2%B7%20Codex%20(CLI%20%C2%B7%20Desktop)-2ab7d4" alt="supported tools: Claude Code (CLI, Desktop), Codex (CLI, Desktop)">
+  <a href="#supported-tools-and-platforms"><img src="https://img.shields.io/badge/supported%20tools-Claude%20Code%20(CLI%20%C2%B7%20Desktop)%20%C2%B7%20Codex%20(CLI%20%C2%B7%20Desktop)-2ab7d4" alt="supported tools: Claude Code (CLI, Desktop), Codex (CLI, Desktop)"></a>
   <br>
   <a href="https://www.npmjs.com/package/elepha"><img src="https://img.shields.io/npm/v/elepha?color=2ab7d4" alt="npm version"></a>
   <a href="https://github.com/elepha-app/elepha/actions/workflows/ci.yml"><img src="https://github.com/elepha-app/elepha/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
