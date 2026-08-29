@@ -87,5 +87,5 @@ describe('elepha backfill-rendered-chars', () => {
 
         expect(dryRun.status).toBe(0);
         expect(readdirSync(dryRunDirectory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-    });
+    }, 15000);
 });

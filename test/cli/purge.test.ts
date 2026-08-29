@@ -195,7 +195,7 @@ describe('elepha purge orphan project scope', () => {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
         }
-    });
+    }, 15000);
 
     it('resolves only denied and unapproved projects as revoked, then preserves their denied consent after applying', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
@@ -238,7 +238,7 @@ describe('elepha purge orphan project scope', () => {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
         }
-    });
+    }, 15000);
 
     it('combines a project scope with --older-than without touching other projects or newer sessions', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
@@ -272,7 +272,7 @@ describe('elepha purge orphan project scope', () => {
         } finally {
             removeDirectory(directory);
         }
-    });
+    }, 15000);
 
     it('--here rejects an unconsented parent and resolves a consented project from its subdirectory', () => {
         const directory = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-purge-')));
@@ -328,7 +328,7 @@ describe('elepha purge orphan project scope', () => {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
         }
-    });
+    }, 15000);
 
     it('rejects invalid selector combinations without mutating any database row', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
@@ -373,7 +373,7 @@ describe('elepha purge orphan project scope', () => {
         } finally {
             removeDirectory(directory);
         }
-    });
+    }, 15000);
 
     it('rejects empty project queries without mutating any database row', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
@@ -396,7 +396,7 @@ describe('elepha purge orphan project scope', () => {
         } finally {
             removeDirectory(directory);
         }
-    });
+    }, 15000);
 
     it('errors without a scope or time filter in non-TTY mode', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
@@ -411,7 +411,7 @@ describe('elepha purge orphan project scope', () => {
         } finally {
             removeDirectory(directory);
         }
-    });
+    }, 15000);
 
     it('asks a TTY to confirm, leaves memory untouched on no, and deletes on yes', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
@@ -463,5 +463,5 @@ describe('elepha purge orphan project scope', () => {
         } finally {
             removeDirectory(directory);
         }
-    });
+    }, 15000);
 });

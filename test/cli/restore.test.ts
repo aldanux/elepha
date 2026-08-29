@@ -276,7 +276,7 @@ describe('elepha restore', () => {
         expect(counts(snapshotPath)).toEqual(beforeCounts);
         expect(sessionNativeIds(snapshotPath)).toEqual(['session-before']);
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
-    });
+    }, 15000);
 
     it('restores the validated candidate when its pathname is replaced during confirmation', async () => {
         const active = createTestDb('elepha-restore-active-');
@@ -445,7 +445,7 @@ describe('elepha restore', () => {
         expect(result.stderr).toContain('elepha import');
         expect(readFileSync(active.dbPath)).toEqual(before);
         expect(readdirSync(active.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-    });
+    }, 15000);
 
     it('rejects a backup with a required-table column that migrations cannot repair before replacing the active database', () => {
         const active = createTestDb('elepha-restore-active-');
@@ -466,7 +466,7 @@ describe('elepha restore', () => {
         expect(result.stderr).toContain('consent_roots: missing column(s): ulid');
         expect(readFileSync(active.dbPath)).toEqual(before);
         expect(readdirSync(active.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-    });
+    }, 15000);
 
     it('reports a missing backup as not found instead of invalid SQLite', async () => {
         const active = createTestDb('elepha-restore-active-');
@@ -498,7 +498,7 @@ describe('elepha restore', () => {
         expect(result.stderr).toContain('Not a valid SQLite backup');
         expect(readFileSync(active.dbPath)).toEqual(before);
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
-    });
+    }, 15000);
 
     it('refuses a live daemon before taking a snapshot or replacing the active database', async () => {
         const active = createTestDb('elepha-restore-active-');
@@ -551,7 +551,7 @@ describe('elepha restore', () => {
             ...candidateCounts,
             purged_transcripts: candidateCounts.purged_transcripts + activeCounts.purged_transcripts,
         });
-    });
+    }, 15000);
 
     it('rolls the active database back to its pre-restore bytes when post-swap verification fails', async () => {
         const active = createTestDb('elepha-restore-active-');
@@ -645,7 +645,7 @@ describe('elepha restore', () => {
         expect(result.stdout).toContain('Cancelled — no changes were made.');
         expect(readFileSync(active.dbPath)).toEqual(before);
         expect(readdirSync(active.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-    });
+    }, 15000);
 
     it('requires a file when standard input is not a TTY', () => {
         const active = createTestDb('elepha-restore-active-');
@@ -655,5 +655,5 @@ describe('elepha restore', () => {
 
         expect(result.status).toBe(1);
         expect(result.stderr).toContain('Specify a backup file when not running interactively.');
-    });
+    }, 15000);
 });

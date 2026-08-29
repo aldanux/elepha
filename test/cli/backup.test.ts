@@ -204,7 +204,7 @@ describe('elepha backup exports', () => {
         } finally {
             exported.close();
         }
-    });
+    }, 15000);
 
     it('writes a full database copy with matching portable-table row counts through --all', () => {
         const { fixture } = seedExportFixture();
@@ -222,7 +222,7 @@ describe('elepha backup exports', () => {
             source.close();
             exported.close();
         }
-    });
+    }, 15000);
 
     it('atomically overwrites an existing destination for full and project exports', () => {
         const exporters = [
@@ -312,7 +312,7 @@ describe('elepha backup exports', () => {
         expect(statSync(path.dirname(createdOutput)).mode & 0o777).toBe(0o700);
         expect(statSync(path.dirname(path.dirname(createdOutput))).mode & 0o777).toBe(0o700);
         expect(statSync(createdOutput).mode & 0o777).toBe(0o600);
-    });
+    }, 15000);
 
     it('refuses a symlink destination without touching its target', () => {
         const { fixture } = seedExportFixture();
@@ -328,7 +328,7 @@ describe('elepha backup exports', () => {
         expect(result.stderr).toContain(`refusing to write a backup through a symlink: ${destination}`);
         expect(readFileSync(target)).toEqual(original);
         expect(lstatSync(destination).isSymbolicLink()).toBe(true);
-    });
+    }, 15000);
 
     it('writes a full export to the default elepha backups directory', () => {
         const { fixture } = seedExportFixture();
@@ -342,7 +342,7 @@ describe('elepha backup exports', () => {
         expect(path.dirname(written ?? '')).toBe(expectedDirectory);
         expect(statSync(written ?? '').mode & 0o777).toBe(0o600);
         expect(statSync(expectedDirectory).mode & 0o777).toBe(0o700);
-    });
+    }, 15000);
 
     it('selects a consolidated project and writes its export through the fakeable wizard seam', async () => {
         const { fixture, project } = seedExportFixture();

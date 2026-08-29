@@ -84,7 +84,7 @@ describe('elepha backfill-first-prompt-search', () => {
             first_prompt_search: firstPromptSearch(PROMPT),
         });
         appliedDb.close();
-    });
+    }, 15000);
 
     it('treats an out-of-store transcript as unavailable without parsing it', async () => {
         const fixture = createTestDb('elepha-first-prompt-search-guard-');

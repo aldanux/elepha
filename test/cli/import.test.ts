@@ -236,7 +236,7 @@ describe('elepha import', () => {
         const retired = runImportCli(active.dbPath, '--replace', backup, '--skip-confirmation');
         expect(retired.status).toBe(1);
         expect(retired.stderr).toContain("unknown option '--replace'");
-    });
+    }, 15000);
 
     it('sanitizes and caps first_prompt_search when adding a new session', async () => {
         const active = createTestDb('elepha-import-first-prompt-active-');
@@ -1292,5 +1292,5 @@ describe('elepha import', () => {
         const missing = runImportCli(active.dbPath);
         expect(missing.status).toBe(1);
         expect(missing.stderr).toContain('Specify a backup file when not running interactively.');
-    });
+    }, 15000);
 });

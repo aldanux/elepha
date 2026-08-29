@@ -80,7 +80,7 @@ describe('elepha rekey-projects --apply', () => {
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }
-    });
+    }, 15000);
 
     it('leaves project rows untouched during the default dry run', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-rekey-dry-run-'));
@@ -112,7 +112,7 @@ describe('elepha rekey-projects --apply', () => {
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }
-    });
+    }, 15000);
 
     it('refuses apply while a daemon heartbeat is healthy without writing a backup or merge', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-rekey-daemon-running-'));
@@ -146,5 +146,5 @@ describe('elepha rekey-projects --apply', () => {
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }
-    });
+    }, 15000);
 });

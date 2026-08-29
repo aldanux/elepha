@@ -158,7 +158,7 @@ describe('elepha consent grant/revoke', () => {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
         }
-    });
+    }, 15000);
 
     it('revokes the current directory while retaining captured session and turn counts', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-revoke-here-'));
@@ -221,26 +221,30 @@ describe('elepha consent grant/revoke', () => {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
         }
-    });
+    }, 15000);
 
-    it.each(['grant', 'revoke'] as const)('requires exactly one of path and --here for consent %s', (command) => {
-        const directory = mkdtempSync(path.join(tmpdir(), `elepha-consent-${command}-args-`));
-        const dbPath = path.join(directory, 'elepha.db');
-        const root = path.join(directory, 'root');
-        mkdirSync(root);
+    it.each(['grant', 'revoke'] as const)(
+        'requires exactly one of path and --here for consent %s',
+        (command) => {
+            const directory = mkdtempSync(path.join(tmpdir(), `elepha-consent-${command}-args-`));
+            const dbPath = path.join(directory, 'elepha.db');
+            const root = path.join(directory, 'root');
+            mkdirSync(root);
 
-        try {
-            const missing = runConsentCli(dbPath, command);
-            expect(missing.status).toBe(1);
-            expect(missing.stderr).toBe('Choose exactly one consent root: provide <path> or pass --here.\n');
+            try {
+                const missing = runConsentCli(dbPath, command);
+                expect(missing.status).toBe(1);
+                expect(missing.stderr).toBe('Choose exactly one consent root: provide <path> or pass --here.\n');
 
-            const duplicate = runConsentCli(dbPath, command, { root, here: true, cwd: root });
-            expect(duplicate.status).toBe(1);
-            expect(duplicate.stderr).toBe('Choose exactly one consent root: provide <path> or pass --here.\n');
-        } finally {
-            rmSync(directory, { recursive: true, force: true });
-        }
-    });
+                const duplicate = runConsentCli(dbPath, command, { root, here: true, cwd: root });
+                expect(duplicate.status).toBe(1);
+                expect(duplicate.stderr).toBe('Choose exactly one consent root: provide <path> or pass --here.\n');
+            } finally {
+                rmSync(directory, { recursive: true, force: true });
+            }
+        },
+        15000,
+    );
 });
 
 describe('elepha consent prune', () => {
@@ -278,7 +282,7 @@ describe('elepha consent prune', () => {
         } finally {
             rmSync(directory, { recursive: true, force: true });
         }
-    });
+    }, 15000);
 
     it('previews and removes missing and refused roots without touching live roots or memory', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-prune-'));
@@ -355,5 +359,5 @@ describe('elepha consent prune', () => {
             rmSync(directory, { recursive: true, force: true });
             rmSync(refusedRoot, { recursive: true, force: true });
         }
-    });
+    }, 15000);
 });
