@@ -1,0 +1,25 @@
+// CLAUDE.md Security Rule 2: the only permitted subprocesses are the two git
+// calls in src/security/subprocess-allowlist.ts. This rule bans every other
+// call to a node:child_process function anywhere else in src/ - bare calls
+// (`execSync(...)`) and member-expression calls (`child_process.exec(...)`).
+// See test/security/subprocess-allowlist.test.ts for the companion check
+// that the allowlist module's own call sites match exactly what's documented.
+
+engine biome(1.0)
+language js(typescript, jsx)
+
+or {
+    `$func($...)` as $call where {
+        $func <: r"^(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)$",
+        register_diagnostic(span=$call, message="Subprocess calls are only allowed in src/security/subprocess-allowlist.ts (CLAUDE.md Security Rule 2). Add the call there and export a named wrapper instead of calling child_process directly here.", severity="error")
+    },
+    `$obj.$method($...)` as $call where {
+        // $obj is restricted to child_process-shaped receiver names - unlike
+        // the bare-call branch above, `.exec`/`.spawn` etc are common method
+        // names on unrelated objects (RegExp.exec, better-sqlite3 Database.exec)
+        // and matching the method name alone produces false positives.
+        $obj <: r"^(?:cp|child_process|childProcess)$",
+        $method <: r"^(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)$",
+        register_diagnostic(span=$call, message="Subprocess calls are only allowed in src/security/subprocess-allowlist.ts (CLAUDE.md Security Rule 2). Add the call there and export a named wrapper instead of calling child_process directly here.", severity="error")
+    }
+}

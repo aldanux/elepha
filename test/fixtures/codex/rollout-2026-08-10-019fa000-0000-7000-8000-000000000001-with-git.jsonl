@@ -1,0 +1,7 @@
+{"timestamp":"2026-08-10T09:00:00.000Z","type":"session_meta","payload":{"session_id":"019fa000-0000-7000-8000-000000000001","id":"019fa000-0000-7000-8000-000000000001","cwd":"/Users/test/demo-project","originator":"codex-tui","cli_version":"0.147.0","source":"cli","git":{"commit_hash":"deadbeef0000000000000000000000000000000","branch":"feature/git-branch-capture","repository_url":null}}}
+{"timestamp":"2026-08-10T09:00:01.000Z","type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/Users/test/demo-project","workspace_roots":["/Users/test/demo-project"]}}
+{"timestamp":"2026-08-10T09:00:01.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Look up the current Node LTS version"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2026-08-10T09:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"Look up the current Node LTS version","images":[],"local_images":[],"text_elements":[]}}
+{"timestamp":"2026-08-10T09:00:02.500Z","type":"response_item","payload":{"type":"web_search_call","status":"completed","call_id":"call1","query":"Node.js current LTS version"}}
+{"timestamp":"2026-08-10T09:00:03.000Z","type":"event_msg","payload":{"type":"web_search_end","call_id":"call1"}}
+{"timestamp":"2026-08-10T09:00:03.500Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Node 22 is the current LTS."}]}}

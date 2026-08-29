@@ -1,0 +1,146 @@
+name: Release PR
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-pr-main
+  cancel-in-progress: false
+
+jobs:
+  version-packages:
+    name: Version Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for pending changesets
+        id: pending
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pending_changeset="$(
+            find .changeset -maxdepth 1 -type f \
+              ! -name README.md \
+              ! -name config.json \
+              -print -quit
+          )"
+
+          if [[ -z "$pending_changeset" ]]; then
+            echo "No pending changesets."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.pending.outputs.found == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.pending.outputs.found == 'true'
+        run: npm ci
+
+      - name: Version packages
+        if: steps.pending.outputs.found == 'true'
+        shell: bash
+        env:
+          RELEASE_BRANCH: changeset-release/main
+        run: |
+          set -euo pipefail
+
+          git switch --create "$RELEASE_BRANCH"
+          npx changeset version
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add --all
+          git commit --signoff --message 'chore: version packages'
+
+      - name: Push branch and open or update pull request
+        if: steps.pending.outputs.found == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_BRANCH: changeset-release/main
+          PR_TITLE: Version Packages
+          PR_BODY: |
+            This pull request applies the pending changesets from `main`.
+
+            Merge it deliberately to apply the version bump and changelog update.
+            Publishing is handled separately.
+        run: |
+          set -euo pipefail
+
+          gh auth setup-git
+          git push --force origin "HEAD:refs/heads/$RELEASE_BRANCH"
+
+          create_pull_request() {
+            gh pr create \
+              --repo "$GH_REPO" \
+              --base main \
+              --head "$RELEASE_BRANCH" \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY"
+          }
+
+          pull_request="$(
+            gh pr list \
+              --repo "$GH_REPO" \
+              --base main \
+              --head "$RELEASE_BRANCH" \
+              --state all \
+              --limit 100 \
+              --json number,state \
+              --jq 'sort_by(.number) | last | if . == null then "" else [.number, .state] | @tsv end'
+          )"
+
+          if [[ -z "$pull_request" ]]; then
+            create_pull_request
+            exit 0
+          fi
+
+          IFS=$'\t' read -r pr_number pr_state <<< "$pull_request"
+          if [[ ! "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "Invalid pull request number returned by GitHub CLI." >&2
+            exit 1
+          fi
+
+          case "$pr_state" in
+            OPEN)
+              gh pr edit "$pr_number" \
+                --repo "$GH_REPO" \
+                --title "$PR_TITLE" \
+                --body "$PR_BODY"
+              ;;
+            CLOSED)
+              gh pr reopen "$pr_number" --repo "$GH_REPO"
+              gh pr edit "$pr_number" \
+                --repo "$GH_REPO" \
+                --title "$PR_TITLE" \
+                --body "$PR_BODY"
+              ;;
+            MERGED)
+              create_pull_request
+              ;;
+            *)
+              echo "Unexpected pull request state: $pr_state" >&2
+              exit 1
+              ;;
+          esac

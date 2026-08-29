@@ -1,0 +1,7 @@
+{
+    "session_id": "00000000-0000-4000-8000-000000000001",
+    "transcript_path": "/tmp/elepha-fixture/claude.jsonl",
+    "cwd": "/tmp/elepha-fixture/project",
+    "hook_event_name": "SessionStart",
+    "source": "startup"
+}

@@ -1,0 +1,97 @@
+{
+    "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+    "vcs": {
+        "enabled": true,
+        "clientKind": "git",
+        "useIgnoreFile": true
+    },
+    "json": {
+        "formatter": {
+            "enabled": true
+        }
+    },
+    "javascript": {
+        "formatter": {
+            "quoteStyle": "single"
+        }
+    },
+    "formatter": {
+        "enabled": true,
+        "indentStyle": "space",
+        "indentWidth": 4,
+        "lineWidth": 140,
+        "lineEnding": "lf"
+    },
+    "linter": {
+        "enabled": true,
+        "rules": {
+            "preset": "recommended"
+        }
+    },
+    "files": {
+        "ignoreUnknown": true,
+        "includes": ["**", "!dist", "!node_modules", "!.doc", "!test/fixtures/biome-plugin"]
+    },
+    "assist": {
+        "actions": {
+            "source": {
+                "organizeImports": "on",
+                "useSortedAttributes": "off",
+                "useSortedKeys": "off"
+            }
+        },
+        "enabled": true
+    },
+    "plugins": [
+        {
+            "path": "./.biome-plugins/no-raw-subprocess.grit",
+            "includes": ["**/src/**", "!**/src/security/subprocess-allowlist.ts"]
+        },
+        {
+            "path": "./.biome-plugins/no-shell-true.grit",
+            "includes": ["**/src/**"]
+        }
+    ],
+    "overrides": [
+        {
+            "includes": ["test/**"],
+            "linter": {
+                "rules": {
+                    "style": {
+                        "noNonNullAssertion": "off"
+                    }
+                }
+            }
+        },
+        {
+            "includes": [
+                "test/security/sanitize.test.ts",
+                "test/security/sanitize-store.test.ts",
+                "test/config/env.test.ts",
+                "test/summarizer/turn-decision-why.test.ts"
+            ],
+            "linter": {
+                "rules": {
+                    "suspicious": {
+                        "noTemplateCurlyInString": "off"
+                    }
+                }
+            }
+        },
+        {
+            "includes": ["src/**/*.{js,ts,jsx,tsx,mjs,cjs,mts,cts}"],
+            "linter": {
+                "enabled": true,
+                "rules": {
+                    "recommended": true,
+                    "style": {
+                        "useBlockStatements": {
+                            "level": "error",
+                            "fix": "safe"
+                        }
+                    }
+                }
+            }
+        }
+    ]
+}

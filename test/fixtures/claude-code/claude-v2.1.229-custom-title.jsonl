@@ -1,0 +1,3 @@
+{"type":"user","uuid":"u-title","timestamp":"2026-08-14T09:33:36.000Z","entrypoint":"claude-desktop","cwd":"/Users/test/demo-project","sessionId":"custom-title-sample","version":"2.1.229","message":{"role":"user","content":"Read the latest changelog"}}
+{"type":"custom-title","customTitle":"Latest project changelog","sessionId":"custom-title-sample"}
+{"type":"assistant","parentUuid":"u-title","uuid":"a-title","timestamp":"2026-08-14T09:33:37.000Z","entrypoint":"claude-desktop","cwd":"/Users/test/demo-project","sessionId":"custom-title-sample","version":"2.1.229","message":{"role":"assistant","content":[{"type":"text","text":"I found the latest changelog."}]}}

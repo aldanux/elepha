@@ -1,0 +1,81 @@
+{
+    "name": "elepha",
+    "version": "0.1.0",
+    "description": "Local memory layer for developers switching between AI coding CLIs",
+    "keywords": [
+        "claude-code",
+        "codex",
+        "coding-agent",
+        "ai-memory",
+        "agent-memory",
+        "agent-memory",
+        "session-memory",
+        "session-history",
+        "context-management",
+        "developer-tools",
+        "cli",
+        "local-first"
+    ],
+    "homepage": "https://github.com/elepha-app/elepha#readme",
+    "bugs": {
+        "url": "https://github.com/elepha-app/elepha/issues"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/elepha-app/elepha.git"
+    },
+    "license": "MPL-2.0",
+    "type": "module",
+    "bin": {
+        "elepha": "./bin/elepha.js"
+    },
+    "files": [
+        "dist",
+        "bin"
+    ],
+    "engines": {
+        "node": ">=22"
+    },
+    "publishConfig": {
+        "access": "public"
+    },
+    "scripts": {
+        "prepublishOnly": "npm run build",
+        "build": "tsc -p tsconfig.json",
+        "dev": "tsx watch src/cli/index.ts",
+        "start": "node dist/cli/index.js",
+        "test": "vitest run",
+        "typecheck": "tsc --noEmit",
+        "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
+        "changeset": "changeset",
+        "release": "changeset version && changeset publish",
+        "format-lint": "biome check --write .",
+        "format:check": "biome check ."
+    },
+    "dependencies": {
+        "@anthropic-ai/sdk": "^0.122.0",
+        "@clack/prompts": "^1.7.0",
+        "@modelcontextprotocol/sdk": "^1.30.0",
+        "better-sqlite3": "^13.0.3",
+        "chokidar": "^5.0.0",
+        "commander": "^15.0.0",
+        "smol-toml": "^1.8.0",
+        "zod": "^4.5.2"
+    },
+    "devDependencies": {
+        "@biomejs/biome": "2.5.11",
+        "@changesets/cli": "^3.0.1",
+        "@commitlint/cli": "^21.2.2",
+        "@commitlint/config-conventional": "^21.2.2",
+        "@types/better-sqlite3": "^9.6.0",
+        "@types/node": "^26.4.0",
+        "tsx": "^4.23.12",
+        "typescript": "^7.0.2",
+        "vitest": "^4.1.11"
+    },
+    "allowScripts": {
+        "better-sqlite3@13.0.3": true,
+        "esbuild@0.28.2": true,
+        "fsevents@2.3.3": true
+    }
+}

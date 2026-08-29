@@ -1,0 +1,13 @@
+// CLAUDE.md Security Rule 2: subprocess calls use execFile(Sync) with an
+// argv array, never shell:true - even inside the allowlisted module itself.
+// Unlike no-raw-subprocess.grit, this one is NOT excluded from
+// src/security/subprocess-allowlist.ts: shell:true is banned everywhere,
+// no exceptions.
+
+engine biome(1.0)
+language js(typescript, jsx)
+
+`$func($...)` as $call where {
+    $call <: contains `shell: true`,
+    register_diagnostic(span=$call, message="shell: true is banned everywhere in this codebase (CLAUDE.md Security Rule 2). Use execFile/execFileSync with an argv array instead.", severity="error")
+}

@@ -1,0 +1,3 @@
+{"type":"user","uuid":"u-frame","timestamp":"2026-08-14T14:03:40.000Z","entrypoint":"cli","cwd":"/Users/test/demo-project","sessionId":"frame-link-sample","version":"2.1.232","message":{"role":"user","content":"Prepare the review"}}
+{"type":"frame-link","sessionId":"frame-link-sample","path":"/private/tmp/claude-501/frame-link-sample/scratchpad/review.html","frameUrl":"https://claude.ai/code/artifact/example","title":"Phase 1 Audit","timestamp":"2026-08-14T14:03:46.231Z"}
+{"type":"assistant","parentUuid":"u-frame","uuid":"a-frame","timestamp":"2026-08-14T14:03:47.000Z","entrypoint":"cli","cwd":"/Users/test/demo-project","sessionId":"frame-link-sample","version":"2.1.232","message":{"role":"assistant","content":[{"type":"text","text":"The review is ready."}]}}
