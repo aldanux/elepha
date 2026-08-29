@@ -17,6 +17,8 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
     steps:
       - name: Check out main
         uses: actions/checkout@v6
@@ -87,3 +89,56 @@ jobs:
       - name: Publish to npm with provenance
         if: steps.release.outputs.publish == 'true'
         run: npm publish --provenance --access public --registry=https://registry.npmjs.org
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    if: needs.publish.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Extract release notes
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(node -p "require('./package.json').version")"
+          notes_file="${RUNNER_TEMP}/release-notes.md"
+          notes="$(
+            awk -v version="$version" '
+              $0 == "## " version { found = 1; next }
+              found && /^## / { exit }
+              found { lines[++count] = $0 }
+              END {
+                while (count > 0 && lines[count] ~ /^[[:space:]]*$/) count--
+                first = 1
+                while (first <= count && lines[first] ~ /^[[:space:]]*$/) first++
+                for (i = first; i <= count; i++) print lines[i]
+              }
+            ' CHANGELOG.md
+          )"
+
+          if [[ -z "$notes" ]]; then
+            printf 'CHANGELOG.md has no release notes for version %s.\n' \
+              "$version" >&2
+            exit 1
+          fi
+
+          printf '%s\n' "$notes" | tee "$notes_file"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.release.outputs.version }}"
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md"
