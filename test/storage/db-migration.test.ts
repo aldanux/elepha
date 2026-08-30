@@ -48,6 +48,10 @@ describe('sessions table migration', () => {
         expect(shownListCols).toEqual(['tool', 'native_session_id', 'session_ids']);
         const incognitoCols = (db.pragma('table_info(incognito_transcripts)') as Array<{ name: string }>).map((c) => c.name);
         expect(incognitoCols).toEqual(['tool', 'native_id', 'tombstoned_at']);
+        const firstPromptSkipCols = (db.pragma('table_info(first_prompt_search_backfill_skips)') as Array<{ name: string }>).map(
+            (c) => c.name,
+        );
+        expect(firstPromptSkipCols).toEqual(['session_id', 'skipped_at']);
         db.close();
     });
 
@@ -91,6 +95,28 @@ describe('migration idempotency and reversibility', () => {
 
         const reopened = openDb(dbPath);
         expect((reopened.pragma('table_info(sessions)') as Array<{ name: string }>).map((c) => c.name)).toContain('first_prompt_search');
+        reopened.close();
+    });
+
+    it('adds the first-prompt background skip table to an existing database and is a no-op when reopened', () => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-first-prompt-search-skips-'));
+        const dbPath = path.join(dir, 'test.db');
+        const prior = openDb(dbPath);
+        prior.exec('DROP TABLE first_prompt_search_backfill_skips');
+        prior.close();
+
+        const migrated = openDb(dbPath);
+        expect((migrated.pragma('table_info(first_prompt_search_backfill_skips)') as Array<{ name: string }>).map((c) => c.name)).toEqual([
+            'session_id',
+            'skipped_at',
+        ]);
+        migrated.close();
+
+        const reopened = openDb(dbPath);
+        expect((reopened.pragma('table_info(first_prompt_search_backfill_skips)') as Array<{ name: string }>).map((c) => c.name)).toEqual([
+            'session_id',
+            'skipped_at',
+        ]);
         reopened.close();
     });
 
