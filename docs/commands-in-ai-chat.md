@@ -20,6 +20,11 @@ This page is the full guide for in-chat recall commands.
 | `elepha:select:<n>`                                | Inject session `n` from the most recently shown query or list results.           |
 | `elepha:help`                                      | Show the in-chat command list.                                                   |
 
+**What a search looks at.** `elepha:query` matches against session titles and the opening
+prompt of each session, not the whole conversation. Search for how you asked for something,
+not for a phrase the assistant wrote back. Once a session is open, `elepha:select:<n>` and
+`elepha:last` inject its turns in full.
+
 ## Maintenance
 
 Full guide: [docs/maintenance.md](maintenance.md).
