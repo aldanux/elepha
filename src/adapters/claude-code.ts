@@ -54,6 +54,9 @@ const KNOWN_SKIP_TYPES = new Set([
     'frame-link',
     // UI decoration: internal latch marker, carries no turn content.
     'atis-latch',
+    // Session usage snapshot: cumulative token/cost, timing, changed-line,
+    // and per-model usage totals. It carries no turn content and must not be ingested.
+    'cost-state',
     // Marks a bridged (Cowork/remote) session. Metadata only: bridge,
     // session, and owner ids plus a sequence number; it carries no turn
     // content and must not be ingested.
