@@ -10,7 +10,7 @@ const CODEX_HISTORY_REVIEW_PREFIX = 'the following is the codex agent history';
 const INTERNAL_COMMAND_START = /^<command-(?:message|name)>/;
 const FILESYSTEM_PATH = /^(?:\/|~\/|\.{1,2}\/|[A-Za-z]:[\\/])\S+$/;
 const SOURCE_PATH = /^(?:[^\s/\\]+[\\/])+[^\s/\\]+\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?$/;
-const COMMENT_LINE = /^(?:\/\/|\/\*|\*\/|<!--|-->)/;
+const COMMENT_LINE = /^(?:\/\/|\/\*|\*\/|<!--|--!?>)/;
 const DIFF_FRAGMENT = /^(?:diff --git\s|index\s+[0-9a-f]+|@@\s|---\s+(?:a\/|\/dev\/null)|\+\+\+\s+(?:b\/|\/dev\/null)|[+-](?:\t| {2,}|\S))/;
 const CODE_STATEMENT =
     /^(?:[}\])]|(?:if|for|while|switch|catch)\s*\(|(?:const|let|var)\s+[A-Za-z_$]|(?:return|throw|await|yield|import|export|class|interface|type|function)\b|(?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*\s*\(.*\)\s*;?$)/;
