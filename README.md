@@ -19,7 +19,7 @@
 
 [elepha demo](https://github.com/user-attachments/assets/478a14aa-acb8-4a51-99d6-e809d0473280)
 
-<small>The elepha demo video shows Codex stopping mid-task, then Claude Code resuming that same session and explaining why an earlier approach was rejected, from a conversation it never had.</small>
+<p><small>The elepha demo video shows Codex stopping mid-task, then Claude Code resuming that same session and explaining why an earlier approach was rejected, from a conversation it never had.</small></p>
 
 ## About elepha
 
