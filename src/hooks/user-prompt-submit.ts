@@ -210,11 +210,12 @@ export async function runUserPromptSubmit(
             if (!query) {
                 commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_QUERY_REQUIRED}`;
             } else {
+                const consent = new ConsentStore(db);
                 const projects =
                     command.scope === 'global'
-                        ? projectResolver(db).listConsentedStored(new ConsentStore(db))
+                        ? projectResolver(db).listConsentedStored(consent)
                         : [consentedProject(db, payload.cwd)].filter((project): project is ProjectSet => project !== undefined);
-                if (command.scope === 'here' && projects.length === 0) {
+                if (command.scope === 'here' && projects.length === 0 && consent.consentState(payload.cwd) !== 'approved') {
                     log(promptLogLine(tool, payload, 'served notice=project_unavailable_or_unconsented'));
                     commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`;
                 } else {

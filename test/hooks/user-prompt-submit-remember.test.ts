@@ -264,11 +264,28 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(global).not.toContain('denied result must not leak');
         expect(global).not.toContain('recency cap');
         expect(global.split('\n').at(-2)).toBe(SELECT_HINT);
-        expect(here).toContain('No recall matches found');
         expect(here).not.toContain('Approved remote match');
-        expect(here).toContain(`No recall matches found for “cross project needle”.\n\n${SELECT_HINT}`);
+        expect(here).toContain(
+            `No recall matches found for “cross project needle” in current. Search every project with elepha:query cross project needle.\n\n${SELECT_HINT}`,
+        );
         expect(here).not.toContain('\n\n\n');
         expect(here.split('\n').at(-2)).toBe(SELECT_HINT);
+    });
+
+    it('reports an unresolved current project separately from a scoped miss', async () => {
+        const fixture = createTestDb('elepha-remember-unknown-project-');
+        const current = addProject(fixture, 'current', 'approved');
+        fixture.db.prepare('DELETE FROM projects WHERE id = ?').run(current.project.id);
+        fixture.close();
+
+        const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query:here unknown needle'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW,
+        });
+
+        expect(contextOf(result)).toContain(
+            `The current directory is not a known project. Search every project with elepha:query unknown needle.\n\n${SELECT_HINT}`,
+        );
     });
 
     it('discards a global recall when a contributing project is revoked during the await', async () => {
@@ -462,7 +479,9 @@ describe('UserPromptSubmit lexical recall', () => {
             undefined,
             'strict',
         );
-        expect(misspelledTokenBody).toContain('No recall matches found for “alpha beta gamma gammma”.');
+        expect(misspelledTokenBody).toContain(
+            'No recall matches found for “alpha beta gamma gammma” in coverage-project. Search every project with elepha:query alpha beta gamma gammma.',
+        );
 
         const { body: unionBody } = await lexicalRecall(reader, [project], unionQuery, 'here', undefined, undefined, 'strict');
         expect(unionBody).toContain('Laravel Cloud application');
@@ -503,7 +522,9 @@ describe('UserPromptSubmit lexical recall', () => {
 
         const strictMode = getSetting('query-matching', {}, matchingConfig).value;
         const strict = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, strictMode);
-        expect(strict.body).toContain('No recall matches found for “alpha beta gamma”.');
+        expect(strict.body).toContain(
+            'No recall matches found for “alpha beta gamma” in lax-project. Search every project with elepha:query alpha beta gamma.',
+        );
 
         setSetting('query-matching', 'lax', matchingConfig);
         const laxMode = getSetting('query-matching', {}, matchingConfig).value;
@@ -670,7 +691,9 @@ describe('UserPromptSubmit lexical recall', () => {
                 now: () => NOW + 2,
             }),
         );
-        expect(deepOnlyContext).toContain('No recall matches found for “buried zephyr”.');
+        expect(deepOnlyContext).toContain(
+            'No recall matches found for “buried zephyr” in alpha-beta-project. Search every project with elepha:query buried zephyr.',
+        );
         expect(deepOnlyContext).not.toContain('Deep transcript noise');
     });
 
