@@ -30,11 +30,6 @@ function isExplicitPauseTurn(turn: ParsedTurn, userMessage: string): boolean {
     return turn.toolCalls.length === 0 && EXPLICIT_PAUSE_REQUEST.test(userMessage);
 }
 
-/** Reports whether a parsed turn survives the raw-serving filter without rendering its body. */
-export function isRenderableRawTurn(turn: ParsedTurn): boolean {
-    return !isExplicitPauseTurn(turn, withoutMemoryCitations(turn.userMessage).trim());
-}
-
 function renderToolCalls(turn: ParsedTurn): string | undefined {
     const pathBearing = turn.toolCalls.filter((call) => call.filePaths.length > 0);
     const withoutPaths = turn.toolCalls.length - pathBearing.length;
