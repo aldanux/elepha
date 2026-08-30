@@ -1,9 +1,10 @@
 name: Release PR
 
+# Manual only. Changesets accumulate on main and stay invisible until a release is
+# deliberately started, so the repository never shows a permanently open release
+# pull request.
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
