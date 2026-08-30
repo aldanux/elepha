@@ -23,6 +23,7 @@ import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/d
 import {
     DEFAULT_IDLE_DEBOUNCE_MS,
     DEFAULT_MAX_CONCURRENT,
+    FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
     SWEEP_INTERVAL_MS,
@@ -47,7 +48,9 @@ import { openProviderTranscript, type ProviderTranscriptOpener } from '../securi
 import { isNearVerbatim, turnText } from '../security/self-ingestion.js';
 import type { ConsentState } from '../storage/consent-store.js';
 import { openDb } from '../storage/db.js';
+import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
 import { MemoryStore } from '../storage/memory-store.js';
+import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
 import type {
@@ -57,6 +60,7 @@ import type {
     SessionClassification,
     SummarizationProvider,
     SummarizerStatus,
+    ToolName,
 } from '../types/index.js';
 import { FailureWindow } from './failure-window.js';
 import { clearHeartbeat, defaultHeartbeatPath, writeHeartbeat } from './heartbeat.js';
@@ -85,6 +89,8 @@ const NOTABLE_FILE_SKIP_CATEGORIES = new Set<FileSkipCategory>([
     'unexpected error',
     'outside watched store',
 ]);
+
+export const FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX = '[elepha] first-prompt search backfill:';
 
 // How often to look for sessions that have gone quiet. Well under the idle
 // threshold so a closed session rolls up promptly rather than up to a full
@@ -172,6 +178,8 @@ export interface DaemonOptions {
     readCorpus?: (watchRoot: string) => Promise<string[]>;
     /** Test seam for deterministically exercising opened-object containment races. */
     openTranscript?: ProviderTranscriptOpener;
+    /** Test seam; production uses FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE. */
+    firstPromptSearchBackfillBatchSize?: number;
 }
 
 function formatDaemonLog(message: string, context: { tool?: string; sessionId?: string } = {}): string {
@@ -200,9 +208,13 @@ export class IngestionDaemon {
     private readonly captureCodex: boolean;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
     private readonly openTranscript: ProviderTranscriptOpener;
+    private readonly firstPromptSearchBackfillBatchSize: number;
     private sweepTimer: NodeJS.Timeout | undefined;
     private initialUpdateCheckTimer: NodeJS.Timeout | undefined;
     private updateCheckTimer: NodeJS.Timeout | undefined;
+    private firstPromptSearchBackfillTimer: NodeJS.Timeout | undefined;
+    private firstPromptSearchBackfillPromise: Promise<void> | undefined;
+    private stopping = false;
     private readonly startedAt = new Date().toISOString();
 
     private watcher: FSWatcher | undefined;
@@ -267,6 +279,7 @@ export class IngestionDaemon {
         this.watcherUsePolling = options.watcherUsePolling ?? false;
         this.watcherPollIntervalMs = options.watcherPollIntervalMs ?? 50;
         this.readCorpus = options.readCorpus ?? ((watchRoot) => readdir(watchRoot, { recursive: true }));
+        this.firstPromptSearchBackfillBatchSize = options.firstPromptSearchBackfillBatchSize ?? FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE;
     }
 
     start(): void {
@@ -293,6 +306,19 @@ export class IngestionDaemon {
         this.log(`[elepha] watching:\n  ${this.watchRoots.join('\n  ')}`);
 
         void this.sweepStartupFiles();
+        this.firstPromptSearchBackfillTimer = setTimeout(() => {
+            this.firstPromptSearchBackfillTimer = undefined;
+            const task = this.backfillFirstPromptSearch().catch((error: unknown) => {
+                this.logError(`${FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX} failed: ${(error as Error).message}`);
+            });
+            this.firstPromptSearchBackfillPromise = task;
+            void task.then(() => {
+                if (this.firstPromptSearchBackfillPromise === task) {
+                    this.firstPromptSearchBackfillPromise = undefined;
+                }
+            });
+        }, 0);
+        this.firstPromptSearchBackfillTimer.unref();
 
         writeHeartbeat(this.heartbeatPath, this.startedAt);
         this.heartbeatTimer = setInterval(() => writeHeartbeat(this.heartbeatPath, this.startedAt), HEARTBEAT_INTERVAL_MS);
@@ -330,6 +356,7 @@ export class IngestionDaemon {
     }
 
     async stop(): Promise<void> {
+        this.stopping = true;
         if (this.stopPromise) {
             return this.stopPromise;
         }
@@ -369,12 +396,112 @@ export class IngestionDaemon {
         if (this.updateCheckTimer) {
             clearInterval(this.updateCheckTimer);
         }
+        if (this.firstPromptSearchBackfillTimer) {
+            clearTimeout(this.firstPromptSearchBackfillTimer);
+        }
         clearHeartbeat(this.heartbeatPath);
         for (const timer of this.idleTimers.values()) {
             clearTimeout(timer);
         }
         this.idleTimers.clear();
         await this.watcher?.close();
+        await this.firstPromptSearchBackfillPromise;
+    }
+
+    private async backfillFirstPromptSearch(): Promise<void> {
+        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as Record<ToolName, SessionAdapter>;
+        while (!this.stopping) {
+            const consentedProjectIds = new ProjectResolver(this.store.database)
+                .listConsentedStored(this.store.consent)
+                .flatMap((project) => project.projectIds);
+            if (consentedProjectIds.length === 0) {
+                return;
+            }
+            const projectPlaceholders = consentedProjectIds.map(() => '?').join(', ');
+            const candidates = this.store.database
+                .prepare(
+                    `SELECT sessions.id
+                     FROM sessions
+                     LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = sessions.id
+                     WHERE sessions.project_id IN (${projectPlaceholders})
+                       AND sessions.first_prompt_search IS NULL
+                       AND skips.session_id IS NULL
+                     ORDER BY id
+                     LIMIT ?`,
+                )
+                .all(...consentedProjectIds, this.firstPromptSearchBackfillBatchSize) as Array<{ id: number }>;
+            if (candidates.length === 0) {
+                return;
+            }
+
+            const sessionIds = candidates.map((candidate) => candidate.id);
+            let writeAuthorizedProjectIds: Set<number> | undefined;
+            const plan = await applyFirstPromptSearchBackfill(this.store.database, adapters, {
+                sessionIds,
+                onlyNull: true,
+                authorizeWrite: (db, sessionId) => {
+                    writeAuthorizedProjectIds ??= new Set(
+                        new ProjectResolver(db).listConsentedStored(this.store.consent).flatMap((project) => project.projectIds),
+                    );
+                    const row = db.prepare('SELECT project_id FROM sessions WHERE id = ?').get(sessionId) as
+                        | { project_id: number }
+                        | undefined;
+                    return row !== undefined && writeAuthorizedProjectIds.has(row.project_id);
+                },
+            });
+            const lastCandidate = candidates.at(-1);
+            if (lastCandidate === undefined) {
+                return;
+            }
+            const lastSessionId = lastCandidate.id;
+
+            const placeholders = sessionIds.map(() => '?').join(', ');
+            const leftNullRows = this.store.database
+                .prepare(`SELECT id FROM sessions WHERE id IN (${placeholders}) AND first_prompt_search IS NULL`)
+                .all(...sessionIds) as Array<{ id: number }>;
+            const recordSkips = this.store.database.transaction((rows: Array<{ id: number }>) => {
+                const currentlyConsented = new Set(
+                    new ProjectResolver(this.store.database)
+                        .listConsentedStored(this.store.consent)
+                        .flatMap((project) => project.projectIds),
+                );
+                const insert = this.store.database.prepare(
+                    'INSERT OR IGNORE INTO first_prompt_search_backfill_skips (session_id, skipped_at) VALUES (?, ?)',
+                );
+                const sessionProject = this.store.database.prepare('SELECT project_id FROM sessions WHERE id = ?');
+                const skippedAt = new Date().toISOString();
+                for (const row of rows) {
+                    const session = sessionProject.get(row.id) as { project_id: number } | undefined;
+                    if (session !== undefined && currentlyConsented.has(session.project_id)) {
+                        insert.run(row.id, skippedAt);
+                    }
+                }
+            });
+            const readableChanges = new Set(plan.changes.filter((change) => !change.transcriptMissing).map((change) => change.sessionId));
+            recordSkips(leftNullRows.filter((row) => !readableChanges.has(row.id)));
+            const remaining = (
+                this.store.database
+                    .prepare(
+                        `SELECT COUNT(*) AS count
+                         FROM sessions
+                         LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = sessions.id
+                         WHERE sessions.project_id IN (${projectPlaceholders})
+                           AND sessions.first_prompt_search IS NULL
+                           AND skips.session_id IS NULL`,
+                    )
+                    .get(...consentedProjectIds) as { count: number }
+            ).count;
+            this.log(
+                `${FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX} processed through session ${lastSessionId}: ${sessionIds.length} session(s), ` +
+                    `indexed ${sessionIds.length - leftNullRows.length}, left NULL ${leftNullRows.length} ` +
+                    `(unavailable transcript: ${plan.sessionsMissingTranscript}), remaining ${remaining}`,
+            );
+
+            if (this.stopping) {
+                return;
+            }
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
     }
 
     private adapterFor(filePath: string, onSkipped?: (skipped: FileSkip) => void): SessionAdapter | undefined {

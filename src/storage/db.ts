@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
 
+-- Background first-prompt indexing leaves an unavailable source NULL, but
+-- remembers that one automatic attempt so every daemon restart does not parse
+-- the same unreadable transcript again. The repair CLI deliberately ignores
+-- this table.
+CREATE TABLE IF NOT EXISTS first_prompt_search_backfill_skips (
+  session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  skipped_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS memories (
   id              INTEGER PRIMARY KEY,
   project_id      INTEGER NOT NULL REFERENCES projects(id),
