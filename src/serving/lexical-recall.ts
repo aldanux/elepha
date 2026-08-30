@@ -248,13 +248,28 @@ function coverageLine(
     return `Partial coverage (${reasons.join(', ')}): searched ${searchedProjects} of ${totalProjects} projects and ${searchedSessions} of ${totalSessions} sessions.`;
 }
 
-function renderBody(query: RecallQuery, hits: RecallHit[], coverage: string | undefined, now: number): LexicalRecallResult {
+function emptyMessage(query: RecallQuery, scope: RecallScope, project: ProjectSet | undefined): string {
+    if (scope === 'global') {
+        return `No recall matches found for “${query.display}”.`;
+    }
+    if (project === undefined) {
+        return `The current directory is not a known project. Search every project with elepha:query ${query.display}.`;
+    }
+    return `No recall matches found for “${query.display}” in ${project.displayName}. Search every project with elepha:query ${query.display}.`;
+}
+
+function renderBody(
+    query: RecallQuery,
+    hits: RecallHit[],
+    coverage: string | undefined,
+    now: number,
+    scope: RecallScope,
+    project: ProjectSet | undefined,
+): LexicalRecallResult {
     const trailer = coverage === undefined ? ['', SELECT_HINT] : ['', coverage, '', SELECT_HINT];
     if (hits.length === 0) {
         return {
-            body: escapeShellSyntax(
-                [DISPLAY_VERBATIM_INSTRUCTIONS, `No recall matches found for “${query.display}”.`, ...trailer].join('\n'),
-            ),
+            body: escapeShellSyntax([DISPLAY_VERBATIM_INSTRUCTIONS, emptyMessage(query, scope, project), ...trailer].join('\n')),
             sessionIds: [],
         };
     }
@@ -348,5 +363,5 @@ export async function lexicalRecall(
         const hit = hitForSession(metadata, query, matchingMode);
         return hit === undefined ? [] : [hit];
     });
-    return renderBody(query, rankAndFloorHits(hits, rarity), coverage, renderedAt);
+    return renderBody(query, rankAndFloorHits(hits, rarity), coverage, renderedAt, scope, projects[0]);
 }
