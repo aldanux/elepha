@@ -17,7 +17,9 @@
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MPL--2.0-2ab7d4" alt="License: MPL-2.0"></a>
 </p>
 
-<!-- Header demo placeholder: record a short terminal cast of a cross-tool handoff from Claude Code to Codex. -->
+[elepha demo](https://github.com/user-attachments/assets/478a14aa-acb8-4a51-99d6-e809d0473280)
+
+<small>The elepha demo video shows Codex stopping mid-task, then Claude Code resuming that same session and explaining why an earlier approach was rejected, from a conversation it never had.</small>
 
 ## About elepha
 
