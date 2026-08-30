@@ -1,5 +1,11 @@
 # elepha
 
+## 0.3.1
+
+### Patch Changes
+
+- Lead each changelog entry with what changed, and put the pull request and author after it by [@aldanux](https://github.com/aldanux) in [#25](https://github.com/elepha-app/elepha/pull/25)
+
 ## 0.3.0
 
 ### Minor Changes
