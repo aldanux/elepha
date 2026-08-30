@@ -36,7 +36,7 @@ describe('init wizard decisions', () => {
         expect(candidates).toEqual([
             expect.objectContaining({
                 root: `${home}/PhpstormProjects`,
-                label: `All projects in ${home}/PhpstormProjects/* (auto-sync)`,
+                label: `Projects under ${home}/PhpstormProjects (auto-sync)`,
                 hint: '1 projects · 1 sessions',
                 projectCount: 1,
                 sessionCount: 1,
@@ -44,7 +44,7 @@ describe('init wizard decisions', () => {
             }),
             expect.objectContaining({
                 root: `${home}/Sites`,
-                label: `All projects in ${home}/Sites/* (auto-sync)`,
+                label: `Projects under ${home}/Sites (auto-sync)`,
                 hint: '2 projects · 5 sessions',
                 projectCount: 2,
                 sessionCount: 5,
@@ -174,7 +174,7 @@ describe('init wizard decisions', () => {
                 root: sites,
                 approved: false,
                 paused: true,
-                label: `All projects in ${sites}/* (auto-sync) (Paused)`,
+                label: `Projects under ${sites} (auto-sync) (Paused)`,
                 hint: '',
             }),
         ]);
