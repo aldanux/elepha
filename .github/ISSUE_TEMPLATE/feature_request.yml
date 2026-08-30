@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a change before building it.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do today, and where elepha gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: The outcome you want
+      description: What should be true afterwards, from a user's point of view.
+    validations:
+      required: true
+  - type: textarea
+    id: fit
+    attributes:
+      label: Why it belongs in elepha
+      description: Optional, and the most useful field. What makes this the memory layer's job.

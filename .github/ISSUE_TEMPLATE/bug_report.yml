@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in elepha does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities do not belong here. Report them privately through
+        [SECURITY.md](https://github.com/elepha-app/elepha/blob/main/SECURITY.md).
+
+        Please search existing issues first.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what elepha did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: elepha version
+      description: The output of `elepha -V`, or the commit you built from.
+    validations:
+      required: true
+  - type: dropdown
+    id: tool
+    attributes:
+      label: AI coding tool and surface
+      options:
+        - Claude Code (CLI)
+        - Claude Code (desktop app)
+        - Codex (CLI)
+        - Codex (desktop app)
+        - Not tool-specific
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and Node.js version
+      description: For example, macOS 15.3 and Node 22.14.0.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or error output
+      description: Optional. Remove anything you would not publish.
+      render: text
