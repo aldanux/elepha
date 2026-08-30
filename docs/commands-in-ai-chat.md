@@ -24,6 +24,6 @@ This page is the full guide for in-chat recall commands.
 
 Full guide: [docs/maintenance.md](maintenance.md).
 
-| Command         | Description                                                                                                                                       |
-|-----------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha:update` | Return `→ Run (Terminal): $ elepha self-update`; it does not update in chat. More details in [docs/maintenance.md](maintenance.md#update-elepha). |
+| Command         | Description                                                                                                                                     |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
+| `elepha:update` | Return `→ Run (Terminal): elepha self-update`; it does not update in chat. More details in [docs/maintenance.md](maintenance.md#update-elepha). |

@@ -26,7 +26,7 @@ waits for a healthy heartbeat. It does not rewrite missing or invalid installati
 artifacts itself. For those repairs it gives the exact terminal handoff:
 
 ```text
-→ Run (Terminal): $ elepha install
+→ Run (Terminal): elepha install
 ```
 
 Codex hook approval is also manual; when that is the remaining problem, open Codex,
