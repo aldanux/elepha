@@ -108,7 +108,7 @@ function cancellation(prompts: PurgePrompts): number {
 function scopeOptions(): PromptOption[] {
     return [
         { value: 'project', label: 'A project' },
-        { value: 'newer-than', label: 'Sessions newer than a date or duration' },
+        { value: 'newer-than', label: 'Sessions ingested after a date or duration' },
         { value: 'older-than', label: 'Sessions older than a date or duration' },
         { value: 'external-agent-imports', label: 'External-agent imports' },
         { value: 'orphan', label: 'Orphaned or temporary projects' },
@@ -251,10 +251,7 @@ export async function runPurgeWizard(options: PurgeWizardOptions): Promise<numbe
         projectIds = selectedProject.projectIds;
     } else if (selected === 'newer-than' || selected === 'older-than') {
         const cutoff = await prompts.text({
-            message:
-                selected === 'newer-than'
-                    ? 'Delete sessions last ingested at or after what time?'
-                    : 'Delete sessions last ingested at or before what time?',
+            message: selected === 'newer-than' ? 'Ingested since when?' : 'Delete sessions last ingested at or before what time?',
             placeholder: '7d, 24h, or 2026-08-01',
             validate: dateOrDuration,
         });

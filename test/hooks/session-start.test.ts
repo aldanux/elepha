@@ -2,7 +2,7 @@ import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, write
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { AUTO_BRIEF_CHAR_BUDGET, HOOK_WATCHDOG_TIMEOUT_MS, SESSION_CHAR_BUDGET } from '../../src/config/constants.js';
+import { AUTO_BRIEF_CHAR_BUDGET, HOOK_WATCHDOG_TIMEOUT_MS, PACKAGE_VERSION, SESSION_CHAR_BUDGET } from '../../src/config/constants.js';
 import { codexSessionsRoot, hookLogPath } from '../../src/config/paths.js';
 import {
     envelope,
@@ -1015,6 +1015,28 @@ describe('P2.8 SessionStart hook', () => {
                 expect(JSON.stringify(result).includes('1.2.4')).toBe(available);
             }
         }
+    });
+
+    it('ignores an update marker naming the running version', async () => {
+        const { dbPath, cwd } = seededDb({ gitCommitCount: 100, sourcePath: AUTO_SOURCE });
+        let recordedBody: string | undefined;
+        const result = await runSessionStart(sessionStartPayload(cwd), 'codex', {
+            dbPath,
+            now: () => NOW,
+            gitBranch: () => 'main',
+            gitCommitCount: () => 100,
+            daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
+            readUpdateAvailable: () => ({ version: PACKAGE_VERSION, checkedAt: '2026-08-29T00:00:00.000Z' }),
+            readConfig: () => AUTO_CONFIG,
+            writeInjection: (_store, input) => {
+                recordedBody = input.body;
+                return true;
+            },
+        });
+
+        expect('output' in result).toBe(true);
+        expect(recordedBody).not.toContain('⬆ elepha');
+        expect(JSON.stringify(result)).not.toContain('⬆ elepha');
     });
 
     it('degrades missing, unreadable, and reparse-empty sources to notify with a distinct log reason', async () => {

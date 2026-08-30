@@ -1,8 +1,7 @@
-import { existsSync, unlinkSync } from 'node:fs';
 import { PRIVATE_FILE_MODE, UPDATE_CHECK_INTERVAL_MS } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { errorMessage } from '../util/error.js';
-import { readJson, writeJson } from '../util/fs.js';
+import { readJson, removeFileIfExists, writeJson } from '../util/fs.js';
 
 const VERSION = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
 
@@ -41,7 +40,7 @@ function validVersion(version: string): RegExpMatchArray | undefined {
     return version.match(VERSION) ?? undefined;
 }
 
-function isNewerVersion(candidate: string, installed: string): boolean {
+export function isNewerVersion(candidate: string, installed: string): boolean {
     const candidateMatch = validVersion(candidate);
     const installedMatch = validVersion(installed);
     if (!candidateMatch || !installedMatch) {
@@ -73,12 +72,6 @@ export function readUpdateAvailable(markerPath: string): UpdateAvailable | undef
     return Number.isFinite(Date.parse(marker.checkedAt)) ? { version: marker.version, checkedAt: marker.checkedAt } : undefined;
 }
 
-function clearMarker(markerPath: string): void {
-    if (existsSync(markerPath)) {
-        unlinkSync(markerPath);
-    }
-}
-
 function isRegistryUnavailable(error: unknown): boolean {
     const message = errorMessage(error);
     return (
@@ -105,13 +98,13 @@ export async function runUpdateCheck(options: UpdateCheckOptions): Promise<Updat
             writeJson(options.statePath, { checkedAt }, PRIVATE_FILE_MODE);
             return { status: 'update_available', version: latestVersion };
         }
-        clearMarker(options.markerPath);
+        removeFileIfExists(options.markerPath);
         writeJson(options.statePath, { checkedAt }, PRIVATE_FILE_MODE);
         return { status: 'current' };
     } catch (error) {
         if (isRegistryUnavailable(error)) {
             const checkedAt = new Date(now).toISOString();
-            clearMarker(options.markerPath);
+            removeFileIfExists(options.markerPath);
             writeJson(options.statePath, { checkedAt }, PRIVATE_FILE_MODE);
             return { status: 'unreachable' };
         }
