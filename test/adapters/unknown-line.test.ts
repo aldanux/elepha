@@ -82,6 +82,43 @@ describe('unrecognized line shapes are loud, not silently skipped', () => {
         expect(turns).toEqual([]);
     });
 
+    it('ClaudeCodeAdapter silently skips cost-state usage metadata without producing a turn or content', async () => {
+        const warn = vi.fn();
+        const adapter = new ClaudeCodeAdapter(warn);
+        const file = tmpFile('session.jsonl');
+        writeFileSync(
+            file,
+            `${JSON.stringify({
+                type: 'cost-state',
+                sessionId: 'session-id',
+                totalCostUSD: 0.16493,
+                totalAPIDuration: 6310,
+                totalAPIDurationWithoutRetries: 6302,
+                totalToolDuration: 0,
+                totalLinesAdded: 0,
+                totalLinesRemoved: 0,
+                totalDuration: 107099,
+                startTime: 1787887081517,
+                modelUsage: {
+                    'claude-sonnet-5': {
+                        inputTokens: 2,
+                        outputTokens: 227,
+                        cacheReadInputTokens: 0,
+                        cacheCreationInputTokens: 40187,
+                        webSearchRequests: 0,
+                        costUSD: 0.163022,
+                    },
+                },
+                hasUnknownModelCost: false,
+            })}\n`,
+        );
+
+        const turns = await collect(adapter.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+
+        expect(warn).not.toHaveBeenCalled();
+        expect(turns).toEqual([]);
+    });
+
     it('ClaudeCodeAdapter silently skips bridge-session metadata without producing a turn or content', async () => {
         const warn = vi.fn();
         const adapter = new ClaudeCodeAdapter(warn);
