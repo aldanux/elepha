@@ -1,5 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { chmodSync, copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs';
+import {
+    chmodSync,
+    copyFileSync,
+    lstatSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    realpathSync,
+    renameSync,
+    unlinkSync,
+    writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { PRIVATE_DIR_MODE } from '../config/constants.js';
 
@@ -83,6 +94,17 @@ export function readJson<T>(file: string): T | undefined {
 export function writeJson(file: string, value: unknown, mode: number): void {
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, `${JSON.stringify(value)}\n`, { mode });
+}
+
+/** Remove an optional file without a separate existence-check race. */
+export function removeFileIfExists(file: string): void {
+    try {
+        unlinkSync(file);
+    } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+        }
+    }
 }
 
 /** Lists regular files without turning a missing optional directory into an error. */

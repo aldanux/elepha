@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { MINIMUM_NODE_MAJOR } from '../config/constants.js';
+import { updateAvailablePath } from '../config/paths.js';
 import {
     npmInstallGlobalElepha,
     npmInvocationForBackend,
@@ -8,6 +9,7 @@ import {
     npmViewElephaLatestAsync,
 } from '../security/subprocess-allowlist.js';
 import { errorMessage } from '../util/error.js';
+import { removeFileIfExists } from '../util/fs.js';
 import { type ResolvedElephaBin, resolveInstalledElephaBin } from './binary.js';
 import { detectLauncherBackend, type LauncherBackend } from './launcher.js';
 import { isSupportedPlatform } from './platform.js';
@@ -127,10 +129,10 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
         throw new Error(`self-update failed while installing elepha@latest: ${errorMessage(error)}`);
     }
 
+    let installedVersion: string;
     try {
         restart(service, approvedRoots, reconcile);
-        const installedVersion = (runtime.readPackageVersion ?? packageVersion)(resolved.packageRoot);
-        return { status: 'updated', previousVersion, version: installedVersion };
+        installedVersion = (runtime.readPackageVersion ?? packageVersion)(resolved.packageRoot);
     } catch (updateError) {
         const updateFailure = errorMessage(updateError);
         const prefix = `self-update failed after installing ${latestVersion}: ${updateFailure}`;
@@ -157,6 +159,9 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
         }
         return { status: 'rolled-back', previousVersion, attemptedVersion: latestVersion, failure: updateFailure };
     }
+
+    removeFileIfExists(updateAvailablePath());
+    return { status: 'updated', previousVersion, version: installedVersion };
 }
 
 function missingApprovedRoots(): never {

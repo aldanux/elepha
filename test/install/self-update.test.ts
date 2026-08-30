@@ -1,6 +1,10 @@
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { updateAvailablePath } from '../../src/config/paths.js';
 import { type SelfUpdateRuntime, selfUpdate } from '../../src/install/self-update.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
+import { withGrantableTestDir } from '../helpers/tmp.js';
 
 interface Scenario {
     platform?: NodeJS.Platform;
@@ -101,6 +105,27 @@ describe('selfUpdate', () => {
             'service stop',
             'service reconcile and verify heartbeat',
         ]);
+    });
+
+    it('clears the update marker after an already-current update succeeds', () => {
+        const root = withGrantableTestDir('self-update-marker-');
+        const previousHome = process.env.ELEPHA_HOME;
+        process.env.ELEPHA_HOME = root;
+        const markerPath = updateAvailablePath();
+        mkdirSync(path.dirname(markerPath), { recursive: true });
+        writeFileSync(markerPath, '{"version":"1.2.3","checkedAt":"2026-08-29T00:00:00.000Z"}\n');
+        const { runtime } = runtimeFor({ latest: '1.2.3', reconciliation: ['active'] });
+
+        try {
+            expect(selfUpdate(runtime)).toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.3' });
+            expect(existsSync(markerPath)).toBe(false);
+        } finally {
+            if (previousHome === undefined) {
+                delete process.env.ELEPHA_HOME;
+            } else {
+                process.env.ELEPHA_HOME = previousHome;
+            }
+        }
     });
 
     it('aborts before stopping capture when the latest registry version cannot be resolved', () => {

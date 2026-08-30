@@ -193,7 +193,7 @@ describe('elepha purge wizard', () => {
                 message: 'What should elepha forget?',
                 options: expect.arrayContaining([
                     { value: 'project', label: 'A project' },
-                    { value: 'newer-than', label: 'Sessions newer than a date or duration' },
+                    { value: 'newer-than', label: 'Sessions ingested after a date or duration' },
                     { value: 'older-than', label: 'Sessions older than a date or duration' },
                     { value: 'external-agent-imports', label: 'External-agent imports' },
                     { value: 'orphan', label: 'Orphaned or temporary projects' },
@@ -239,6 +239,31 @@ describe('elepha purge wizard', () => {
             db.close();
             rmSync(directory, { recursive: true, force: true });
         }
+    });
+
+    it('uses ingestion-time vocabulary once for the newer-than scope', async () => {
+        const { prompts } = fakePrompts(['newer-than'], true);
+
+        await expect(
+            runPurgeWizard({
+                input: ttyStream(),
+                output: ttyStream(),
+                store: {} as MemoryStore,
+                prompts,
+                runPurge: async () => true,
+                runExternalAgentImports: async () => true,
+            }),
+        ).resolves.toBe(0);
+
+        expect(prompts.select).toHaveBeenCalledWith({
+            message: 'What should elepha forget?',
+            options: expect.arrayContaining([{ value: 'newer-than', label: 'Sessions ingested after a date or duration' }]),
+        });
+        expect(prompts.text).toHaveBeenCalledWith({
+            message: 'Ingested since when?',
+            placeholder: '7d, 24h, or 2026-08-01',
+            validate: expect.any(Function),
+        });
     });
 
     it('cancels at confirmation without changing the previewed rows', async () => {

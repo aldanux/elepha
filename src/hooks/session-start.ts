@@ -9,10 +9,11 @@ import {
     AUTO_BRIEF_MAX_COMMITS_BEHIND,
     AUTO_BRIEF_NOTIFY_AGE_MS,
     HOOK_WATCHDOG_TIMEOUT_MS,
+    PACKAGE_VERSION,
 } from '../config/constants.js';
 import { readMemoryConfig, type StartupMode } from '../config/memory-config.js';
 import { updateAvailablePath } from '../config/paths.js';
-import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
+import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
@@ -186,7 +187,7 @@ function withDaemonHealthWarning(body: string, now: number, healthCheck: typeof 
 function withUpdateNotice(body: string, readMarker: (markerPath: string) => UpdateAvailable | undefined): string {
     try {
         const update = readMarker(updateAvailablePath());
-        if (!update) {
+        if (!update || !isNewerVersion(update.version, PACKAGE_VERSION)) {
             return body;
         }
         const notice = `⬆ elepha ${update.version} available — ${terminalHandoff('self-update')}`;
