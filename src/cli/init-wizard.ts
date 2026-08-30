@@ -75,7 +75,7 @@ export function folderCandidates(
         );
         return {
             root: group.root,
-            label: `All projects in ${group.root}/* (auto-sync)${paused ? ' (Paused)' : ''}`,
+            label: `Projects under ${group.root} (auto-sync)${paused ? ' (Paused)' : ''}`,
             hint: paused ? '' : `${group.projects.length} projects · ${sessionCount} sessions`,
             projectCount: group.projects.length,
             sessionCount,

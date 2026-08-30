@@ -108,6 +108,16 @@ describe('elepha init', () => {
             expect(consentOutput).not.toContain(ELEPHA_WORDMARK);
             expect(consentOutput).toContain(ELEPHA_TAGLINE);
             expect(consent.prompts.select).toHaveBeenCalledOnce();
+            expect(consent.prompts.select).toHaveBeenCalledWith({
+                message: 'How should elepha remember your projects?',
+                options: [
+                    {
+                        value: 'folder',
+                        label: 'By folder — every project inside it, including new ones (recommended)',
+                    },
+                    { value: 'individual', label: 'By individual project — only the ones you pick' },
+                ],
+            });
             expect(consent.events).toContain('note:Tools detected: Claude Code, Codex');
         } finally {
             db.close();
@@ -152,19 +162,22 @@ describe('elepha init', () => {
             expect(prompts.select).toHaveBeenCalledWith({
                 message: 'How should elepha remember your projects?',
                 options: [
-                    { value: 'folder', label: 'By folder — auto-sync everything inside (recommended)' },
-                    { value: 'individual', label: 'By individual project — manual-sync by selection' },
+                    {
+                        value: 'folder',
+                        label: 'By folder — every project inside it, including new ones (recommended)',
+                    },
+                    { value: 'individual', label: 'By individual project — only the ones you pick' },
                 ],
             });
             expect(prompts.multiselect).toHaveBeenCalledWith({
-                message: 'Which folders should elepha remember?',
+                message: 'Which folders should elepha auto-sync?',
                 options: [
                     {
                         value: phpstormProjects,
-                        label: `All projects in ${phpstormProjects}/* (auto-sync)`,
+                        label: `Projects under ${phpstormProjects} (auto-sync)`,
                         hint: '1 projects · 4 sessions',
                     },
-                    { value: sites, label: `All projects in ${sites}/* (auto-sync)`, hint: '2 projects · 3 sessions' },
+                    { value: sites, label: `Projects under ${sites} (auto-sync)`, hint: '2 projects · 3 sessions' },
                 ],
                 initialValues: [],
             });
@@ -379,7 +392,7 @@ describe('elepha init', () => {
             ).resolves.toBe(0);
 
             expect(prompts.multiselect).toHaveBeenCalledWith(
-                expect.objectContaining({ message: 'Which projects should elepha remember?', initialValues: [project] }),
+                expect.objectContaining({ message: 'Which projects should elepha auto-sync?', initialValues: [project] }),
             );
             expect(store.consent.list()).toEqual([expect.objectContaining({ path: project, state: 'denied' })]);
         } finally {

@@ -132,7 +132,7 @@ export async function runConfigWizard(options: ConfigWizardOptions = {}): Promis
 
         const choices = settingChoices(setting.key);
         const choice = await prompts.select({
-            message: `How should ${setting.key} be configured?`,
+            message: 'Which value should elepha use?',
             options: choices,
         });
         if (prompts.isCancel(choice) || typeof choice !== 'string' || !choices.some((option) => option.value === choice)) {

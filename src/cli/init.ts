@@ -137,8 +137,8 @@ export async function runInit(options: InitOptions): Promise<number> {
     const mode = await prompts.select({
         message: 'How should elepha remember your projects?',
         options: [
-            { value: 'folder', label: 'By folder — auto-sync everything inside (recommended)' },
-            { value: 'individual', label: 'By individual project — manual-sync by selection' },
+            { value: 'folder', label: 'By folder — every project inside it, including new ones (recommended)' },
+            { value: 'individual', label: 'By individual project — only the ones you pick' },
         ],
     });
     if (prompts.isCancel(mode) || (mode !== 'folder' && mode !== 'individual')) {
@@ -178,7 +178,7 @@ export async function runInit(options: InitOptions): Promise<number> {
               )
             : individualCandidates(individualSource, (root) => options.store.consent.consentState(root), effectiveSessionCount);
     const selectedRoots = await prompts.multiselect({
-        message: mode === 'folder' ? 'Which folders should elepha remember?' : 'Which projects should elepha remember?',
+        message: mode === 'folder' ? 'Which folders should elepha auto-sync?' : 'Which projects should elepha auto-sync?',
         options: promptOptions(candidates),
         initialValues: candidates.filter((candidate) => candidate.approved).map((candidate) => candidate.root),
     });
