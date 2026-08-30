@@ -36,13 +36,25 @@ class TitleFixtureAdapter implements SessionAdapter {
 
     async *parseTurns(_filePath: string, _sinceCursor?: string, _options?: ParseTurnsOptions): AsyncIterable<ParsedTurn> {
         yield turn(0, 'Initial CSP request', 'Review CSP headers for iframe components');
-        yield turn(1, '/compact', 'Review CSP headers for iframe components');
+        yield turn(
+            1,
+            '<command-name>/compact</command-name>\n<command-message>compact</command-message>',
+            'Review CSP headers for iframe components',
+        );
         yield turn(2, 'This session is being continued from a previous conversation that ran out of context. Summary: prior work.');
         yield turn(3, 'Replace the iframe sandbox directive with the reviewed policy');
         yield turn(4, 'elepha:list', 'Elepha list');
-        yield turn(5, '/compact', 'Compact conversation');
+        yield turn(5, '<command-name>/compact</command-name>\n<command-message>compact</command-message>', 'Compact conversation');
         yield turn(6, 'elepha:list');
         yield turn(7, 'Implement filtered recent sessions', 'Filtered recent sessions');
+        yield turn(
+            8,
+            '**Executor:** Codex CLI · gpt-5.6-terra · effort high · **new chat**\n\n## Objective\nRepair title derivation for the first repeated routing header.',
+        );
+        yield turn(
+            9,
+            '**Executor:** Codex CLI · gpt-5.6-terra · effort high · **new chat**\n\n## Objective\nRepair title derivation for the second repeated routing header.',
+        );
     }
 }
 
@@ -111,8 +123,10 @@ describe('session-title backfill', () => {
                     (3, 'codex', 'codex-title-backfill', 0, 1, ?, '2026-08-01T00:00:00.000Z', '2026-08-01T00:01:00.000Z'),
                     (4, 'claude-code', 'title-backfill', 2, 1, ?, '2026-08-03T00:00:00.000Z', '2026-08-03T00:01:00.000Z'),
                     (5, 'claude-code', 'command-only-title-backfill', 0, 1, ?, '2026-08-04T00:00:00.000Z', '2026-08-04T00:01:00.000Z'),
-                    (6, 'claude-code', 'command-then-work-title-backfill', 0, 1, ?, '2026-08-05T00:00:00.000Z', '2026-08-05T00:01:00.000Z')`,
-        ).run(claudeSource, claudeSource, codexSource, claudeSource, claudeSource, claudeSource);
+                    (6, 'claude-code', 'command-then-work-title-backfill', 0, 1, ?, '2026-08-05T00:00:00.000Z', '2026-08-05T00:01:00.000Z'),
+                    (7, 'claude-code', 'first-repeated-header', 0, 1, ?, '2026-08-06T00:00:00.000Z', '2026-08-06T00:01:00.000Z'),
+                    (8, 'claude-code', 'second-repeated-header', 0, 1, ?, '2026-08-07T00:00:00.000Z', '2026-08-07T00:01:00.000Z')`,
+        ).run(claudeSource, claudeSource, codexSource, claudeSource, claudeSource, claudeSource, claudeSource, claudeSource);
         const insertMemory = db.prepare(
             `INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at)
              VALUES (1, ?, ?, ?, '2026-08-01T00:00:00.000Z', '[]', '[]', '[]', '2026-08-01T00:00:00.000Z')`,
@@ -126,6 +140,8 @@ describe('session-title backfill', () => {
         insertMemory.run(5, 5, 'claude-code');
         insertMemory.run(6, 6, 'claude-code');
         insertMemory.run(6, 7, 'claude-code');
+        insertMemory.run(7, 8, 'claude-code');
+        insertMemory.run(8, 9, 'claude-code');
 
         const adapters: Record<ToolName, SessionAdapter> = {
             'claude-code': new TitleFixtureAdapter(),
@@ -140,6 +156,8 @@ describe('session-title backfill', () => {
             [4, UNTITLED_EPISODE],
             [5, UNTITLED_EPISODE],
             [6, 'Filtered recent sessions'],
+            [7, 'Repair title derivation for the first repeated routing header.'],
+            [8, 'Repair title derivation for the second repeated routing header.'],
         ]);
 
         await applySessionTitleBackfill(db, adapters);
@@ -150,6 +168,8 @@ describe('session-title backfill', () => {
             { id: 4, title: UNTITLED_EPISODE },
             { id: 5, title: UNTITLED_EPISODE },
             { id: 6, title: 'Filtered recent sessions' },
+            { id: 7, title: 'Repair title derivation for the first repeated routing header.' },
+            { id: 8, title: 'Repair title derivation for the second repeated routing header.' },
         ]);
         expect((await planSessionTitleBackfill(db, adapters)).changes).toHaveLength(0);
         db.close();

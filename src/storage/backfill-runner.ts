@@ -25,6 +25,7 @@ export interface BackfillDeriver<Session, Change extends BackfillChange, State =
     }): Promise<Change | undefined>;
     shouldWrite(change: Change): boolean;
     write(db: Database, change: Change): BackfillWriteResult;
+    finalize?(plan: BackfillPlan<Change>, state: State): BackfillPlan<Change>;
     recordConcurrentSkips?(plan: BackfillPlan<Change>, skipped: number): void;
     afterApply?(input: { db: Database; adapters: Record<ToolName, SessionAdapter>; plan: BackfillPlan<Change> }): Promise<void>;
 }
@@ -49,7 +50,8 @@ export async function planBackfill<Session, Change extends BackfillChange, State
         }
     }
 
-    return { changes, sessionsScanned: sessions.length, sessionsMissingTranscript };
+    const plan = { changes, sessionsScanned: sessions.length, sessionsMissingTranscript };
+    return deriver.finalize?.(plan, state) ?? plan;
 }
 
 export async function applyBackfill<Session, Change extends BackfillChange, State>(
