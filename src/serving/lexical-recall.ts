@@ -65,6 +65,7 @@ interface RecallRarity {
 }
 
 const FILLER_WORDS = new Set<string>(REMEMBER_QUERY_FILLER_WORDS);
+export const STRICT_RECALL_FALLBACK_NOTICE = 'No session matched every term; these sessions match some:';
 
 function folded(value: string): string {
     return value
@@ -265,6 +266,7 @@ function renderBody(
     now: number,
     scope: RecallScope,
     project: ProjectSet | undefined,
+    usedLaxFallback: boolean,
 ): LexicalRecallResult {
     const trailer = coverage === undefined ? ['', SELECT_HINT] : ['', coverage, '', SELECT_HINT];
     if (hits.length === 0) {
@@ -282,6 +284,8 @@ function renderBody(
             servedContextInstructions(nonce),
             DISPLAY_VERBATIM_INSTRUCTIONS,
             '',
+            usedLaxFallback ? STRICT_RECALL_FALLBACK_NOTICE : undefined,
+            usedLaxFallback ? '' : undefined,
             `Recall hits for “${query.display}” (${shown.length} shown of ${hits.length}):`,
             ...shown.map(
                 (hit, index) => `${index + 1}. [${relativeTime(hit.endedAt, now)} | ${hit.tool}] · ${hit.project} · ${hit.sessionTitle}`,
@@ -359,9 +363,19 @@ export async function lexicalRecall(
     ].filter((reason): reason is string => reason !== undefined);
     const coverage = coverageLine(reasons, searchedProjects, projects.length, searchedSessions, allCandidates.length);
     const rarity = prepareRarity(prepared, query);
-    const hits = prepared.flatMap((metadata) => {
+    const matched = prepared.flatMap((metadata) => {
         const hit = hitForSession(metadata, query, matchingMode);
         return hit === undefined ? [] : [hit];
     });
-    return renderBody(query, rankAndFloorHits(hits, rarity), coverage, renderedAt, scope, projects[0]);
+    let hits = rankAndFloorHits(matched, rarity);
+    let usedLaxFallback = false;
+    if (matchingMode === 'strict' && hits.length === 0) {
+        const laxMatches = prepared.flatMap((metadata) => {
+            const hit = hitForSession(metadata, query, 'lax');
+            return hit === undefined ? [] : [hit];
+        });
+        hits = rankAndFloorHits(laxMatches, rarity);
+        usedLaxFallback = hits.length > 0;
+    }
+    return renderBody(query, hits, coverage, renderedAt, scope, projects[0], usedLaxFallback);
 }

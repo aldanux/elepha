@@ -13,7 +13,7 @@ import {
     REMEMBER_QUERY_REQUIRED,
     SELECT_HINT,
 } from '../../src/serving/instructions.js';
-import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
+import { lexicalRecall, STRICT_RECALL_FALLBACK_NOTICE, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import type { ServedSession, SessionReader } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
 import { openDb } from '../../src/storage/db.js';
@@ -496,7 +496,59 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(singleTokenBody).toContain('Alpha Beta Gamma oldest title');
     });
 
-    it('uses lax matching across split terms while preserving the two-token floor', async () => {
+    it('falls back from strict to labelled lax matches without changing true misses', async () => {
+        const project: ProjectSet = {
+            key: 'fallback-project',
+            displayName: 'fallback-project',
+            paths: ['/fallback-project'],
+            projectIds: [1],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const target = recallSession(
+            1,
+            'Idempotent cache initialization',
+            '2026-08-22T11:00:00.000Z',
+            'Build an in-memory Map for request deduplication',
+        );
+        const sessions = [
+            target,
+            ...Array.from({ length: 200 }, (_, index) =>
+                recallSession(index + 2, `Routine deployment ${index}`, '2026-08-22T10:00:00.000Z'),
+            ),
+        ];
+        const sessionsFor = vi.fn(() => sessions);
+        const reader = {
+            sessionsFor,
+            storedRecallFieldsFor: () => new Map(sessions.map((session) => [session.id, new Map()])),
+            turns: async () => ({ reason: 'must_not_parse' }),
+        } as unknown as SessionReader;
+        const fallbackQuery = tokenizeRecallQuery('in-memory idempotency');
+        const strictQuery = tokenizeRecallQuery('in-memory');
+        const missingQuery = tokenizeRecallQuery('persistent convergence');
+        expect(fallbackQuery).toBeDefined();
+        expect(strictQuery).toBeDefined();
+        expect(missingQuery).toBeDefined();
+        if (!fallbackQuery || !strictQuery || !missingQuery) return;
+
+        const fallback = await lexicalRecall(reader, [project], fallbackQuery, 'here', () => 0, undefined, 'strict');
+        expect(fallback.body).toContain(`${STRICT_RECALL_FALLBACK_NOTICE}\n\nRecall hits for “in-memory idempotency”`);
+        expect(fallback.body).toContain('Idempotent cache initialization');
+        expect(fallback.sessionIds).toEqual([target.id]);
+        expect(sessionsFor).toHaveBeenCalledTimes(1);
+
+        const strict = await lexicalRecall(reader, [project], strictQuery, 'here', () => 0, undefined, 'strict');
+        expect(strict.body).not.toContain(STRICT_RECALL_FALLBACK_NOTICE);
+        expect(strict.body).toContain('Idempotent cache initialization');
+
+        const missing = await lexicalRecall(reader, [project], missingQuery, 'here', () => 0, undefined, 'strict');
+        expect(missing.body).toBe(
+            `${DISPLAY_VERBATIM_INSTRUCTIONS}\nNo recall matches found for “persistent convergence” in fallback-project. Search every project with elepha:query persistent convergence.\n\n${SELECT_HINT}`,
+        );
+        expect(missing.sessionIds).toEqual([]);
+    });
+
+    it('labels the strict fallback but not explicit lax matching while preserving the two-token floor', async () => {
         const project: ProjectSet = {
             key: 'lax-project',
             displayName: 'lax-project',
@@ -522,14 +574,17 @@ describe('UserPromptSubmit lexical recall', () => {
 
         const strictMode = getSetting('query-matching', {}, matchingConfig).value;
         const strict = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, strictMode);
-        expect(strict.body).toContain(
-            'No recall matches found for “alpha beta gamma” in lax-project. Search every project with elepha:query alpha beta gamma.',
-        );
+        expect(strict.body).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+        expect(strict.body).toContain('Alpha Beta combined work');
+        expect(strict.body).not.toContain('Gamma isolated work');
+        expect(strict.body).not.toContain('Alpha isolated work');
+        expect(strict.sessionIds).toEqual([1]);
 
         setSetting('query-matching', 'lax', matchingConfig);
         const laxMode = getSetting('query-matching', {}, matchingConfig).value;
         const lax = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, laxMode);
 
+        expect(lax.body).not.toContain(STRICT_RECALL_FALLBACK_NOTICE);
         expect(lax.body).toContain('Alpha Beta combined work');
         expect(lax.body).not.toContain('Gamma isolated work');
         expect(lax.body).not.toContain('Alpha isolated work');
