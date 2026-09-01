@@ -10,7 +10,8 @@ schema change.
 installed global build, installs the latest release, restarts the capture daemon so
 database migrations run, and verifies that capture becomes healthy again. If the
 installed version already matches the latest release, it reports that the install is
-already current and does not reinstall or restart capture.
+already current and does not reinstall or restart capture. If capture is unhealthy,
+`elepha doctor` restarts the service and verifies it.
 
 If the new build fails after installation, elepha makes one rollback attempt to the
 previous recorded version and restarts the service again. A failed rollback or an
