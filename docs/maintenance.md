@@ -8,7 +8,9 @@ schema change.
 
 `elepha self-update` runs the update workflow. On macOS, the updater finds the
 installed global build, installs the latest release, restarts the capture daemon so
-database migrations run, and verifies that capture becomes healthy again.
+database migrations run, and verifies that capture becomes healthy again. If the
+installed version already matches the latest release, it reports that the install is
+already current and does not reinstall or restart capture.
 
 If the new build fails after installation, elepha makes one rollback attempt to the
 previous recorded version and restarts the service again. A failed rollback or an
