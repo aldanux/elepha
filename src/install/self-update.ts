@@ -36,6 +36,7 @@ export interface SelfUpdateRuntime {
 
 export type SelfUpdateResult =
     | { status: 'updated'; previousVersion: string; version: string }
+    | { status: 'current'; version: string }
     | { status: 'rolled-back'; previousVersion: string; attemptedVersion: string; failure: string };
 
 export function packageVersion(packageRoot: string): string {
@@ -121,6 +122,11 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
         latestVersion = npm.latestVersion();
     } catch (error) {
         throw new Error(`self-update preflight failed: could not resolve elepha@latest: ${errorMessage(error)}`);
+    }
+
+    if (latestVersion === previousVersion) {
+        removeFileIfExists(updateAvailablePath());
+        return { status: 'current', version: previousVersion };
     }
 
     try {

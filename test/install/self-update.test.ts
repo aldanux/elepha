@@ -107,17 +107,18 @@ describe('selfUpdate', () => {
         ]);
     });
 
-    it('clears the update marker after an already-current update succeeds', () => {
+    it('reports current without installing or restarting when the registry version matches', () => {
         const root = withGrantableTestDir('self-update-marker-');
         const previousHome = process.env.ELEPHA_HOME;
         process.env.ELEPHA_HOME = root;
         const markerPath = updateAvailablePath();
         mkdirSync(path.dirname(markerPath), { recursive: true });
         writeFileSync(markerPath, '{"version":"1.2.3","checkedAt":"2026-08-29T00:00:00.000Z"}\n');
-        const { runtime } = runtimeFor({ latest: '1.2.3', reconciliation: ['active'] });
+        const { runtime, events } = runtimeFor({ latest: '1.2.3', reconciliation: ['active'] });
 
         try {
-            expect(selfUpdate(runtime)).toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.3' });
+            expect(selfUpdate(runtime)).toEqual({ status: 'current', version: '1.2.3' });
+            expect(events).toEqual(['npm view elepha@latest']);
             expect(existsSync(markerPath)).toBe(false);
         } finally {
             if (previousHome === undefined) {
