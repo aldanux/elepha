@@ -3,11 +3,11 @@
 // extraction and rollups are optional work layered on top.
 //
 // Every file change triggers two kinds of scan:
-//  - a prompt scan (closeTrailingOnIdle: false) - picks up any turn that
-//    already closed via a following boundary line, without waiting;
-//  - a debounced idle scan (closeTrailingOnIdle: true), fired once the file
-//    has gone quiet for idleDebounceMs - flushes a trailing turn that never
-//    got a following boundary line (e.g. the session is still open).
+// - a prompt scan (closeTrailingOnIdle: false) - picks up any turn that
+//   already closed via a following boundary line, without waiting;
+// - a debounced idle scan (closeTrailingOnIdle: true), fired once the file
+//   has gone quiet for idleDebounceMs - flushes a trailing turn that never
+//   got a following boundary line (e.g. the session is still open).
 // Both go through a bounded concurrency queue: cost per summarization call is
 // negligible, but several projects writing at once are not, and without a
 // per-file mutex a second scan could re-read a cursor the first is still
@@ -96,11 +96,9 @@ export const FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX = '[elepha] first-prompt se
 // threshold so a closed session rolls up promptly rather than up to a full
 // threshold late.
 
-/**
- * A format change can create one unknown line per transcript record. Keep the
- * daemon log useful by emitting each distinct adapter message once, while a
- * bounded FIFO prevents a long-lived process from retaining unbounded keys.
- */
+// A format change can create one unknown line per transcript record. Keep the
+// daemon log useful by emitting each distinct adapter message once, while a
+// bounded FIFO prevents a long-lived process from retaining unbounded keys.
 export function deduplicateDaemonUnknownLineWarnings(
     warn: (message: string) => void,
     limit = MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
@@ -144,41 +142,40 @@ export interface DaemonOptions {
     maxConcurrentSummaries?: number;
     log?: (msg: string) => void;
     logError?: (msg: string) => void;
-    /** Overrides the watched root directories. Defaults to the real ~/.claude/projects and ~/.codex/sessions; tests point this at a temp dir. */
+    // Overrides the watched roots. Tests use repository-owned fixtures instead
+    // of the real Claude Code and Codex stores.
     watchRoots?: string[];
-    /** Overrides the heartbeat file path (see ./heartbeat.ts). Defaults to ~/.elepha/daemon.heartbeat.json; tests point this at a temp file. */
+    // Overrides the heartbeat file path. Defaults to ~/.elepha/daemon.heartbeat.json; tests point this at a temp file.
     heartbeatPath?: string;
-    /** Test seam for launchd-managed logs. Production uses the canonical ~/.elepha/logs paths. */
+    // Test seam for launchd-managed logs. Production uses the canonical ~/.elepha/logs paths.
     daemonLogPaths?: DaemonLogPaths;
-    /** Session rollups. Omit to disable rollups entirely (tests that only exercise turn ingestion). */
+    // Session rollups. Omit to disable rollups entirely (tests that only exercise turn ingestion).
     rollupService?: RollupService;
-    /** Mechanical rollup state only: capture-only activity reopens an existing final rollup without synthesizing it. */
+    // Mechanical rollup state only: capture-only activity reopens an existing final rollup without synthesizing it.
     rollups?: Pick<RollupStore, 'markLive'>;
-    /** How often to sweep for sessions gone idle. Defaults to SWEEP_INTERVAL_MS. */
+    // How often to sweep for sessions gone idle. Defaults to SWEEP_INTERVAL_MS.
     sweepIntervalMs?: number;
-    /** Test seam for the daemon-owned registry check. The hook never uses it. */
+    // Test seam for the daemon-owned registry check. The hook never uses it.
     updateCheck?: () => Promise<unknown> | unknown;
-    /** How often to revisit the persisted 24-hour update-check cache. */
+    // How often to revisit the persisted 24-hour update-check cache.
     updateCheckIntervalMs?: number;
-    /**
-     * Forces chokidar to poll instead of using native OS watch descriptors
-     * (fsevents on macOS, inotify on Linux). Off by default - native watching
-     * is cheaper and this changes real filesystem-event behavior, so it's not
-     * something to flip in production. Exists for test environments whose
-     * sandbox restricts the underlying `watch` syscall itself (distinct from
-     * the process fd ulimit - polling never calls it, it just stats on an
-     * interval). See test/daemon and test/security's daemon-backed tests.
-     */
+    // Forces chokidar to poll instead of using native OS watch descriptors
+    // (fsevents on macOS, inotify on Linux). Off by default - native watching
+    // is cheaper and this changes real filesystem-event behavior, so it's not
+    // something to flip in production. Exists for test environments whose
+    // sandbox restricts the underlying `watch` syscall itself (distinct from
+    // the process fd ulimit - polling never calls it, it just stats on an
+    // interval). Daemon-backed tests opt into polling explicitly.
     watcherUsePolling?: boolean;
-    /** Poll interval in ms when watcherUsePolling is set. Defaults to 50ms. */
+    // Poll interval in ms when watcherUsePolling is set. Defaults to 50ms.
     watcherPollIntervalMs?: number;
-    /** Reads capture preferences once at daemon startup; tests inject resolved values. */
+    // Reads capture preferences once at daemon startup; tests inject resolved values.
     readConfig?: typeof readMemoryConfig;
-    /** Test seam for counting corpus walks without changing filesystem traversal. */
+    // Test seam for counting corpus walks without changing filesystem traversal.
     readCorpus?: (watchRoot: string) => Promise<string[]>;
-    /** Test seam for deterministically exercising opened-object containment races. */
+    // Test seam for deterministically exercising opened-object containment races.
     openTranscript?: ProviderTranscriptOpener;
-    /** Test seam; production uses FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE. */
+    // Test seam; production uses FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE.
     firstPromptSearchBackfillBatchSize?: number;
 }
 
@@ -228,13 +225,13 @@ export class IngestionDaemon {
         void this.stop().catch((error: unknown) => this.logError(`[elepha] shutdown failed: ${(error as Error).message}`));
     };
 
-    /** Shared with the adapters' unknown-line warnings: one log line per distinct message, bounded FIFO. */
+    // Shared with the adapters' unknown-line warnings: one log line per distinct message, bounded FIFO.
     private readonly warnDeduplicated: (message: string) => void;
     private readonly failureWindow: FailureWindow;
     private readonly skippedFiles = new Map<string, FileSkip>();
     private readonly oversizedFileSkipCache = new Map<string, { size: number; mtimeMs: number; skipped: FileSkip }>();
     private readonly readabilityGuard = new ReadabilityGuard();
-    /** Classification per transcript file, so the rollup path doesn't re-read session_meta on every batch. */
+    // Classification per transcript file, so the rollup path doesn't re-read session_meta on every batch.
     private readonly kindCache = new Map<string, SessionClassification>();
     private readonly customTitleCache = new Map<
         string,
@@ -556,17 +553,15 @@ export class IngestionDaemon {
         });
     }
 
-    /**
-     * Replays local transcripts for one newly-approved root without enabling a
-     * synthesis provider. Approval must make the already-written transcript
-     * useful, but it must not turn a CLI acknowledgement into unbounded API
-     * spend. The normal daemon will continue with provider work on new turns.
-     */
+    // Replays local transcripts for one newly-approved root without enabling a
+    // synthesis provider. Approval must make the already-written transcript
+    // useful, but it must not turn a CLI acknowledgement into unbounded API
+    // spend. The normal daemon will continue with provider work on new turns.
     async backfillApprovedRoot(root: string): Promise<number> {
         return this.backfillApprovedRoots([root]);
     }
 
-    /** Replays the provider corpus once for every newly-approved root in the set. */
+    // Replays the provider corpus once for every newly-approved root in the set.
     async backfillApprovedRoots(roots: string[]): Promise<number> {
         const canonicalRoots = [...new Set(roots.map((root) => canonicalizeExisting(root)))];
         if (canonicalRoots.length === 0) {
@@ -586,12 +581,10 @@ export class IngestionDaemon {
         return ingested;
     }
 
-    /**
-     * Cold-start work is intentionally an ordered, awaited sweep rather than
-     * unbounded initial watch events. scanFile() is its file boundary: one
-     * bad transcript reports a skip and cannot prevent a later one from being
-     * read.
-     */
+    // Cold-start work is intentionally an ordered, awaited sweep rather than
+    // unbounded initial watch events. scanFile() is its file boundary: one
+    // bad transcript reports a skip and cannot prevent a later one from being
+    // read.
     private async sweepStartupFiles(): Promise<void> {
         const summary: SweepSummary = { files: 0, ingested: 0, skipped: new Map(), emptySessions: new Map() };
         for (const watchRoot of this.watchRoots) {
@@ -903,7 +896,7 @@ export class IngestionDaemon {
 
             // Mid-task handoff can't wait for session close - that's the whole
             // wedge - so the rollup refreshes as each batch lands, not only at
-            // the end. Incremental by construction (see RollupService), so this
+            // the end. Incremental by construction, so this
             // costs one small merge per batch rather than a full re-summary.
             if (ingested > 0) {
                 await this.refreshRollup(adapter, real, nativeId, 'live');
@@ -1097,12 +1090,10 @@ export class IngestionDaemon {
         return inserted;
     }
 
-    /**
-     * The adapter has already logged a sentinel match and intentionally did
-     * not emit a persistable turn. We still create/locate its ordinary session
-     * so its cursor can move past the complete source range without recording
-     * memory, rendered stats, boundary state, or a summarizer call.
-     */
+    // The adapter has already logged a sentinel match and intentionally did
+    // not emit a persistable turn. We still create/locate its ordinary session
+    // so its cursor can move past the complete source range without recording
+    // memory, rendered stats, boundary state, or a summarizer call.
     private async advanceDroppedTurn(turn: ParsedTurn, customTitle?: string): Promise<void> {
         if (isRefusedProjectRoot(turn.projectPath)) {
             this.recordSkippedFile(
@@ -1136,13 +1127,11 @@ export class IngestionDaemon {
         }
     }
 
-    /**
-     * Turn-level consent fallback behind the file-level gate in scanFile. A
-     * later pending cwd is dropped without creating a pending root (that
-     * decision belongs to the first cwd) and is logged once per transcript and
-     * cwd. A denied cwd is returned distinctly so callers can permanently veto
-     * the native session and stop before advancing beyond the denied turn.
-     */
+    // Turn-level consent fallback behind the file-level gate in scanFile. A
+    // later pending cwd is dropped without creating a pending root (that
+    // decision belongs to the first cwd) and is logged once per transcript and
+    // cwd. A denied cwd is returned distinctly so callers can permanently veto
+    // the native session and stop before advancing beyond the denied turn.
     private consentStateForTurn(turn: ParsedTurn): ConsentState {
         const state = this.store.consent.consentState(turn.projectPath);
         if (state === 'pending') {
@@ -1156,11 +1145,9 @@ export class IngestionDaemon {
         return state;
     }
 
-    /**
-     * Recomputes a session's rollup. `state` is 'live' for a mid-session batch
-     * and 'final' once the transcript has gone idle - but 'final' is only ever
-     * a heuristic, and any later turn returns the session to 'live'.
-     */
+    // Recomputes a session's rollup. `state` is 'live' for a mid-session batch
+    // and 'final' once the transcript has gone idle - but 'final' is only ever
+    // a heuristic, and any later turn returns the session to 'live'.
     private async refreshRollup(adapter: SessionAdapter, filePath: string, nativeId: string, state: 'live' | 'final'): Promise<void> {
         if (!this.rollupService) {
             return;
@@ -1207,12 +1194,10 @@ export class IngestionDaemon {
         }
     }
 
-    /**
-     * Closes sessions whose transcripts have gone quiet, including those that
-     * ended while the daemon was down - without this startup sweep, a session
-     * that finished during downtime would sit 'live' forever, since no further
-     * file event will ever arrive for it.
-     */
+    // Closes sessions whose transcripts have gone quiet, including those that
+    // ended while the daemon was down - without this startup sweep, a session
+    // that finished during downtime would sit 'live' forever, since no further
+    // file event will ever arrive for it.
     async sweepIdleSessions(now = Date.now()): Promise<number> {
         if (!this.rollupService) {
             return 0;

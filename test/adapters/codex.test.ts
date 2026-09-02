@@ -7,9 +7,8 @@ import type { ParsedTurn } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 // Both fixtures below are trimmed real samples (content genericized, structure
-// and field names untouched) pulled from real ~/.codex/sessions transcripts,
-// annotated by the CLI version they came from - see codex.ts's header comment
-// for why: an earlier version of this adapter assumed a made-up envelope for
+// and field names untouched) pulled from real ~/.codex/sessions transcripts
+// and annotated by CLI version. An earlier adapter assumed a made-up envelope for
 // apply_patch and missed 100% of real calls (0/542 across every sampled
 // version), because the old fixtures were built on the same wrong assumption
 // and so agreed with the adapter instead of catching it.

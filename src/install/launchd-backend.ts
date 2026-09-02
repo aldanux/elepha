@@ -90,18 +90,16 @@ function xml(value: string): string {
     return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-/**
- * The launchd process starts with a minimal environment. Propagate only
- * location overrides needed to keep an explicitly isolated install together;
- * secrets remain in the daemon's isolated .env file and never enter a plist.
- * Values are rendered physical and absolute so the plist hash does not depend
- * on how the installing shell spelled them.
- */
+// The launchd process starts with a minimal environment. Propagate only
+// location overrides needed to keep an explicitly isolated install together;
+// secrets remain in the daemon's isolated .env file and never enter a plist.
+// Values are rendered physical and absolute so the plist hash does not depend
+// on how the installing shell spelled them.
 export function managedPlistEnvironment(environment: NodeJS.ProcessEnv = process.env): Array<[string, string]> {
     return managedServiceEnvironment(environment);
 }
 
-/** Deterministic plist with no Node/package/repository path. */
+// Deterministic plist with no Node/package/repository path.
 export function renderDaemonPlist(paths: LaunchdServicePaths, environment: NodeJS.ProcessEnv = process.env): string {
     const string = (value: string) => `<string>${xml(value)}</string>`;
     const physical = (value: string) => string(physicalInstallPath(value));
@@ -327,7 +325,7 @@ export class LaunchdBackend implements ServiceBackend {
         return healthyHeartbeat(this.paths.heartbeat, this.healthCheck.now());
     }
 
-    /** Wait for launchd's launcher and daemon to produce a fresh healthy heartbeat. */
+    // Wait for launchd's launcher and daemon to produce a fresh healthy heartbeat.
     waitForHealthy(): boolean {
         return waitForHealthyHeartbeat(() => this.healthy(), this.healthCheck);
     }

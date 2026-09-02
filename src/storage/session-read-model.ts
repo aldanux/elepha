@@ -97,11 +97,9 @@ export function jsonArrayLength(value: string | null): number | null {
     }
 }
 
-/**
- * Canonical read-time substantive predicate. A rollup with decisions
- * or files is substantive; otherwise stored capture is substantive from two
- * turns onward or when a turn touched files.
- */
+// Canonical read-time substantive predicate. A rollup with decisions
+// or files is substantive; otherwise stored capture is substantive from two
+// turns onward or when a turn touched files.
 export function isSubstantive(
     session: Pick<ServedSession, 'rollup_state' | 'rollup_decisions' | 'turn_count' | 'has_files_touched'>,
 ): boolean {
@@ -119,7 +117,7 @@ const SERVED_SESSION_SELECT = `SELECT s.*, r.title AS rollup_title, r.summary AS
         MAX(CASE WHEN m.has_external_content = 1 THEN 1 ELSE 0 END) AS has_external_content
  FROM sessions s LEFT JOIN session_rollups r ON r.session_id = s.id LEFT JOIN memories m ON m.session_id = s.id`;
 
-/** The single project-session query used by serving readers, newest activity first. */
+// The single project-session query used by serving readers, newest activity first.
 export function readProjectSessions(db: Database.Database, projectIds: readonly number[]): ServedSession[] {
     const placeholders = projectIds.map(() => '?').join(',');
     const rows = db
@@ -132,7 +130,7 @@ export function readProjectSessions(db: Database.Database, projectIds: readonly 
     return rows.map((row) => hydrateServedSession(db, row));
 }
 
-/** One grouped read for list-project aggregate inputs, ordered like the canonical session list. */
+// One grouped read for list-project aggregate inputs, ordered like the canonical session list.
 export function readProjectSessionAggregates(db: Database.Database, projectIds: readonly number[]): ProjectSessionAggregate[] {
     if (projectIds.length === 0) {
         return [];
@@ -168,17 +166,15 @@ export function readProjectSessionAggregates(db: Database.Database, projectIds: 
     }));
 }
 
-/** Indexed session-id lookup sharing the exact hydrated shape used by project reads. */
+// Indexed session-id lookup sharing the exact hydrated shape used by project reads.
 export function readSessionById(db: Database.Database, id: number): ServedSession | undefined {
     const row = db.prepare(`${SERVED_SESSION_SELECT} WHERE s.id = ? GROUP BY s.id`).get(id) as RawServedSession | undefined;
     return row === undefined ? undefined : hydrateServedSession(db, row);
 }
 
-/**
- * Indexed lookup on sessions.UNIQUE(tool, native_id, segment_index), for
- * callers that need exactly one session. Consent-independent by design; the
- * caller owns any consent gate.
- */
+// Indexed lookup on sessions.UNIQUE(tool, native_id, segment_index), for
+// callers that need exactly one session. Consent-independent by design; the
+// caller owns any consent gate.
 export function readSessionByNaturalKey(
     db: Database.Database,
     key: { tool: ToolName; nativeId: string; segmentIndex: number },

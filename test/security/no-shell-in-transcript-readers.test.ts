@@ -90,7 +90,7 @@ describe('no shell reachable from transcript-reading code', () => {
             path.join(SRC_ROOT, 'daemon', 'readability-guard.ts'),
         ];
         // Bare "exec" is deliberately excluded: RegExp.prototype.exec() is a
-        // common, unrelated builtin (see ROLLOUT_ID_RE.exec() in codex.ts),
+        // common, unrelated builtin such as RegExp.exec(),
         // and matching the method name alone produces false positives -
         // execSync/execFile/execFileSync/spawn/spawnSync/fork have no such
         // legitimate collision in this codebase.

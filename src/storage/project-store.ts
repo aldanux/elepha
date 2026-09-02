@@ -29,7 +29,7 @@ export class ProjectStore {
     private readonly resolveGitRoot: (projectPath: string) => string | null;
     private readonly resolveGitRemote: (gitRoot: string) => string | null;
     private readonly resolveGitRootCommit: (gitRoot: string) => string | null;
-    /** Git discovery is per-cwd input, so null results must be cached as well. */
+    // Git discovery is per-cwd input, so null results must be cached as well.
     private readonly gitRootsByCwd = new Map<string, string | null>();
     private readonly stmts: {
         findProjectByPath: Statement;
@@ -62,12 +62,10 @@ export class ProjectStore {
         };
     }
 
-    /**
-     * Finds or creates the project row for a captured cwd. Git-backed projects
-     * are keyed by their repository root; rootless directories retain the
-     * historical cwd key. Resolution is cached for this store lifetime so the
-     * daemon does not execute git for every turn from the same cwd.
-     */
+    // Finds or creates the project row for a captured cwd. Git-backed projects
+    // are keyed by their repository root; rootless directories retain the
+    // historical cwd key. Resolution is cached for this store lifetime so the
+    // daemon does not execute git for every turn from the same cwd.
     upsertProject(projectPath: string, identity = this.resolveProjectIdentity(projectPath)): ProjectRow {
         const existing = identity.gitRoot
             ? ((this.stmts.findProjectByGitRoot.get(identity.gitRoot) as ProjectRow | undefined) ?? undefined)
@@ -90,12 +88,10 @@ export class ProjectStore {
         return this.getProjectById(inserted.id)!;
     }
 
-    /**
-     * Resolves the values needed by upsertProject before its caller opens a
-     * write transaction. Stored identities and the per-cwd cache avoid git on
-     * the common path; a stored rootless row is deliberately re-probed by a
-     * new store so it can adopt a repository created since first capture.
-     */
+    // Resolves the values needed by upsertProject before its caller opens a
+    // write transaction. Stored identities and the per-cwd cache avoid git on
+    // the common path; a stored rootless row is deliberately re-probed by a
+    // new store so it can adopt a repository created since first capture.
     resolveProjectIdentity(projectPath: string): ResolvedProjectIdentity {
         const byPath = this.stmts.findProjectByPath.get(projectPath) as ProjectRow | undefined;
         if (byPath?.git_root) {

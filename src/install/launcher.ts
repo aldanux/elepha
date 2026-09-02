@@ -7,7 +7,7 @@ export type LauncherBackendKind = 'nvm' | 'fnm' | 'asdf' | 'homebrew' | 'standal
 
 export interface LauncherBackend {
     kind: LauncherBackendKind;
-    /** Stable executable/control path, never a Node-version installation path. */
+    // Stable executable/control path, never a Node-version installation path.
     command: string;
     root?: string;
     npmBin?: string;
@@ -137,10 +137,8 @@ function nvmDefaultMismatchError(defaultVersion: string | undefined, activeVersi
     );
 }
 
-/**
- * Select the manager that owns process.execPath. Discovery is only metadata and
- * stable control files; no manager binary or shell is executed here.
- */
+// Select the manager that owns process.execPath. Discovery is only metadata and
+// stable control files; no manager binary or shell is executed here.
 export function detectLauncherBackend(options: LauncherOptions): LauncherBackend {
     const execPath = realpathSync(options.execPath ?? process.execPath);
     const env = options.env ?? process.env;
@@ -249,7 +247,7 @@ function requiredPath(value: string | undefined): string {
     return value;
 }
 
-/** Render the stable, version-free POSIX launcher. */
+// Render the stable, version-free POSIX launcher.
 export function renderLauncher(backend: LauncherBackend, minimumNodeMajor: number): string {
     const versionProbe = `${shellQuote('-e')} ${shellQuote(FIXED_PROBE)} ${minimumNodeMajor}`;
     const packageProbe = `internal launcher-probe ${minimumNodeMajor}`;

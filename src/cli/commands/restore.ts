@@ -135,7 +135,7 @@ function removeTemporaryDatabase(dbPath: string, directory: string): void {
     }
 }
 
-/** Opens the staged backup so accepted older backups receive the same idempotent migrations as the active database. */
+// Opens the staged backup so accepted older backups receive the same idempotent migrations as the active database.
 function verifyStagedSchema(stagedPath: string): void {
     let staged: Database.Database | undefined;
     let canonical: Database.Database | undefined;
@@ -300,7 +300,8 @@ function verifyRestoredDatabase(dbPath: string, expectedCounts: RestoreCounts): 
     }
 }
 
-/** Validates an external SQLite file then replaces the active database; it cannot use runDestructiveOp because the apply is an atomic file replacement, not a SQL transaction. */
+// Restore replaces the database file atomically after validation, so its apply
+// step cannot use the SQL-transaction destructive-operation runner.
 export async function runRestoreOperation(candidatePath: string, runtime: RestoreRuntime = {}): Promise<RestoreResult> {
     const dbPath = runtime.dbPath ?? defaultDbPath();
     if (!existsSync(candidatePath)) {
@@ -380,7 +381,7 @@ function reportRestoreError(error: unknown): void {
     process.exitCode = 1;
 }
 
-/** Registers full-database restore. Project exports are deliberately reserved for the future import command. */
+// Registers full-database restore. Project exports are deliberately reserved for the future import command.
 export function registerRestore(program: Command): void {
     program
         .command('restore [file]')

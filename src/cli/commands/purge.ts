@@ -136,7 +136,7 @@ export function registerPurge(program: Command): void {
         });
 }
 
-/** Existing preview -> backup -> apply -> verify engine for every SQLite purge scope. */
+// Existing preview -> backup -> apply -> verify engine for every SQLite purge scope.
 export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, options: PurgeOperationOptions): Promise<boolean> {
     let cancelled = false;
     let verificationFailed = false;

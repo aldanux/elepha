@@ -6,25 +6,21 @@ import type { ParsedTurn, SummarizationOutput, ToolName, TurnDecision } from '..
 import { firstPromptSearch } from './first-prompt-search.js';
 import type { SessionStore } from './session-store.js';
 
-/**
- * Rule 3 for a per-turn decision. Both fields take the ESCAPE policy, not
- * strip: a decision may legitimately need to name the syntax it ruled out.
- * `why` stays null when the transcript gave no reason - see TurnDecision.
- */
+// Rule 3 for a per-turn decision. Both fields take the ESCAPE policy, not
+// strip: a decision may legitimately need to name the syntax it ruled out.
+// `why` stays null when the transcript gave no reason.
 export function sanitizeTurnDecision(d: TurnDecision): TurnDecision {
     return { what: escapeShellSyntax(d.what), why: d.why === null ? null : escapeShellSyntax(d.why) };
 }
 
-/**
- * Reads a stored decisions column, which holds EITHER the current
- * `{what, why}` objects or the bare strings every row written before per-turn
- * rationale capture used. Legacy strings become `why: null`, which is the
- * truth about them: no reason was ever captured, and the rationale those rows
- * appear to have was manufactured downstream by the rollup model.
- *
- * Migrating the column in place was the alternative and it would be a lie -
- * it would have to invent the `why` it is supposed to be recording.
- */
+// Reads a stored decisions column, which holds EITHER the current
+// `{what, why}` objects or the bare strings every row written before per-turn
+// rationale capture used. Legacy strings become `why: null`, which is the
+// truth about them: no reason was ever captured, and the rationale those rows
+// appear to have was manufactured downstream by the rollup model.
+//
+// Migrating the column in place was the alternative and it would be a lie -
+// it would have to invent the `why` it is supposed to be recording.
 export function hydrateTurnDecisions(raw: string): TurnDecision[] {
     let parsed: unknown;
     try {
@@ -131,40 +127,36 @@ export class TurnStore {
         };
     }
 
-    /**
-     * Source turn indexes remain native-file-global across segments. This
-     * protects a whole already-processed batch being replayed after a cut:
-     * UNIQUE(session_id, turn_index) alone cannot see that turn N lives in an
-     * older segment. It is a dedupe lookup only; boundary evidence still comes
-     * exclusively from the active session row.
-     */
+    // Source turn indexes remain native-file-global across segments. This
+    // protects a whole already-processed batch being replayed after a cut:
+    // UNIQUE(session_id, turn_index) alone cannot see that turn N lives in an
+    // older segment. It is a dedupe lookup only; boundary evidence still comes
+    // exclusively from the active session row.
     hasMemoryForNativeTurn(tool: ToolName, nativeId: string, turnIndex: number): boolean {
         return this.stmts.hasMemoryForNativeTurn.get(tool, nativeId, turnIndex) !== undefined;
     }
 
-    /** Most recent turn_started_at across all memories - the "when did it last actually ingest something" signal for `elepha status`. */
+    // Latest turn timestamp, which is the actual-ingestion signal for status.
     getLastIngestedAt(): string | undefined {
         const row = this.db.prepare('SELECT MAX(turn_started_at) as last FROM memories').get() as { last: string | null };
         return row.last ?? undefined;
     }
 
-    /**
-     * Persists one turn's summary and advances the session cursor in a single
-     * transaction. This is the live-ingestion path only - INSERT OR IGNORE on
-     * UNIQUE(session_id, turn_index) makes a duplicate scan of an
-     * already-stored turn (overlapping watch events, see daemon/index.ts) a
-     * no-op instead of a duplicate row, safe only because the cursor advance
-     * is atomic with it (a two-statement version turns this dedupe guard into
-     * silent data loss). For deliberately overwriting an already-stored turn
-     * with a re-summarized result, use reingestTurn instead - IGNORE here
-     * would silently discard the fix.
-     */
+    // Persists one turn's summary and advances the session cursor in a single
+    // transaction. This is the live-ingestion path only - INSERT OR IGNORE on
+    // UNIQUE(session_id, turn_index) makes a duplicate scan of an
+    // already-stored turn from overlapping watch events, a
+    // no-op instead of a duplicate row, safe only because the cursor advance
+    // is atomic with it (a two-statement version turns this dedupe guard into
+    // silent data loss). For deliberately overwriting an already-stored turn
+    // with a re-summarized result, use reingestTurn instead - IGNORE here
+    // would silently discard the fix.
     recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): boolean {
         const run = this.db.transaction(() => this.recordTurnInTransaction(turn, sessionDbId, projectId, summary));
         return run();
     }
 
-    /** Records a live turn while an enclosing ingestion transaction owns its session row. */
+    // Records a live turn while an enclosing ingestion transaction owns its session row.
     recordTurnInTransaction(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): boolean {
         if (this.stmts.isTranscriptPurged.get(turn.tool, turn.sessionId) !== undefined) {
             return false;
@@ -204,16 +196,14 @@ export class TurnStore {
         }
     }
 
-    /**
-     * Overwrites an existing (session_id, turn_index) row with a fresh
-     * summary - the `elepha reingest` maintenance path. Deliberately does NOT
-     * touch sessions.cursor: reingest re-derives turns from byte 0 of the
-     * source file independently of the live daemon's forward cursor, and
-     * must never regress or advance it. Uses INSERT ... ON CONFLICT DO UPDATE
-     * rather than delete-then-insert so there is no window where the row is
-     * gone - a crash mid-reingest leaves either the old or the new value,
-     * never neither.
-     */
+    // Overwrites an existing (session_id, turn_index) row with a fresh
+    // summary - the `elepha reingest` maintenance path. Deliberately does NOT
+    // touch sessions.cursor: reingest re-derives turns from byte 0 of the
+    // source file independently of the live daemon's forward cursor, and
+    // must never regress or advance it. Uses INSERT ... ON CONFLICT DO UPDATE
+    // rather than delete-then-insert so there is no window where the row is
+    // gone - a crash mid-reingest leaves either the old or the new value,
+    // never neither.
     reingestTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): void {
         const now = new Date().toISOString();
         this.stmts.reingestMemory.run({
@@ -232,7 +222,7 @@ export class TurnStore {
         this.stmts.reingestFirstPromptSearch.run(firstPromptSearch(turn.userMessage), sessionDbId, turn.turnIndex, sessionDbId);
     }
 
-    /** Every turn of one session, in turn order - the rollup input. */
+    // Every turn of one session, in turn order - the rollup input.
     listMemoriesForSession(sessionId: number): MemoryRow[] {
         const rows = this.db.prepare('SELECT * FROM memories WHERE session_id = ? ORDER BY turn_index').all(sessionId) as Array<
             Omit<MemoryRow, 'decisions' | 'files_touched' | 'pending_items'> & Record<string, string>

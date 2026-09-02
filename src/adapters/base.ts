@@ -6,7 +6,7 @@
 // adapter: turn-boundary assembly. A turn is only emitted once provably
 // closed (a subsequent turn-opening line was parsed, or the caller asserts
 // the file has been idle past its debounce window). Getting this wrong is
-// not self-correcting — see ParseTurnsOptions in ../types.
+// not self-correcting.
 
 import { createHash } from 'node:crypto';
 import { type FileHandle, open, stat } from 'node:fs/promises';
@@ -50,7 +50,7 @@ function discriminatorDigest(value: unknown): string {
     return createHash('sha256').update(digestInput).digest('hex').slice(0, DISCRIMINATOR_DIGEST_HEX_CHARS);
 }
 
-/** Renders an untrusted line discriminator without copying arbitrary transcript content into diagnostics. */
+// Renders an untrusted line discriminator without copying arbitrary transcript content into diagnostics.
 export function safeDiscriminator(value: unknown): string {
     const isString = typeof value === 'string';
     const display = isString ? value : value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
@@ -69,13 +69,13 @@ export function safeDiscriminator(value: unknown): string {
 
 export interface RawLine {
     text: string;
-    /** Absolute byte offset of the first byte of this line (including any prior lines). */
+    // Absolute byte offset of the first byte of this line (including any prior lines).
     byteStart: number;
-    /** Absolute byte offset of the first byte after this line's trailing newline. */
+    // Absolute byte offset of the first byte after this line's trailing newline.
     byteEnd: number;
 }
 
-/** Tool-specific observations normalized before applying shared empty-session precedence. */
+// Tool-specific observations normalized before applying shared empty-session precedence.
 export interface EmptySessionSignals {
     assistantContribution?: boolean;
     toolCall?: boolean;
@@ -163,7 +163,7 @@ export class OversizedTranscriptRecordError extends Error {
 
 export interface BoundedLine {
     text: string;
-    /** Original byte length including a trailing newline when present. */
+    // Original byte length including a trailing newline when present.
     byteLength: number;
     terminated: boolean;
 }
@@ -171,11 +171,11 @@ export interface BoundedLine {
 export interface BoundedLineReadOptions {
     start?: number;
     maxRecordBytes?: number;
-    /** Reads from this already-opened file without taking ownership or changing its position. */
+    // Reads from this already-opened file without taking ownership or changing its position.
     handle?: FileHandle;
 }
 
-/** Reads JSONL records without retaining a pending record beyond the per-record ceiling. */
+// Reads JSONL records without retaining a pending record beyond the per-record ceiling.
 export async function* readBoundedLines(filePath: string, options: BoundedLineReadOptions = {}): AsyncIterable<BoundedLine> {
     const start = options.start ?? 0;
     const maxRecordBytes = options.maxRecordBytes ?? MAX_TRANSCRIPT_RECORD_BYTES;
@@ -248,11 +248,9 @@ export async function* readBoundedLines(filePath: string, options: BoundedLineRe
     }
 }
 
-/**
- * Reads a transcript through filesystem APIs and applies the classification
- * precedence shared by both JSONL formats. Adapters provide their own line
- * signals so format knowledge remains at the adapter boundary.
- */
+// Reads a transcript through filesystem APIs and applies the classification
+// precedence shared by both JSONL formats. Adapters provide their own line
+// signals so format knowledge remains at the adapter boundary.
 export async function classifyEmptyJsonlSession(
     filePath: string,
     signalsFor: (line: unknown) => EmptySessionSignals,
@@ -301,11 +299,9 @@ export async function classifyEmptyJsonlSession(
     return { kind: 'no assistant contribution' };
 }
 
-/**
- * Resolves a possibly-relative path emitted by a tool call to an absolute,
- * normalized form. Does not resolve symlinks: the file may already be gone
- * by the time we parse the turn, and realpath would throw on that.
- */
+// Resolves a possibly-relative path emitted by a tool call to an absolute,
+// normalized form. Does not resolve symlinks: the file may already be gone
+// by the time we parse the turn, and realpath would throw on that.
 export function resolveAbsolute(filePath: string, baseDir: string): string {
     return path.isAbsolute(filePath) ? path.normalize(filePath) : path.normalize(path.resolve(baseDir, filePath));
 }
@@ -400,107 +396,95 @@ function hasAssistantContribution(state: TurnBuilderState): boolean {
 
 export type LineClass = 'boundary' | 'content' | 'skip';
 
-/**
- * Shared turn-assembly engine. Adapters supply the tool-specific line
- * classification and folding logic; this class owns byte-offset tracking,
- * partial-line discard, and the boundary-vs-idle close rule.
- */
+// Shared turn-assembly engine. Adapters supply the tool-specific line
+// classification and folding logic; this class owns byte-offset tracking,
+// partial-line discard, and the boundary-vs-idle close rule.
 export abstract class JsonlTurnAdapter implements SessionAdapter {
     abstract readonly tool: ToolName;
     abstract readonly watchGlobs: string[];
 
-    /**
-     * Called whenever classify() sees a line shape it doesn't explicitly
-     * recognize. The bug this guards against: an adapter's classify() falls
-     * through to 'skip' by default, so a wrong or outdated assumption about
-     * the source format produces months of silently-empty data with zero
-     * signal - exactly what happened with Codex's apply_patch envelope.
-     * Defaults to console.warn; the daemon wires this into its own log.
-     */
+    // Called whenever classify() sees a line shape it doesn't explicitly
+    // recognize. The bug this guards against: an adapter's classify() falls
+    // through to 'skip' by default, so a wrong or outdated assumption about
+    // the source format produces months of silently-empty data with zero
+    // signal - exactly what happened with Codex's apply_patch envelope.
+    // Defaults to console.warn; the daemon wires this into its own log.
     constructor(protected readonly warnUnknownLine: (message: string) => void = (msg) => console.warn(msg)) {}
 
-    /** Files already alerted for a cursor desync, deduped so a frozen session does not re-log identically on every debounced rescan. */
+    // Dedupes cursor-desync alerts so a frozen session does not emit the same warning on every debounced rescan.
     private readonly desyncAlerted = new Set<string>();
 
     abstract matches(filePath: string): boolean;
 
-    /** Derives the native session/thread id from the file's own path (both tools encode it in the filename). */
+    // Derives the native session/thread id from the file's own path (both tools encode it in the filename).
     abstract nativeSessionId(filePath: string): string;
 
-    /** Defaults to 'primary'; adapters override where the format exposes a reliable signal. */
+    // Defaults to 'primary'; adapters override where the format exposes a reliable signal.
     async classifySession(_filePath: string): Promise<SessionClassification> {
         return { kind: 'primary' };
     }
 
     abstract classifyEmptySession(filePath: string): Promise<EmptySessionAnalysis | undefined>;
 
-    /** Most transcript formats do not expose a user-set session title. */
+    // Most transcript formats do not expose a user-set session title.
     async readCustomTitle(_filePath: string, _fromOffset = 0): Promise<{ customTitle?: string; scannedTo: number }> {
         return { scannedTo: 0 };
     }
 
-    /** Classifies one parsed JSONL line. Implementations must call warnUnknownLine() for any shape not in their explicit known-set, rather than silently returning 'skip'. */
+    // Unknown shapes must call warnUnknownLine() rather than silently returning 'skip'.
     protected abstract classify(line: unknown, filePath: string): LineClass;
 
-    /** Extracts a cwd from this line, if it carries one. Called on every line regardless of classification. */
+    // Extracts a cwd from this line, if it carries one. Called on every line regardless of classification.
     protected abstract cwdOf(line: unknown): string | undefined;
 
-    /** Extracts this line's timestamp, if any. */
+    // Extracts this line's timestamp, if any.
     protected abstract timestampOf(line: unknown): string | undefined;
 
-    /**
-     * Session-surface discriminator on this line, if any (Claude Code:
-     * per-line `entrypoint`; Codex: `originator`, only on session_meta).
-     * Not abstract - most lines in both formats don't carry it, so the base
-     * loop tracks "last seen" exactly like cwdOf, and an adapter that never
-     * overrides this just never sets a surface (NULL, not a wrong guess).
-     */
+    // Session-surface discriminator on this line, if any (Claude Code:
+    // per-line `entrypoint`; Codex: `originator`, only on session_meta).
+    // Not abstract - most lines in both formats don't carry it, so the base
+    // loop tracks "last seen" exactly like cwdOf, and an adapter that never
+    // overrides this just never sets a surface (NULL, not a wrong guess).
     protected surfaceOf(_line: unknown): string | undefined {
         return undefined;
     }
 
-    /**
-     * Git branch on this line, if any. Per-turn for Claude Code
-     * (`gitBranch`), session-constant for Codex (`session_meta.payload.git.branch`; no
-     * per-turn equivalent found in the full local corpus).
-     */
+    // Git branch on this line, if any. Per-turn for Claude Code
+    // (`gitBranch`), session-constant for Codex (`session_meta.payload.git.branch`; no
+    // per-turn equivalent found in the full local corpus).
     protected branchOf(_line: unknown): string | undefined {
         return undefined;
     }
 
-    /**
-     * True if this raw line is a tool-fetched-external-content call. Checked
-     * on every line regardless of classify()'s boundary/content/skip verdict
-     * (Codex's web_search_call is itself a 'skip' line under KNOWN_RESPONSE_ITEM_SKIP -
-     * this hook still needs to see it, the same way cwdOf sees skip lines).
-     */
+    // True if this raw line is a tool-fetched-external-content call. Checked
+    // on every line regardless of classify()'s boundary/content/skip verdict
+    // (Codex's web_search_call is itself a 'skip' line under KNOWN_RESPONSE_ITEM_SKIP -
+    // this hook still needs to see it, the same way cwdOf sees skip lines).
     protected isExternalFetchLine(_line: unknown): boolean {
         return false;
     }
 
-    /**
-     * True if this raw line is a Codex resume marker (`<environment_context>`) - a boundary signal
-     * only, never content. Checked on every line, independent of classify()'s
-     * verdict, the same way isExternalFetchLine is: the marker line itself is
-     * classified 'skip' (it's a synthetic role:user response_item, "not
-     * something a person typed"), so it never opens or closes a turn on its
-     * own - it just sets a pending flag the next turn boundary picks up. Base
-     * default false; Claude Code never overrides this (it has per-turn
-     * gitBranch and doesn't need it).
-     */
+    // True if this raw line is a Codex resume marker (`<environment_context>`) - a boundary signal
+    // only, never content. Checked on every line, independent of classify()'s
+    // verdict, the same way isExternalFetchLine is: the marker line itself is
+    // classified 'skip' (it's a synthetic role:user response_item, "not
+    // something a person typed"), so it never opens or closes a turn on its
+    // own - it just sets a pending flag the next turn boundary picks up. Base
+    // default false; Claude Code never overrides this (it has per-turn
+    // gitBranch and doesn't need it).
     protected isResumeMarkerLine(_line: unknown): boolean {
         return false;
     }
 
-    /** Claude Code emits ai-title as standalone metadata between a prompt and its response. */
+    // Claude Code emits ai-title as standalone metadata between a prompt and its response.
     protected aiTitleOf(_line: unknown): string | undefined {
         return undefined;
     }
 
-    /** Updates transient assembly bookkeeping without making a skipped plumbing line part of the turn payload. */
+    // Updates transient assembly bookkeeping without making a skipped plumbing line part of the turn payload.
     protected observeToolCallState(_state: TurnBuilderState, _line: unknown): void {}
 
-    /** Folds a 'boundary' or 'content' line's data into the in-progress turn. */
+    // Folds a 'boundary' or 'content' line's data into the in-progress turn.
     protected abstract fold(state: TurnBuilderState, line: unknown): void;
 
     async *parseTurns(filePath: string, sinceCursor?: string, options?: ParseTurnsOptions): AsyncIterable<ParsedTurn> {

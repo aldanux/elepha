@@ -87,12 +87,11 @@ const deriver: BackfillDeriver<SessionSeed, CustomTitleChange> = {
     },
 };
 
-/** Reports the exact rows a custom-title backfill would touch, without writing. */
 export async function planCustomTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<CustomTitlePlan> {
     return planBackfill(db, adapters, deriver);
 }
 
-/** Applies only planned custom_title changes in one transaction. */
+// Applies only planned custom_title changes in one transaction.
 export async function applyCustomTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<CustomTitlePlan> {
     return applyBackfill(db, adapters, deriver);
 }

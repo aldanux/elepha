@@ -32,7 +32,7 @@ export interface SanitizeChange {
 
 export interface SanitizePlan {
     changes: SanitizeChange[];
-    /** Rows touched, as opposed to individual field edits. */
+    // Rows touched, as opposed to individual field edits.
     rollupRows: number;
     memoryRows: number;
 }
@@ -92,7 +92,7 @@ export function sanitizeRollupPendingItemsField(raw: string): string {
 
 interface FieldSpec {
     field: string;
-    /** True when the column stores JSON rather than a display string - see leafStrings(). */
+    // JSON columns must be decoded before checking their leaf strings.
     json: boolean;
     transform: (raw: string) => string;
 }
@@ -129,7 +129,6 @@ function collect(db: Database, table: 'session_rollups' | 'memories', idColumn: 
     return changes;
 }
 
-/** What the backfill would change, without changing anything. */
 export function planSanitize(db: Database): SanitizePlan {
     const changes = [...collect(db, 'session_rollups', 'session_id', ROLLUP_FIELDS), ...collect(db, 'memories', 'id', MEMORY_FIELDS)];
     return {
@@ -139,7 +138,7 @@ export function planSanitize(db: Database): SanitizePlan {
     };
 }
 
-/** Applies planSanitize's plan in a single transaction. Returns the plan that was applied, for reporting. */
+// Applies planSanitize's plan in a single transaction. Returns the plan that was applied, for reporting.
 export function applySanitize(db: Database): SanitizePlan {
     const plan = planSanitize(db);
     const apply = db.transaction(() => {
@@ -159,12 +158,10 @@ export interface SanitizeResidue {
     text: string;
 }
 
-/**
- * Post-backfill verification: re-run the detector over every sanitized field
- * in the store. This is the check that turns "the store never holds executable
- * syntax" from a comment into an invariant, so it re-reads from SQL rather
- * than trusting the plan it just applied.
- */
+// Post-backfill verification: re-run the detector over every sanitized field
+// in the store. This is the check that turns "the store never holds executable
+// syntax" from a comment into an invariant, so it re-reads from SQL rather
+// than trusting the plan it just applied.
 export function verifySanitize(db: Database): SanitizeResidue[] {
     const residue: SanitizeResidue[] = [];
     const check = (table: 'session_rollups' | 'memories', idColumn: string, fields: FieldSpec[]) => {
@@ -189,15 +186,13 @@ export function verifySanitize(db: Database): SanitizeResidue[] {
     return residue;
 }
 
-/**
- * The stored strings inside a field, JSON-decoded where the field is JSON.
- *
- * Running the detector on the raw column text instead would report false
- * positives: JSON escapes a backslash as `\\`, so a correctly escaped
- * `` \` `` is stored as `` \\` ``, whose backslash parity reads as
- * "unescaped backtick" to the detector. The invariant is about the values the
- * store hands out, not their transport encoding.
- */
+// The stored strings inside a field, JSON-decoded where the field is JSON.
+//
+// Running the detector on the raw column text instead would report false
+// positives: JSON escapes a backslash as `\\`, so a correctly escaped
+// `` \` `` is stored as `` \\` ``, whose backslash parity reads as
+// "unescaped backtick" to the detector. The invariant is about the values the
+// store hands out, not their transport encoding.
 function leafStrings(raw: string, isJson: boolean): string[] {
     if (!isJson) {
         return [raw];

@@ -67,7 +67,7 @@ export interface InitOptions {
     detectTools?: () => Promise<DiscoveryResult['detectedTools']>;
     daemon?: Pick<IngestionDaemon, 'backfillApprovedRoots'>;
     reconcile?: (approvedRoots: number) => void;
-    /** Test seam; production routes every visual element through @clack/prompts. */
+    // Test seam; production routes every visual element through @clack/prompts.
     prompts?: InitPrompts;
 }
 
@@ -106,7 +106,7 @@ function cancellation(prompts: InitPrompts): number {
     return 0;
 }
 
-/** Interactive consent onboarding. It intentionally has no non-interactive mode. */
+// Interactive consent onboarding. It intentionally has no non-interactive mode.
 export async function runInit(options: InitOptions): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;

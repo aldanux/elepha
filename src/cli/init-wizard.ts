@@ -24,7 +24,6 @@ interface FolderGroup {
     projects: DiscoveredProject[];
 }
 
-/** Groups projects by their top-level directory under the user's home. */
 export function groupFolderCandidates(
     projects: DiscoveredProject[],
     isRefusedRoot: (root: string) => boolean = isRefusedProjectRoot,
@@ -110,7 +109,6 @@ export function individualCandidates(
     });
 }
 
-/** Maps checkbox values to the consent mutations, without performing I/O. */
 export function consentChanges(
     candidates: InitCandidate[],
     selectedRoots: readonly string[],

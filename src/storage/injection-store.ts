@@ -38,7 +38,7 @@ export class InjectionStore {
         };
     }
 
-    /** Stores a future injection's exact body once; normalized-hash uniqueness makes repeats safe. */
+    // Stores a future injection's exact body once; normalized-hash uniqueness makes repeats safe.
     recordInjection(input: RecordInjectionInput): boolean {
         const bodyHash = createHash('sha256').update(normalizeForNearVerbatim(input.body)).digest('hex');
         const result = this.stmts.insertInjection.run({

@@ -28,16 +28,14 @@ interface BiomeCheckResult {
     diagnostics: BiomeDiagnostic[];
 }
 
-/**
- * Runs the real .biome-plugins/*.grit files (referenced by absolute path, not
- * copied - so this can never silently drift from what actually ships) against
- * one fixture, in an isolated scratch dir. Isolation is required, not just
- * tidy: this repo's own root biome.json is a "root" config, and running
- * biome anywhere under this repo's tree makes it refuse to apply a second,
- * different config ("Found a nested root configuration, but there's already
- * a root configuration") - the fixture would otherwise have to live under the
- * real project config, which is exactly what we don't want it silently doing.
- */
+// Runs the real .biome-plugins/*.grit files (referenced by absolute path, not
+// copied - so this can never silently drift from what actually ships) against
+// one fixture, in an isolated scratch dir. Isolation is required, not just
+// tidy: this repo's own root biome.json is a "root" config, and running
+// biome anywhere under this repo's tree makes it refuse to apply a second,
+// different config ("Found a nested root configuration, but there's already
+// a root configuration") - the fixture would otherwise have to live under the
+// real project config, which is exactly what we don't want it silently doing.
 function runBiomeCheck(fixturePath: string): BiomeCheckResult {
     const scratchDir = mkdtempSync(path.join(tmpdir(), 'elepha-biome-plugin-fixture-'));
     try {

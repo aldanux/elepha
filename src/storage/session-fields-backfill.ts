@@ -39,7 +39,7 @@ export interface SessionFieldsChange {
     transcriptMissing: boolean;
     before: SessionFieldsBefore;
     after: SessionFieldsBefore;
-    /** Count of memories rows whose has_external_content flipped for this session. */
+    // Count of memories rows whose has_external_content flipped for this session.
     memoryFlagsChanged: number;
 }
 
@@ -61,7 +61,7 @@ interface SessionSeed {
     trailing_files: string;
 }
 
-/** The NULL-preserving result: reused for both "doesn't exist" and "exists but couldn't actually be read". */
+// The NULL-preserving result: reused for both "doesn't exist" and "exists but couldn't actually be read".
 function unreadableResult(session: SessionSeed): { after: SessionFieldsBefore; turns: ParsedTurn[]; transcriptMissing: boolean } {
     return {
         transcriptMissing: true,
@@ -226,9 +226,8 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
                     updateFlag.run(turn.hasExternalContent ? 1 : 0, change.sessionId, turn.turnIndex);
                 }
             });
-            // Same failure mode as deriveForSession's parseTurns call - a file
-            // that became unreadable between phase 1 (buildPlan, above) and this
-            // second pass (a delete/permission race, or a directory path) must
+            // A file that became unreadable between planning and this second
+            // pass (a delete/permission race, or a directory path) must
             // not abort the rest of the batch. The sessions-table fields for this
             // session were already written by apply() above; skipping just this
             // session's has_external_content flips leaves them stale rather than
@@ -249,12 +248,11 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
     },
 };
 
-/** What the backfill would change, without changing anything. */
 export async function planSessionFieldsBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionFieldsPlan> {
     return planBackfill(db, adapters, deriver);
 }
 
-/** Applies the plan in a single transaction. Re-derives turns a second time inside the transaction closure is avoided by computing the plan first, then writing it - matches planPurge/applyPurge's shape. */
+// Planning finishes transcript reads before the single write transaction begins.
 export async function applySessionFieldsBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionFieldsPlan> {
     return applyBackfill(db, adapters, deriver);
 }

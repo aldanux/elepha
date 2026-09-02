@@ -40,7 +40,7 @@ export function hasInstallSnapshot(file: string, directory?: string): boolean {
     return existsSync(snapshotPath(file, directory));
 }
 
-/** Retain the pre-install bytes so a clean install/uninstall cycle is exactly reversible. */
+// Retain the pre-install bytes so a clean install/uninstall cycle is exactly reversible.
 export function rememberInstallSnapshots(changes: ConfigChange[], originals: ConfigOriginal[], directory?: string): void {
     for (const change of changes) {
         if (change.kind !== 'write') {
@@ -64,7 +64,7 @@ export function deleteInstallSnapshots(files: string[], directory?: string): voi
     }
 }
 
-/** Prefer the exact original only if no one changed the managed document since install. */
+// Prefer the exact original only if no one changed the managed document since install.
 export function restoreInstallSnapshot(file: string, current: string, directory?: string): InstallSnapshotRestore | undefined {
     const snapshotFile = snapshotPath(file, directory);
     if (!existsSync(snapshotFile)) {
@@ -81,7 +81,7 @@ export function restoreInstallSnapshot(file: string, current: string, directory?
     }
 }
 
-/** Apply a logical multi-file config change or restore every original on failure. */
+// Apply a logical multi-file config change or restore every original on failure.
 export function applyConfigTransaction(changes: ConfigChange[]): ConfigTransactionResult | false {
     const changed = changes.filter((change) =>
         change.kind === 'delete'

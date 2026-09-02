@@ -18,12 +18,12 @@ export class ShownSessionListStore {
         this.listForChat = db.prepare('SELECT session_ids FROM shown_session_lists WHERE tool = ? AND native_session_id = ?');
     }
 
-    /** Replaces the complete ordered list so one chat can only open what it was most recently shown. */
+    // Replaces the complete ordered list so one chat can only open what it was most recently shown.
     replace(tool: ToolName, nativeSessionId: string, sessionIds: readonly number[]): void {
         this.replaceList.run(tool, nativeSessionId, JSON.stringify(sessionIds));
     }
 
-    /** Undefined means no list has ever been shown; an empty array is a shown list with no rows. */
+    // Undefined means no list has ever been shown; an empty array is a shown list with no rows.
     forChat(tool: ToolName, nativeSessionId: string): number[] | undefined {
         const row = this.listForChat.get(tool, nativeSessionId) as ShownSessionListRow | undefined;
         if (row === undefined) {

@@ -89,7 +89,7 @@ function phraseText(value: string): string {
     return componentTokens(value).join(' ');
 }
 
-/** Returns undefined for empty and filler-only queries, so callers never start a broad scan. */
+// Returns undefined for empty and filler-only queries, so callers never start a broad scan.
 export function tokenizeRecallQuery(value: string): RecallQuery | undefined {
     const display = value.replace(/\s+/g, ' ').trim();
     const components = componentTokens(value).filter((token) => !FILLER_WORDS.has(token));
@@ -147,7 +147,7 @@ function startsWithElephaCommand(value: string | null | undefined): boolean {
 }
 
 function isRecallCommandSession(session: ServedSession): boolean {
-    // D80: the title comes from the first non-command turn, so a real title
+    // The title comes from the first non-command turn, so a real title
     // (or custom title) means substantive work — surface it even if the
     // session opened with an elepha: command (first_prompt_search matches).
     if (hasRealContent(session)) {
@@ -308,7 +308,7 @@ function renderBody(
     return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId) };
 }
 
-/** Scans recent sessions without an index and returns a fully budgeted injection body. */
+// Scans recent sessions without an index and returns a fully budgeted injection body.
 export async function lexicalRecall(
     reader: SessionReader,
     projects: ProjectSet[],
@@ -327,7 +327,8 @@ export async function lexicalRecall(
     const scanStartedAt = scanClock();
     const renderedAt = relativeNow ?? scanStartedAt;
     const prepared: PreparedMetadata[] = [];
-    // Matching is synchronous stored-metadata tokenization, so there is no reparse or I/O to cancel or run concurrently.
+    // Matching only tokenizes stored metadata synchronously; there is no I/O to
+    // cancel or run concurrently.
     for (const candidate of candidates) {
         if (scanClock() - scanStartedAt > REMEMBER_SCAN_BUDGET_MS) {
             break;

@@ -117,12 +117,11 @@ const deriver: BackfillDeriver<SessionSeed, SessionTitleChange, SessionTitleStat
     },
 };
 
-/** Shows title changes without writing. */
 export async function planSessionTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionTitlePlan> {
     return planBackfill(db, adapters, deriver);
 }
 
-/** Applies only readable sessions' derived titles in one transaction. */
+// Applies only readable sessions' derived titles in one transaction.
 export async function applySessionTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionTitlePlan> {
     return applyBackfill(db, adapters, deriver);
 }

@@ -16,7 +16,7 @@ export interface TestDatabase {
     close(): void;
 }
 
-/** Opens a fresh on-disk database through the production schema initializer. */
+// Opens a fresh on-disk database through the production schema initializer.
 export function createTestDb(prefix = 'elepha-test-db-'): TestDatabase {
     const directory = withGrantableTestDir(prefix);
     const dbPath = path.join(directory, 'elepha.db');
@@ -61,10 +61,8 @@ export interface SeedSessionOptions {
     trailingFiles?: readonly string[];
 }
 
-/**
- * Seeds a session through MemoryStore. The final UPDATE covers stored metadata
- * that MemoryStore intentionally derives only during live ingestion.
- */
+// Seeds a session through MemoryStore. The final UPDATE covers stored metadata
+// that MemoryStore intentionally derives only during live ingestion.
 export function seedSession(fixture: TestDatabase, options: SeedSessionOptions): SessionRow {
     const session = fixture.store.upsertSession(
         options.tool ?? 'codex',
@@ -182,7 +180,7 @@ export interface SeedRollupOptions {
     state?: RollupState;
 }
 
-/** Seeds a session-level rollup through the production persistence boundary. */
+// Seeds a session-level rollup through the production persistence boundary.
 export function seedRollup(fixture: TestDatabase, options: SeedRollupOptions): void {
     const rollups = new RollupStore(fixture.db);
     rollups.write(

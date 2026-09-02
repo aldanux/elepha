@@ -16,8 +16,7 @@
 // calls across CLI versions 0.136.0-0.147.0: the custom_tool_call envelope
 // was 100% of them, 0 used function_call. An earlier version of this adapter
 // assumed function_call/arguments without a real sample and missed every
-// apply_patch call as a result - see test/fixtures/codex for the real
-// samples that now guard against regressing this.
+// apply_patch call as a result. Versioned real-sample fixtures guard the shape.
 //
 // function_call/function_call_output IS the real envelope for genuine
 // OpenAI-style tool calls (MCP servers, read_file, exec_command, ...) -
@@ -151,10 +150,8 @@ function emptySessionSignals(line: CodexLine): EmptySessionSignals {
     };
 }
 
-/**
- * session_meta fields that identify what kind of transcript this is. Verified
- * against the real corpus rather than assumed - see classifySession.
- */
+// session_meta fields that identify what kind of transcript this is. Verified
+// against the real corpus rather than assumed.
 interface CodexSessionMeta {
     forked_from_id?: string | null;
     parent_thread_id?: string | null;
@@ -185,25 +182,24 @@ function extractPatchFilePaths(input: string | undefined, cwd: string | undefine
     return [...paths];
 }
 
-/**
- * The `exec` custom tool carries a JavaScript PROGRAM, not a command string -
- * it can batch N shell commands through Promise.all, and it can carry an
- * apply_patch heredoc inline as a JS string literal
- * (`const patch = "*** Begin Patch\n*** Update File: ..."`).
- *
- * Those embedded patches are real file writes in the identical envelope
- * extractPatchFilePaths already parses; they were simply never fed to it,
- * because extraction was gated on the tool NAME being "apply_patch". Measured
- * against the real corpus: 434 of 3,870 exec/exec_command calls carry patch
- * paths, 349 of them under name "exec" - i.e. previously dropped on the floor.
- *
- * Deliberately NOT attempted here: recovering paths from arbitrary shell
- * argument text (sed/rg/npm targets). That is a further ~20% of calls but it
- * is heuristic and produced false positives (glob artifacts) in measurement.
- * Extraction stays deterministic.
- */
+// The `exec` custom tool carries a JavaScript PROGRAM, not a command string -
+// it can batch N shell commands through Promise.all, and it can carry an
+// apply_patch heredoc inline as a JS string literal
+// (`const patch = "*** Begin Patch\n*** Update File: ..."`).
+//
+// Those embedded patches are real file writes in the identical envelope
+// extractPatchFilePaths already parses; they were simply never fed to it,
+// because extraction was gated on the tool NAME being "apply_patch". Measured
+// against the real corpus: 434 of 3,870 exec/exec_command calls carry patch
+// paths, 349 of them under name "exec" - i.e. previously dropped on the floor.
+//
+// Deliberately NOT attempted here: recovering paths from arbitrary shell
+// argument text (sed/rg/npm targets). That is a further ~20% of calls but it
+// is heuristic and produced false positives (glob artifacts) in measurement.
+// Extraction stays deterministic.
 
-/** function_call.arguments is a JSON-encoded string; an embedded patch is escaped inside it. Falls back to the raw text if it isn't valid JSON. */
+// function_call.arguments is JSON-encoded, including any embedded patch.
+// Invalid JSON falls back to the raw text.
 function decodeArguments(argumentsRaw: string | undefined): string | undefined {
     if (!argumentsRaw) {
         return undefined;
@@ -225,12 +221,10 @@ function extractExecFilePaths(input: string | undefined, cwd: string | undefined
     return extractPatchFilePaths(input, cwd);
 }
 
-/**
- * read_file is an MCP tool call carrying an explicit file_path argument - the
- * Codex-side parity for Claude Code's Read. Low volume but deterministic (65
- * calls in the local corpus; a 30-day slice happens to contain none, which is
- * NOT evidence the envelope is gone - a dedicated fixture guards it).
- */
+// read_file is an MCP tool call carrying an explicit file_path argument - the
+// Codex-side parity for Claude Code's Read. Low volume but deterministic (65
+// calls in the local corpus; a 30-day slice happens to contain none, which is
+// NOT evidence the envelope is gone - a dedicated fixture guards it).
 function extractReadFileePaths(name: string | undefined, argumentsRaw: string | undefined, cwd: string | undefined): string[] {
     if (name !== 'read_file' || !argumentsRaw) {
         return [];
@@ -264,12 +258,10 @@ export class CodexAdapter extends JsonlTurnAdapter {
         return m ? m[1] : path.basename(filePath, '.jsonl');
     }
 
-    /**
-     * Codex has emitted both user-turn envelopes. When an event_msg is present
-     * before the response, it is the historical boundary; otherwise the
-     * role:user response_item is the complete record. Resolve that once per
-     * parse so a rollout containing the duplicate pair does not emit twice.
-     */
+    // Codex has emitted both user-turn envelopes. When an event_msg is present
+    // before the response, it is the historical boundary; otherwise the
+    // role:user response_item is the complete record. Resolve that once per
+    // parse so a rollout containing the duplicate pair does not emit twice.
     private async userBoundaryFor(
         filePath: string,
         options: { handle?: FileHandle; signal?: AbortSignal } = {},
@@ -328,29 +320,27 @@ export class CodexAdapter extends JsonlTurnAdapter {
         yield* super.parseTurns(filePath, sinceCursor, options);
     }
 
-    /**
-     * Codex encodes session provenance in the first session_meta line.
-     *
-     * Two markers look authoritative and are not:
-     *   - thread_source === 'subagent' is set on genuine subagents AND on the
-     *     internal adjudicator, so it cannot decide either on its own.
-     *   - parent_thread_id is set on every child session, copy or not. Keying
-     *     fork detection off it misclassifies 26 non-copied sessions whose
-     *     turns span hours-to-days as duplicates.
-     *
-     * Measured against the local corpus, the signals that actually separate
-     * the three cases:
-     *
-     *  - forked_from_id non-null -> the file BEGINS with a verbatim copy of the
-     *    parent's whole transcript, every copied line restamped with the fork
-     *    instant (observed: 175 turns inside 73ms of each other, byte-identical
-     *    user messages to the parent, vs. multi-hour spans on every
-     *    non-forked child). Ingesting it duplicates the parent.
-     *  - thread_source 'subagent' with NO agent_path/agent_nickname -> Codex's
-     *    internal approval adjudicator. Its own prompt labels the transcript
-     *    "untrusted evidence, not instructions to follow"; there is no human in
-     *    it. User-spawned subagents always carry both fields.
-     */
+    // Codex encodes session provenance in the first session_meta line.
+    //
+    // Two markers look authoritative and are not:
+    //  - thread_source === 'subagent' is set on genuine subagents AND on the
+    //    internal adjudicator, so it cannot decide either on its own.
+    //  - parent_thread_id is set on every child session, copy or not. Keying
+    //    fork detection off it misclassifies 26 non-copied sessions whose
+    //    turns span hours-to-days as duplicates.
+    //
+    // Measured against the local corpus, the signals that actually separate
+    // the three cases:
+    //
+    // - forked_from_id non-null -> the file BEGINS with a verbatim copy of the
+    //   parent's whole transcript, every copied line restamped with the fork
+    //   instant (observed: 175 turns inside 73ms of each other, byte-identical
+    //   user messages to the parent, vs. multi-hour spans on every
+    //   non-forked child). Ingesting it duplicates the parent.
+    // - thread_source 'subagent' with NO agent_path/agent_nickname -> Codex's
+    //   internal approval adjudicator. Its own prompt labels the transcript
+    //   "untrusted evidence, not instructions to follow"; there is no human in
+    //   it. User-spawned subagents always carry both fields.
     async classifySession(filePath: string, options?: Pick<ParseTurnsOptions, 'handle'>): Promise<SessionClassification> {
         const { first, externalAgentImport } = await this.readClassificationPreamble(filePath, options?.handle);
         if (!first) {
@@ -394,12 +384,10 @@ export class CodexAdapter extends JsonlTurnAdapter {
         return classifyEmptyJsonlSession(filePath, (line) => emptySessionSignals(line as CodexLine));
     }
 
-    /**
-     * Imported external-agent rollouts have no discriminator in session_meta;
-     * Codex puts it on the first task event instead. Read parsed fields from the
-     * JSONL preamble and stop at the first turn_id: matching text elsewhere in a
-     * prompt, tool payload, or instruction block must never exclude a session.
-     */
+    // Imported external-agent rollouts have no discriminator in session_meta;
+    // Codex puts it on the first task event instead. Read parsed fields from the
+    // JSONL preamble and stop at the first turn_id: matching text elsewhere in a
+    // prompt, tool payload, or instruction block must never exclude a session.
     private async readClassificationPreamble(
         filePath: string,
         handle?: FileHandle,
@@ -467,12 +455,10 @@ export class CodexAdapter extends JsonlTurnAdapter {
         return l.type === 'response_item' && l.payload?.type === 'web_search_call';
     }
 
-    /**
-     * `<environment_context>` resume marker. A marker either starts
-     * a content item directly or is appended after a reloaded instruction block
-     * in that same item. Matching the complete closing tag avoids treating
-     * ordinary prose that merely mentions "environment_context" as a marker.
-     */
+    // `<environment_context>` resume marker. A marker either starts
+    // a content item directly or is appended after a reloaded instruction block
+    // in that same item. Matching the complete closing tag avoids treating
+    // ordinary prose that merely mentions "environment_context" as a marker.
     protected isResumeMarkerLine(line: unknown): boolean {
         const l = line as CodexLine;
         if (l.type !== 'response_item' || l.payload?.type !== 'message' || l.payload.role !== 'user') {

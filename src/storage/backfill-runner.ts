@@ -30,7 +30,7 @@ export interface BackfillDeriver<Session, Change extends BackfillChange, State =
     afterApply?(input: { db: Database; adapters: Record<ToolName, SessionAdapter>; plan: BackfillPlan<Change> }): Promise<void>;
 }
 
-/** Plans and applies transcript-derived storage backfills. Verification reuses its plan result. */
+// Plans and applies transcript-derived storage backfills. Verification reuses its plan result.
 export async function planBackfill<Session, Change extends BackfillChange, State>(
     db: Database,
     adapters: Record<ToolName, SessionAdapter>,

@@ -1,6 +1,5 @@
-// Haiku-backed SummarizationProvider. Sole implementation for this phase -
-// kept behind the SummarizationProvider interface (see ../types) so a local
-// provider (e.g. Ollama) can be added later without touching call sites.
+// Haiku stays behind SummarizationProvider so another provider can be added
+// without changing call sites.
 
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
@@ -52,14 +51,13 @@ function tryParse(candidate: string): RawOutput | undefined {
     }
 }
 
-/** Tries the raw text as-is, then a fenced block if present, then the outermost {...} span - cheap, local, no API call. Exported for direct unit testing - see test/summarizer/haiku-provider.test.ts. */
 // Model output body extraction is deliberately over-tolerant, not because the
 // prompt is ambiguous (it explicitly says "no markdown fences, no
 // commentary") but because Haiku wraps output in a ```json fence anyway on
 // every observed call - confirmed live in fixed-sampling runs, 100% reproduction.
 // This is a contract mismatch between what we ask for and what the model
 // reliably does, not a stochastic glitch, so a plain identical retry never
-// recovers it - see the repair-pass fallback in summarize() below.
+// recovers it. The repair pass therefore changes the input.
 export function parseOutput(raw: string): RawOutput | undefined {
     for (const candidate of extractJsonCandidate(raw)) {
         const parsed = tryParse(candidate);
@@ -95,7 +93,7 @@ export class HaikuSummarizationProvider implements SummarizationProvider {
         const userContent = buildSummarizationUserContent(input.userMessage, input.assistantText);
 
         // Attempt 1: the real request. Attempt 2 only fires if attempt 1
-        // failed, and its shape depends on WHY attempt 1 failed - see below.
+        // failed, and its shape depends on WHY attempt 1 failed.
         // Resending identical input after a deterministic formatting
         // failure never recovers it, so attempt 2 is never a plain repeat.
         const first = await this.call(1, userContent, TURN_SUMMARIZATION_MAX_TOKENS);

@@ -4,9 +4,8 @@
 // whose transcript file has been idle for IDLE_CLOSE_MS is rolled up and marked
 // 'final', but "final" only means "quiet for a while". Codex Desktop reopens
 // sessions days later and appends to the original rollout file, so a final
-// rollup can be woken back to 'live' any number of times. Every path here is
-// written for that: see RollupStore's watermark for why re-processing the same
-// turns can't double-count.
+// rollup can be woken back to 'live' any number of times. RollupStore's
+// watermark prevents reprocessing the same turns from double-counting.
 
 import { IDLE_CLOSE_MS } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
@@ -16,30 +15,26 @@ import { chunkTurns, type RollupTurnInput } from '../summarizer/rollup-prompt.js
 import { attributeDecisions, type RollupProvider } from '../summarizer/rollup-provider.js';
 import type { SessionKind } from '../types/index.js';
 
-/**
- * Result of one `rollupSession` call. `wrote` is true if any batch landed;
- * `complete` is true only if every fresh batch was processed without an
- * abort (a failed summarization or a concurrent writer moving the
- * watermark). A caller that only checks `wrote` (as the old boolean return
- * did) can't tell a full rebuild from a partial one that got interrupted
- * three batches in - that's the CLI's "Rolled up 10 session(s)" false
- * success line, fixed at the source.
- */
+// Result of one `rollupSession` call. `wrote` is true if any batch landed;
+// `complete` is true only if every fresh batch was processed without an
+// abort (a failed summarization or a concurrent writer moving the
+// watermark). A caller that only checks `wrote` (as the old boolean return
+// did) can't tell a full rebuild from a partial one that got interrupted
+// three batches in - that's the CLI's "Rolled up 10 session(s)" false
+// success line, fixed at the source.
 export interface RollupOutcome {
     wrote: boolean;
     complete: boolean;
 }
 
-/**
- * True if the session's stored watermark still matches what this batch's
- * write is about to be conditioned on. `expected: undefined` (the
- * unconditional first batch of a from-scratch rebuild) always matches -
- * there's nothing to verify against yet. Checked immediately before every
- * batch's model call, not just at write time: it can't close the race
- * entirely (a concurrent writer can still land mid-API-call, which only the
- * write's own conditional UPDATE catches), but it does turn a same-tick
- * collision into a free skip instead of a paid-for one.
- */
+// True if the session's stored watermark still matches what this batch's
+// write is about to be conditioned on. `expected: undefined` (the
+// unconditional first batch of a from-scratch rebuild) always matches -
+// there's nothing to verify against yet. Checked immediately before every
+// batch's model call, not just at write time: it can't close the race
+// entirely (a concurrent writer can still land mid-API-call, which only the
+// write's own conditional UPDATE catches), but it does turn a same-tick
+// collision into a free skip instead of a paid-for one.
 export function watermarkStillMatches(rollups: RollupStore, sessionId: number, expected: number | undefined): boolean {
     if (expected === undefined) {
         return true;
@@ -47,7 +42,7 @@ export function watermarkStillMatches(rollups: RollupStore, sessionId: number, e
     return rollups.get(sessionId)?.rolled_up_through_turn_index === expected;
 }
 
-/** How long a transcript file must be idle before its session is considered closed. */
+// How long a transcript file must be idle before its session is considered closed.
 function toRollupInput(rows: MemoryRow[]): RollupTurnInput[] {
     return rows.map((r) => ({
         turnIndex: r.turn_index,
@@ -88,19 +83,16 @@ export class RollupService {
         this.logError = options.logError ?? this.log;
     }
 
-    /** A new turn landed: any 'final' rollup for this session is stale and must return to 'live'. */
+    // A new turn landed: any 'final' rollup for this session is stale and must return to 'live'.
     noteActivity(sessionDbId: number): void {
         this.rollups.markLive(sessionDbId);
     }
 
-    /**
-     * Rolls up one session, incrementally when a rollup already exists.
-     *
-     * `complete: false` covers everything that isn't "every fresh batch
-     * landed" - no turns past the watermark, a failed summarization, or
-     * another writer moving the watermark underneath a multi-batch rebuild.
-     * See RollupOutcome.
-     */
+    // Rolls up one session, incrementally when a rollup already exists.
+    //
+    // `complete: false` covers everything that isn't "every fresh batch
+    // landed" - no turns past the watermark, a failed summarization, or
+    // another writer moving the watermark underneath a multi-batch rebuild.
     async rollupSession(
         session: SessionRow,
         kind: SessionKind,
@@ -310,7 +302,7 @@ export class RollupService {
         };
     }
 
-    /** True when a transcript file has been quiet long enough to treat the session as closed. */
+    // True when a transcript file has been quiet long enough to treat the session as closed.
     isIdle(mtimeMs: number, now = Date.now()): boolean {
         return now - mtimeMs >= this.idleCloseMs;
     }

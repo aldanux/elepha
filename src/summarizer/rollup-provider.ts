@@ -1,7 +1,5 @@
-// Haiku-backed session rollup generation. Same defensive-parsing contract as
-// the per-turn summarizer (see haiku-provider.ts): the model wraps JSON in
-// markdown fences regardless of instructions, so output is extracted, not
-// trusted.
+// Haiku-backed session rollup generation. The model wraps JSON in Markdown
+// fences regardless of instructions, so output is extracted defensively.
 
 import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
@@ -36,18 +34,16 @@ export interface ParsedDecision {
     turn_index?: number;
 }
 
-/**
- * `turn_index` arrives as a STRING from this model - `"turn_index": "0"` -
- * despite the prompt asking for a number, in fixed-sampling runs, reproducibly.
- *
- * The first version of this field was `z.number().int().optional()`, whose
- * comment claimed optionality meant "a model that ignores the instruction
- * still parses". It does not: `optional()` tolerates an ABSENT key, not a
- * wrong-typed one, so every rollup failed to parse and a rebuild died on
- * its first three sessions. Textbook instance of this codebase's own
- * "format instructions in a prompt are a suggestion, not a contract" - added
- * while fixing a different instance of the same rule.
- */
+// `turn_index` arrives as a STRING from this model - `"turn_index": "0"` -
+// despite the prompt asking for a number, in fixed-sampling runs, reproducibly.
+//
+// The first version of this field was `z.number().int().optional()`, whose
+// comment claimed optionality meant "a model that ignores the instruction
+// still parses". It does not: `optional()` tolerates an ABSENT key, not a
+// wrong-typed one, so every rollup failed to parse and a rebuild died on
+// its first three sessions. Textbook instance of this codebase's own
+// "format instructions in a prompt are a suggestion, not a contract" - added
+// while fixing a different instance of the same rule.
 function coerceTurnIndex(value: unknown): number | undefined {
     if (typeof value === 'number' && Number.isInteger(value)) {
         return value;
@@ -58,14 +54,12 @@ function coerceTurnIndex(value: unknown): number | undefined {
     return undefined;
 }
 
-/**
- * One decision, or undefined if it is unusable.
- *
- * Nothing here can fail the enclosing rollup. A malformed or hollow decision
- * costs that decision; it must never cost the title, the summary, the pending
- * items and every other decision in the session, which is what a strict
- * element schema inside `z.array()` does.
- */
+// One decision, or undefined if it is unusable.
+//
+// Nothing here can fail the enclosing rollup. A malformed or hollow decision
+// costs that decision; it must never cost the title, the summary, the pending
+// items and every other decision in the session, which is what a strict
+// element schema inside `z.array()` does.
 function coerceDecision(raw: unknown): ParsedDecision | undefined {
     if (!raw || typeof raw !== 'object') {
         return undefined;
@@ -95,12 +89,10 @@ export interface RollupOutput {
     summary: string;
     decisions: ParsedDecision[];
     pending_items: string[];
-    /**
-     * Decisions the model emitted that were unusable (no `what`, or no `why`).
-     * Reported rather than dropped silently: a rollup that quietly loses half
-     * its decisions to a prompt regression must be distinguishable from a
-     * session that genuinely made few.
-     */
+    // Decisions the model emitted that were unusable (no `what`, or no `why`).
+    // Reported rather than dropped silently: a rollup that quietly loses half
+    // its decisions to a prompt regression must be distinguishable from a
+    // session that genuinely made few.
     droppedDecisions: number;
 }
 
@@ -177,25 +169,23 @@ function overlap(a: Set<string>, b: Set<string>): number {
     return shared / Math.min(a.size, b.size);
 }
 
-/**
- * Assigns each returned decision a turn of origin, IN CODE.
- *
- * The prompt asks for `turn_index`, but the whole reason this exists is that
- * the merge model does not reliably follow ordering instructions - trusting it
- * to self-report provenance would rebuild the bug one level up. So:
- *
- *  1. Accept the model's `turn_index` only when it names a turn that was
- *     actually in this batch. Anything else is discarded silently-as-data, not
- *     silently-as-failure: the next steps still produce a value.
- *  2. Otherwise, match the decision text against the batch's own per-turn
- *     decision strings and take the best-overlapping turn.
- *  3. Otherwise, fall back to the batch's LAST turn index. The decision came
- *     out of this batch, so its true origin is somewhere in it; biasing the
- *     fallback newest keeps an unplaceable decision visible in the brief
- *     instead of sinking it to the bottom, which is the failure mode being
- *     fixed. Over-attributing recency is recoverable; under-attributing it is
- *     the bug.
- */
+// Assigns each returned decision a turn of origin, IN CODE.
+//
+// The prompt asks for `turn_index`, but the whole reason this exists is that
+// the merge model does not reliably follow ordering instructions - trusting it
+// to self-report provenance would rebuild the bug one level up. So:
+//
+// 1. Accept the model's `turn_index` only when it names a turn that was
+//    actually in this batch. Anything else is discarded silently-as-data, not
+//    silently-as-failure: the next steps still produce a value.
+// 2. Otherwise, match the decision text against the batch's own per-turn
+//    decision strings and take the best-overlapping turn.
+// 3. Otherwise, fall back to the batch's LAST turn index. The decision came
+//    out of this batch, so its true origin is somewhere in it; biasing the
+//    fallback newest keeps an unplaceable decision visible in the brief
+//    instead of sinking it to the bottom, which is the failure mode being
+//    fixed. Over-attributing recency is recoverable; under-attributing it is
+//    the bug.
 export function attributeDecisions(
     decisions: RollupOutput['decisions'],
     batch: RollupTurnInput[],
@@ -257,16 +247,14 @@ export class HaikuRollupProvider implements RollupProvider {
         return this.call(ROLLUP_MERGE_SYSTEM_PROMPT, buildRollupMergeUserContent(previous, newTurns));
     }
 
-    /**
-     * One rollup request, retried ONCE at a larger output budget if the first
-     * attempt ran out of room mid-JSON.
-     *
-     * A same-budget retry risks the same truncation, so it is pure waste.
-     * The only thing worth changing is the budget - the input was never the
-     * problem. (A malformed-but-complete response is a different failure and
-     * is not retried here: rollups are recomputed from turn rows on the next
-     * pass, and the watermark deliberately does not advance on failure.)
-     */
+    // One rollup request, retried ONCE at a larger output budget if the first
+    // attempt ran out of room mid-JSON.
+    //
+    // A same-budget retry risks the same truncation, so it is pure waste.
+    // The only thing worth changing is the budget - the input was never the
+    // problem. (A malformed-but-complete response is a different failure and
+    // is not retried here: rollups are recomputed from turn rows on the next
+    // pass, and the watermark deliberately does not advance on failure.)
     private async call(system: string, userContent: string): Promise<RollupResult> {
         const first = await this.callOnce(system, userContent, ROLLUP_MAX_TOKENS, 1);
         if (first.status === 'ok' || !first.truncated) {

@@ -356,7 +356,7 @@ function groupRows(rows: StoredSession[]): StoredSession[][] {
     return [...groups.values()];
 }
 
-/** Read-only preview. Re-reads JSONL so resumeMarkerBefore is not discarded. */
+// Read-only preview. Re-reads JSONL so resumeMarkerBefore is not discarded.
 export async function planResegmentation(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<ResegmentationPlan> {
     const allSessions = sessionRows(db);
     const groups: ResegmentationGroupPlan[] = [];
@@ -541,7 +541,7 @@ function insertSessionFromSegment(db: Database, tool: ToolName, nativeId: string
     return Number(info.lastInsertRowid);
 }
 
-/** Applies exactly the previewed ready groups in one transaction. */
+// Applies exactly the previewed ready groups in one transaction.
 export function applyResegmentation(db: Database, plan: ResegmentationPlan): ResegmentationPlan {
     const ready = plan.groups.filter((group) => group.status === 'ready' && group.requiresWrite);
     const apply = db.transaction(() => {

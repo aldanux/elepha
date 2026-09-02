@@ -56,7 +56,7 @@ export interface PurgeWizardOptions {
     output?: PurgeOutput;
     error?: Writable;
     store: MemoryStore;
-    /** Test seam; production routes every visual element through @clack/prompts. */
+    // Test seam; production routes every visual element through @clack/prompts.
     prompts?: PurgePrompts;
     runPurge(scope: PurgeScope, plan: PurgePlan, confirm: (plan: PurgePlan) => Promise<boolean>): Promise<boolean>;
     runExternalAgentImports(confirm: (sessionCount: number) => Promise<boolean>): Promise<boolean>;
@@ -197,7 +197,7 @@ async function confirmPurge(prompts: PurgePrompts, sessionCount: number): Promis
     return true;
 }
 
-/** Interactive front-end for the existing purge engines. It does not delete or back up data itself. */
+// Interactive front-end for the existing purge engines. It does not delete or back up data itself.
 export async function runPurgeWizard(options: PurgeWizardOptions): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;

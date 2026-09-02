@@ -47,7 +47,7 @@ function renderToolCalls(turn: ParsedTurn): string | undefined {
     return `**Tool calls**\n\n${lines.join('\n')}`;
 }
 
-/** Renders one kept turn, or null for an explicit no-tool-call pause. */
+// Renders one kept turn, or null for an explicit no-tool-call pause.
 export function renderRawTurn(turn: ParsedTurn, renderedTurnNumber: number = turn.turnIndex): string | null {
     // Adapters preserve transcript whitespace. It is not conversation content
     // at the outer edges, and retaining it would make the stored count differ
@@ -68,7 +68,7 @@ export function renderRawTurn(turn: ParsedTurn, renderedTurnNumber: number = tur
         .join('\n\n');
 }
 
-/** Produces the rendered sequence once so every consumer shares its filter. */
+// Produces the rendered sequence once so every consumer shares its filter.
 export function renderableRawTurns(turns: Iterable<ParsedTurn>, renderedTurnOffset: number = 0): string[] {
     const rendered: string[] = [];
     for (const turn of turns) {
@@ -80,18 +80,18 @@ export function renderableRawTurns(turns: Iterable<ParsedTurn>, renderedTurnOffs
     return rendered;
 }
 
-/** Renders a segment's turns with the exact inter-turn bytes served to consumers. */
+// Renders a segment's turns with the exact inter-turn bytes served to consumers.
 export function renderRawTurns(turns: Iterable<ParsedTurn>): string {
     const rendered = renderableRawTurns(turns);
     return rendered.length === 0 ? '' : `${rendered.join(RAW_TURN_SEPARATOR)}\n`;
 }
 
-/** Stored turn-count input: the exact number of turns renderRawTurns keeps. */
+// Stored turn-count input: the exact number of turns renderRawTurns keeps.
 export function renderedTurns(turns: Iterable<ParsedTurn>): number {
     return renderableRawTurns(turns).length;
 }
 
-/** Stored token-estimate input: the exact character count of renderRawTurns(). */
+// Stored token-estimate input: the exact character count of renderRawTurns().
 export function renderedChars(turns: Iterable<ParsedTurn>): number {
     return renderRawTurns(turns).length;
 }

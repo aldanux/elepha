@@ -47,10 +47,8 @@ export function formatLauncherProbeFailure(failure: LauncherProbeFailure): strin
     ].join('\n');
 }
 
-/**
- * The launcher verifies that the currently running package is elepha and the
- * selected Node major can run it. The launcher separately owns Node discovery.
- */
+// The launcher verifies that the currently running package is elepha and the
+// selected Node major can run it. The launcher separately owns Node discovery.
 export function launcherProbe(minimum: number): LauncherProbeResult {
     const expected = `>=${minimum}`;
     const execPath = process.execPath;

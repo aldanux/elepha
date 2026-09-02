@@ -35,7 +35,7 @@ export interface ImportWizardOptions {
     error?: Writable;
     backups?: string[];
     skipConfirmation?: boolean;
-    /** Test seam; production routes every visual element through @clack/prompts. */
+    // Test seam; production routes every visual element through @clack/prompts.
     prompts?: ImportPrompts;
     importBackup(file: string, overwrite: boolean, confirm?: () => Promise<boolean>): Promise<{ cancelled: boolean }>;
 }
@@ -69,7 +69,7 @@ function listImportBackups(directory = importBackupDirectory()): string[] {
     return listRegularFiles(directory).sort((a, b) => path.basename(b).localeCompare(path.basename(a)));
 }
 
-/** Interactive backup and mode selection; validation, preview, snapshot, and merge stay in the import operation. */
+// Interactive backup and mode selection; validation, preview, snapshot, and merge stay in the import operation.
 export async function runImportWizard(options: ImportWizardOptions): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;

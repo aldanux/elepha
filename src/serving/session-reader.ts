@@ -130,12 +130,10 @@ export class SessionReader {
         this.adapters = adapters;
     }
 
-    /**
-     * Memoized per reader instance, the same pattern as ProjectResolver.list:
-     * one operation's repeated reads of a project share a single load. A
-     * long-lived caller constructs a fresh reader per request so later
-     * requests observe daemon writes.
-     */
+    // Memoized per reader instance, the same pattern as ProjectResolver.list:
+    // one operation's repeated reads of a project share a single load. A
+    // long-lived caller constructs a fresh reader per request so later
+    // requests observe daemon writes.
     sessionsFor(project: ProjectSet): ServedSession[] {
         const key = project.projectIds.join(',');
         const cached = this.sessionsMemo.get(key);
@@ -152,11 +150,9 @@ export class SessionReader {
         return readProjectSessionAggregates(this.db, projectIds);
     }
 
-    /**
-     * Reads every session belonging to the already consent-filtered project
-     * sets in one newest-first query. The caller owns the consent boundary;
-     * this reader only combines its internal project ids.
-     */
+    // Reads every session belonging to the already consent-filtered project
+    // sets in one newest-first query. The caller owns the consent boundary;
+    // this reader only combines its internal project ids.
     recentConsentedSessions(projects: readonly ProjectSet[]): ServedSession[] {
         const projectIds = [...new Set(projects.flatMap((project) => project.projectIds))].sort((a, b) => a - b);
         if (projectIds.length === 0) {

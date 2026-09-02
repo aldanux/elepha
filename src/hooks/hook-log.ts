@@ -28,7 +28,7 @@ function trimHookLog(file: string, dependencies: HookLogDependencies): void {
     dependencies.replaceFile(file, retained);
 }
 
-/** Best-effort hook diagnostics must never affect hook delivery. */
+// Best-effort hook diagnostics must never affect hook delivery.
 export function appendHookLog(message: string, dependencyOverrides: Partial<HookLogDependencies> = {}): void {
     try {
         const dependencies = { ...DEFAULT_DEPENDENCIES, ...dependencyOverrides };

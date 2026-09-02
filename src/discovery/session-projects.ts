@@ -63,11 +63,9 @@ async function directoryExists(directory: string): Promise<boolean> {
     return (await stat(directory).catch(() => undefined))?.isDirectory() ?? false;
 }
 
-/**
- * Reads only enough JSONL metadata to find the session cwd and its timestamp.
- * The parsed `message`/turn payload, if present on that same line, is never
- * examined or retained. The reader stops at the first cwd line.
- */
+// Reads only enough JSONL metadata to find the session cwd and its timestamp.
+// The parsed `message`/turn payload, if present on that same line, is never
+// examined or retained. The reader stops at the first cwd line.
 export async function readSessionMetadata(filePath: string): Promise<SessionMetadata | undefined> {
     const handle = await open(filePath, 'r');
     let fileSize: number;
@@ -151,11 +149,9 @@ export async function readSessionMetadata(filePath: string): Promise<SessionMeta
     return undefined;
 }
 
-/**
- * Resolves a git worktree by metadata only. A `.git` directory or file is a
- * sufficient root marker; no git subprocess, config, or file contents are
- * read because the cwd originated in an unapproved transcript.
- */
+// Resolves a git worktree by metadata only. A `.git` directory or file is a
+// sufficient root marker; no git subprocess, config, or file contents are
+// read because the cwd originated in an unapproved transcript.
 async function gitRootFor(cwd: string): Promise<string | undefined> {
     let current = path.resolve(cwd);
     for (;;) {
@@ -174,7 +170,7 @@ function safeTimestamp(value: string): string {
     return Number.isNaN(new Date(value).getTime()) ? '' : new Date(value).toISOString();
 }
 
-/** Presence is based on a local transcript store, never on an interactive tool picker. */
+// Presence is based on a local transcript store, never on an interactive tool picker.
 export async function detectSessionTools(paths: DiscoveryPaths = {}): Promise<ToolName[]> {
     const detected: ToolName[] = [];
     for (const store of discoveryStores(paths)) {
@@ -208,7 +204,7 @@ function accumulate(candidates: Map<string, CandidateAccumulator>, root: string,
     });
 }
 
-/** Metadata-only, like the rest of this module: checks directory structure and never opens transcript content. */
+// Metadata-only, like the rest of this module: checks directory structure and never opens transcript content.
 export async function discoverFolderRepos(
     roots: readonly string[],
     alreadyDiscovered: readonly DiscoveredProject[],
@@ -256,7 +252,7 @@ export async function discoverFolderRepos(
     return projects;
 }
 
-/** Scans transcript metadata only; it never calls a turn parser or reads a turn's content. */
+// Scans transcript metadata only; it never calls a turn parser or reads a turn's content.
 export async function discoverSessionProjects(paths: DiscoveryPaths = {}): Promise<DiscoveryResult> {
     const stores = discoveryStores(paths);
     const detectedTools = await detectSessionTools(paths);

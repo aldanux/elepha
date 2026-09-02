@@ -1,6 +1,6 @@
 // Prompt for the per-turn summarization call. Model only judges decisions and
-// pending_items - files_touched is computed deterministically from toolCalls
-// upstream (see memory-store.recordTurn) and never asked of the model.
+// pending_items. files_touched is computed deterministically from tool calls
+// and never asked of the model.
 
 import { MAX_SUMMARIZATION_FIELD_CHARS } from '../config/constants.js';
 
@@ -39,13 +39,11 @@ export function buildSummarizationUserContent(userMessage: string, assistantText
     return `<user_message>${truncate(userMessage)}</user_message>\n<assistant_reply>${truncate(assistantText)}</assistant_reply>`;
 }
 
-/**
- * Repair-pass prompt: sends the model its own malformed output back and asks
- * for a fix. Deliberately NOT a resend of the original request - retrying
- * identical input against a deterministic formatting failure just
- * reproduces the same failure. This is meaningfully different input, so it
- * can actually recover a call the first attempt garbled.
- */
+// Repair-pass prompt: sends the model its own malformed output back and asks
+// for a fix. Deliberately NOT a resend of the original request - retrying
+// identical input against a deterministic formatting failure just
+// reproduces the same failure. This is meaningfully different input, so it
+// can actually recover a call the first attempt garbled.
 export function buildRepairUserContent(malformedOutput: string): string {
     return `Your previous response did not parse as JSON:\n${truncate(malformedOutput)}\n\nReturn ONLY the corrected JSON matching {"decisions": [{"what": string, "why": string|null}], "pending_items": string[]}. No markdown code fences, no commentary, just the raw JSON object.`;
 }

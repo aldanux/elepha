@@ -8,7 +8,7 @@ type MaybePromise<T> = T | Promise<T>;
 export interface DestructiveOpOptions<Plan> {
     applyRequested: boolean;
     db: ReturnType<typeof openDb>;
-    /** Human-readable verb used if the live daemon prevents mutation. */
+    // Human-readable verb used if the live daemon prevents mutation.
     operationLabel?: string;
     plan(): MaybePromise<Plan>;
     describe(plan: Plan): void;
@@ -23,7 +23,7 @@ export interface DestructiveOpOptions<Plan> {
     };
 }
 
-/** Runs the shared preview -> optional confirm -> backup -> apply -> verify sequence. */
+// Runs the shared preview -> optional confirm -> backup -> apply -> verify sequence.
 export async function runDestructiveOp<Plan>(opts: DestructiveOpOptions<Plan>): Promise<boolean> {
     const plan = await opts.plan();
     opts.describe(plan);

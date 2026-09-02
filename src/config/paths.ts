@@ -31,13 +31,13 @@ export function expandUserPath(p: string): string {
     return p.startsWith('~/') ? path.join(homedir(), p.slice(2)) : p;
 }
 
-/** Claude Code's config root. Honors CLAUDE_CONFIG_DIR, else ~/.claude. */
+// Claude Code's config root. Honors CLAUDE_CONFIG_DIR, else ~/.claude.
 export function claudeConfigDir(): string {
     const override = process.env.CLAUDE_CONFIG_DIR?.trim();
     return override ? path.resolve(override) : path.join(homedir(), '.claude');
 }
 
-/** Codex's home. Honors CODEX_HOME, else ~/.codex. */
+// Codex's home. Honors CODEX_HOME, else ~/.codex.
 export function codexHome(): string {
     const override = process.env.CODEX_HOME?.trim();
     return override ? path.resolve(override) : path.join(homedir(), '.codex');
@@ -61,7 +61,7 @@ export function providerStoreRoot(tool: ToolName): string {
     throw new Error(`Unsupported transcript provider: ${String(tool)}`);
 }
 
-/** elepha's own user configuration; hooks only read it and never create it. */
+// elepha's own user configuration; hooks only read it and never create it.
 export function elephaConfigPath(): string {
     return elephaPaths().config;
 }
@@ -78,7 +78,7 @@ export function claudeSettingsPath(): string {
     return path.join(claudeConfigDir(), 'settings.json');
 }
 
-/** Claude Code's user-scoped MCP registry. Project .mcp.json is deliberately never used here. */
+// Claude Code's user-scoped MCP registry. Project .mcp.json is deliberately never used here.
 export function claudeMcpPath(): string {
     const override = process.env.ELEPHA_CLAUDE_MCP_PATH?.trim();
     if (override) {
@@ -91,7 +91,7 @@ export function codexConfigPath(): string {
     return path.join(codexHome(), 'config.toml');
 }
 
-/** elepha-owned paths are kept together so persistent integrations never learn a Node-manager path. */
+// elepha-owned paths are kept together so persistent integrations never learn a Node-manager path.
 export function elephaHome(): string {
     const override = process.env.ELEPHA_HOME?.trim();
     if (override) {
@@ -100,7 +100,7 @@ export function elephaHome(): string {
     return path.join(homedir(), '.elepha');
 }
 
-/** Complete elepha-owned layout for one user home. */
+// Complete elepha-owned layout for one user home.
 export function elephaPaths(home = homedir()): {
     home: string;
     root: string;
@@ -142,7 +142,7 @@ export function elephaPaths(home = homedir()): {
     };
 }
 
-/** A service label is also a LaunchAgents filename component, so keep it path-safe. */
+// A service label is also a LaunchAgents filename component, so keep it path-safe.
 export function elephaServiceLabel(): string {
     const override = process.env.ELEPHA_SERVICE_LABEL?.trim();
     if (!override) {
@@ -174,12 +174,12 @@ export function daemonHeartbeatPath(): string {
     return elephaPaths().heartbeat;
 }
 
-/** Daemon-owned cache state for the daily registry check. */
+// Daemon-owned cache state for the daily registry check.
 export function updateCheckStatePath(): string {
     return elephaPaths().updateCheckState;
 }
 
-/** Hook-readable marker written only when the daemon found a newer release. */
+// Hook-readable marker written only when the daemon found a newer release.
 export function updateAvailablePath(): string {
     return elephaPaths().updateAvailable;
 }
@@ -196,17 +196,15 @@ export function daemonLaunchAgentPath(label = elephaServiceLabel()): string {
     return label === elephaServiceLabel() ? elephaPaths().launchAgent : path.join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
 }
 
-/** Forward-slash form, for substring checks that must behave the same on Windows. */
+// Forward-slash form, for substring checks that must behave the same on Windows.
 export function toPosix(p: string): string {
     return p.split(path.sep).join('/');
 }
 
-/**
- * Separator-normalized form for COMPARISON ONLY, case-folded on platforms whose
- * filesystems are case-insensitive by default. This platform check deliberately
- * does not detect volume-level overrides. Never persist this form: case-folding
- * destroys the real casing and can merge distinct files on case-sensitive volumes.
- */
+// Separator-normalized form for COMPARISON ONLY, case-folded on platforms whose
+// filesystems are case-insensitive by default. This platform check deliberately
+// does not detect volume-level overrides. Never persist this form: case-folding
+// destroys the real casing and can merge distinct files on case-sensitive volumes.
 export function normalizeForCompare(p: string): string;
 export function normalizeForCompare(p: string, platform: NodeJS.Platform): string;
 export function normalizeForCompare(p: string, platform: unknown = process.platform): string {
@@ -219,7 +217,7 @@ export function samePath(a: string, b: string, platform: NodeJS.Platform = proce
     return normalizeForCompare(a, platform) === normalizeForCompare(b, platform);
 }
 
-/** Resolves symlinks when possible; non-existent paths retain lexical resolution. */
+// Resolves symlinks when possible; non-existent paths retain lexical resolution.
 export function canonicalizeExisting(p: string): string {
     try {
         return realpathSync(p);
@@ -228,7 +226,7 @@ export function canonicalizeExisting(p: string): string {
     }
 }
 
-/** True if `child` is inside `parent` (or is `parent`), using platform-default case handling. */
+// True if `child` is inside `parent` (or is `parent`), using platform-default case handling.
 export function isWithin(parent: string, child: string, platform: NodeJS.Platform = process.platform): boolean {
     const p = normalizeForCompare(parent, platform).replace(/\/+$/, '');
     const c = normalizeForCompare(child, platform);
@@ -378,22 +376,20 @@ function isRefusedWslWindowsRoot(candidate: string): boolean {
     );
 }
 
-/**
- * Directories that must never become a project, regardless of what a
- * transcript's cwd says.
- *
- * $HOME itself is the one that actually bit us: a Codex session run from the
- * home directory registered `/Users/<me>` as a project and ingested personal
- * content (medical imaging files) into memory. Purging the row is not a fix -
- * the next session from that cwd recreates it, which is exactly what happened
- * within hours of the purge. The refusal has to live at ingestion.
- *
- * Only the directory ITSELF is refused, not everything beneath it: real
- * projects live under $HOME. `~/Documents`, `~/Desktop` and `~/Downloads` are
- * refused as project roots for the same reason - they are document dumps, not
- * codebases. Tool config homes are refused as whole trees because their
- * contents are provider state, not user projects.
- */
+// Directories that must never become a project, regardless of what a
+// transcript's cwd says.
+//
+// $HOME itself is the one that actually bit us: a Codex session run from the
+// home directory registered `/Users/<me>` as a project and ingested personal
+// content (medical imaging files) into memory. Purging the row is not a fix -
+// the next session from that cwd recreates it, which is exactly what happened
+// within hours of the purge. The refusal has to live at ingestion.
+//
+// Only the directory ITSELF is refused, not everything beneath it: real
+// projects live under $HOME. `~/Documents`, `~/Desktop` and `~/Downloads` are
+// refused as project roots for the same reason - they are document dumps, not
+// codebases. Tool config homes are refused as whole trees because their
+// contents are provider state, not user projects.
 export function isRefusedProjectRoot(projectPath: string): boolean {
     if (!projectPath.trim()) {
         return true; // an empty cwd yields an unreachable project row
@@ -419,11 +415,9 @@ export function isRefusedProjectRoot(projectPath: string): boolean {
     );
 }
 
-/**
- * De-duplicates paths that differ only by case, keeping the first spelling
- * seen. Used for files_touched: on macOS the same file reached via different
- * casing must not appear twice.
- */
+// De-duplicates paths that differ only by case, keeping the first spelling
+// seen. Used for files_touched: on macOS the same file reached via different
+// casing must not appear twice.
 export function dedupePaths(paths: string[]): string[] {
     const seen = new Map<string, string>();
     for (const p of paths) {

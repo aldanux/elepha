@@ -41,11 +41,9 @@ function textResult(text: string): McpToolResult {
 
 export const mcpResponseShaper: McpResponseShaper = { result, textResult };
 
-/**
- * The MCP process is a read client. It checks the daemon-owned schema but
- * never invokes openDb(): openDb() hardens files, migrates, and grandfathers
- * consent roots, so all writes remain daemon-owned.
- */
+// The MCP process is a read client. It checks the daemon-owned schema but
+// never invokes openDb(): openDb() hardens files, migrates, and grandfathers
+// consent roots, so all writes remain daemon-owned.
 function schemaReadiness(db: Pick<Database.Database, 'prepare'>): SchemaReadiness {
     const names = new Set(
         (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name),
@@ -75,10 +73,8 @@ export function createMcpServer(service: ElephaMcpService): McpServer {
     return server;
 }
 
-/**
- * Builds either the normal read surface or the same three-tool surface whose
- * calls refuse with a named schema reason. The check itself is read-only.
- */
+// Builds either the normal read surface or the same three-tool surface whose
+// calls refuse with a named schema reason. The check itself is read-only.
 export function createMcpServerForDatabase(db: Database.Database): McpServer {
     const readiness = schemaReadiness(db);
     if (readiness.ready) {
@@ -103,14 +99,14 @@ function registerTools(server: McpServer, tools: ReturnType<typeof mcpToolDefini
     server.registerTool(tools.getSession.name, tools.getSession.configuration, tools.getSession.handler);
 }
 
-/** Starts the only network-facing transport. stdout remains reserved for JSON-RPC. */
+// Starts the only network-facing transport. stdout remains reserved for JSON-RPC.
 export async function serveMcp(dbPath: string = defaultDbPath()): Promise<void> {
     const db = openMcpReadOnlyDatabase(dbPath);
     const server = createMcpServerForDatabase(db);
     await server.connect(new StdioServerTransport());
 }
 
-/** Read-only connection seam used by the stdio server and its write-proof test. */
+// Read-only connection seam used by the stdio server and its write-proof test.
 export function openMcpReadOnlyDatabase(dbPath: string = defaultDbPath()): Database.Database {
     return new Database(dbPath, { readonly: true, fileMustExist: true });
 }

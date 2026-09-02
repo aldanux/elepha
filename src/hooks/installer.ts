@@ -57,7 +57,7 @@ function hooksObject(config: Record<string, unknown>): Record<string, unknown> {
         : {};
 }
 
-/** Pure Claude settings transform. It removes just elepha's handler, never a sibling group. */
+// Pure Claude settings transform. It removes just elepha's handler, never a sibling group.
 export function transformClaudeHook(text: string, bin: string, uninstall = false): string {
     let config: Record<string, unknown> = {};
     if (text.trim()) {
@@ -130,7 +130,7 @@ function codexBlock(bin: string, event: HookEvent): string {
     )}\ntimeout = ${INSTALLED_HOOK_TIMEOUT_SECONDS}\n${event === SESSION_START ? `statusMessage = "Loading project memory"\n${CODEX_ADDITIONAL_CONTEXT_LIMIT}\n` : ''}${blockEnd(event)}\n`;
 }
 
-/** Text-level TOML transform keeps unrelated comments and table order intact. */
+// Text-level TOML transform keeps unrelated comments and table order intact.
 export function transformCodexHook(text: string, bin: string, uninstall = false, configPath?: string): string {
     try {
         parse(text);
@@ -187,11 +187,9 @@ export function transformCodexHook(text: string, bin: string, uninstall = false,
     return next;
 }
 
-/**
- * The managed group is appended, but users can add later groups before removal.
- * Codex keys trust state by positional hook identity, so move those later keys
- * with their handlers rather than letting uninstall silently disable them.
- */
+// The managed group is appended, but users can add later groups before removal.
+// Codex keys trust state by positional hook identity, so move those later keys
+// with their handlers rather than letting uninstall silently disable them.
 function rekeyCodexTrustState(text: string, configPath: string, eventName: HookEvent['configName'], removedGroup: number): string {
     const headers = Array.from(text.matchAll(/^[ \t]*\[[^\r\n]*(?:\r?\n|$)/gm));
     let result = '';

@@ -68,8 +68,7 @@ describe('RollupStore', () => {
     });
 
     it('re-inserting (version rebuild) replaces the row rather than throwing on the primary key', () => {
-        // Rebuild-in-progress support (see rollup-service.ts): a caller can pin
-        // the stamped version explicitly, e.g. to keep an intermediate rebuild
+        // A caller can pin the stamped version to keep an intermediate rebuild
         // batch looking stale so it stays a rebuild candidate until the batch
         // that actually finishes the session. Omitting it keeps every existing
         // caller's behavior (current version) unchanged.

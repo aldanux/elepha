@@ -16,10 +16,8 @@ function isDirectory(file: string): boolean {
     return statSync(file, { throwIfNoEntry: false })?.isDirectory() ?? false;
 }
 
-/**
- * Presence is intentionally filesystem-only: registering a config for a tool
- * that is not installed creates an orphan entry that status can never mark ready.
- */
+// Presence is intentionally filesystem-only: registering a config for a tool
+// that is not installed creates an orphan entry that status can never mark ready.
 export function detectPresentTools(paths: ToolConfigPaths): PresentTools {
     return {
         claude: isDirectory(path.dirname(paths.claudeSettings)) || existsSync(paths.claudeMcp),

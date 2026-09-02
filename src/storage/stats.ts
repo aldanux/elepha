@@ -1,7 +1,4 @@
-// Dogfooding instrumentation - temporary scaffolding to size real usage
-// (Phase 2 design questions: rows/session, decision quality signal proxy,
-// pending_items accumulation rate, files_touched miss rate per tool).
-// Not part of the served-memory feature surface.
+// Local diagnostics only; these metrics are not part of served memory.
 
 export function median(values: number[]): number {
     if (values.length === 0) {
@@ -21,7 +18,6 @@ export function minMedianMax(values: number[]): { min: number; median: number; m
 
 const DURATION_RE = /^(\d+)([mhd])$/;
 
-/** Parses shorthand like "24h", "7d", "30m", or falls back to a plain ISO date string. Returns an ISO timestamp. */
 export function parseSince(input: string): string {
     const m = DURATION_RE.exec(input);
     if (!m) {
@@ -63,9 +59,11 @@ export interface Stats {
     memoriesPerSession: { min: number; median: number; max: number; count: number };
     pendingItemsPerSession: { min: number; median: number; max: number; count: number };
     byProject: ProjectCount[];
-    /** Empty decisions AND empty pending_items - a content-shape signal only. Doesn't distinguish "model genuinely had nothing to report" from "pipeline failed before producing content" - cross-reference byStatus for that. */
+    // Content shape only. Consult byStatus to distinguish a quiet model result
+    // from a pipeline failure.
     noise: { count: number; total: number };
-    /** Rows by summarizer_status. 'not_configured' is intentional capture-only data; 'parse_error'/'api_error' are pipeline failures wearing the same empty-array shape. */
+    // 'not_configured' is intentional capture-only data; 'parse_error' and
+    // 'api_error' are pipeline failures with the same empty-array shape.
     byStatus: StatusCount[];
     filesTouchedZero: ToolZeroPaths[];
 }

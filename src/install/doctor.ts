@@ -40,10 +40,8 @@ function addNextStep(nextSteps: string[], line: string): void {
     }
 }
 
-/**
- * Read every recovery prerequisite, repairing only a non-healthy managed daemon.
- * The injected seams make the service lifecycle deterministic in unit tests.
- */
+// Read every recovery prerequisite, repairing only a non-healthy managed daemon.
+// The injected seams make the service lifecycle deterministic in unit tests.
 export function runDoctor(runtime: DoctorRuntime): DoctorResult;
 export function runDoctor(runtime: DoctorRuntime = missingApprovedRoots()): DoctorResult {
     const lines: string[] = [];

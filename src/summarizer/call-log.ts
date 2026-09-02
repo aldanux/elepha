@@ -20,7 +20,8 @@ export interface SummarizerCallLogEntry {
     attempt: number;
     rateLimited: boolean;
     error: string | null;
-    /** Outcome of this specific call attempt - lets health reporting tell a genuine API success apart from a call that succeeded but produced unparseable content (previously both logged as error:null and were indistinguishable). */
+    // Distinguishes API success from an unparseable successful response;
+    // both previously looked like error:null.
     status: SummarizerStatus;
 }
 
@@ -60,7 +61,7 @@ function datedLogFilenameDate(filename: string): string | undefined {
     return match ? validIsoDate(match[1]) : undefined;
 }
 
-/** Truncates and redacts key/token-shaped substrings from an error message before it's logged. */
+// Truncates and redacts key/token-shaped substrings from an error message before it's logged.
 export function sanitizeErrorMessage(message: string): string {
     let out = message.replace(BEARER_RE, 'Bearer [redacted]').replace(KEY_LIKE_RE, '[redacted]');
     if (out.length > MAX_ERROR_LENGTH) {
@@ -115,7 +116,7 @@ export class SummarizerCallLog {
         }
     }
 
-    /** Reads logged call entries with timestamp >= sinceIso. Dated files older than the threshold day are rejected before opening. */
+    // Dated files older than the threshold day are rejected before opening.
     readEntriesSince(sinceIso: string): SummarizerCallLogEntry[] {
         let files: string[];
         try {

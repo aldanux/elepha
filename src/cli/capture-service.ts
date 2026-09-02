@@ -30,7 +30,7 @@ export const defaultDaemonControlRuntime: DaemonControlRuntime = {
     daemonHealth: () => daemonHealth(),
 };
 
-/** Resolves the installed managed service without printing command-specific guidance. */
+// Resolves the installed managed service without printing command-specific guidance.
 export function resolveCaptureService(runtime: DaemonControlRuntime = defaultDaemonControlRuntime): ServiceBackend | undefined {
     if (!isSupportedPlatform(runtime.platform)) {
         return undefined;
@@ -39,7 +39,7 @@ export function resolveCaptureService(runtime: DaemonControlRuntime = defaultDae
     return runtime.hasServiceArtifacts(service) ? service : undefined;
 }
 
-/** Stops capture before disabling automatic restarts. */
+// Stops capture before disabling automatic restarts.
 export function pauseCaptureService(service: ServiceBackend): CaptureServiceTransition {
     const before = service.status();
     if (!before.loaded && before.disabled && !before.unknown) {
@@ -75,7 +75,7 @@ function isFreshHeartbeat(heartbeat: Heartbeat | undefined, previous: Heartbeat 
     return new Date(heartbeat.startedAt).getTime() > new Date(previous.startedAt).getTime();
 }
 
-/** Enables capture before starting the managed service. */
+// Enables capture before starting the managed service.
 export function resumeCaptureService(
     service: ServiceBackend,
     runtime: Pick<DaemonControlRuntime, 'daemonHealth' | 'now' | 'sleep'> = defaultDaemonControlRuntime,

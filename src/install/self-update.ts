@@ -52,7 +52,7 @@ export function packageVersion(packageRoot: string): string {
     return manifest.version;
 }
 
-/** Daemon-only registry query. Foreground self-update remains synchronous. */
+// Daemon-only registry query. Foreground self-update remains synchronous.
 export async function installedAndLatestElephaVersionAsync(
     runtime: Pick<SelfUpdateRuntime, 'resolveInstalledBin' | 'readPackageVersion' | 'detectBackend'> = {},
 ): Promise<{ installedVersion: string; latestVersion: string }> {
@@ -93,11 +93,9 @@ function restart(service: ServiceBackend, approvedRoots: number, reconcile: Reco
     }
 }
 
-/**
- * Updates the globally-installed elepha package and restarts its managed
- * capture service. Rollback restores only the prior code and healthy service;
- * additive schema migrations are intentionally left in place.
- */
+// Updates the globally-installed elepha package and restarts its managed
+// capture service. Rollback restores only the prior code and healthy service;
+// additive schema migrations are intentionally left in place.
 export function selfUpdate(runtime: SelfUpdateRuntime): SelfUpdateResult;
 export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()): SelfUpdateResult {
     const platform = runtime.platform ?? process.platform;

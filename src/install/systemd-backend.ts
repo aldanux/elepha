@@ -105,7 +105,7 @@ function systemdExecutable(value: string): string {
     return /[\s"\\]/.test(escaped) ? systemdQuoted(value) : escaped;
 }
 
-/** Deterministic user unit with no Node, package, or repository path. */
+// Deterministic user unit with no Node, package, or repository path.
 export function renderDaemonUnit(paths: SystemdServicePaths, environment: NodeJS.ProcessEnv = process.env): string {
     const serviceEnvironment = [
         ['HOME', physicalInstallPath(paths.home)],

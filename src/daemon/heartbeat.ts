@@ -39,7 +39,7 @@ export function clearHeartbeat(filePath: string): void {
     }
 }
 
-/** True if a process with this pid exists, regardless of who owns it. */
+// True if a process with this pid exists, regardless of who owns it.
 export function isPidAlive(pid: number): boolean {
     try {
         process.kill(pid, 0);

@@ -44,7 +44,7 @@ function humanAge(ms: number): string {
     return `${Math.round(hours / 24)}d`;
 }
 
-/** The heartbeat verdict shared by status, doctor, and rollup's rebuild guard. */
+// The heartbeat verdict shared by status, doctor, and rollup's rebuild guard.
 export function daemonHealth(heartbeatPath = daemonHeartbeatPath(), now = Date.now()): DaemonHealth {
     const heartbeat = readHeartbeat(heartbeatPath);
     if (!heartbeat) {
@@ -91,7 +91,7 @@ export function integrationHealth(
     };
 }
 
-/** Checks the managed launcher itself, without executing it or a shell. */
+// Checks the managed launcher itself, without executing it or a shell.
 export function managedLauncherHealth(service: ServiceBackend = serviceBackend()): LauncherHealth {
     try {
         const manifest = readJson<{

@@ -40,7 +40,7 @@ export interface RestoreWizardOptions {
     output?: RestoreOutput;
     error?: Writable;
     backups?: FullBackup[];
-    /** Test seam; production routes every visual element through @clack/prompts. */
+    // Test seam; production routes every visual element through @clack/prompts.
     prompts?: RestorePrompts;
     restore(file: string, confirm: () => Promise<boolean>): Promise<{ cancelled: boolean }>;
 }
@@ -95,7 +95,7 @@ async function promptForPath(prompts: RestorePrompts): Promise<string | symbol> 
     });
 }
 
-/** Interactive front-end for restore; validation, preview, snapshot, and replacement stay in the restore operation. */
+// Interactive front-end for restore; validation, preview, snapshot, and replacement stay in the restore operation.
 export async function runRestoreWizard(options: RestoreWizardOptions): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;

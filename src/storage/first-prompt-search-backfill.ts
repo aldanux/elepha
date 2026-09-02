@@ -24,11 +24,11 @@ export interface FirstPromptSearchPlan {
 }
 
 export interface FirstPromptSearchBackfillScope {
-    /** Limits daemon-owned work to one bounded batch; omitted by the repair CLI. */
+    // Limits daemon-owned work to one bounded batch; omitted by the repair CLI.
     sessionIds: readonly number[];
-    /** Prevents background repair from replacing a value written concurrently by ingestion. */
+    // Prevents background repair from replacing a value written concurrently by ingestion.
     onlyNull: boolean;
-    /** Rechecks daemon-owned authorization inside the transaction immediately before a write. */
+    // Rechecks daemon-owned authorization inside the transaction immediately before a write.
     authorizeWrite?: (db: Database, sessionId: number) => boolean;
 }
 
@@ -143,7 +143,6 @@ function daemonBatchDeriver(
     };
 }
 
-/** Shows first-prompt search changes without writing. */
 export async function planFirstPromptSearchBackfill(
     db: Database,
     adapters: Record<ToolName, SessionAdapter>,
@@ -152,7 +151,7 @@ export async function planFirstPromptSearchBackfill(
     return planBackfill(db, adapters, scope === undefined ? deriver : daemonBatchDeriver(scope));
 }
 
-/** Applies only readable sessions' derived first-prompt search documents in one transaction. */
+// Applies only readable sessions' derived first-prompt search documents in one transaction.
 export async function applyFirstPromptSearchBackfill(
     db: Database,
     adapters: Record<ToolName, SessionAdapter>,

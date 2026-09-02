@@ -32,7 +32,7 @@ export interface FullBackup {
     bytes: number;
 }
 
-/** Registers portable, user-requested database exports. Safety snapshots remain in storage/backup.ts. */
+// Registers portable, user-requested database exports. Safety snapshots remain in storage/backup.ts.
 export function registerBackup(program: Command): void {
     program
         .command('backup')
@@ -107,7 +107,7 @@ function backupDirectory(): string {
     return path.join(elephaHome(), USER_BACKUPS_DIR_NAME);
 }
 
-/** Lists complete database exports only; project exports are not valid restore candidates. */
+// Lists complete database exports only; project exports are not valid restore candidates.
 export function listFullBackups(): FullBackup[] {
     return listRegularFiles(backupDirectory())
         .filter((file) => /^elepha-full-.*\.db$/.test(path.basename(file)))
@@ -136,7 +136,7 @@ export function defaultBackupPath(project?: ProjectSet): string {
     return path.join(backupDirectory(), filename);
 }
 
-/** Existing directories stay directories; a trailing separator also creates a directory. Other values are file paths. */
+// Existing directories stay directories; a trailing separator also creates a directory. Other values are file paths.
 export function resolveOutput(output: string | undefined, defaultPath: string): string {
     if (output === undefined) {
         return defaultPath;
@@ -148,7 +148,7 @@ export function resolveOutput(output: string | undefined, defaultPath: string): 
     return resolved;
 }
 
-/** Full exports retain the source database bytes after a WAL checkpoint, unlike pruned safety snapshots. */
+// Full exports retain the source database bytes after a WAL checkpoint, unlike pruned safety snapshots.
 export function exportAll(db: Database.Database, destination: string, force = false): string {
     if (db.name === ':memory:') {
         throw new Error('A full backup requires an on-disk database.');
@@ -163,7 +163,7 @@ export function exportAll(db: Database.Database, destination: string, force = fa
     return destination;
 }
 
-/** Exports exactly one resolved ProjectSet and the four portable tables that reference it. */
+// Exports exactly one resolved ProjectSet and the four portable tables that reference it.
 export function exportProject(source: Database.Database, project: ProjectSet, destination: string, force = false): string {
     refuseActiveDatabaseDestination(source.name, destination);
     prepareDestination(destination, force);
@@ -194,7 +194,7 @@ function refuseActiveDatabaseDestination(activeDatabase: string, destination: st
     }
 }
 
-/** Rejects unsafe destinations before creating a backup file. */
+// Rejects unsafe destinations before creating a backup file.
 function prepareDestination(destination: string, force: boolean): void {
     let destinationInfo: ReturnType<typeof lstatSync> | undefined;
     try {

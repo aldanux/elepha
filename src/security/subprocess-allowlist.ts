@@ -18,11 +18,9 @@ import { SYSTEMD_SERVICE_NAME } from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
 import type { LauncherBackend } from '../install/launcher.js';
 
-// `cwd` above is transcript content (see memory-store.ts:upsertProject), so it
-// is effectively attacker-controlled - an attacker who can place a
-// directory anywhere under a watched store also controls that directory's
-// .git/config. Git's config precedence is
-//   system < global < local (repo) < worktree < -c (command line) < env
+// A consent-checked project directory can still contain hostile .git/config
+// values. Git's config precedence is
+//  system < global < local (repo) < worktree < -c (command line) < env
 // so an explicit `-c key=value` for every config key known to make git spawn
 // a subprocess wins over whatever a hostile local config says, regardless of
 // which directory git runs in. This is the actual fix - path/existence
@@ -70,17 +68,15 @@ function copySubprocessEnv(keys: readonly string[]): NodeJS.ProcessEnv {
     return environment;
 }
 
-/** Local-only subprocesses receive no network proxy or CA credentials. */
+// Local-only subprocesses receive no network proxy or CA credentials.
 function localSubprocessEnv(): NodeJS.ProcessEnv {
     return copySubprocessEnv(LOCAL_SUBPROCESS_ENV_KEYS);
 }
 
-/**
- * npm never inherits the complete CLI environment: it can contain credentials
- * loaded from elepha's .env. Proxy URLs may contain credentials, so this
- * network-capable environment belongs only to npm. Do not add broad prefixes:
- * npm_config_* can contain registry auth tokens.
- */
+// npm never inherits the complete CLI environment: it can contain credentials
+// loaded from elepha's .env. Proxy URLs may contain credentials, so this
+// network-capable environment belongs only to npm. Do not add broad prefixes:
+// npm_config_* can contain registry auth tokens.
 function baseSubprocessEnv(): NodeJS.ProcessEnv {
     return {
         ...localSubprocessEnv(),
@@ -185,29 +181,29 @@ export function gitRemoteGetUrlOrigin(cwd: string): string | null {
     return runGit(['remote', 'get-url', 'origin'], cwd);
 }
 
-/** Current branch for a consent-checked, stored project directory only. */
+// Current branch for a consent-checked, stored project directory only.
 export function gitRevParseAbbrevRefHead(cwd: string): string | null {
     return runGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd);
 }
 
-/** Async current branch probe for latency-sensitive hook paths. */
+// Async current branch probe for latency-sensitive hook paths.
 export function gitRevParseAbbrevRefHeadAsync(cwd: string, signal: AbortSignal): Promise<string | null> {
     return runGitAsync(['rev-parse', '--abbrev-ref', 'HEAD'], cwd, signal);
 }
 
-/** Commit count at a segment boundary. Non-integers are not evidence. */
+// Commit count at a segment boundary. Non-integers are not evidence.
 export function gitRevListCountHead(cwd: string): number | null {
     const value = runGit(['rev-list', '--count', 'HEAD'], cwd);
     return value !== null && /^\d+$/.test(value) ? Number(value) : null;
 }
 
-/** Async commit count probe for latency-sensitive hook paths. */
+// Async commit count probe for latency-sensitive hook paths.
 export async function gitRevListCountHeadAsync(cwd: string, signal: AbortSignal): Promise<number | null> {
     const value = await runGitAsync(['rev-list', '--count', 'HEAD'], cwd, signal);
     return value !== null && /^\d+$/.test(value) ? Number(value) : null;
 }
 
-/** Stable repository identity when an origin remote is absent or changes. */
+// Stable repository identity when an origin remote is absent or changes.
 export function gitRootCommit(cwd: string): string | null {
     const value = runGit(['rev-list', '--max-parents=0', 'HEAD'], cwd);
     if (value === null) {
@@ -241,10 +237,8 @@ function canonicalLaunchctlTargets(): { domain: string; service: string; plist: 
     }
 }
 
-/**
- * The sole launchd boundary. Callers pass only canonical targets built from
- * process.getuid(), the fixed elepha label, and the canonical plist path.
- */
+// The sole launchd boundary. Callers pass only canonical targets built from
+// process.getuid(), the fixed elepha label, and the canonical plist path.
 export function launchctl(args: readonly string[]): { stdout: string; stderr: string; status: number } {
     const verb = args[0] as LaunchctlVerb | undefined;
     const targets = canonicalLaunchctlTargets();
@@ -291,7 +285,7 @@ const SYSTEMCTL_TARGET_VERBS: ReadonlySet<SystemctlVerb> = new Set([
     'show',
 ]);
 
-/** The sole systemd boundary: one user service and no caller-defined arguments. */
+// The sole systemd boundary: one user service and no caller-defined arguments.
 export function systemctl(args: readonly string[]): { stdout: string; stderr: string; status: number } {
     const verb = args[1] as SystemctlVerb | undefined;
     const valid =
@@ -351,11 +345,9 @@ function resolvedNpmExecutable(npmBin: string | undefined): string {
     throw new Error('npm backend is missing an executable npm path');
 }
 
-/**
- * Maps the already-validated launcher backend to the same manager-controlled
- * npm command. Nothing supplied by a transcript, consent record, or config
- * reaches this command or its argv.
- */
+// Maps the already-validated launcher backend to the same manager-controlled
+// npm command. Nothing supplied by a transcript, consent record, or config
+// reaches this command or its argv.
 export function npmInvocationForBackend(backend: LauncherBackend): NpmInvocation {
     if (backend.kind === 'nvm') {
         return {
@@ -455,17 +447,17 @@ function parseNpmLatestVersion(output: string): string {
     return version;
 }
 
-/** Resolve the registry's current dist-tag before any daemon lifecycle mutation. */
+// Resolve the registry's current dist-tag before any daemon lifecycle mutation.
 export function npmViewElephaLatest(invocation: NpmInvocation): string {
     return parseNpmLatestVersion(runNpm(invocation, ['view', 'elepha@latest', 'version', '--json']).trim());
 }
 
-/** Resolve the registry's current dist-tag without blocking the daemon event loop. */
+// Resolve the registry's current dist-tag without blocking the daemon event loop.
 export async function npmViewElephaLatestAsync(invocation: NpmInvocation): Promise<string> {
     return parseNpmLatestVersion((await runNpmAsync(invocation, ['view', 'elepha@latest', 'version', '--json'])).trim());
 }
 
-/** Install only elepha's registry package at a validated immutable version. */
+// Install only elepha's registry package at a validated immutable version.
 export function npmInstallGlobalElepha(invocation: NpmInvocation, version: string | 'latest'): void {
     if (version !== 'latest' && !validPackageVersion(version)) {
         throw new Error('npm installation version is outside elepha allowlist');
