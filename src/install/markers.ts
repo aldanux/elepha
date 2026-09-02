@@ -1,4 +1,4 @@
-/** Exact bytes owned by elepha's installed configuration and launcher formats. */
+// Exact bytes owned by elepha's installed configuration and launcher formats.
 export const LAUNCHER_MARKER = '# elepha-managed-launcher: v1';
 
 export const CODEX_SESSION_START_BEGIN = '# elepha-session-start: begin';

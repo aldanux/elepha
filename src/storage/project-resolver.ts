@@ -11,14 +11,14 @@ import type { ConsentStore } from './consent-store.js';
 import type { ProjectRow } from './memory-store.js';
 
 export interface ProjectSet {
-    /** Stable identity: remote URL, root commit, resolved git root, then shallowest member path. */
+    // Stable identity: remote URL, root commit, resolved git root, then shallowest member path.
     key: string;
     displayName: string;
-    /** Every project-row path, preserving the original stored casing. */
+    // Every project-row path, preserving the original stored casing.
     paths: string[];
-    /** Internal SQL scope; callers query with project_id IN (...). */
+    // Internal SQL scope; callers query with project_id IN (...).
     projectIds: number[];
-    /** Re-resolved on construction; never trusts the stale captured column. */
+    // Re-resolved on construction; never trusts the stale captured column.
     gitRoot: string | null;
     gitRemote: string | null;
 }
@@ -33,7 +33,7 @@ export interface ProjectCandidate {
 export type ProjectResolution = { project: ProjectSet } | { ambiguous: true; candidates: ProjectCandidate[] } | { project: null };
 
 export interface ProjectResolverOptions {
-    /** Injection seam for deterministic tests; production uses the Rule 2 allowlisted git call. */
+    // Injection seam for deterministic tests; production uses the Rule 2 allowlisted git call.
     resolveGitRoot?: (projectPath: string) => string | null;
 }
 
@@ -72,11 +72,9 @@ function commonRemote(members: ResolvedProjectRow[]): string | null {
     return remotes.every((remote) => remote === first) ? first : null;
 }
 
-/**
- * Groups no-root rows only when one stored path contains the other. Siblings
- * merely sharing a filesystem ancestor remain separate: broadening to an
- * invented ancestor would silently over-merge unrelated projects.
- */
+// Groups no-root rows only when one stored path contains the other. Siblings
+// merely sharing a filesystem ancestor remain separate: broadening to an
+// invented ancestor would silently over-merge unrelated projects.
 function prefixGroups(rows: ResolvedProjectRow[]): ProjectSetBuild[] {
     const groups: ProjectSetBuild[] = [];
     for (const row of [...rows].sort(shallowestFirst)) {
@@ -120,7 +118,7 @@ export class ProjectResolver {
         this.resolveGitRoot = options.resolveGitRoot ?? gitRevParseShowToplevel;
     }
 
-    /** Uses captured identity unless consent is supplied, then live-resolves only approved paths. */
+    // Uses captured identity unless consent is supplied, then live-resolves only approved paths.
     list(consent?: ProjectConsent): ProjectSet[] {
         if (consent === undefined) {
             return this.listStored();
@@ -148,12 +146,10 @@ export class ProjectResolver {
         return projects;
     }
 
-    /**
-     * Hook-budget enumeration groups rows by their captured identity without
-     * probing Git. A moved checkout without a remote or root commit may remain
-     * path-grouped here; consent-aware callers that need live checkout precision
-     * use list(consent).
-     */
+    // Hook-budget enumeration groups rows by their captured identity without
+    // probing Git. A moved checkout without a remote or root commit may remain
+    // path-grouped here; consent-aware callers that need live checkout precision
+    // use list(consent).
     listStored(): ProjectSet[] {
         if (this.listStoredMemo !== undefined) {
             return this.listStoredMemo;
@@ -230,7 +226,7 @@ export class ProjectResolver {
         return this.match(query, sets);
     }
 
-    /** Restricts resolution to sets with an approved member path and no denied member path. */
+    // Restricts resolution to sets with an approved member path and no denied member path.
     resolveConsented(query: string, consent: Pick<ConsentStore, 'isConsented' | 'consentState'>): ProjectResolution {
         // An existing unconsented caller path must never become a Git subprocess cwd.
         // Consented paths and loose names may proceed to consent-checked or stored candidate paths.

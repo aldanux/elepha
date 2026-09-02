@@ -169,13 +169,11 @@ CREATE TABLE IF NOT EXISTS incognito_transcripts (
 );
 `;
 
-/**
- * No migration framework exists yet (single-table-additive product, pre-1.0).
- * Columns added after the initial CREATE TABLE need an idempotent ALTER TABLE
- * here, guarded by a PRAGMA table_info check, since ALTER TABLE ADD COLUMN
- * has no IF NOT EXISTS form and CREATE TABLE IF NOT EXISTS is a no-op against
- * an already-existing table.
- */
+// No migration framework exists yet (single-table-additive product, pre-1.0).
+// Columns added after the initial CREATE TABLE need an idempotent ALTER TABLE
+// here, guarded by a PRAGMA table_info check, since ALTER TABLE ADD COLUMN
+// has no IF NOT EXISTS form and CREATE TABLE IF NOT EXISTS is a no-op against
+// an already-existing table.
 function migrate(db: Database.Database): void {
     migrateSessionsTable(db);
 
@@ -249,15 +247,13 @@ function migrate(db: Database.Database): void {
     }
 }
 
-/**
- * Sessions are unique by tool, native id, and segment index, with
- * surface/git_branch/kind/trailing_branch/trailing_files. SQLite has no
- * ALTER TABLE ... DROP/ADD CONSTRAINT, so a constraint change needs a full
- * table rebuild - the destructive-operations rule applies even though this
- * runs unconditionally at openDb() time, not behind a CLI --apply flag,
- * because it is purely additive to the row set (same ids, same row count)
- * and gated by foreign_key_check before commit.
- */
+// Sessions are unique by tool, native id, and segment index, with
+// surface/git_branch/kind/trailing_branch/trailing_files. SQLite has no
+// ALTER TABLE ... DROP/ADD CONSTRAINT, so a constraint change needs a full
+// table rebuild - the destructive-operations rule applies even though this
+// runs unconditionally at openDb() time, not behind a CLI --apply flag,
+// because it is purely additive to the row set (same ids, same row count)
+// and gated by foreign_key_check before commit.
 function migrateSessionsTable(db: Database.Database): void {
     const columns = (db.pragma('table_info(sessions)') as Array<{ name: string }>).map((c) => c.name);
     if (columns.includes('segment_index')) {

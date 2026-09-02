@@ -11,7 +11,7 @@ function encode(value: bigint, length: number): string {
     return out;
 }
 
-/** Generates a canonical 26-character ULID without adding a runtime dependency. */
+// Generates a canonical 26-character ULID without adding a runtime dependency.
 export function newUlid(now = Date.now()): string {
     const time = encode(BigInt(now), 10);
     const randomness = randomBytes(10).reduce((value, byte) => (value << 8n) | BigInt(byte), 0n);

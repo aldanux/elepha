@@ -61,7 +61,7 @@ const defaultResponseShaper: McpResponseShaper = {
     textResult: (text) => ({ content: [{ type: 'text', text }] }),
 };
 
-/** Creates the tool handlers' read-only query and rendering layer. Exported for focused tests. */
+// Creates the tool handlers' read-only query and rendering layer. Exported for focused tests.
 export class ElephaMcpService implements McpToolHandlers {
     private readonly consent: ConsentStore;
     private readonly adapters: Record<ToolName, SessionAdapter>;
@@ -84,11 +84,9 @@ export class ElephaMcpService implements McpToolHandlers {
                   };
     }
 
-    /**
-     * A reader per request, like the per-request ProjectResolver: its memo
-     * scopes to one tool call, so repeated project reads within the call share
-     * a load while the next call still observes daemon writes.
-     */
+    // A reader per request, like the per-request ProjectResolver: its memo
+    // scopes to one tool call, so repeated project reads within the call share
+    // a load while the next call still observes daemon writes.
     private newReader(): SessionReader {
         return new SessionReader(this.db, this.adapters);
     }
@@ -231,7 +229,7 @@ export class ElephaMcpService implements McpToolHandlers {
         };
     }
 
-    /** Indexed natural-key lookup; consent-independent, so callers own the gate. */
+    // Indexed natural-key lookup; consent-independent, so callers own the gate.
     private findStoredSession(id: string): ServedSession | undefined {
         const parsed = parsePublicSessionId(id);
         return parsed === null ? undefined : readSessionByNaturalKey(this.db, parsed);
@@ -335,7 +333,7 @@ function projectContent(project: ProjectSet): Record<string, unknown> {
     };
 }
 
-/** Defines the MCP surface independently from its transport registration. */
+// Defines the MCP surface independently from its transport registration.
 export function mcpToolDefinitions(handlers: McpToolHandlers) {
     return {
         listProjects: {

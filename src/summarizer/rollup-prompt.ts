@@ -4,25 +4,19 @@
 
 import { MAX_ROLLUP_BATCH_CHARS, MAX_ROLLUP_CARRY_CHARS } from '../config/constants.js';
 
-/**
- * Per-call budget for the turns half of a rollup or merge prompt. Turns are
- * CHUNKED to fit this, never truncated to fit it - see chunkTurns().
- *
- * This file used to end with `truncate(renderTurns(turns), 12000)`, which cut
- * from the END: on any large session the newest turns never reached the model
- * at all. That was the mechanical half of the merge-loss bug (24 of 29
- * merge-capable rollups missing decisions their own turn rows contain), and it
- * demonstrates why a bound must drop the oldest and say so: the wrong
- * behaviour is what `slice` gives you for free.
- */
+// Per-call budget for the turns half of a rollup or merge prompt. Turns are
+// Callers chunk turns to fit this budget; they never truncate the batch.
+//
+// This file used to end with `truncate(renderTurns(turns), 12000)`, which cut
+// from the END: on any large session the newest turns never reached the model
+// at all. That was the mechanical half of the merge-loss bug (24 of 29
+// merge-capable rollups missing decisions their own turn rows contain), and it
+// demonstrates why a bound must drop the oldest and say so: the wrong
+// behaviour is what `slice` gives you for free.
 
-/** Budget for the carried previous rollup in a merge prompt. */
-
-/**
- * Marker emitted whenever a genuine ceiling binds. Deliberately visible to the
- * model and greppable in logs: a silent drop is indistinguishable from a turn
- * that had nothing to say.
- */
+// Marker emitted whenever a genuine ceiling binds. Deliberately visible to the
+// model and greppable in logs: a silent drop is indistinguishable from a turn
+// that had nothing to say.
 function omittedMarker(n: number, what: string): string {
     return `[${n} earlier ${what} omitted - batch budget]`;
 }
@@ -57,18 +51,16 @@ everything was concluded.
 Rules: JSON only, no markdown fences, no commentary. Never invent facts absent
 from the input.`;
 
-/**
- * Ordering contract. Measured cause of the merge-loss bug, in the ~17% of it
- * the model was actually responsible for (the other ~83% was end-truncation,
- * fixed in code above): asked to "carry forward and add", the model reliably
- * re-emitted the previous decisions and stopped, treating the new turns as
- * already covered.
- *
- * This instruction is a HINT, not the mechanism. `attributeDecisions` in
- * rollup-provider.ts assigns provenance in code and the store sorts by it, so
- * a model that ignores every word below still cannot bury the new decisions -
- * which is the point, because it already ignored a politer version.
- */
+// Ordering contract. Measured cause of the merge-loss bug, in the ~17% of it
+// the model was actually responsible for (the other ~83% was end-truncation,
+// fixed in code above): asked to "carry forward and add", the model reliably
+// re-emitted the previous decisions and stopped, treating the new turns as
+// already covered.
+//
+// This instruction is a HINT, not the mechanism. `attributeDecisions` in
+// rollup-provider.ts assigns provenance in code and the store sorts by it, so
+// a model that ignores every word below still cannot bury the new decisions -
+// which is the point, because it already ignored a politer version.
 const ORDERING_CONTRACT = `Ordering: the returned "decisions" array must END with the decisions established
 by the NEW turns, in the order they occurred. Never drop a decision from the new
 turns to make room for an older one — if something must be dropped, drop the
@@ -117,17 +109,15 @@ function renderTurns(turns: RollupTurnInput[]): string {
     return turns.map(renderTurn).join('\n');
 }
 
-/**
- * Reduces ONE turn that is on its own too large for a batch. This is the only
- * irreducible case - a batch of one cannot be split further - so it is the one
- * place a genuine ceiling still binds.
- *
- * It binds from the OLDEST end (decisions and pending items are dropped from
- * the front) and leaves a visible marker. `filesTouched` is dropped wholesale
- * first: it is
- * the cheapest content per character and is recomputed deterministically from
- * the turn rows anyway, so the model losing sight of it costs nothing.
- */
+// Reduces ONE turn that is on its own too large for a batch. This is the only
+// irreducible case - a batch of one cannot be split further - so it is the one
+// place a genuine ceiling still binds.
+//
+// It binds from the OLDEST end (decisions and pending items are dropped from
+// the front) and leaves a visible marker. `filesTouched` is dropped wholesale
+// first: it is
+// the cheapest content per character and is recomputed deterministically from
+// the turn rows anyway, so the model losing sight of it costs nothing.
 export function shrinkOversizedTurn(turn: RollupTurnInput, maxChars: number): { turn: RollupTurnInput; omitted: number } {
     let candidate: RollupTurnInput = { ...turn, filesTouched: [] };
     if (renderTurn(candidate).length <= maxChars) {
@@ -154,20 +144,18 @@ export function shrinkOversizedTurn(turn: RollupTurnInput, maxChars: number): { 
 
 export interface TurnBatch {
     turns: RollupTurnInput[];
-    /** Items dropped from oversized single turns in this batch. Zero on the normal path. */
+    // Items dropped from oversized single turns in this batch. Zero on the normal path.
     omitted: number;
 }
 
-/**
- * Splits turns into batches that each render within `maxChars`, IN ORDER, with
- * no turn ever discarded. This replaces end-truncation: a 204-turn session
- * becomes 20 sequential merge calls instead of one call that saw the first 15
- * turns and nothing else.
- *
- * A session at or below the budget - the overwhelming majority, given Codex
- * median 6 turns and Claude Code median 1 - yields exactly one batch and one
- * model call, so the normal path is unchanged.
- */
+// Splits turns into batches that each render within `maxChars`, IN ORDER, with
+// no turn ever discarded. This replaces end-truncation: a 204-turn session
+// becomes 20 sequential merge calls instead of one call that saw the first 15
+// turns and nothing else.
+//
+// A session at or below the budget - the overwhelming majority, given Codex
+// median 6 turns and Claude Code median 1 - yields exactly one batch and one
+// model call, so the normal path is unchanged.
 export function chunkTurns(turns: RollupTurnInput[], maxChars: number = MAX_ROLLUP_BATCH_CHARS): TurnBatch[] {
     const batches: TurnBatch[] = [];
     let current: RollupTurnInput[] = [];
@@ -219,17 +207,15 @@ export interface PreviousRollup {
     pendingItems: string[];
 }
 
-/**
- * Renders the carried rollup within MAX_CARRY_CHARS.
- *
- * This is a genuine ceiling (the carried rollup grows without bound as a
- * session runs), so it gets the same treatment as the brief one layer up:
- * keep the NEWEST decisions, shorten the summary before dropping any decision,
- * and mark what went. The previous version char-truncated the whole block from
- * the end, which cut the newest decisions and the pending list off entirely -
- * feeding the merge model an input that had already lost the thing the merge
- * was supposed to preserve.
- */
+// Renders the carried rollup within MAX_CARRY_CHARS.
+//
+// This is a genuine ceiling (the carried rollup grows without bound as a
+// session runs), so it gets the same treatment as the brief one layer up:
+// keep the NEWEST decisions, shorten the summary before dropping any decision,
+// and mark what went. The previous version char-truncated the whole block from
+// the end, which cut the newest decisions and the pending list off entirely -
+// feeding the merge model an input that had already lost the thing the merge
+// was supposed to preserve.
 export function renderPreviousRollup(previous: PreviousRollup, maxChars: number = MAX_ROLLUP_CARRY_CHARS): string {
     const render = (summary: string, decisions: PreviousRollup['decisions'], dropped: number): string =>
         [
@@ -255,7 +241,7 @@ export function renderPreviousRollup(previous: PreviousRollup, maxChars: number 
     }
 
     // 1. Shorten the summary first - it is prose, and losing half a sentence
-    //    costs less than losing a decision with its rationale.
+    //   costs less than losing a decision with its rationale.
     if (summary.length > 240) {
         summary = `${summary.slice(0, 240)}…`;
     }

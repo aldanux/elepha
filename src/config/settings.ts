@@ -132,10 +132,8 @@ function writeConfig(filePath: string, config: ConfigObject): void {
     chmodSync(filePath, PRIVATE_FILE_MODE);
 }
 
-/**
- * `ELEPHA_NO_UPDATE_CHECK` is intentionally presence-based: it is a
- * per-invocation kill switch, while config.json is the persistent preference.
- */
+// `ELEPHA_NO_UPDATE_CHECK` is intentionally presence-based: it is a
+// per-invocation kill switch, while config.json is the persistent preference.
 export function getSetting<K extends SettingKey>(key: K, environment?: NodeJS.ProcessEnv, filePath?: string): EffectiveSetting<K>;
 export function getSetting(key: string, environment?: NodeJS.ProcessEnv, filePath?: string): EffectiveSetting;
 export function getSetting(

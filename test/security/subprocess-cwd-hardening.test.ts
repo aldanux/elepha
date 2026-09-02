@@ -1,6 +1,5 @@
-// gitRevParseShowToplevel/gitRemoteGetUrlOrigin run with cwd sourced
-// straight from transcript content (see memory-store.ts:upsertProject). A
-// hostile LOCAL .git/config in an attacker-planted directory can set keys
+// Even a canonicalized, consent-checked project can contain hostile local
+// .git/config values such as
 // like core.fsmonitor/core.sshCommand/core.pager to command strings git
 // executes. Git's `-c key=value` outranks repo-local config (system < global
 // < local < worktree < -c), so passing explicit neutralizing overrides

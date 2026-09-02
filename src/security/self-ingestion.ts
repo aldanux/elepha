@@ -1,6 +1,6 @@
 import type { ParsedTurn } from '../types/index.js';
 
-/** Complete textual surface used by both Rule 4 guards. */
+// Complete textual surface used by both Rule 4 guards.
 export function turnText(turn: Pick<ParsedTurn, 'userMessage' | 'assistantText' | 'toolCalls'>): string {
     return [turn.userMessage, turn.assistantText, ...turn.toolCalls.map((call) => JSON.stringify(call))].join('\n');
 }
@@ -24,11 +24,9 @@ function shingles(text: string, size = 8): Set<string> {
     return out;
 }
 
-/**
- * Rule 4 quote-back threshold: an exact long injected line, or at least 60%
- * of the body's distinct normalized 8-grams. Short/empty bodies cannot match
- * through shingles because their denominator would not be meaningful.
- */
+// Rule 4 quote-back threshold: an exact long injected line, or at least 60%
+// of the body's distinct normalized 8-grams. Short/empty bodies cannot match
+// through shingles because their denominator would not be meaningful.
 export function isNearVerbatim(turn: string, injection: string): boolean {
     const normalizedTurn = normalizeForNearVerbatim(turn);
     const normalizedInjection = normalizeForNearVerbatim(injection);

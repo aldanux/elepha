@@ -25,10 +25,8 @@ function failureReason(error: unknown): ProviderTranscriptOpenReason {
     return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'transcript_missing' : 'transcript_unreadable';
 }
 
-/**
- * Opens a provider transcript and proves that the opened file is the same
- * regular file reached by a fresh, contained physical path resolution.
- */
+// Opens a provider transcript and proves that the opened file is the same
+// regular file reached by a fresh, contained physical path resolution.
 export async function openProviderTranscript(
     tool: ToolName,
     sourcePath: string,

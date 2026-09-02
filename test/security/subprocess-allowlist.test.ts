@@ -49,11 +49,11 @@ describe('subprocess allowlist', () => {
                 .join(' '),
         );
         // The fixed git allowlist:
-        //   git rev-parse --show-toplevel
-        //   git remote get-url origin
-        //   git rev-parse --abbrev-ref HEAD
-        //   git rev-list --count HEAD
-        //   git rev-list --max-parents=0 HEAD
+        //  git rev-parse --show-toplevel
+        //  git remote get-url origin
+        //  git rev-parse --abbrev-ref HEAD
+        //  git rev-list --count HEAD
+        //  git rev-list --max-parents=0 HEAD
         expect(gitCalls.sort()).toEqual([
             'remote get-url origin',
             'rev-list --count HEAD',

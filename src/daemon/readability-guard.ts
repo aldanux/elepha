@@ -39,14 +39,12 @@ function containsBinaryBytes(bytes: Buffer): boolean {
 export class ReadabilityGuard {
     private readonly readabilityChecked = new Set<string>();
 
-    /**
-     * File-level readability guard. warnUnknownLine() cannot cover this: it
-     * fires per parsed LINE, so a transcript we can't tokenize at all (a
-     * compressed .zst rollout, a binary/rotated file) produces zero warnings
-     * and zero rows - indistinguishable from an idle session. Codex has
-     * shipped compressed rollouts before; if that returns, this is what says
-     * so out loud instead of the watcher going quietly empty.
-     */
+    // File-level readability guard. warnUnknownLine() cannot cover this: it
+    // fires per parsed LINE, so a transcript we can't tokenize at all (a
+    // compressed .zst rollout, a binary/rotated file) produces zero warnings
+    // and zero rows - indistinguishable from an idle session. Codex has
+    // shipped compressed rollouts before; if that returns, this is what says
+    // so out loud instead of the watcher going quietly empty.
     async assertReadableJsonl(filePath: string): Promise<FileSkip | undefined> {
         if (this.readabilityChecked.has(filePath)) {
             return;

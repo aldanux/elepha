@@ -38,7 +38,7 @@ export interface SessionStartDependencies {
     gitBranch?: (cwd: string, signal: AbortSignal) => string | null | PromiseLike<string | null>;
     gitCommitCount?: (cwd: string, signal: AbortSignal) => number | null | PromiseLike<number | null>;
     daemonHealth?: typeof classifyDaemonHealth;
-    /** Local daemon marker only. The hook never performs the registry check. */
+    // Local daemon marker only. The hook never performs the registry check.
     readUpdateAvailable?: (markerPath: string) => UpdateAvailable | undefined;
     writeInjection?: (store: MemoryStore, input: Parameters<MemoryStore['recordInjection']>[0]) => boolean;
 }
@@ -197,7 +197,7 @@ function withUpdateNotice(body: string, readMarker: (markerPath: string) => Upda
     }
 }
 
-/** Pure orchestration seam used by tests and the thin CLI adapter. */
+// Pure orchestration seam used by tests and the thin CLI adapter.
 export async function runSessionStart(rawStdin: string, tool: HookTool, dependencies: SessionStartDependencies = {}): Promise<HookResult> {
     const log = dependencies.log ?? logLine;
     const payload = parsePayload(rawStdin, tool, 'SessionStart');
@@ -353,7 +353,7 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
     }
 }
 
-/** CLI boundary: no diagnostics or partial JSON may reach stdout. */
+// CLI boundary: no diagnostics or partial JSON may reach stdout.
 export async function runSessionStartCli(tool: HookTool): Promise<void> {
     const watchdog = setTimeout(() => {
         handleWatchdogTimeout(tool);

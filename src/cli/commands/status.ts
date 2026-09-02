@@ -8,11 +8,9 @@ import { synthesisProviderName } from '../../summarizer/provider-config.js';
 import { errorMessage } from '../../util/error.js';
 import { synthesisStatusReport } from '../status.js';
 
-/**
- * Daemon liveness, derived from the same heartbeat file `status` reports.
- * `daemonHealth` is shared so `rollup --rebuild` can refuse to race a live
- * daemon without duplicating the pid/staleness logic.
- */
+// Daemon liveness, derived from the same heartbeat file `status` reports.
+// `daemonHealth` is shared so `rollup --rebuild` can refuse to race a live
+// daemon without duplicating the pid/staleness logic.
 export function registerStatus(program: Command): void {
     program
         .command('status')

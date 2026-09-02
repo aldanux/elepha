@@ -120,11 +120,9 @@ function aiTitle(value: string | undefined): string | undefined {
     return title === '' ? undefined : title;
 }
 
-/**
- * Resolves the title for one persisted segment without reading a transcript
- * at serve time. An ai-title replaces the fallback only in the segment that
- * emitted it; a later segment begins with no inherited state.
- */
+// Resolves the title for one persisted segment without reading a transcript
+// at serve time. An ai-title replaces the fallback only in the segment that
+// emitted it; a later segment begins with no inherited state.
 export function titleForTurn(
     currentTitle: string | null,
     turn: Pick<ParsedTurn, 'aiTitle' | 'userMessage'>,
@@ -142,12 +140,12 @@ export function titleForTurn(
     return currentTitle;
 }
 
-/** Derives the closed title rule for a fully known segment during backfill. */
+// Derives the closed title rule for a fully known segment during backfill.
 export function titleForSegment(turns: Iterable<Pick<ParsedTurn, 'aiTitle' | 'userMessage'>>, includeAiTitle: boolean): string {
     return titleCandidatesForSegment(turns, includeAiTitle)[0] ?? UNTITLED_EPISODE;
 }
 
-/** Ordered title candidates for corpus-aware backfills. */
+// Ordered title candidates for corpus-aware backfills.
 export function titleCandidatesForSegment(turns: Iterable<Pick<ParsedTurn, 'aiTitle' | 'userMessage'>>, includeAiTitle: boolean): string[] {
     let firstAiTitle: string | undefined;
     let firstPromptCandidates: string[] | undefined;
@@ -180,7 +178,7 @@ function remainingCandidatesMatch(
     return leftRemaining.length === rightRemaining.length && leftRemaining.every((candidate, index) => candidate === rightRemaining[index]);
 }
 
-/** Rejects repeated boilerplate while retaining prose when no later candidate can distinguish the sessions. */
+// Rejects repeated boilerplate while retaining prose when no later candidate can distinguish the sessions.
 export function distinctSessionTitles(candidateLists: readonly (readonly string[])[]): string[] {
     const indexes = candidateLists.map(() => 0);
     const selected = (): string[] => candidateLists.map((candidates, index) => candidates[indexes[index]] ?? UNTITLED_EPISODE);

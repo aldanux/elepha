@@ -14,13 +14,13 @@ import {
 import path from 'node:path';
 import { PRIVATE_DIR_MODE } from '../config/constants.js';
 
-/** Creates a directory and ensures it is private even when it already existed. */
+// Creates a directory and ensures it is private even when it already existed.
 export function ensurePrivateDir(dir: string): void {
     mkdirSync(dir, { recursive: true });
     chmodSync(dir, PRIVATE_DIR_MODE);
 }
 
-/** Creates missing directories and hardens only the directories created by this call. */
+// Creates missing directories and hardens only the directories created by this call.
 export function ensureCreatedDirsPrivate(dir: string): void {
     const firstCreated = mkdirSync(dir, { recursive: true });
     if (firstCreated === undefined) {
@@ -37,12 +37,12 @@ export function ensureCreatedDirsPrivate(dir: string): void {
     }
 }
 
-/** Applies a restrictive mode to an already-written private file. */
+// Applies a restrictive mode to an already-written private file.
 export function setPrivateFileMode(file: string, mode: number): void {
     chmodSync(file, mode);
 }
 
-/** Atomically replace a file without replacing a symlink that points at it. */
+// Atomically replace a file without replacing a symlink that points at it.
 export function atomicWrite(file: string, text: string, mode: number): void {
     const target = (() => {
         try {
@@ -61,7 +61,7 @@ export function atomicWrite(file: string, text: string, mode: number): void {
     chmodSync(target, mode);
 }
 
-/** Atomically replaces a file with a byte-for-byte private copy without treating binary data as text. */
+// Atomically replaces a file with a byte-for-byte private copy without treating binary data as text.
 export function atomicCopyPrivateFile(source: string, destination: string, mode: number): void {
     const target = (() => {
         try {
@@ -81,7 +81,7 @@ export function atomicCopyPrivateFile(source: string, destination: string, mode:
     chmodSync(target, mode);
 }
 
-/** Read JSON only when the complete file can be read and parsed. */
+// Read JSON only when the complete file can be read and parsed.
 export function readJson<T>(file: string): T | undefined {
     try {
         return JSON.parse(readFileSync(file, 'utf8')) as T;
@@ -90,13 +90,13 @@ export function readJson<T>(file: string): T | undefined {
     }
 }
 
-/** Create the parent directory and write a newline-terminated JSON file. */
+// Create the parent directory and write a newline-terminated JSON file.
 export function writeJson(file: string, value: unknown, mode: number): void {
     mkdirSync(path.dirname(file), { recursive: true });
     writeFileSync(file, `${JSON.stringify(value)}\n`, { mode });
 }
 
-/** Remove an optional file without a separate existence-check race. */
+// Remove an optional file without a separate existence-check race.
 export function removeFileIfExists(file: string): void {
     try {
         unlinkSync(file);
@@ -107,7 +107,7 @@ export function removeFileIfExists(file: string): void {
     }
 }
 
-/** Lists regular files without turning a missing optional directory into an error. */
+// Lists regular files without turning a missing optional directory into an error.
 export function listRegularFiles(directory: string): string[] {
     try {
         return readdirSync(directory, { withFileTypes: true })

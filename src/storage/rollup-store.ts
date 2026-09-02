@@ -10,35 +10,33 @@
 //
 // Two independent guards, either of which alone would be sufficient:
 //
-//  1. WATERMARK, enforced in SQL. rolled_up_through_turn_index advances in the
-//     SAME transaction that writes the content it accounts for, and the write
-//     is conditional on the watermark still being where the caller read it
-//     (`WHERE rolled_up_through_turn_index = :expected`). A duplicate or
-//     concurrent apply finds the watermark moved and writes nothing. A crash
-//     between the LLM call and the commit costs one wasted call and changes
-//     nothing on disk.
-//  2. SET SEMANTICS in the merge itself. decisions dedupe by `what`,
-//     pending_items and files_touched by value. Applying the same merge twice
-//     yields the same arrays.
+// 1. WATERMARK, enforced in SQL. rolled_up_through_turn_index advances in the
+//    SAME transaction that writes the content it accounts for, and the write
+//    is conditional on the watermark still being where the caller read it
+//    (`WHERE rolled_up_through_turn_index = :expected`). A duplicate or
+//    concurrent apply finds the watermark moved and writes nothing. A crash
+//    between the LLM call and the commit costs one wasted call and changes
+//    nothing on disk.
+// 2. SET SEMANTICS in the merge itself. decisions dedupe by `what`,
+//    pending_items and files_touched by value. Applying the same merge twice
+//    yields the same arrays.
 
 import type { Database, Statement } from 'better-sqlite3';
 import { dedupePaths } from '../config/paths.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 
-/**
- * Every rollup from the old schema is stale, for three independent reasons
- * that all landed together so the corpus is rebuilt once rather than three
- * times:
- *
- *  - the prompt builder end-truncated its input, so on large sessions the
- *    newest turns never reached the model (measured: 83% of all lost decisions);
- *  - decisions now carry `turnIndex`/`at` provenance, assigned in code;
- *  - `why` is now captured at the turn, where the transcript is still in the
- *    prompt, instead of being inferred afterwards from the decision text.
- *
- * `elepha rollup --rebuild` is what actually reaches them: the default sweep
- * skips `final` rollups.
- */
+// Every rollup from the old schema is stale, for three independent reasons
+// that all landed together so the corpus is rebuilt once rather than three
+// times:
+//
+// - the prompt builder end-truncated its input, so on large sessions the
+//   newest turns never reached the model (measured: 83% of all lost decisions);
+// - decisions now carry `turnIndex`/`at` provenance, assigned in code;
+// - `why` is now captured at the turn, where the transcript is still in the
+//   prompt, instead of being inferred afterwards from the decision text.
+//
+// `elepha rollup --rebuild` is what actually reaches them: the default sweep
+// skips `final` rollups.
 export const ROLLUP_VERSION = 2;
 
 export type RollupState = 'live' | 'final';
@@ -46,34 +44,28 @@ export type RollupState = 'live' | 'final';
 export interface RollupDecision {
     what: string;
     why: string;
-    /**
-     * Turn this decision came from. Optional because rows written before
-     * provenance existed have none, and because the model cannot be trusted to
-     * supply it - it is assigned in code (see attributeDecisions) and only
-     * accepted from the model when it names a turn that was actually in the
-     * batch.
-     */
+    // Turn this decision came from. Optional because rows written before
+    // provenance existed have none, and because the model cannot be trusted to
+    // supply it - it is assigned deterministically in code and only
+    // accepted from the model when it names a turn that was actually in the
+    // batch.
     turnIndex?: number;
-    /** Timestamp of that turn, denormalized so ordering needs no join. */
+    // Timestamp of that turn, denormalized so ordering needs no join.
     at?: string;
 }
 
-/**
- * Newest-first by provenance. Decisions with no `turnIndex` (pre-provenance
- * rows) sort oldest, which is both true and the safe direction: they are never
- * preferred over a decision we can actually place in time.
- */
+// Newest-first by provenance. Decisions with no `turnIndex` (pre-provenance
+// rows) sort oldest, which is both true and the safe direction: they are never
+// preferred over a decision we can actually place in time.
 export function sortDecisionsByTurn(decisions: RollupDecision[]): RollupDecision[] {
     return [...decisions].sort((a, b) => (b.turnIndex ?? -1) - (a.turnIndex ?? -1));
 }
 
-/**
- * The newest K decisions, in turn order. This is the selection the brief and
- * the carried-rollup budget both need, and it lives HERE, in code, rather than
- * in a prompt instruction - the merge model demonstrably drops new decisions
- * when asked politely not to, and a selection rule that the model can violate
- * is not a selection rule.
- */
+// The newest K decisions, in turn order. This is the selection the brief and
+// the carried-rollup budget both need, and it lives HERE, in code, rather than
+// in a prompt instruction - the merge model demonstrably drops new decisions
+// when asked politely not to, and a selection rule that the model can violate
+// is not a selection rule.
 export function newestDecisions(decisions: RollupDecision[], k: number): RollupDecision[] {
     return sortDecisionsByTurn(decisions)
         .slice(0, k)
@@ -118,13 +110,10 @@ export interface RollupWrite {
     summarizerStatus: string;
     state: RollupState;
     throughTurnIndex: number;
-    /**
-     * Overrides the stamped `rollup_version`. Omit for the normal case
-     * (current version). A rebuild-in-progress passes the OLD version for
-     * every batch except its last, so the row stays a rebuild candidate
-     * (`rollup_version <> current`) until the rebuild actually finishes -
-     * see rollup-service.ts's per-batch `rollupVersion` computation.
-     */
+    // Overrides the stamped `rollup_version`. Omit for the normal case
+    // (current version). A rebuild-in-progress passes the OLD version for
+    // every batch except its last, so the row stays a rebuild candidate
+    // (`rollup_version <> current`) until the rebuild actually finishes.
     rollupVersion?: number;
 }
 
@@ -146,7 +135,7 @@ function hydrate(row: RawRollupRow | undefined): SessionRollupRow | undefined {
     };
 }
 
-/** Merges two rollup halves with set semantics, so applying the same merge twice is a no-op. */
+// Merges two rollup halves with set semantics, so applying the same merge twice is a no-op.
 export function mergeRollupContent(
     previous: { decisions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] },
     incoming: { decisions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] },
@@ -244,12 +233,10 @@ export class RollupStore {
         return hydrate(this.stmts.get.get(sessionId) as RawRollupRow | undefined);
     }
 
-    /**
-     * Writes a rollup. `expectedThroughTurnIndex` is the watermark the caller
-     * read before computing; the update only lands if it hasn't moved since.
-     * Returns false when the write was rejected as already-applied - that is a
-     * normal outcome, not an error.
-     */
+    // Writes a rollup. `expectedThroughTurnIndex` is the watermark the caller
+    // read before computing; the update only lands if it hasn't moved since.
+    // Returns false when the write was rejected as already-applied - that is a
+    // normal outcome, not an error.
     write(w: RollupWrite, expectedThroughTurnIndex: number | undefined): boolean {
         // Security Rule 3 CHOKE POINT, not caller discipline: a caller can
         // forget, a store cannot. Display strings are stripped (the
@@ -293,7 +280,7 @@ export class RollupStore {
         return run();
     }
 
-    /** Reopened session: a final rollup returns to live so the next close recomputes it incrementally. */
+    // Reopened session: a final rollup returns to live so the next close recomputes it incrementally.
     markLive(sessionId: number): void {
         this.stmts.markLive.run(sessionId);
     }
@@ -302,16 +289,14 @@ export class RollupStore {
         return (this.stmts.listByProject.all(projectId) as RawRollupRow[]).map((r) => hydrate(r) as SessionRollupRow);
     }
 
-    /**
-     * The listing view: top-level sessions with their sub-agent work attached,
-     * rather than sub-agents competing for space as peers. Sub-agents are 36% of
-     * Claude Code sessions locally (16 of 44) at a median of one turn each, so
-     * listing them flat buries the real sessions.
-     *
-     * Nothing is deleted from storage, and every child stays reachable through
-     * its parent. The served read model computes substance, so this
-     * legacy rollup listing no longer reads the inert stored column.
-     */
+    // The listing view: top-level sessions with their sub-agent work attached,
+    // rather than sub-agents competing for space as peers. Sub-agents are 36% of
+    // Claude Code sessions locally (16 of 44) at a median of one turn each, so
+    // listing them flat buries the real sessions.
+    //
+    // Nothing is deleted from storage, and every child stays reachable through
+    // its parent. The served read model computes substance, so this
+    // legacy rollup listing no longer reads the inert stored column.
     listSessions(projectId: number, options: { includeAll?: boolean } = {}): SessionListEntry[] {
         const all = this.listByProject(projectId);
         const childrenByParent = new Map<number, SessionRollupRow[]>();
@@ -347,6 +332,6 @@ export class RollupStore {
 
 export interface SessionListEntry {
     rollup: SessionRollupRow;
-    /** Sub-agent rollups belonging to this session. Empty for a session with no sub-agents. */
+    // Sub-agent rollups belonging to this session. Empty for a session with no sub-agents.
     children: SessionRollupRow[];
 }

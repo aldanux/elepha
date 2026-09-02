@@ -29,13 +29,13 @@ function makeTurn(index: number): ParsedTurn {
     };
 }
 
-/** Records one decision per turn, each long enough that ~12 turns fill a batch. */
+// Records one decision per turn, each long enough that ~12 turns fill a batch.
 const BULK = 'q'.repeat(600);
 
 class CountingProvider implements RollupProvider {
     rollupCalls: RollupTurnInput[][] = [];
     mergeCalls: Array<{ previous: PreviousRollup; turns: RollupTurnInput[] }> = [];
-    /** Batch index (1-based across all calls) at which to return a failure. */
+    // Batch index (1-based across all calls) at which to return a failure.
     failAtCall: number | null = null;
 
     private callCount = 0;

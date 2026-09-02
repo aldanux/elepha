@@ -69,7 +69,7 @@ function selectedColumns(rules: TableRules): string[] {
     return [...(rules.jsonStringArrays ?? []), ...(rules.enums ?? [])].map((rule) => `"${rule.column}"`);
 }
 
-/** Validates untrusted backup values without materializing candidate tables in memory. */
+// Validates untrusted backup values without materializing candidate tables in memory.
 export function validateCandidateSemantics(db: Database.Database, tables: readonly CandidateSemanticTable[]): string[] {
     const violations: string[] = [];
     const addViolation = (violation: string): boolean => {

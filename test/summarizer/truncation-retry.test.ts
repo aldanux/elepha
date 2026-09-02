@@ -9,7 +9,7 @@ interface FakeCall {
     text: string;
 }
 
-/** Replaces the SDK client with a scripted sequence, recording the max_tokens of each request. */
+// Replaces the SDK client with a scripted sequence, recording the max_tokens of each request.
 function scriptClient(provider: object, script: FakeCall[]): number[] {
     const seen: number[] = [];
     let i = 0;

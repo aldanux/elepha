@@ -169,7 +169,7 @@ async function commandBody(
     };
 }
 
-/** Pure orchestration seam used by tests and the thin CLI adapter. */
+// Pure orchestration seam used by tests and the thin CLI adapter.
 export async function runUserPromptSubmit(
     rawStdin: string,
     tool: HookTool,
@@ -291,7 +291,7 @@ export async function runUserPromptSubmit(
     }
 }
 
-/** CLI boundary: no diagnostics or partial JSON may reach stdout. */
+// CLI boundary: no diagnostics or partial JSON may reach stdout.
 export async function runUserPromptSubmitCli(tool: HookTool): Promise<void> {
     try {
         const input = await readStdin();

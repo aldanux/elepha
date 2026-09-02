@@ -256,7 +256,7 @@ export function registerBackfills(program: Command): void {
                 verify: async () => {
                     const verify = await planSessionFieldsBackfill(db, adapters);
                     // A session whose transcript is permanently missing is reported every
-                    // run (see session-fields-backfill.ts) so the operator can see it -
+                    // run so the operator can see it -
                     // that is not a pending change apply() could have applied, so it must
                     // not fail verification forever. Only a session whose fields could
                     // actually be rewritten but still differ counts as a real failure.

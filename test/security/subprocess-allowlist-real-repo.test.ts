@@ -1,5 +1,5 @@
-// Subprocess hardening (see subprocess-allowlist.ts) must not break the normal
-// case: a real git repo, no hostile config. Runs against an actual `git`
+// Subprocess hardening must not break a real repo with no hostile config.
+// This runs against an actual `git`
 // binary, unmocked - the mock-based test in subprocess-cwd-hardening.test.ts
 // checks the args are constructed correctly; this checks they still work.
 

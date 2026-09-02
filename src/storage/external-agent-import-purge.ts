@@ -115,7 +115,7 @@ function emptiedProjects(db: Database.Database, sessionIds: number[], projectIds
         .all(...projectIds, ...sessionIds, ...sessionIds) as ExternalImportPurgeProject[];
 }
 
-/** Read-only preview. Every currently referenced Codex transcript is re-read from disk. */
+// Read-only preview. Every currently referenced Codex transcript is re-read from disk.
 export async function planExternalAgentImportPurge(
     db: Database.Database,
     adapter: Pick<CodexAdapter, 'classifySession'>,
@@ -223,7 +223,7 @@ function assertPlanStillMatches(db: Database.Database, plan: ExternalImportPurge
     }
 }
 
-/** Applies exactly the previewed row ids in one transaction. */
+// Applies exactly the previewed row ids in one transaction.
 export function applyExternalAgentImportPurge(db: Database.Database, plan: ExternalImportPurgePlan): void {
     if (plan.issues.length > 0) {
         throw new Error(`cannot apply with ${plan.issues.length} unreadable or missing source transcript(s)`);
@@ -250,7 +250,7 @@ export function applyExternalAgentImportPurge(db: Database.Database, plan: Exter
     db.pragma('wal_checkpoint(TRUNCATE)');
 }
 
-/** Re-reads remaining Codex source paths and validates counts plus foreign keys. */
+// Re-reads remaining Codex source paths and validates counts plus foreign keys.
 export async function verifyExternalAgentImportPurge(
     db: Database.Database,
     adapter: Pick<CodexAdapter, 'classifySession'>,

@@ -12,11 +12,9 @@ export interface DaemonLogPaths {
     stderr: string;
 }
 
-/**
- * Keeps one previous generation per launchd-managed log. The process's
- * inherited descriptor may still point at the archive for this invocation;
- * the next KeepAlive launch opens the fresh primary path.
- */
+// Keeps one previous generation per launchd-managed log. The process's
+// inherited descriptor may still point at the archive for this invocation;
+// the next KeepAlive launch opens the fresh primary path.
 export function rotateDaemonLogs(paths: DaemonLogPaths, maxBytes = DAEMON_LOG_ROTATE_MAX_BYTES): string[] {
     const rotated: string[] = [];
     for (const logPath of [paths.stdout, paths.stderr]) {

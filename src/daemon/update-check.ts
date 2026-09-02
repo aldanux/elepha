@@ -31,7 +31,7 @@ export type UpdateCheckResult =
     | { status: 'unreachable' }
     | { status: 'failed' };
 
-/** Resolves the persistent preference after the explicit per-invocation opt-out. */
+// Resolves the persistent preference after the explicit per-invocation opt-out.
 export function updateCheckEnabled(environment: NodeJS.ProcessEnv = process.env, configPath?: string): boolean {
     return getSetting('update-check', environment, configPath).value;
 }

@@ -31,7 +31,7 @@ function sort(value: unknown): unknown {
     return value;
 }
 
-/** Matches Codex's normalized command-hook fingerprint. */
+// Matches Codex's normalized command-hook fingerprint.
 export function codexTrustHash(handler: CodexHandler, event: CodexHookEvent = 'SessionStart'): string {
     const timeout = Math.max(1, handler.timeout ?? 600);
     const command: Record<string, unknown> = { type: 'command', command: handler.command, timeout, async: handler.async ?? false };

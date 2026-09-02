@@ -44,11 +44,9 @@ function canonicalPath(projectPath: string): string {
     return canonicalizeExisting(projectPath);
 }
 
-/**
- * First-open migration for pre-consent databases. It is intentionally
- * additive: existing memories are evidence captured before consent existed,
- * so grandfathering never deletes or rewrites them.
- */
+// First-open migration for pre-consent databases. It is intentionally
+// additive: existing memories are evidence captured before consent existed,
+// so grandfathering never deletes or rewrites them.
 export function grandfatherConsentRoots(db: Database): ConsentRoot[] {
     const inserted: ConsentRoot[] = [];
 
@@ -135,7 +133,7 @@ export class ConsentStore {
         return this.db.prepare('DELETE FROM consent_roots WHERE ulid = ?').run(ulid).changes > 0;
     }
 
-    /** An approved root covers itself and its descendants, case-insensitively on macOS. */
+    // An approved root covers itself and its descendants, case-insensitively on macOS.
     isConsented(projectPath: string): boolean {
         return this.consentState(projectPath) === 'approved';
     }
@@ -176,7 +174,7 @@ export class ConsentStore {
             }, undefined);
     }
 
-    /** Records an unseen root once; a pending decision must be visible, never a quiet drop. */
+    // Records an unseen root once; a pending decision must be visible, never a quiet drop.
     recordPending(projectPath: string): ConsentRoot {
         const canonical = canonicalPath(projectPath);
         const current = this.list().find((root) => samePath(root.path, canonical));
@@ -198,7 +196,7 @@ export class ConsentStore {
         return row;
     }
 
-    /** Returns the effective capture-off state, recording only grantable unseen roots as pending. */
+    // Returns the effective capture-off state, recording only grantable unseen roots as pending.
     captureOffNudge(projectPath: string): ConsentRoot | 'refused' | undefined {
         const decision = this.explicitConsentDecision(projectPath);
         if (decision?.state === 'approved') {

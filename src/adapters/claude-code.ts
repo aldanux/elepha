@@ -14,8 +14,8 @@
 // A type not in that set triggers warnUnknownLine() instead of silently
 // falling through. This format is internal to Claude Code and can change
 // between versions; a wrong or outdated assumption here should be
-// loud, not quietly-empty data (see codex.ts for the version of this bug that
-// already happened once, on the other adapter).
+// loud, not quietly-empty data; an assumed Codex envelope once hid every
+// apply_patch call.
 
 import path from 'node:path';
 import { claudeProjectsRoot, isWithin, toPosix } from '../config/paths.js';
@@ -165,11 +165,9 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
         return path.basename(filePath, '.jsonl');
     }
 
-    /**
-     * Claude Code writes custom-title as a standalone UI event. Last title
-     * wins, matching the transcript's append-only state without treating the
-     * event as a user/assistant turn or changing rendered output.
-     */
+    // Claude Code writes custom-title as a standalone UI event. Last title
+    // wins, matching the transcript's append-only state without treating the
+    // event as a user/assistant turn or changing rendered output.
     async readCustomTitle(filePath: string, fromOffset = 0): Promise<{ customTitle?: string; scannedTo: number }> {
         let customTitle: string | undefined;
         let scannedTo = fromOffset;
@@ -190,16 +188,14 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
         return customTitle === undefined ? { scannedTo } : { customTitle, scannedTo };
     }
 
-    /**
-     * Sub-agent transcripts live at
-     * `<projects>/<project-dir>/<parent-session-uuid>/subagents/agent-<hex>.jsonl`.
-     *
-     * The path is the marker, deliberately: the per-line fields that look
-     * authoritative are not. Across the real corpus `isSidechain` and
-     * `sessionId` are present on most lines but ABSENT on others within the
-     * same file, so a first-line probe misclassifies ~25% of these files. The
-     * directory layout was right for 16 of 16, and costs no read at all.
-     */
+    // Sub-agent transcripts live at
+    // `<projects>/<project-dir>/<parent-session-uuid>/subagents/agent-<hex>.jsonl`.
+    //
+    // The path is the marker, deliberately: the per-line fields that look
+    // authoritative are not. Across the real corpus `isSidechain` and
+    // `sessionId` are present on most lines but ABSENT on others within the
+    // same file, so a first-line probe misclassifies ~25% of these files. The
+    // directory layout was right for 16 of 16, and costs no read at all.
     async classifySession(filePath: string): Promise<SessionClassification> {
         const parts = toPosix(filePath).split('/');
         const subagentsAt = parts.lastIndexOf('subagents');

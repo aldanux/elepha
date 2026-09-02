@@ -12,7 +12,7 @@ export function extractText(message: Anthropic.Message): string {
         .join('');
 }
 
-/** Returns direct, fenced, then outermost-brace candidates in the established fallback order. */
+// Returns direct, fenced, then outermost-brace candidates in the established fallback order.
 export function extractJsonCandidate(raw: string): string[] {
     const candidates = [raw.trim()];
     const fenced = raw.match(FENCE_RE);

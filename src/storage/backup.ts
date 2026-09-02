@@ -12,7 +12,7 @@ import { BACKUP_KEEP, PRIVATE_FILE_MODE } from '../config/constants.js';
 
 const BACKUP_MARKER = '.bak-';
 
-/** Checkpoints the live database, then copies it to a timestamped sibling, mode 0600. */
+// Checkpoints the live database, then copies it to a timestamped sibling, mode 0600.
 export function writeBackup(db: Database.Database, dbPath: string): string {
     const backupPath = `${dbPath}${BACKUP_MARKER}${new Date().toISOString().replace(/[:.]/g, '-')}`;
     const [checkpoint] = db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: unknown }>;
@@ -24,7 +24,8 @@ export function writeBackup(db: Database.Database, dbPath: string): string {
     return backupPath;
 }
 
-/** Deletes every backup for dbPath except the `keep` most recent (by filename, which sorts chronologically for the ISO-derived suffix). Returns the paths deleted. */
+// The ISO-derived filename suffix sorts chronologically, so filename order
+// determines the retained snapshots.
 export function pruneBackups(dbPath: string, keep: number): string[] {
     const dir = path.dirname(dbPath);
     const prefix = `${path.basename(dbPath)}${BACKUP_MARKER}`;
@@ -40,7 +41,7 @@ export function pruneBackups(dbPath: string, keep: number): string[] {
     return toDelete;
 }
 
-/** Writes a backup, retains the configured number of snapshots, and reports both actions. */
+// Writes a backup, retains the configured number of snapshots, and reports both actions.
 export function backupDatabaseAndReport(db: Database.Database, dbPath: string, log: (message: string) => void = console.log): string {
     const backupPath = writeBackup(db, dbPath);
     log(`\nBacked up ${dbPath} to ${backupPath}.`);

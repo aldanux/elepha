@@ -42,7 +42,7 @@ export function printInstallation(result: ReturnType<typeof installElepha>, acti
     }
 }
 
-/** Refuses an operation only while the daemon has a fresh, healthy heartbeat. */
+// Refuses an operation only while the daemon has a fresh, healthy heartbeat.
 export function refuseIfDaemonRunning(operation: string): boolean {
     const { state, healthy } = daemonHealth();
     if (healthy) {
@@ -83,7 +83,7 @@ async function waitForCaptureToStop(): Promise<boolean> {
     return true;
 }
 
-/** Runs a destructive operation only after confirming that the capture writer is stopped. */
+// Runs a destructive operation only after confirming that the capture writer is stopped.
 export async function withCapturePaused(operation: string, fn: () => Promise<void>): Promise<boolean> {
     const health = daemonHealth();
     if (!health.healthy) {

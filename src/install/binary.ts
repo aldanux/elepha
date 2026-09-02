@@ -2,7 +2,7 @@ import { accessSync, lstatSync, readFileSync, realpathSync, statSync } from 'nod
 import path from 'node:path';
 
 export interface ResolvedElephaBin {
-    /** Stable npm shim/candidate path. Never the package-store realpath. */
+    // Stable npm shim/candidate path. Never the package-store realpath.
     bin: string;
     packageRoot: string;
 }
@@ -17,7 +17,7 @@ function quotePosix(value: string): string {
     return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-/** The command lives in a client shell field, so quote only the executable path. */
+// The command lives in a client shell field, so quote only the executable path.
 export type HookCommandName = 'session-start' | 'user-prompt-submit';
 
 export function hookCommand(bin: string, tool: 'claude-code' | 'codex', hook: HookCommandName = 'session-start'): string {
@@ -38,10 +38,8 @@ function packageRootFor(target: string): string | undefined {
     }
 }
 
-/**
- * Validate an executable without spawning it. This deliberately accepts an npm
- * shim path while checking its resolved target belongs to the installed package.
- */
+// Validate an executable without spawning it. This deliberately accepts an npm
+// shim path while checking its resolved target belongs to the installed package.
 function resolveCandidate(candidate: string): ResolvedElephaBin | undefined {
     try {
         lstatSync(candidate);

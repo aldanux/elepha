@@ -53,7 +53,7 @@ export function serviceBackend(options: ServiceBackendOptions = {}): ServiceBack
     }
 }
 
-/** Called after consent mutations; an absent service is intentionally a no-op. */
+// Called after consent mutations; an absent service is intentionally a no-op.
 export function reconcileCaptureService(service: ServiceBackend, approvedRoots: number): 'not installed' | 'awaiting consent' | 'active' {
     if (!service.isInstalled()) {
         return 'not installed';

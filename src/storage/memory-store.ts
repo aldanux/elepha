@@ -19,7 +19,8 @@ export type { SessionRow } from './session-store.js';
 export type { MemoryRow } from './turn-store.js';
 export { hydrateTurnDecisions } from './turn-store.js';
 
-/** One group of project rows consolidated onto a single canonical row. Returned for reporting - a migration that can't show its work isn't reviewable. */
+// One project-row group consolidated onto a canonical row. The full mapping is
+// returned so the migration remains reviewable.
 export interface ProjectMergePlan {
     canonical: ProjectRow;
     gitRoot: string | null;
@@ -27,29 +28,29 @@ export interface ProjectMergePlan {
 }
 
 export interface MemoryStoreOptions {
-    /** Test seam; production resolves through the Rule 2 subprocess allowlist. */
+    // Test seam; production resolves through the Rule 2 subprocess allowlist.
     resolveGitRoot?: (projectPath: string) => string | null;
-    /** Test seam paired with resolveGitRoot so git-backed project creation stays deterministic. */
+    // Test seam paired with resolveGitRoot so git-backed project creation stays deterministic.
     resolveGitRemote?: (gitRoot: string) => string | null;
-    /** Test seam paired with resolveGitRoot so git-backed project creation stays deterministic. */
+    // Test seam paired with resolveGitRoot so git-backed project creation stays deterministic.
     resolveGitRootCommit?: (gitRoot: string) => string | null;
-    /** Test seam for the session/segment baseline captured from the same resolved project identity. */
+    // Test seam for the session/segment baseline captured from the same resolved project identity.
     resolveGitCommitCount?: (projectPath: string) => number | null;
 }
 
-/** What to purge: at most one project scope, optionally narrowed by time. */
+// What to purge: at most one project scope, optionally narrowed by time.
 export interface PurgeScope {
-    /** Purge every session belonging to project rows matching this path or display name (see findProjectsForPurge). */
+    // Purge every session belonging to project rows matching this path or display name.
     projectPath?: string;
-    /** Purge every session belonging to these already-resolved project rows. */
+    // Purge every session belonging to these already-resolved project rows.
     projectIds?: number[];
-    /** Purge every project row at or below one approved consent root. */
+    // Purge every project row at or below one approved consent root.
     projectRoot?: string;
-    /** Purge sessions with last_ingested_at >= this ISO timestamp. */
+    // Purge sessions with last_ingested_at >= this ISO timestamp.
     newerThan?: string;
-    /** Purge sessions with last_ingested_at <= this ISO timestamp. */
+    // Purge sessions with last_ingested_at <= this ISO timestamp.
     olderThan?: string;
-    /** Purge everything: every session, every project row. */
+    // Purge everything: every session, every project row.
     all?: boolean;
 }
 
@@ -65,11 +66,12 @@ export interface PurgeSessionPreview {
     turnCount: number;
 }
 
-/** Preview of a purge before it runs: the actual session list, not just a count, because aggregates hide misclassification. */
+// A purge preview includes the actual sessions because counts hide
+// misclassification.
 export interface PurgePlan {
     scope: PurgeScope;
     sessions: PurgeSessionPreview[];
-    /** Project rows that will have zero sessions left and are therefore removed too. */
+    // Project rows that will have zero sessions left and are therefore removed too.
     emptiedProjects: ProjectRow[];
 }
 
@@ -146,12 +148,12 @@ export class MemoryStore {
         return this.sessions.findSession(tool, nativeId);
     }
 
-    /** A purge freezes the whole native transcript, across all its segments. */
+    // A purge freezes the whole native transcript, across all its segments.
     isTranscriptPurged(tool: ToolName, nativeId: string): boolean {
         return this.db.prepare('SELECT 1 FROM purged_transcripts WHERE tool = ? AND native_id = ?').get(tool, nativeId) !== undefined;
     }
 
-    /** Records only the stable provider/session identity, never transcript content. */
+    // Records only the stable provider/session identity, never transcript content.
     recordIncognitoTranscript(tool: ToolName, nativeId: string): void {
         this.db
             .prepare('INSERT OR IGNORE INTO incognito_transcripts (tool, native_id, tombstoned_at) VALUES (?, ?, ?)')
@@ -195,12 +197,10 @@ export class MemoryStore {
         return this.turns.recordTurn(turn, sessionDbId, projectId, summary);
     }
 
-    /**
-     * Creates the project/session and records one live turn as one SQLite
-     * transaction. Write blockers and native-turn dedupe are authoritative
-     * here: an earlier scan check may avoid work, but it cannot make a
-     * persistence decision across concurrent writers.
-     */
+    // Creates the project/session and records one live turn as one SQLite
+    // transaction. Write blockers and native-turn dedupe are authoritative
+    // here: an earlier scan check may avoid work, but it cannot make a
+    // persistence decision across concurrent writers.
     recordIngestedTurn(
         turn: ParsedTurn,
         meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
@@ -272,7 +272,7 @@ export class MemoryStore {
         };
     }
 
-    /** The final consent and tombstone decision must share the transaction that would mutate capture rows. */
+    // The final consent and tombstone decision must share the transaction that would mutate capture rows.
     private recordIncognitoIfWriteBlocked(turn: ParsedTurn): boolean {
         const consentState = this.consent.consentState(turn.projectPath);
         const mustRecordIncognito =
@@ -293,17 +293,15 @@ export class MemoryStore {
         return this.sessions.listSessionsWithMemoriesSince(sinceIso);
     }
 
-    /**
-     * Consolidates project rows that identify the same repository even when a
-     * checkout was renamed or moved. A stored remote is the durable identity,
-     * followed by the root commit; a live git root is the fallback for legacy
-     * rows without either value.
-     *
-     * When a group has a live checkout, its canonical row is chosen from those
-     * live members, preferring the repository root and then the shallowest
-     * path. Without a live checkout, the shallowest row survives but keeps its
-     * existing path and git root rather than being rewritten to stale data.
-     */
+    // Consolidates project rows that identify the same repository even when a
+    // checkout was renamed or moved. A stored remote is the durable identity,
+    // followed by the root commit; a live git root is the fallback for legacy
+    // rows without either value.
+    //
+    // When a group has a live checkout, its canonical row is chosen from those
+    // live members, preferring the repository root and then the shallowest
+    // path. Without a live checkout, the shallowest row survives but keeps its
+    // existing path and git root rather than being rewritten to stale data.
     planRekeyProjectsByIdentity(resolveGitRoot: (path: string) => string | null): ProjectMergePlan[] {
         const groups = new Map<string, Array<{ project: ProjectRow; gitRoot: string | null }>>();
         for (const project of this.listProjects()) {
@@ -346,7 +344,7 @@ export class MemoryStore {
         return plans;
     }
 
-    /** Applies planRekeyProjectsByIdentity's plan in a single transaction. Returns the plan that was applied, for reporting. */
+    // Applies and returns the same plan in one transaction for reporting.
     rekeyProjectsByIdentity(resolveGitRoot: (path: string) => string | null): ProjectMergePlan[] {
         const plans = this.planRekeyProjectsByIdentity(resolveGitRoot);
         const apply = this.db.transaction(() => {
@@ -368,14 +366,12 @@ export class MemoryStore {
         return plans;
     }
 
-    /**
-     * Project rows matching a purge query: exact path match if one exists,
-     * otherwise every row whose path or display_name contains the query.
-     * Unlike findProject() (single best guess, for UX lookups), this returns
-     * every match because one project can be fragmented across multiple rows,
-     * and a purge that only
-     * hit the first match would silently leave the rest behind.
-     */
+    // Project rows matching a purge query: exact path match if one exists,
+    // otherwise every row whose path or display_name contains the query.
+    // Unlike findProject() (single best guess, for UX lookups), this returns
+    // every match because one project can be fragmented across multiple rows,
+    // and a purge that only
+    // hit the first match would silently leave the rest behind.
     findProjectsForPurge(query: string): ProjectRow[] {
         if (query.trim().length === 0) {
             return [];
@@ -388,10 +384,8 @@ export class MemoryStore {
         return rows.filter((r) => r.path.includes(query) || r.display_name?.includes(query));
     }
 
-    /**
-     * Computes what a purge would delete, without deleting anything. The
-     * actual session list, not just a count: aggregates hide misclassification.
-     */
+    // Computes what a purge would delete, without deleting anything. The
+    // actual session list, not just a count: aggregates hide misclassification.
     planPurge(scope: PurgeScope): PurgePlan {
         let sessionRows: SessionRow[];
         if (scope.projectRoot !== undefined) {
@@ -454,7 +448,7 @@ export class MemoryStore {
         return { scope, sessions, emptiedProjects };
     }
 
-    /** Applies exactly the still-present sessions in a previewed purge plan, in one transaction. */
+    // Applies exactly the still-present sessions in a previewed purge plan, in one transaction.
     applyPurgePlan(plan: PurgePlan, purgedAt = new Date().toISOString()): PurgePlan {
         const sessionIdentity = this.db.prepare('SELECT tool, native_id FROM sessions WHERE id = ?');
         const tombstone = this.db.prepare('INSERT OR IGNORE INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)');
@@ -498,7 +492,7 @@ export class MemoryStore {
         return { ...plan, sessions: appliedSessions, emptiedProjects };
     }
 
-    /** Plans and applies a scope immediately. Existing callers retain the same behavior and signature. */
+    // Plans and applies a scope immediately. Existing callers retain the same behavior and signature.
     purge(scope: PurgeScope, purgedAt = new Date().toISOString()): PurgePlan {
         return this.applyPurgePlan(this.planPurge(scope), purgedAt);
     }
@@ -511,7 +505,7 @@ export class MemoryStore {
         return this.turns.listRecentMemories(projectId, limit);
     }
 
-    /** Dogfooding instrumentation - see ./stats.ts. Not part of the served-memory surface. */
+    // Local diagnostics only; never part of served memory.
     getStats(sinceIso: string): Stats {
         const byTool = this.db
             .prepare(`SELECT tool, COUNT(DISTINCT session_id) as sessions, COUNT(*) as turns

@@ -26,10 +26,8 @@ export function dataBlockClose(nonce: string): string {
     return `[[elepha-end ${nonce}]]`;
 }
 
-/**
- * Binds the read-path framing to the unpredictable delimiters in this one
- * injection. A transcript cannot reliably forge a matching close delimiter.
- */
+// Binds the read-path framing to the unpredictable delimiters in this one
+// injection. A transcript cannot reliably forge a matching close delimiter.
 export function servedContextInstructions(nonce: string): string {
     return [
         SERVER_INSTRUCTIONS,

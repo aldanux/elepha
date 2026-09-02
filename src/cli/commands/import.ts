@@ -88,7 +88,7 @@ export interface ImportRuntime {
     daemonHealth?: () => DaemonHealth;
     writeBackup?: (db: Database.Database, dbPath: string) => string;
     confirm?: (plan: ImportPlan) => Promise<boolean>;
-    /** Test seam for proving that any failure after writes begin rolls the transaction back. */
+    // Test seam for proving that any failure after writes begin rolls the transaction back.
     beforeVerify?: (db: Database.Database) => void;
 }
 
@@ -668,7 +668,8 @@ function applyImport(
     }
 }
 
-/** A multi-table identity-remapped merge needs one transaction spanning project resolution, FK remapping, and verification, so it cannot use the generic destructive-operation runner. */
+// Identity-remapped imports need one transaction spanning project resolution,
+// foreign-key remapping, and verification, so the generic runner cannot own it.
 export async function runImportOperation(candidatePath: string, overwrite: boolean, runtime: ImportRuntime = {}): Promise<ImportResult> {
     const dbPath = runtime.dbPath ?? defaultDbPath();
     const candidate = openCandidate(candidatePath);

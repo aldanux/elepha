@@ -39,7 +39,7 @@ export interface BackupWizardOptions {
     defaultOutput(project?: ProjectSet): string;
     backupAll(output: string): Promise<string>;
     backupProject(project: ProjectSet, output: string): Promise<string>;
-    /** Test seam; production routes every visual element through @clack/prompts. */
+    // Test seam; production routes every visual element through @clack/prompts.
     prompts?: BackupPrompts;
 }
 
@@ -92,7 +92,6 @@ async function chooseOutput(prompts: BackupPrompts, defaultOutput: string): Prom
     return prompts.isCancel(output) || typeof output !== 'string' ? undefined : output.trim();
 }
 
-/** Interactive scope and destination selection for `elepha backup`. */
 export async function runBackupWizard(options: BackupWizardOptions): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;

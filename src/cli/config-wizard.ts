@@ -38,7 +38,7 @@ export interface ConfigWizardOptions {
     output?: ConfigOutput;
     environment?: NodeJS.ProcessEnv;
     configPath?: string;
-    /** Test seam; production routes every visual element through @clack/prompts. */
+    // Test seam; production routes every visual element through @clack/prompts.
     prompts?: ConfigPrompts;
 }
 
@@ -99,7 +99,6 @@ function settingChoices(key: SettingKey): PromptOption[] {
     }));
 }
 
-/** Interactive settings picker for bare `elepha config`. */
 export async function runConfigWizard(options: ConfigWizardOptions = {}): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;

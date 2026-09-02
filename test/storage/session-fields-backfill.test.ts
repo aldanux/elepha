@@ -15,7 +15,7 @@ const FIXTURE = `{"type":"attachment","uuid":"u0","timestamp":"2026-08-01T10:00:
 `;
 
 // Codex-shaped fixture - session_meta carries originator + git.branch (only
-// on that one line, session-constant per base.ts's branchOf comment), a
+// on that one line and session-constant), a
 // turn_context, a user response_item + matching user_message event_msg
 // (the boundary), and an assistant response_item (the close). Modeled on
 // the real minimal with-git fixture at

@@ -22,7 +22,6 @@ interface ProjectSeed {
 export type ResolveGitRoot = (projectPath: string) => string | null;
 export type ResolveGitRootCommit = (gitRoot: string) => string | null;
 
-/** Reports legacy project rows whose current repository identity can be recovered without writing. */
 export function planRootCommitBackfill(
     db: Database,
     resolveGitRoot: ResolveGitRoot,
@@ -45,7 +44,7 @@ export function planRootCommitBackfill(
     return { changes, projectsScanned: projects.length, projectsUnresolvable, projectsSkippedConcurrent: 0 };
 }
 
-/** Fills only project rows that still need the identity captured by the fresh plan. */
+// Fills only project rows that still need the identity captured by the fresh plan.
 export function applyRootCommitBackfill(
     db: Database,
     resolveGitRoot: ResolveGitRoot,
