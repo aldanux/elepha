@@ -7,7 +7,6 @@ Issues.
 
 ## Table of contents
 
-- [Contribution terms](#contribution-terms)
 - [Prerequisites](#prerequisites)
   - [Set up a local checkout](#set-up-a-local-checkout)
 - [Reporting bugs](#reporting-bugs)
@@ -21,19 +20,6 @@ Issues.
 - [Formatting and linting](#formatting-and-linting)
 - [Changelog](#changelog)
 - [Coding conventions](#coding-conventions)
-
-## Contribution terms
-
-Each commit in a code contribution must include a `Signed-off-by` line matching its
-author. Add it with `git commit -s` and use your real name for both; pseudonymous or
-anonymous contributions are not accepted. By signing, you certify under the
-[Developer Certificate of Origin](https://developercertificate.org/) that you wrote the change or have the right to
-submit it, and that the contribution will be public and permanent under the project's
-licence.
-
-Documentation-only changes are exempt because GitHub's web editor cannot add a
-sign-off, and typo fixes should not require a local clone. Sign-offs are checked
-automatically on pull requests.
 
 ## Prerequisites
 
@@ -125,9 +111,8 @@ Pull requests will not be accepted if they:
 ## Commit guidelines
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/) and
-the rules configured through `@commitlint/config-conventional`, while
-[Contribution terms](#contribution-terms) governs code-contribution sign-offs. Use a
-concise type, an optional scope, and an imperative description:
+the rules configured through `@commitlint/config-conventional`. Use a concise type, an
+optional scope, and an imperative description:
 
 ```text
 type(scope): description

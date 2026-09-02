@@ -10,5 +10,4 @@
 
 - [ ] A changeset is included (`npx changeset`), or this change is invisible to someone using
       elepha and does not need one.
-- [ ] Commits are signed off (`git commit -s`) and use conventional messages. CI enforces
-      both; this is the reminder, not the gate.
+- [ ] Commits use conventional messages. CI enforces this; this is the reminder, not the gate.
