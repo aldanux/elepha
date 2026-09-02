@@ -8,7 +8,7 @@ export const ELEPHA_WORDMARK = `███████╗ ██╗      ██�
 ███████╗ ███████╗ ███████╗ ██║      ██║  ██║ ██║  ██║
 ╚══════╝ ╚══════╝ ╚══════╝ ╚═╝      ╚═╝  ╚═╝ ╚═╝  ╚═╝`;
 export const ELEPHA_TAGLINE = ` · 🐘 elepha · switch tools, keep the context · `;
-export const DOCS_URL = 'https://github.com/elepha-app/elepha#readme';
+export const DOCS_URL = 'https://github.com/aldanux/elepha#readme';
 export { PACKAGE_VERSION } from './version.js';
 export const BACKUP_KEEP = 5;
 export const USER_BACKUPS_DIR_NAME = 'backups';

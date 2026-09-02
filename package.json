@@ -15,13 +15,13 @@
         "cli",
         "local-first"
     ],
-    "homepage": "https://github.com/elepha-app/elepha#readme",
+    "homepage": "https://github.com/aldanux/elepha#readme",
     "bugs": {
-        "url": "https://github.com/elepha-app/elepha/issues"
+        "url": "https://github.com/aldanux/elepha/issues"
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/elepha-app/elepha.git"
+        "url": "git+https://github.com/aldanux/elepha.git"
     },
     "license": "MPL-2.0",
     "type": "module",

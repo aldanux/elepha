@@ -1,6 +1,6 @@
 {
     "$schema": "https://unpkg.com/@changesets/config@3.0.0/schema.json",
-    "changelog": ["./changelog.js", { "repo": "elepha-app/elepha" }],
+    "changelog": ["./changelog.js", { "repo": "aldanux/elepha" }],
     "commit": false,
     "fixed": [],
     "linked": [],
