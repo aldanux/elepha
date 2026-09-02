@@ -50,7 +50,7 @@ dependencies, and run the project scripts. Public work is tracked through GitHub
 Clone the repository and install its dependencies:
 
 ```console
-git clone https://github.com/elepha-app/elepha.git
+git clone https://github.com/aldanux/elepha.git
 cd elepha
 npm install
 ```

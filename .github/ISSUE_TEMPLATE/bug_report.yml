@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Security vulnerabilities do not belong here. Report them privately through
-        [SECURITY.md](https://github.com/elepha-app/elepha/blob/main/SECURITY.md).
+        [SECURITY.md](https://github.com/aldanux/elepha/blob/main/SECURITY.md).
 
         Please search existing issues first.
   - type: textarea
