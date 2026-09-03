@@ -30,9 +30,7 @@ function renderToolCalls(projection: FilteredTurnProjection): string | undefined
     return `**Tool calls**\n\n${lines.join('\n')}`;
 }
 
-// Renders one kept turn, or null for an explicit no-tool-call pause.
-export function renderRawTurn(turn: ParsedTurn, renderedTurnNumber: number = turn.turnIndex): string | null {
-    const projection = filterTurn(turn);
+export function renderFilteredTurn(projection: FilteredTurnProjection, renderedTurnNumber: number): string | null {
     if (!projection.included) {
         return null;
     }
@@ -45,6 +43,22 @@ export function renderRawTurn(turn: ParsedTurn, renderedTurnNumber: number = tur
     ]
         .filter((section): section is string => section !== undefined)
         .join('\n\n');
+}
+
+// Renders one kept turn, or null for an explicit no-tool-call pause.
+export function renderRawTurn(turn: ParsedTurn, renderedTurnNumber: number = turn.turnIndex): string | null {
+    return renderFilteredTurn(filterTurn(turn), renderedTurnNumber);
+}
+
+export function renderableFilteredTurns(projections: Iterable<FilteredTurnProjection>, renderedTurnOffset: number = 0): string[] {
+    const rendered: string[] = [];
+    for (const projection of projections) {
+        const text = renderFilteredTurn(projection, renderedTurnOffset + rendered.length + 1);
+        if (text !== null) {
+            rendered.push(text);
+        }
+    }
+    return rendered;
 }
 
 // Produces the rendered sequence once so every consumer shares its filter.

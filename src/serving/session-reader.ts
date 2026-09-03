@@ -7,11 +7,20 @@ import { defaultAdapters } from '../adapters/index.js';
 import {
     AUTO_BRIEF_AGGREGATE_FILE_LIMIT,
     AUTO_BRIEF_AGGREGATE_SESSION_LIMIT,
+    DURABLE_CAPTURE_FILTER_VERSION,
     MAX_GET_SESSION_LAST_N,
     RECENT_SESSION_WINDOW_MS,
     SESSION_CHAR_BUDGET,
 } from '../config/constants.js';
-import { omissionMarker, RAW_TURN_SEPARATOR, renderableRawTurns, renderRawTurn } from '../rendering/raw-turn-renderer.js';
+import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
+import {
+    omissionMarker,
+    RAW_TURN_SEPARATOR,
+    renderableFilteredTurns,
+    renderableRawTurns,
+    renderFilteredTurn,
+    renderRawTurn,
+} from '../rendering/raw-turn-renderer.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
 import type { ProjectSet } from '../storage/project-resolver.js';
 import {
@@ -56,6 +65,40 @@ interface RetainedTurn {
     renderedLength: number;
 }
 
+interface RetainedFilteredTurn {
+    projection: FilteredTurnProjection;
+    renderedLength: number;
+}
+
+interface StoredFilteredTurnRow {
+    turn_index: number;
+    included: number;
+    user_prompt: string;
+    assistant_response: string;
+    tool_calls: string;
+    omitted_tool_call_count: number;
+    filter_version: number;
+}
+
+interface DurableTurnCollection {
+    complete: boolean;
+    present: boolean;
+    projections?: FilteredTurnProjection[];
+    omittedBefore?: number;
+    reason?: string;
+}
+
+interface TurnCollection {
+    turns?: ParsedTurn[];
+    omittedBefore?: number;
+    retentionHighWater?: { turns: number; renderedChars: number };
+    reason?: string;
+}
+
+interface SourceTurnCollection extends TurnCollection {
+    sourceUnavailable?: boolean;
+}
+
 function leafStrings(value: unknown): string[] {
     if (typeof value === 'string') {
         return [value];
@@ -74,6 +117,28 @@ function decodedStrings(value: string): string[] {
         return leafStrings(JSON.parse(value));
     } catch {
         return [];
+    }
+}
+
+function decodedToolCalls(value: string): FilterableToolCall[] | undefined {
+    try {
+        const parsed: unknown = JSON.parse(value);
+        if (
+            !Array.isArray(parsed) ||
+            parsed.some(
+                (call) =>
+                    !call ||
+                    typeof call !== 'object' ||
+                    typeof (call as { name?: unknown }).name !== 'string' ||
+                    !Array.isArray((call as { filePaths?: unknown }).filePaths) ||
+                    (call as { filePaths: unknown[] }).filePaths.some((filePath) => typeof filePath !== 'string'),
+            )
+        ) {
+            return undefined;
+        }
+        return parsed as FilterableToolCall[];
+    } catch {
+        return undefined;
     }
 }
 
@@ -219,20 +284,127 @@ export class SessionReader {
         return this.storedRecallFieldsFor([session]).get(session.id) ?? new Map();
     }
 
+    private durableTurns(session: Pick<ServedSession, 'id'>, bounds: TurnCollectionBounds, signal?: AbortSignal): DurableTurnCollection {
+        const status = this.db
+            .prepare(
+                `SELECT state, filter_version
+                 FROM durable_capture_status
+                 WHERE session_id = ?`,
+            )
+            .get(session.id) as { state: string; filter_version: number } | undefined;
+        if (status === undefined) {
+            const capturedRow = this.db
+                .prepare(
+                    `SELECT 1
+                     FROM filtered_turns ft
+                     JOIN memories m ON m.id = ft.memory_id
+                     WHERE m.session_id = ?
+                     LIMIT 1`,
+                )
+                .get(session.id);
+            return { complete: false, present: capturedRow !== undefined };
+        }
+        if (
+            (status.state !== 'complete' && status.state !== 'complete_truncated') ||
+            status.filter_version !== DURABLE_CAPTURE_FILTER_VERSION
+        ) {
+            return { complete: false, present: true };
+        }
+        const uncovered = this.db
+            .prepare(
+                `SELECT 1
+                 FROM memories m
+                 LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+                 WHERE m.session_id = ?
+                   AND (ft.memory_id IS NULL OR ft.filter_version <> ?)
+                 LIMIT 1`,
+            )
+            .get(session.id, DURABLE_CAPTURE_FILTER_VERSION);
+        if (uncovered !== undefined) {
+            return { complete: false, present: true };
+        }
+
+        const rows = this.db
+            .prepare(
+                `SELECT m.turn_index, ft.included, ft.user_prompt, ft.assistant_response, ft.tool_calls,
+                        ft.omitted_tool_call_count, ft.filter_version
+                 FROM memories m
+                 JOIN filtered_turns ft ON ft.memory_id = m.id
+                 WHERE m.session_id = ?
+                 ORDER BY m.turn_index`,
+            )
+            .iterate(session.id) as Iterable<StoredFilteredTurnRow>;
+        const retained = new Map<number, RetainedFilteredTurn>();
+        let renderedTurns = 0;
+        let omittedBefore = 0;
+        let retainedRenderedChars = 0;
+        try {
+            for (const row of rows) {
+                if (signal?.aborted) {
+                    return { complete: true, present: true, reason: 'deadline' };
+                }
+                const toolCalls = decodedToolCalls(row.tool_calls);
+                if (toolCalls === undefined) {
+                    return { complete: false, present: true };
+                }
+                const projection: FilteredTurnProjection = {
+                    filterVersion: row.filter_version,
+                    included: row.included === 1,
+                    userPrompt: row.user_prompt,
+                    assistantResponse: row.assistant_response,
+                    toolCalls,
+                    omittedToolCallCount: row.omitted_tool_call_count,
+                };
+                const rendered = renderFilteredTurn(projection, renderedTurns + 1);
+                if (rendered === null) {
+                    continue;
+                }
+                renderedTurns += 1;
+                const framedLength = dataBlockOpen(bounds.nonce).length + 1 + rendered.length + 1 + dataBlockClose(bounds.nonce).length;
+                retainedRenderedChars += framedLength + (retained.size === 0 ? 1 : RAW_TURN_SEPARATOR.length);
+                retained.set(row.turn_index, { projection, renderedLength: framedLength });
+                while ((bounds.lastN !== undefined && retained.size > bounds.lastN) || retainedRenderedChars > bounds.charBudget) {
+                    const oldest = retained.entries().next().value;
+                    if (oldest === undefined) {
+                        break;
+                    }
+                    const [oldestIndex, oldestTurn] = oldest;
+                    const oldestContribution = oldestTurn.renderedLength + (retained.size === 1 ? 1 : RAW_TURN_SEPARATOR.length);
+                    retained.delete(oldestIndex);
+                    retainedRenderedChars -= oldestContribution;
+                    omittedBefore += 1;
+                }
+            }
+        } catch {
+            return { complete: false, present: true };
+        }
+        return {
+            complete: true,
+            present: true,
+            projections: [...retained.values()].map((entry) => entry.projection),
+            omittedBefore,
+        };
+    }
+
     async turns(
         session: ServedSession,
         signal?: AbortSignal,
         storedIndexes?: ReadonlySet<number>,
         bounds?: TurnCollectionBounds,
-    ): Promise<{
-        turns?: ParsedTurn[];
-        omittedBefore?: number;
-        retentionHighWater?: { turns: number; renderedChars: number };
-        reason?: string;
-    }> {
+    ): Promise<TurnCollection> {
+        const { sourceUnavailable: _, ...result } = await this.sourceTurns(session, signal, storedIndexes, bounds);
+        return result;
+    }
+
+    private async sourceTurns(
+        session: ServedSession,
+        signal?: AbortSignal,
+        storedIndexes?: ReadonlySet<number>,
+        bounds?: TurnCollectionBounds,
+    ): Promise<SourceTurnCollection> {
         const opened = await this.openTranscript(session.tool, session.source_path);
         if ('reason' in opened) {
-            return { reason: opened.reason };
+            return { reason: opened.reason, sourceUnavailable: true };
         }
         const { handle } = opened;
         try {
@@ -321,9 +493,18 @@ export class SessionReader {
     ): Promise<{ episode?: BoundedEpisode; reason?: string }> {
         const nonce = randomUUID();
         const boundedLastN = lastN === undefined ? undefined : Math.min(Math.max(1, Math.trunc(lastN)), MAX_GET_SESSION_LAST_N);
-        const parsed = await this.turns(session, signal, undefined, { lastN: boundedLastN, charBudget, nonce });
+        const durable = this.durableTurns(session, { lastN: boundedLastN, charBudget, nonce }, signal);
+        if (durable.complete) {
+            if (durable.projections === undefined) {
+                return { reason: durable.reason };
+            }
+            return {
+                episode: boundedFilteredRender(durable.projections, boundedLastN, charBudget, nonce, durable.omittedBefore),
+            };
+        }
+        const parsed = await this.sourceTurns(session, signal, undefined, { lastN: boundedLastN, charBudget, nonce });
         return parsed.turns === undefined
-            ? { reason: parsed.reason }
+            ? { reason: parsed.sourceUnavailable && durable.present ? 'durable_capture_incomplete' : parsed.reason }
             : { episode: boundedRender(parsed.turns, boundedLastN, charBudget, nonce, parsed.omittedBefore) };
     }
 
@@ -366,7 +547,27 @@ export function boundedRender(
     nonce: string = randomUUID(),
     omittedBefore: number = 0,
 ): BoundedEpisode {
-    const pieces = renderableRawTurns(turns, omittedBefore).map((piece) => `${dataBlockOpen(nonce)}\n${piece}\n${dataBlockClose(nonce)}`);
+    return boundedRenderedPieces(renderableRawTurns(turns, omittedBefore), lastN, charBudget, nonce, omittedBefore);
+}
+
+function boundedFilteredRender(
+    projections: Iterable<FilteredTurnProjection>,
+    lastN?: number,
+    charBudget: number = SESSION_CHAR_BUDGET,
+    nonce: string = randomUUID(),
+    omittedBefore: number = 0,
+): BoundedEpisode {
+    return boundedRenderedPieces(renderableFilteredTurns(projections, omittedBefore), lastN, charBudget, nonce, omittedBefore);
+}
+
+function boundedRenderedPieces(
+    renderedPieces: Iterable<string>,
+    lastN: number | undefined,
+    charBudget: number,
+    nonce: string,
+    omittedBefore: number,
+): BoundedEpisode {
+    const pieces = [...renderedPieces].map((piece) => `${dataBlockOpen(nonce)}\n${piece}\n${dataBlockClose(nonce)}`);
     const eligible = lastN === undefined ? pieces : pieces.slice(-lastN);
     const chosen: string[] = [];
     let renderedChars = 0;
