@@ -1,5 +1,13 @@
 # elepha
 
+## 0.3.1
+
+### Patch Changes
+
+- Lead each changelog entry with what changed, and put the pull request and author after it by [@aldanux](https://github.com/aldanux) in [#25](https://github.com/aldanux/elepha/pull/25)
+- Point user-facing repository and documentation links at `aldanux/elepha` by [@aldanux](https://github.com/aldanux) in [#39](https://github.com/aldanux/elepha/pull/39)
+- Report when `elepha self-update` is already on the latest version instead of printing an update from a version to itself by [@vsolano9](https://github.com/vsolano9) in [#36](https://github.com/aldanux/elepha/pull/36)
+
 ## 0.3.0
 
 ### Minor Changes
