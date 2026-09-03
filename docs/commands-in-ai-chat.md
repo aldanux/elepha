@@ -20,9 +20,11 @@ This page is the full guide for in-chat recall commands.
 | `elepha:select:<n>`                                | Inject session `n` from the most recently shown query or list results.           |
 | `elepha:help`                                      | Show the in-chat command list.                                                   |
 
-**What a search looks at.** `elepha:query` matches against session titles and the opening
-prompt of each session, not the whole conversation. Search for how you asked for something,
-not for a phrase the assistant wrote back. Once a session is open, `elepha:select:<n>` and
+**What a search looks at.** `elepha:query` matches session titles and the opening prompt.
+Where a session has a rollup, it also matches what that session concluded: its summary, the
+decisions recorded in it, and what it left open. Rollups are written only when a synthesis
+provider is configured, so on an install without one a search matches titles and opening
+prompts alone. A search never reads the conversation itself. Once a session is open, `elepha:select:<n>` and
 `elepha:last` inject its turns in full.
 
 ## Maintenance

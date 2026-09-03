@@ -496,6 +496,119 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(singleTokenBody).toContain('Alpha Beta Gamma oldest title');
     });
 
+    it('matches rollup summaries, decision text, and pending items without exposing rollup text or indexing file paths', async () => {
+        const project: ProjectSet = {
+            key: 'rollup-project',
+            displayName: 'rollup-project',
+            paths: ['/rollup-project'],
+            projectIds: [1],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const sessions: ServedSession[] = [
+            {
+                ...recallSession(1, 'Receipt storage review', '2026-08-22T11:00:00.000Z'),
+                rollup_summary: 'Rejected an in-memory Map for receipt storage.',
+            },
+            {
+                ...recallSession(2, 'Database implementation review', '2026-08-22T10:00:00.000Z'),
+                rollup_decisions: JSON.stringify([{ what: 'Selected durable receipts', why: 'Keeps restarts idempotent' }]),
+            },
+            {
+                ...recallSession(3, 'Release follow-up', '2026-08-22T09:00:00.000Z'),
+                rollup_pending_items: JSON.stringify(['Verify cache recovery']),
+            },
+            {
+                ...recallSession(4, 'Unrelated file work', '2026-08-22T08:00:00.000Z'),
+                rollup_files_touched: JSON.stringify(['/workspace/secret-rollup-needle.ts']),
+            },
+        ];
+        const reader = {
+            sessionsFor: () => sessions,
+            turns: async () => ({ reason: 'must_not_parse' }),
+        } as unknown as SessionReader;
+
+        for (const [queryText, expectedId] of [
+            ['in-memory', 1],
+            ['durable receipts', 2],
+            ['restarts idempotent', 2],
+            ['cache recovery', 3],
+        ] as const) {
+            const query = tokenizeRecallQuery(queryText);
+            expect(query).toBeDefined();
+            if (!query) return;
+            const result = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, 'strict');
+            expect(result.sessionIds).toEqual([expectedId]);
+        }
+
+        const summaryQuery = tokenizeRecallQuery('in-memory');
+        const fileQuery = tokenizeRecallQuery('secret rollup needle');
+        expect(summaryQuery).toBeDefined();
+        expect(fileQuery).toBeDefined();
+        if (!summaryQuery || !fileQuery) return;
+        const summaryResult = await lexicalRecall(reader, [project], summaryQuery, 'here', () => 0, undefined, 'strict');
+        expect(summaryResult.body).toContain('Receipt storage review');
+        expect(summaryResult.body).not.toContain('Rejected an in-memory Map');
+        const fileResult = await lexicalRecall(reader, [project], fileQuery, 'here', () => 0, undefined, 'strict');
+        expect(fileResult.sessionIds).toEqual([]);
+    });
+
+    it('treats malformed rollup decisions as empty without throwing', async () => {
+        const project: ProjectSet = {
+            key: 'malformed-rollup-project',
+            displayName: 'malformed-rollup-project',
+            paths: ['/malformed-rollup-project'],
+            projectIds: [1],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const session = {
+            ...recallSession(1, 'Unrelated review', '2026-08-22T11:00:00.000Z'),
+            rollup_decisions: '{"what":"corrupted payload"',
+        };
+        const reader = {
+            sessionsFor: () => [session],
+            turns: async () => ({ reason: 'must_not_parse' }),
+        } as unknown as SessionReader;
+        const query = tokenizeRecallQuery('corrupted payload');
+        expect(query).toBeDefined();
+        if (!query) return;
+
+        await expect(lexicalRecall(reader, [project], query, 'here', () => 0, undefined, 'strict')).resolves.toMatchObject({
+            sessionIds: [],
+        });
+    });
+
+    it('ranks title matches above exact opening phrases and exact opening phrases above rollup matches', async () => {
+        const project: ProjectSet = {
+            key: 'rollup-ranking-project',
+            displayName: 'rollup-ranking-project',
+            paths: ['/rollup-ranking-project'],
+            projectIds: [1],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const sessions: ServedSession[] = [
+            {
+                ...recallSession(3, 'Newest derived result', '2026-08-22T11:00:00.000Z'),
+                rollup_summary: 'Durable cache choice',
+            },
+            recallSession(2, 'Middle opening result', '2026-08-22T10:00:00.000Z', 'Please make the durable cache choice'),
+            recallSession(1, 'Durable cache choice', '2026-08-22T09:00:00.000Z'),
+        ];
+        const reader = {
+            sessionsFor: () => sessions,
+            turns: async () => ({ reason: 'must_not_parse' }),
+        } as unknown as SessionReader;
+        const query = tokenizeRecallQuery('durable cache choice');
+        expect(query).toBeDefined();
+        if (!query) return;
+
+        const result = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, 'strict');
+
+        expect(result.sessionIds).toEqual([1, 2, 3]);
+    });
+
     it('falls back from strict to labelled lax matches without changing true misses', async () => {
         const project: ProjectSet = {
             key: 'fallback-project',
@@ -653,7 +766,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(transcriptParses).toBe(0);
     });
 
-    it('does not search derived, file, project, assistant, or later-turn fields', async () => {
+    it('searches session rollups but not turn-derived, file, project, assistant, or later-turn fields', async () => {
         const fixture = createTestDb('elepha-remember-rank-');
         const current = addProject(fixture, 'alpha-beta-project', 'approved');
         const cases = [
@@ -724,9 +837,9 @@ describe('UserPromptSubmit lexical recall', () => {
             }),
         );
         expect(context).toContain('Alpha Beta title');
+        expect(context).toContain('Derived summary');
         expect(context).not.toContain('Filename match');
         expect(context).not.toContain('Derived decision');
-        expect(context).not.toContain('Derived summary');
 
         const rawContext = contextOf(
             await runUserPromptSubmit(payload(current.projectPath, 'elepha:query:here gamma delta'), 'codex', {
