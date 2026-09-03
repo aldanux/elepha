@@ -1,6 +1,6 @@
 {
     "name": "elepha",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "description": "Local memory layer for developers switching between AI coding CLIs",
     "keywords": [
         "claude-code",
