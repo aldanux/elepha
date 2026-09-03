@@ -1,5 +1,5 @@
 import type { Database, Statement } from 'better-sqlite3';
-import { type DurableCaptureState, SESSION_CHAR_BUDGET } from '../config/constants.js';
+import { DURABLE_CAPTURE_FILTER_VERSION, type DurableCaptureState, SESSION_CHAR_BUDGET } from '../config/constants.js';
 import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import { detectShellSyntax, escapeShellSyntax } from '../security/sanitize.js';
 
@@ -147,5 +147,15 @@ export class DurableCaptureStore {
         });
         const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
         this.upsertStatus.run(sessionId, row.state, projection.filterVersion, capturedAt);
+    }
+
+    setStatus(sessionId: number, state: DurableCaptureState, updatedAt: string): void {
+        this.upsertStatus.run(sessionId, state, DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
+    }
+
+    refreshStatus(sessionId: number, updatedAt: string): DurableCaptureState {
+        const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
+        this.setStatus(sessionId, row.state, updatedAt);
+        return row.state;
     }
 }
