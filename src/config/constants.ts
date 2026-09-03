@@ -15,6 +15,18 @@ export const USER_BACKUPS_DIR_NAME = 'backups';
 export const CHARS_PER_TOKEN = 4;
 export const SESSION_TOKEN_BUDGET = 20_000;
 export const SESSION_CHAR_BUDGET = SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN;
+export const DURABLE_CAPTURE_FILTER_VERSION = 1;
+export const DURABLE_CAPTURE_STATES = [
+    'complete',
+    'complete_truncated',
+    'disabled_gap',
+    'backfilling',
+    'source_unavailable',
+    'parse_error',
+    'revoked',
+    'incognito',
+] as const;
+export type DurableCaptureState = (typeof DURABLE_CAPTURE_STATES)[number];
 export const MAX_GET_SESSION_LAST_N = 500;
 export const GET_SESSION_DEADLINE_MS = 5_000;
 export const AUTO_BRIEF_TOKEN_BUDGET = 4_000;

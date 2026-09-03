@@ -193,8 +193,8 @@ export class MemoryStore {
         return this.turns.getLastIngestedAt();
     }
 
-    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): boolean {
-        return this.turns.recordTurn(turn, sessionDbId, projectId, summary);
+    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput, durableCapture = false): boolean {
+        return this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture);
     }
 
     // Creates the project/session and records one live turn as one SQLite
@@ -206,6 +206,7 @@ export class MemoryStore {
         meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
         startNextSegment: boolean,
         summary: SummarizationOutput,
+        durableCapture = false,
     ): { project: ProjectRow; session: SessionRow; inserted: boolean } | undefined {
         const resolved = this.resolveTurnGitValues(turn, startNextSegment);
         const write = this.db.transaction(() => {
@@ -227,7 +228,11 @@ export class MemoryStore {
             if (startNextSegment) {
                 session = this.sessions.startNextSegment(session, project.id, turn.sourcePath, meta, resolved.gitCommitCount);
             }
-            return { project, session, inserted: this.turns.recordTurnInTransaction(turn, session.id, project.id, summary) };
+            return {
+                project,
+                session,
+                inserted: this.turns.recordTurnInTransaction(turn, session.id, project.id, summary, durableCapture),
+            };
         });
         return write();
     }

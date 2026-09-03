@@ -203,6 +203,7 @@ export class IngestionDaemon {
     private readonly watcherPollIntervalMs: number;
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
+    private readonly durableCapture: boolean;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
     private readonly openTranscript: ProviderTranscriptOpener;
     private readonly firstPromptSearchBackfillBatchSize: number;
@@ -247,6 +248,7 @@ export class IngestionDaemon {
         }
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
+        this.durableCapture = configResult.config.durableCapture ?? false;
         this.store = options.store ?? new MemoryStore(openDb());
         this.openTranscript = options.openTranscript ?? openProviderTranscript;
         this.summarizer = options.summarizer;
@@ -1064,7 +1066,7 @@ export class IngestionDaemon {
         if (this.summarizer) {
             this.trackOutcome(summary.status);
         }
-        const persisted = this.store.recordIngestedTurn(turn, meta, cut, summary);
+        const persisted = this.store.recordIngestedTurn(turn, meta, cut, summary, this.durableCapture);
         if (!persisted) {
             return false;
         }

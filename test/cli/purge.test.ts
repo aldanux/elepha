@@ -68,7 +68,12 @@ function databaseRows(dbPath: string): Record<string, unknown[]> {
         return Object.fromEntries(
             tables.map(({ name }) => {
                 const quotedName = name.replaceAll('"', '""');
-                return [name, db.prepare(`SELECT * FROM "${quotedName}" ORDER BY rowid`).all()];
+                const primaryKey = (db.pragma(`table_info("${quotedName}")`) as Array<{ name: string; pk: number }>)
+                    .filter((column) => column.pk > 0)
+                    .sort((a, b) => a.pk - b.pk)
+                    .map((column) => `"${column.name.replaceAll('"', '""')}"`);
+                const orderBy = primaryKey.length > 0 ? primaryKey.join(', ') : 'rowid';
+                return [name, db.prepare(`SELECT * FROM "${quotedName}" ORDER BY ${orderBy}`).all()];
             }),
         );
     } finally {

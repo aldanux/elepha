@@ -4,6 +4,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { openDb } from '../../src/storage/db.js';
+import { withGrantableTestDir } from '../helpers/tmp.js';
 
 describe('sessions table migration', () => {
     it('a fresh :memory: DB has the final schema with no migration needed', () => {
@@ -52,7 +53,75 @@ describe('sessions table migration', () => {
             (c) => c.name,
         );
         expect(firstPromptSkipCols).toEqual(['session_id', 'skipped_at']);
+        expect((db.pragma('table_info(filtered_turns)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+            'memory_id',
+            'included',
+            'user_prompt',
+            'assistant_response',
+            'tool_calls',
+            'omitted_tool_call_count',
+            'dropped_tool_ref_count',
+            'omitted_before_chars',
+            'filter_version',
+            'captured_at',
+        ]);
+        expect((db.pragma('table_info(durable_capture_status)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+            'session_id',
+            'state',
+            'filter_version',
+            'updated_at',
+        ]);
         db.close();
+    });
+
+    it('creates durable capture FTS objects, rebuilds pre-existing rows once, and remains idempotent on reopen', () => {
+        const directory = withGrantableTestDir('elepha-durable-capture-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const existing = openDb(dbPath);
+        existing.exec(`
+          INSERT INTO projects (path, first_seen_at, last_seen_at)
+          VALUES ('/legacy', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+          INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
+          VALUES ('codex', 'legacy', 1, '/legacy.jsonl', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+          INSERT INTO memories
+            (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at)
+          VALUES
+            (1, 1, 0, 'codex', '2026-01-01T00:00:00.000Z', '[]', '[]', '[]', '2026-01-01T00:00:00.000Z');
+          INSERT INTO filtered_turns
+            (memory_id, included, user_prompt, assistant_response, filter_version, captured_at)
+          VALUES (1, 1, 'legacy durable needle', 'response', 1, '2026-01-01T00:00:00.000Z');
+          DROP TRIGGER filtered_turns_ai;
+          DROP TRIGGER filtered_turns_ad;
+          DROP TRIGGER filtered_turns_au;
+          DROP TABLE filtered_turns_fts;
+        `);
+        existing.close();
+
+        const migrated = openDb(dbPath);
+        expect(
+            migrated
+                .prepare(
+                    `SELECT type, name FROM sqlite_master
+                     WHERE name IN ('filtered_turns_fts', 'filtered_turns_ai', 'filtered_turns_ad', 'filtered_turns_au')
+                     ORDER BY name`,
+                )
+                .all(),
+        ).toEqual([
+            { type: 'trigger', name: 'filtered_turns_ad' },
+            { type: 'trigger', name: 'filtered_turns_ai' },
+            { type: 'trigger', name: 'filtered_turns_au' },
+            { type: 'table', name: 'filtered_turns_fts' },
+        ]);
+        expect(migrated.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'needle'").all()).toEqual([
+            { rowid: 1 },
+        ]);
+        migrated.close();
+
+        const reopened = openDb(dbPath);
+        expect(reopened.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'needle'").all()).toEqual([
+            { rowid: 1 },
+        ]);
+        reopened.close();
     });
 
     it('accepts (tool, native_id, 1) alongside (tool, native_id, 0)', () => {

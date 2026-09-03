@@ -3,6 +3,7 @@
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { DURABLE_CAPTURE_STATES } from '../config/constants.js';
 import { elephaHome } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
@@ -77,6 +78,26 @@ CREATE TABLE IF NOT EXISTS memories (
   UNIQUE (session_id, turn_index)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_project_time ON memories(project_id, turn_started_at);
+
+CREATE TABLE IF NOT EXISTS filtered_turns (
+  memory_id               INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+  included                INTEGER NOT NULL CHECK (included IN (0,1)),
+  user_prompt             TEXT NOT NULL DEFAULT '',
+  assistant_response      TEXT NOT NULL DEFAULT '',
+  tool_calls              TEXT NOT NULL DEFAULT '[]',
+  omitted_tool_call_count INTEGER NOT NULL DEFAULT 0,
+  dropped_tool_ref_count  INTEGER NOT NULL DEFAULT 0,
+  omitted_before_chars    INTEGER NOT NULL DEFAULT 0,
+  filter_version          INTEGER NOT NULL,
+  captured_at             TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS durable_capture_status (
+  session_id     INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  state          TEXT NOT NULL CHECK (state IN (${DURABLE_CAPTURE_STATES.map((state) => `'${state}'`).join(',')})),
+  filter_version INTEGER NOT NULL,
+  updated_at     TEXT NOT NULL
+);
 
 -- Session-level rollups. Additive: turn rows in memories are never deleted
 -- after rollup, and a rollup can always be rebuilt from them.
@@ -247,6 +268,45 @@ function migrate(db: Database.Database): void {
     }
 }
 
+function migrateDurableCaptureFts(db: Database.Database): void {
+    const existed = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'filtered_turns_fts'").get() !== undefined;
+    const apply = db.transaction(() => {
+        db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS filtered_turns_fts USING fts5(
+        user_prompt,
+        assistant_response,
+        tool_calls,
+        content='filtered_turns',
+        content_rowid='memory_id'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_ai AFTER INSERT ON filtered_turns BEGIN
+        INSERT INTO filtered_turns_fts(rowid, user_prompt, assistant_response, tool_calls)
+        VALUES (new.memory_id, new.user_prompt, new.assistant_response, new.tool_calls);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_ad AFTER DELETE ON filtered_turns BEGIN
+        INSERT INTO filtered_turns_fts(filtered_turns_fts, rowid, user_prompt, assistant_response, tool_calls)
+        VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_au AFTER UPDATE ON filtered_turns BEGIN
+        INSERT INTO filtered_turns_fts(filtered_turns_fts, rowid, user_prompt, assistant_response, tool_calls)
+        VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
+        INSERT INTO filtered_turns_fts(rowid, user_prompt, assistant_response, tool_calls)
+        VALUES (new.memory_id, new.user_prompt, new.assistant_response, new.tool_calls);
+      END;
+    `);
+        // CREATE VIRTUAL TABLE does not index rows already present in its
+        // external-content table. Rebuild only on first creation; later opens
+        // rely on the sync triggers and remain a migration no-op.
+        if (!existed) {
+            db.exec("INSERT INTO filtered_turns_fts(filtered_turns_fts) VALUES ('rebuild')");
+        }
+    });
+    apply();
+}
+
 // Sessions are unique by tool, native id, and segment index, with
 // surface/git_branch/kind/trailing_branch/trailing_files. SQLite has no
 // ALTER TABLE ... DROP/ADD CONSTRAINT, so a constraint change needs a full
@@ -316,6 +376,7 @@ export function openDb(dbPath: string = defaultDbPath()): Database.Database {
     db.pragma('foreign_keys = ON');
     db.exec(SCHEMA);
     migrate(db);
+    migrateDurableCaptureFts(db);
     grandfatherConsentRoots(db);
     canonicalizeConsentRoots(db);
     if (dbPath !== ':memory:') {

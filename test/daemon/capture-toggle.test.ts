@@ -97,7 +97,9 @@ describe('per-tool capture toggle', () => {
             heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
             watcherUsePolling: true,
             log: (message) => logs.push(message),
-            readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG, captureClaudeCode: true, captureCodex: false } }),
+            readConfig: () => ({
+                config: { ...DEFAULT_MEMORY_CONFIG, captureClaudeCode: true, captureCodex: false, durableCapture: true },
+            }),
         });
         daemon.start();
 
@@ -105,6 +107,8 @@ describe('per-tool capture toggle', () => {
 
         expect(store.findSession('claude-code', claudeSessionId)).toBeDefined();
         expect(store.findSession('codex', codexSessionId)).toBeUndefined();
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
+        expect(store.database.prepare('SELECT state FROM durable_capture_status').get()).toEqual({ state: 'complete' });
         expect(logs).not.toContain(`[elepha] skipped ${codexFile}: capture is disabled for codex`);
         expect(logs.some((message) => message.includes('capture disabled: 1'))).toBe(true);
     });
