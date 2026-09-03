@@ -1,5 +1,12 @@
 # elepha
 
+## 0.3.2
+
+### Patch Changes
+
+- Make `elepha:query` match session summaries, recorded decisions, and pending items by [@aldanux](https://github.com/aldanux) in [#46](https://github.com/aldanux/elepha/pull/46)
+- Lead with the reasoning elepha preserves and update the npm package description by [@aldanux](https://github.com/aldanux) in [#45](https://github.com/aldanux/elepha/pull/45)
+
 ## 0.3.1
 
 ### Patch Changes

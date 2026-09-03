@@ -1,6 +1,6 @@
 {
     "name": "elepha",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "description": "Local memory for AI coding tools: keeps the reasoning your commits do not.",
     "keywords": [
         "claude-code",
