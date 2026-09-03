@@ -374,6 +374,97 @@ describe('elepha restore', () => {
         }
     });
 
+    it('scrubs restored durable copies and FTS terms for active purge and incognito tombstones', async () => {
+        const active = createTestDb('elepha-restore-active-');
+        const candidate = createTestDb('elepha-restore-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        const project = candidate.store.upsertProject(path.join(candidate.directory, 'durable-project'));
+        for (const [nativeId, needle] of [
+            ['restored-purged-copy', 'restorepurgedneedle'],
+            ['restored-incognito-copy', 'restoreincognitoneedle'],
+        ] as const) {
+            const session = candidate.store.upsertSession(
+                'codex',
+                nativeId,
+                project.id,
+                path.join(candidate.directory, `${nativeId}.jsonl`),
+            );
+            candidate.store.recordTurn(
+                {
+                    tool: 'codex',
+                    sessionId: nativeId,
+                    sourcePath: session.source_path,
+                    projectPath: project.path,
+                    turnIndex: 0,
+                    startedAt: '2026-08-01T00:00:00.000Z',
+                    endedAt: '2026-08-01T00:00:01.000Z',
+                    userMessage: needle,
+                    assistantText: 'restored sensitive response',
+                    toolCalls: [],
+                    cursor: '0',
+                    hasExternalContent: false,
+                    resumeMarkerBefore: false,
+                },
+                session.id,
+                project.id,
+                { decisions: [], pending_items: [], status: 'ok' },
+                true,
+            );
+        }
+        fullBackup(candidate.dbPath, backup);
+        active.db
+            .prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)')
+            .run('codex', 'restored-purged-copy', '2026-08-02T00:00:00.000Z');
+        active.store.recordIncognitoTranscript('codex', 'restored-incognito-copy');
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = openDb(active.dbPath);
+        try {
+            expect(
+                restored
+                    .prepare(
+                        `SELECT s.native_id
+                         FROM filtered_turns ft
+                         JOIN memories m ON m.id = ft.memory_id
+                         JOIN sessions s ON s.id = m.session_id
+                         WHERE s.native_id IN ('restored-purged-copy', 'restored-incognito-copy')`,
+                    )
+                    .all(),
+            ).toEqual([]);
+            expect(
+                restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'restorepurgedneedle'").all(),
+            ).toEqual([]);
+            expect(
+                restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'restoreincognitoneedle'").all(),
+            ).toEqual([]);
+            expect(
+                restored.prepare("SELECT native_id FROM sessions WHERE native_id LIKE 'restored-%-copy' ORDER BY native_id").all(),
+            ).toEqual([{ native_id: 'restored-incognito-copy' }, { native_id: 'restored-purged-copy' }]);
+            expect(
+                restored
+                    .prepare(
+                        `SELECT COUNT(*) AS count
+                         FROM memories m
+                         JOIN sessions s ON s.id = m.session_id
+                         WHERE s.native_id IN ('restored-purged-copy', 'restored-incognito-copy')`,
+                    )
+                    .get(),
+            ).toEqual({ count: 2 });
+        } finally {
+            restored.close();
+        }
+    });
+
     it('unions active incognito vetoes into a restored backup that predates the tombstone table', async () => {
         const active = createTestDb('elepha-restore-active-');
         const candidate = createTestDb('elepha-restore-candidate-');

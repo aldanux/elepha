@@ -266,6 +266,26 @@ function unionTranscriptTombstones(dbPath: string, tombstones: TranscriptTombsto
                     insert.run(transcript.tool, transcript.native_id, recordedAt);
                 }
             }
+            // Delete explicitly so the filtered-turn AFTER DELETE trigger also
+            // removes every indexed term from the external-content FTS table.
+            restored
+                .prepare(
+                    `DELETE FROM filtered_turns
+                     WHERE memory_id IN (
+                         SELECT m.id
+                         FROM memories m
+                         JOIN sessions s ON s.id = m.session_id
+                         WHERE EXISTS (
+                                   SELECT 1 FROM purged_transcripts p
+                                   WHERE p.tool = s.tool AND p.native_id = s.native_id
+                               )
+                            OR EXISTS (
+                                   SELECT 1 FROM incognito_transcripts i
+                                   WHERE i.tool = s.tool AND i.native_id = s.native_id
+                               )
+                     )`,
+                )
+                .run();
         })();
         const checkpoint = restored.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
         if (checkpoint[0]?.busy !== 0) {

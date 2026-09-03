@@ -777,10 +777,10 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(result.sessionIds).toEqual([title.id, strongContent.id, newerContent.id, olderContent.id, body.id]);
     });
 
-    it('keeps tombstoned and non-consented content outside the FTS result set', async () => {
+    it('keeps tombstoned and revoked content out of search and serving while retaining the copy for re-approval', async () => {
         const fixture = createTestDb('elepha-query-content-scope-');
         const approved = addProject(fixture, 'approved', 'approved');
-        const denied = addProject(fixture, 'denied', 'denied');
+        const revoked = addProject(fixture, 'revoked', 'approved');
         const visible = addSession(fixture, approved.project, approved.projectPath, {
             nativeId: 'visible-content',
             title: 'Visible durable work',
@@ -799,13 +799,13 @@ describe('UserPromptSubmit lexical recall', () => {
             timestamp: '2026-08-22T09:00:00.000Z',
             turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
         });
-        const unconsented = addSession(fixture, denied.project, denied.projectPath, {
-            nativeId: 'denied-content',
-            title: 'Denied durable work',
+        const revokedSession = addSession(fixture, revoked.project, revoked.projectPath, {
+            nativeId: 'revoked-content',
+            title: 'Revoked durable work',
             timestamp: '2026-08-22T08:00:00.000Z',
             turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
         });
-        for (const session of [visible, purged, incognito, unconsented]) {
+        for (const session of [visible, purged, incognito, revokedSession]) {
             addDurableCopy(fixture, session, [{ assistant: 'scopedcontentneedle' }]);
         }
         fixture.db
@@ -816,16 +816,63 @@ describe('UserPromptSubmit lexical recall', () => {
             .run(incognito.tool, incognito.native_id, new Date(NOW).toISOString());
         fixture.close();
 
-        const result = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
+        const beforeRevoke = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW,
         });
-        const context = contextOf(result);
+        expect(contextOf(beforeRevoke)).toContain('Revoked durable work');
+        const servedBeforeRevoke = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 1,
+        });
+        expect(contextOf(servedBeforeRevoke)).toContain('scopedcontentneedle');
 
-        expect(context).toContain('Visible durable work');
-        expect(context).not.toContain('Purged durable work');
-        expect(context).not.toContain('Incognito durable work');
-        expect(context).not.toContain('Denied durable work');
+        const revokeDb = openDb(fixture.dbPath);
+        const copyBeforeRevoke = revokeDb
+            .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+            .all(revokedSession.id);
+        new ConsentStore(revokeDb).revoke(revoked.projectPath);
+        expect(
+            revokeDb
+                .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                .all(revokedSession.id),
+        ).toEqual(copyBeforeRevoke);
+        revokeDb.close();
+
+        const blockedServe = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 2,
+        });
+        expect(blockedServe).toEqual({ reason: 'project_unavailable_or_unconsented' });
+        const whileRevoked = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 3,
+        });
+        const revokedContext = contextOf(whileRevoked);
+
+        expect(revokedContext).toContain('Visible durable work');
+        expect(revokedContext).not.toContain('Purged durable work');
+        expect(revokedContext).not.toContain('Incognito durable work');
+        expect(revokedContext).not.toContain('Revoked durable work');
+
+        const grantDb = openDb(fixture.dbPath);
+        new ConsentStore(grantDb).grant(revoked.projectPath);
+        expect(
+            grantDb
+                .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                .all(revokedSession.id),
+        ).toEqual(copyBeforeRevoke);
+        grantDb.close();
+        const afterReapproval = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 4,
+        });
+        expect(contextOf(afterReapproval)).toContain('Revoked durable work');
+        const servedAfterReapproval = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 5,
+        });
+        expect(contextOf(servedAfterReapproval)).toContain('scopedcontentneedle');
     });
 
     it('reports durable content coverage and makes partial-copy misses explicitly inconclusive', async () => {

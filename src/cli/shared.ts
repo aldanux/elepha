@@ -131,10 +131,13 @@ export function printPurgePlan(plan: PurgePlan): void {
         return;
     }
     const totalTurns = plan.sessions.reduce((sum, s) => sum + s.turnCount, 0);
+    const totalFilteredTurns = plan.sessions.reduce((sum, s) => sum + s.filteredTurnCount, 0);
+    const totalFilteredBytes = plan.sessions.reduce((sum, s) => sum + s.filteredBytes, 0);
     const emptiedProjectPaths = new Set(plan.emptiedProjects.map((project) => project.path));
     const projectPaths = [...new Set(plan.sessions.map((session) => session.projectPath))].sort((a, b) => a.localeCompare(b));
 
     console.log(`In total: ${plan.sessions.length} session(s), ${totalTurns} turn(s).`);
+    console.log(`Stored conversation copy: ${totalFilteredTurns} filtered turn(s), ${totalFilteredBytes} byte(s).`);
     console.log('\nelepha memory in these projects:');
     for (const projectPath of projectPaths) {
         console.log(

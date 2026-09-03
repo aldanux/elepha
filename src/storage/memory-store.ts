@@ -64,6 +64,11 @@ export interface PurgeSessionPreview {
     startedAt: string;
     lastIngestedAt: string;
     turnCount: number;
+    filteredTurnCount: number;
+    filteredBytes: number;
+    // Retained only so post-apply verification can detect orphaned FTS postings
+    // after the parent memories and session have been deleted.
+    filteredMemoryIds: number[];
 }
 
 // A purge preview includes the actual sessions because counts hide
@@ -155,9 +160,33 @@ export class MemoryStore {
 
     // Records only the stable provider/session identity, never transcript content.
     recordIncognitoTranscript(tool: ToolName, nativeId: string): void {
-        this.db
-            .prepare('INSERT OR IGNORE INTO incognito_transcripts (tool, native_id, tombstoned_at) VALUES (?, ?, ?)')
-            .run(tool, nativeId, new Date().toISOString());
+        const record = this.db.transaction(() => {
+            this.db
+                .prepare('INSERT OR IGNORE INTO incognito_transcripts (tool, native_id, tombstoned_at) VALUES (?, ?, ?)')
+                .run(tool, nativeId, new Date().toISOString());
+            // Delete the child explicitly: SQLite does not reliably run this
+            // table's FTS cleanup trigger for an FK cascade.
+            this.db
+                .prepare(
+                    `DELETE FROM filtered_turns
+                     WHERE memory_id IN (
+                         SELECT m.id
+                         FROM memories m
+                         JOIN sessions s ON s.id = m.session_id
+                         WHERE s.tool = ? AND s.native_id = ?
+                     )`,
+                )
+                .run(tool, nativeId);
+            this.db
+                .prepare(
+                    `DELETE FROM durable_capture_status
+                     WHERE session_id IN (
+                         SELECT id FROM sessions WHERE tool = ? AND native_id = ?
+                     )`,
+                )
+                .run(tool, nativeId);
+        });
+        record();
     }
 
     isTranscriptIncognito(tool: ToolName, nativeId: string): boolean {
@@ -422,17 +451,33 @@ export class MemoryStore {
         }
         const projectById = new Map(this.listProjects().map((p) => [p.id, p]));
         const countTurns = this.db.prepare('SELECT COUNT(*) as c FROM memories WHERE session_id = ?');
-        const sessions: PurgeSessionPreview[] = sessionRows.map((s) => ({
-            id: s.id,
-            nativeId: s.native_id,
-            title: s.title,
-            projectId: s.project_id,
-            projectPath: projectById.get(s.project_id)?.path ?? '(unknown project)',
-            tool: s.tool,
-            startedAt: s.started_at,
-            lastIngestedAt: s.last_ingested_at,
-            turnCount: (countTurns.get(s.id) as { c: number }).c,
-        }));
+        const filteredRows = this.db.prepare(
+            `SELECT ft.memory_id,
+                    length(CAST(ft.user_prompt AS BLOB))
+                      + length(CAST(ft.assistant_response AS BLOB))
+                      + length(CAST(ft.tool_calls AS BLOB)) AS bytes
+             FROM filtered_turns ft
+             JOIN memories m ON m.id = ft.memory_id
+             WHERE m.session_id = ?
+             ORDER BY m.turn_index`,
+        );
+        const sessions: PurgeSessionPreview[] = sessionRows.map((s) => {
+            const filtered = filteredRows.all(s.id) as Array<{ memory_id: number; bytes: number }>;
+            return {
+                id: s.id,
+                nativeId: s.native_id,
+                title: s.title,
+                projectId: s.project_id,
+                projectPath: projectById.get(s.project_id)?.path ?? '(unknown project)',
+                tool: s.tool,
+                startedAt: s.started_at,
+                lastIngestedAt: s.last_ingested_at,
+                turnCount: (countTurns.get(s.id) as { c: number }).c,
+                filteredTurnCount: filtered.length,
+                filteredBytes: filtered.reduce((sum, row) => sum + row.bytes, 0),
+                filteredMemoryIds: filtered.map((row) => row.memory_id),
+            };
+        });
         // A project is "emptied" if every one of its sessions is in this
         // purge - compare against its true total, not just what we selected.
         const purgedByProject = new Map<number, number>();
@@ -458,6 +503,10 @@ export class MemoryStore {
         const sessionIdentity = this.db.prepare('SELECT tool, native_id FROM sessions WHERE id = ?');
         const tombstone = this.db.prepare('INSERT OR IGNORE INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)');
         const deleteRollup = this.db.prepare('DELETE FROM session_rollups WHERE session_id = ?');
+        const deleteFilteredTurns = this.db.prepare(
+            'DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)',
+        );
+        const deleteDurableCaptureStatus = this.db.prepare('DELETE FROM durable_capture_status WHERE session_id = ?');
         const deleteMemories = this.db.prepare('DELETE FROM memories WHERE session_id = ?');
         const deleteSession = this.db.prepare('DELETE FROM sessions WHERE id = ?');
         const countProjectSessions = this.db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE project_id = ?');
@@ -475,6 +524,8 @@ export class MemoryStore {
                 }
                 tombstone.run(identity.tool, identity.native_id, purgedAt);
                 deleteRollup.run(s.id);
+                deleteFilteredTurns.run(s.id);
+                deleteDurableCaptureStatus.run(s.id);
                 deleteMemories.run(s.id);
                 deleteSession.run(s.id);
                 appliedSessions.push(s);

@@ -202,6 +202,54 @@ describe('elepha purge orphan project scope', () => {
         }
     }, 15000);
 
+    it('reports and verifies durable-copy deletion through the CLI purge lifecycle', () => {
+        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-durable-'));
+        const dbPath = path.join(directory, 'elepha.db');
+        const projectPath = path.join(directory, 'durable-project');
+        const db = openDb(dbPath);
+        const store = new MemoryStore(db);
+        const project = store.upsertProject(projectPath);
+        const session = store.upsertSession('codex', 'durable-cli-purge', project.id, path.join(directory, 'durable.jsonl'));
+        store.recordTurn(
+            {
+                tool: 'codex',
+                sessionId: session.native_id,
+                sourcePath: session.source_path,
+                projectPath,
+                turnIndex: 0,
+                startedAt: '2026-08-01T00:00:00.000Z',
+                endedAt: '2026-08-01T00:00:01.000Z',
+                userMessage: 'clipurgeuniqueneedle',
+                assistantText: 'durable response',
+                toolCalls: [],
+                cursor: '0',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            },
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'ok' },
+            true,
+        );
+        db.close();
+
+        try {
+            const result = runPurgeCli(dbPath, '--project', projectPath, '--apply');
+
+            expect(result.status, result.stderr).toBe(0);
+            expect(result.stdout).toContain('Stored conversation copy: 1 filtered turn(s), ');
+            const verified = openDb(dbPath);
+            expect(verified.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+            expect(verified.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+            expect(
+                verified.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'clipurgeuniqueneedle'").all(),
+            ).toEqual([]);
+            verified.close();
+        } finally {
+            removeDirectory(directory);
+        }
+    }, 15000);
+
     it('resolves only denied and unapproved projects as revoked, then preserves their denied consent after applying', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
         const projectDirectory = withGrantableTestDir('purge-revoked-');
