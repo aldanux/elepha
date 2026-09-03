@@ -99,11 +99,6 @@ a reason that still applies. That conversation happened, and it is still on your
 remember where, or when, or under which repository. It is one session among hundreds, and
 the tool you are sitting in has never seen a single one of them.
 
-**Your history disappeared.** Claude Code deletes session files after its retention period.
-The chats go, and with them the ability to resume or summarise them, in the same tool, with
-no warning. What **elepha** kept is not the conversation, it is what the session concluded
-and what it left open.
-
 ## Privacy and consent
 
 **elepha** runs entirely on your machine: capture, storage, search, and recall are local, with no hosted memory service. The one exception
