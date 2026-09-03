@@ -38,6 +38,7 @@ export const FIRST_PROMPT_SEARCH_CAP = 4_000;
 export const REMEMBER_MATCH_SCORES = {
     title: 12_000,
     exactPhrase: 10_000,
+    rollup: 6_000,
     body: 3_000,
 } as const;
 

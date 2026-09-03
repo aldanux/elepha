@@ -1,5 +1,6 @@
-// Deterministic read-only recall over stored titles and the cached first user
-// prompt. No transcript-derived value can reach a subprocess from this module.
+// Deterministic read-only recall over stored titles, the cached first user
+// prompt, and session rollups. No transcript-derived value can reach a
+// subprocess from this module.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -56,6 +57,7 @@ interface Match {
 interface PreparedMetadata {
     candidate: SessionCandidate;
     firstTurnMatch: Match;
+    rollupMatch: Match;
     titleMatch: Match;
 }
 
@@ -169,6 +171,34 @@ function hitIdentity(candidate: SessionCandidate): Pick<RecallHit, 'project' | '
     };
 }
 
+function parsedJsonArray(value: string | null | undefined): unknown[] {
+    if (!value?.trim()) {
+        return [];
+    }
+    try {
+        const parsed: unknown = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+}
+
+function rollupDecisionTexts(value: string | null): string[] {
+    return parsedJsonArray(value).flatMap((item) => {
+        if (item === null || Array.isArray(item) || typeof item !== 'object') {
+            return [];
+        }
+        const { what, why } = item as Record<string, unknown>;
+        return typeof what === 'string' && typeof why === 'string' ? [what, why] : [];
+    });
+}
+
+function rollupTexts(session: ServedSession): string[] {
+    const summary = typeof session.rollup_summary === 'string' && session.rollup_summary.trim() ? [session.rollup_summary] : [];
+    const pendingItems = parsedJsonArray(session.rollup_pending_items).filter((item): item is string => typeof item === 'string');
+    return [...summary, ...rollupDecisionTexts(session.rollup_decisions), ...pendingItems];
+}
+
 function prepareMetadata(candidate: SessionCandidate, query: RecallQuery): PreparedMetadata {
     const session = candidate.session;
     const sessionTitles = [session.title, session.custom_title, session.rollup_title].filter((value): value is string => Boolean(value));
@@ -177,13 +207,14 @@ function prepareMetadata(candidate: SessionCandidate, query: RecallQuery): Prepa
         session.first_prompt_search === null
             ? { exactPhrase: false, tokens: new Set<string>() }
             : match([session.first_prompt_search], query);
-    return { candidate, firstTurnMatch, titleMatch };
+    const rollupMatch = match(rollupTexts(session), query);
+    return { candidate, firstTurnMatch, rollupMatch, titleMatch };
 }
 
 function prepareRarity(prepared: PreparedMetadata[], query: RecallQuery): RecallRarity {
     const documentFrequency = new Map(query.tokens.map((token) => [token, 0]));
     for (const metadata of prepared) {
-        const documentTokens = new Set([...metadata.titleMatch.tokens, ...metadata.firstTurnMatch.tokens]);
+        const documentTokens = new Set([...metadata.titleMatch.tokens, ...metadata.firstTurnMatch.tokens, ...metadata.rollupMatch.tokens]);
         for (const token of documentTokens) {
             documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
         }
@@ -201,8 +232,8 @@ function prepareRarity(prepared: PreparedMetadata[], query: RecallQuery): Recall
 }
 
 function hitForSession(metadata: PreparedMetadata, query: RecallQuery, matchingMode: QueryMatchingMode): RecallHit | undefined {
-    const { candidate, firstTurnMatch, titleMatch } = metadata;
-    const matchedTokens = new Set([...titleMatch.tokens, ...firstTurnMatch.tokens]);
+    const { candidate, firstTurnMatch, rollupMatch, titleMatch } = metadata;
+    const matchedTokens = new Set([...titleMatch.tokens, ...firstTurnMatch.tokens, ...rollupMatch.tokens]);
     const matchesQuery =
         matchingMode === 'strict'
             ? query.components.every((token) => matchedTokens.has(token))
@@ -220,10 +251,24 @@ function hitForSession(metadata: PreparedMetadata, query: RecallQuery, matchingM
             tier: REMEMBER_MATCH_SCORES.title,
         };
     }
+    if (firstTurnMatch.exactPhrase) {
+        return {
+            ...hitIdentity(candidate),
+            matchedTokens,
+            tier: REMEMBER_MATCH_SCORES.exactPhrase,
+        };
+    }
+    if (rollupMatch.tokens.size > 0) {
+        return {
+            ...hitIdentity(candidate),
+            matchedTokens,
+            tier: REMEMBER_MATCH_SCORES.rollup,
+        };
+    }
     return {
         ...hitIdentity(candidate),
         matchedTokens,
-        tier: firstTurnMatch.exactPhrase ? REMEMBER_MATCH_SCORES.exactPhrase : REMEMBER_MATCH_SCORES.body,
+        tier: REMEMBER_MATCH_SCORES.body,
     };
 }
 
