@@ -150,6 +150,11 @@ logging tool, which is exactly the fragile pattern elepha is built to avoid.
   tests — never retyped.
 - **Comments are for an external reader.** Keep the rationale, threshold, or rule inline
   so a comment stands alone; no internal tracking codes and no doc pointers.
+- **Line comments only.** Use `//`. No `/** */` blocks. The signature and the types
+  already state what a function takes and returns, so a JSDoc block restates them in a
+  second place that nothing checks and that goes stale on the first refactor. A comment
+  carries what the types cannot: why this threshold, why this order, what breaks if you
+  change it.
 - **Consent and eligibility are use-time decisions.** Never expand a grant the user did
   not make, and never treat a consent or eligibility view built before awaited work as
   authoritative afterward. Rebuild the current view immediately before serving
