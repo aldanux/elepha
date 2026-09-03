@@ -1,7 +1,7 @@
 {
     "name": "elepha",
     "version": "0.3.1",
-    "description": "Local memory layer for developers switching between AI coding CLIs",
+    "description": "Local memory for AI coding tools: keeps the reasoning your commits do not.",
     "keywords": [
         "claude-code",
         "codex",
