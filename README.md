@@ -72,7 +72,7 @@ schema and command surface can change between releases.
 
 1. **Reads local transcripts in the background.** It watches the session files that supported tools already write, limited to projects and folders you approve.
 2. **Builds one searchable local memory.** It organizes eligible sessions in one local database.
-3. **Recalls inside your current chat.** Find a session with `elepha:query`, open it with `elepha:select:<n>`, or go straight to the latest with `elepha:last`. Search looks at session titles and how you opened each session, and, for sessions that have a rollup, at what they concluded; opening one brings the whole conversation back, reasoning included.
+3. **Recalls inside your current chat.** Find a session with `elepha:query`, open it with `elepha:select:<n>`, or go straight to the latest with `elepha:last`. Search looks at session titles and how you opened each session; at what a session concluded where it has a rollup; and, for sessions recorded with durable capture, at the stored filtered conversation. It never reads raw transcripts, thinking, tool output, or fetched external content, and it searches the local index, not the provider's files at query time. Opening a session brings the whole conversation back.
 
 <!-- In-chat demo placeholder: show elepha:list and elepha:last recalling a real session. -->
 

@@ -51,6 +51,7 @@ export const REMEMBER_MATCH_SCORES = {
     title: 12_000,
     exactPhrase: 10_000,
     rollup: 6_000,
+    content: 4_500,
     body: 3_000,
 } as const;
 

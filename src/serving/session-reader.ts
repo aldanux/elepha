@@ -54,6 +54,26 @@ export interface StoredTurnRecallFields {
 
 export type StoredSessionRecallFields = Map<number, StoredTurnRecallFields>;
 
+export interface StoredContentCoverage {
+    complete: number;
+    completeTruncated: number;
+    incomplete: number;
+    neverCaptured: number;
+    total: number;
+}
+
+export interface StoredContentMatch {
+    bm25: number;
+    texts: string[];
+}
+
+export interface StoredContentRecall {
+    coverage: StoredContentCoverage;
+    matches: Map<number, StoredContentMatch>;
+    rowCapReached: boolean;
+    timeBudgetReached: boolean;
+}
+
 interface TurnCollectionBounds {
     lastN?: number;
     charBudget: number;
@@ -208,6 +228,152 @@ export class SessionReader {
         const rows = readProjectSessions(this.db, project.projectIds);
         this.sessionsMemo.set(key, rows);
         return rows;
+    }
+
+    storedContentRecallFor(
+        sessions: Iterable<Pick<ServedSession, 'id'>>,
+        matchExpressions: readonly string[],
+        perComponentRowCap: number,
+        withinBudget: () => boolean,
+    ): StoredContentRecall {
+        const requestedIds = [...new Set([...sessions].map((session) => session.id))];
+        const emptyCoverage: StoredContentCoverage = {
+            complete: 0,
+            completeTruncated: 0,
+            incomplete: 0,
+            neverCaptured: 0,
+            total: 0,
+        };
+        if (requestedIds.length === 0) {
+            return { coverage: emptyCoverage, matches: new Map(), rowCapReached: false, timeBudgetReached: false };
+        }
+
+        const coverageRows = this.db
+            .prepare(
+                `WITH requested(id) AS (
+                     SELECT CAST(value AS INTEGER) FROM json_each(?)
+                 )
+                 SELECT s.id, dcs.state, dcs.filter_version,
+                        EXISTS (
+                            SELECT 1 FROM filtered_turns ft
+                            JOIN memories m ON m.id = ft.memory_id
+                            WHERE m.session_id = s.id
+                        ) AS has_filtered,
+                        EXISTS (
+                            SELECT 1 FROM memories m
+                            LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+                            WHERE m.session_id = s.id
+                              AND (ft.memory_id IS NULL OR ft.filter_version <> ?)
+                        ) AS has_uncovered
+                 FROM requested
+                 JOIN sessions s ON s.id = requested.id
+                 LEFT JOIN durable_capture_status dcs ON dcs.session_id = s.id
+                 WHERE NOT EXISTS (
+                           SELECT 1 FROM purged_transcripts p
+                           WHERE p.tool = s.tool AND p.native_id = s.native_id
+                       )
+                   AND NOT EXISTS (
+                           SELECT 1 FROM incognito_transcripts i
+                           WHERE i.tool = s.tool AND i.native_id = s.native_id
+                       )
+                 ORDER BY s.id`,
+            )
+            .all(JSON.stringify(requestedIds), DURABLE_CAPTURE_FILTER_VERSION) as Array<{
+            filter_version: number | null;
+            has_filtered: number;
+            has_uncovered: number;
+            id: number;
+            state: string | null;
+        }>;
+        const activeIds = coverageRows.map((row) => row.id);
+        const coverage = { ...emptyCoverage, total: activeIds.length };
+        for (const row of coverageRows) {
+            const currentAndCovered = row.filter_version === DURABLE_CAPTURE_FILTER_VERSION && row.has_uncovered === 0;
+            if (row.state === 'complete' && currentAndCovered) {
+                coverage.complete += 1;
+            } else if (row.state === 'complete_truncated' && currentAndCovered) {
+                coverage.completeTruncated += 1;
+            } else if (row.state !== null || row.has_filtered === 1) {
+                coverage.incomplete += 1;
+            } else {
+                coverage.neverCaptured += 1;
+            }
+        }
+        if (activeIds.length === 0) {
+            return { coverage, matches: new Map(), rowCapReached: false, timeBudgetReached: false };
+        }
+
+        const activeIdsJson = JSON.stringify(activeIds);
+        const ftsStatement = this.db.prepare(
+            `WITH eligible(id) AS (
+                 SELECT CAST(value AS INTEGER) FROM json_each(?)
+             )
+             SELECT m.session_id, filtered_turns_fts.rowid AS memory_id, bm25(filtered_turns_fts) AS score
+             FROM eligible
+             JOIN memories m ON m.session_id = eligible.id
+             JOIN filtered_turns_fts ON filtered_turns_fts.rowid = m.id
+             WHERE filtered_turns_fts MATCH ?
+             ORDER BY score, m.session_id, memory_id
+             LIMIT ?`,
+        );
+        const bestScoreBySession = new Map<number, number>();
+        const matchedSessionIds = new Set<number>();
+        let rowCapReached = false;
+        let timeBudgetReached = false;
+        for (const expression of matchExpressions) {
+            if (!withinBudget()) {
+                timeBudgetReached = true;
+                break;
+            }
+            const rows = ftsStatement.all(activeIdsJson, expression, perComponentRowCap) as Array<{
+                memory_id: number;
+                score: number;
+                session_id: number;
+            }>;
+            rowCapReached ||= rows.length === perComponentRowCap;
+            for (const row of rows) {
+                matchedSessionIds.add(row.session_id);
+                const previous = bestScoreBySession.get(row.session_id);
+                if (previous === undefined || row.score < previous) {
+                    bestScoreBySession.set(row.session_id, row.score);
+                }
+            }
+        }
+
+        const textsBySession = new Map<number, string[]>();
+        if (matchedSessionIds.size > 0 && withinBudget()) {
+            const rows = this.db
+                .prepare(
+                    `SELECT m.session_id, ft.user_prompt, ft.assistant_response, ft.tool_calls
+                     FROM filtered_turns ft
+                     JOIN memories m ON m.id = ft.memory_id
+                     WHERE m.session_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+                     ORDER BY m.session_id, m.turn_index`,
+                )
+                .iterate(JSON.stringify([...matchedSessionIds])) as Iterable<{
+                assistant_response: string;
+                session_id: number;
+                tool_calls: string;
+                user_prompt: string;
+            }>;
+            for (const row of rows) {
+                if (!withinBudget()) {
+                    timeBudgetReached = true;
+                    break;
+                }
+                const texts = textsBySession.get(row.session_id) ?? [];
+                texts.push(row.user_prompt, row.assistant_response, row.tool_calls);
+                textsBySession.set(row.session_id, texts);
+            }
+        } else if (matchedSessionIds.size > 0) {
+            timeBudgetReached = true;
+        }
+
+        const matches = new Map<number, StoredContentMatch>();
+        for (const [sessionId, texts] of textsBySession) {
+            matches.set(sessionId, { bm25: bestScoreBySession.get(sessionId) ?? 0, texts });
+        }
+        return { coverage, matches, rowCapReached, timeBudgetReached };
     }
 
     sessionAggregatesFor(projects: readonly ProjectSet[]): ProjectSessionAggregate[] {

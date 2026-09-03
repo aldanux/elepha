@@ -1,6 +1,6 @@
 // Deterministic read-only recall over stored titles, the cached first user
-// prompt, and session rollups. No transcript-derived value can reach a
-// subprocess from this module.
+// prompt, session rollups, and the filtered durable copy. No
+// transcript-derived value can reach a subprocess from this module.
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -17,7 +17,15 @@ import { escapeShellSyntax } from '../security/sanitize.js';
 import type { ProjectSet } from '../storage/project-resolver.js';
 import { relativeTime } from '../util/relative-time.js';
 import { DISPLAY_VERBATIM_INSTRUCTIONS, SELECT_HINT, servedContextInstructions } from './instructions.js';
-import { endedAt, hasRealContent, type ServedSession, type SessionReader, surfaceLabel, titleOf } from './session-reader.js';
+import {
+    endedAt,
+    hasRealContent,
+    type ServedSession,
+    type SessionReader,
+    type StoredContentCoverage,
+    surfaceLabel,
+    titleOf,
+} from './session-reader.js';
 
 export type RecallScope = 'global' | 'here';
 
@@ -34,6 +42,7 @@ interface SessionCandidate {
 }
 
 interface RecallHit {
+    contentBm25?: number;
     project: string;
     sessionTitle: string;
     date: string;
@@ -56,6 +65,8 @@ interface Match {
 
 interface PreparedMetadata {
     candidate: SessionCandidate;
+    contentBm25?: number;
+    contentMatch: Match;
     firstTurnMatch: Match;
     rollupMatch: Match;
     titleMatch: Match;
@@ -141,7 +152,17 @@ function idfScore(hit: RecallHit, rarity: RecallRarity): number {
 }
 
 function compareHits(a: RecallHit, b: RecallHit, rarity: RecallRarity): number {
-    return idfScore(b, rarity) - idfScore(a, rarity) || b.tier - a.tier || compareText(b.endedAt, a.endedAt) || a.sessionId - b.sessionId;
+    const contentOrder =
+        a.tier === REMEMBER_MATCH_SCORES.content && b.tier === REMEMBER_MATCH_SCORES.content
+            ? (a.contentBm25 ?? 0) - (b.contentBm25 ?? 0)
+            : 0;
+    return (
+        idfScore(b, rarity) - idfScore(a, rarity) ||
+        b.tier - a.tier ||
+        contentOrder ||
+        compareText(b.endedAt, a.endedAt) ||
+        a.sessionId - b.sessionId
+    );
 }
 
 function startsWithElephaCommand(value: string | null | undefined): boolean {
@@ -208,13 +229,18 @@ function prepareMetadata(candidate: SessionCandidate, query: RecallQuery): Prepa
             ? { exactPhrase: false, tokens: new Set<string>() }
             : match([session.first_prompt_search], query);
     const rollupMatch = match(rollupTexts(session), query);
-    return { candidate, firstTurnMatch, rollupMatch, titleMatch };
+    return { candidate, contentMatch: { exactPhrase: false, tokens: new Set() }, firstTurnMatch, rollupMatch, titleMatch };
 }
 
 function prepareRarity(prepared: PreparedMetadata[], query: RecallQuery): RecallRarity {
     const documentFrequency = new Map(query.tokens.map((token) => [token, 0]));
     for (const metadata of prepared) {
-        const documentTokens = new Set([...metadata.titleMatch.tokens, ...metadata.firstTurnMatch.tokens, ...metadata.rollupMatch.tokens]);
+        const documentTokens = new Set([
+            ...metadata.titleMatch.tokens,
+            ...metadata.firstTurnMatch.tokens,
+            ...metadata.rollupMatch.tokens,
+            ...metadata.contentMatch.tokens,
+        ]);
         for (const token of documentTokens) {
             documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
         }
@@ -232,8 +258,8 @@ function prepareRarity(prepared: PreparedMetadata[], query: RecallQuery): Recall
 }
 
 function hitForSession(metadata: PreparedMetadata, query: RecallQuery, matchingMode: QueryMatchingMode): RecallHit | undefined {
-    const { candidate, firstTurnMatch, rollupMatch, titleMatch } = metadata;
-    const matchedTokens = new Set([...titleMatch.tokens, ...firstTurnMatch.tokens, ...rollupMatch.tokens]);
+    const { candidate, contentBm25, contentMatch, firstTurnMatch, rollupMatch, titleMatch } = metadata;
+    const matchedTokens = new Set([...titleMatch.tokens, ...firstTurnMatch.tokens, ...rollupMatch.tokens, ...contentMatch.tokens]);
     const matchesQuery =
         matchingMode === 'strict'
             ? query.components.every((token) => matchedTokens.has(token))
@@ -265,6 +291,14 @@ function hitForSession(metadata: PreparedMetadata, query: RecallQuery, matchingM
             tier: REMEMBER_MATCH_SCORES.rollup,
         };
     }
+    if (contentMatch.tokens.size > 0) {
+        return {
+            ...hitIdentity(candidate),
+            contentBm25,
+            matchedTokens,
+            tier: REMEMBER_MATCH_SCORES.content,
+        };
+    }
     return {
         ...hitIdentity(candidate),
         matchedTokens,
@@ -287,11 +321,31 @@ function coverageLine(
     totalProjects: number,
     searchedSessions: number,
     totalSessions: number,
+    contentCoverage: StoredContentCoverage | undefined,
+    absenceIsInconclusive: boolean,
 ): string | undefined {
-    if (reasons.length === 0) {
+    if (reasons.length === 0 && (contentCoverage === undefined || contentCoverage.total === 0)) {
         return undefined;
     }
-    return `Partial coverage (${reasons.join(', ')}): searched ${searchedProjects} of ${totalProjects} projects and ${searchedSessions} of ${totalSessions} sessions.`;
+    const partialDurableCopies =
+        contentCoverage === undefined ? 0 : contentCoverage.completeTruncated + contentCoverage.incomplete + contentCoverage.neverCaptured;
+    const allReasons = [...reasons, partialDurableCopies > 0 ? 'partial durable copies' : undefined].filter(
+        (reason): reason is string => reason !== undefined,
+    );
+    const scanCoverage =
+        allReasons.length === 0
+            ? undefined
+            : `Partial coverage (${allReasons.join(', ')}): searched ${searchedProjects} of ${totalProjects} projects and ${searchedSessions} of ${totalSessions} sessions.`;
+    const durableCoverage =
+        contentCoverage === undefined || contentCoverage.total === 0
+            ? undefined
+            : `Content coverage: ${contentCoverage.complete} complete, ${contentCoverage.completeTruncated} complete_truncated, ${contentCoverage.incomplete} incomplete, ${contentCoverage.neverCaptured} never durably captured.`;
+    const inconclusive = absenceIsInconclusive && allReasons.length > 0 ? 'Absence is not conclusive.' : undefined;
+    return [scanCoverage, durableCoverage, inconclusive].filter((part): part is string => part !== undefined).join(' ');
+}
+
+function quotedFtsToken(token: string): string {
+    return `"${token.replaceAll('"', '""')}"`;
 }
 
 function emptyMessage(query: RecallQuery, scope: RecallScope, project: ProjectSet | undefined): string {
@@ -353,7 +407,7 @@ function renderBody(
     return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId) };
 }
 
-// Scans recent sessions without an index and returns a fully budgeted injection body.
+// Scans recent metadata plus indexed durable content and returns a fully budgeted injection body.
 export async function lexicalRecall(
     reader: SessionReader,
     projects: ProjectSet[],
@@ -380,8 +434,39 @@ export async function lexicalRecall(
         }
         prepared.push(prepareMetadata(candidate, query));
     }
+    const metadataPrepared = [...prepared];
+    const contentRecall =
+        typeof reader.storedContentRecallFor === 'function'
+            ? reader.storedContentRecallFor(
+                  allCandidates.map((candidate) => candidate.session),
+                  [...new Set(query.components)].map(quotedFtsToken),
+                  REMEMBER_SESSION_RECENCY_CAP[scope],
+                  () => scanClock() - scanStartedAt <= REMEMBER_SCAN_BUDGET_MS,
+              )
+            : undefined;
+    const preparedBySession = new Map(prepared.map((metadata) => [metadata.candidate.session.id, metadata]));
+    if (contentRecall !== undefined) {
+        const candidateBySession = new Map(allCandidates.map((candidate) => [candidate.session.id, candidate]));
+        for (const [sessionId, content] of contentRecall.matches) {
+            const candidate = candidateBySession.get(sessionId);
+            if (candidate === undefined) {
+                continue;
+            }
+            const contentMatch = match(content.texts, query);
+            if (contentMatch.tokens.size === 0) {
+                continue;
+            }
+            const metadata = preparedBySession.get(sessionId) ?? prepareMetadata(candidate, query);
+            metadata.contentBm25 = content.bm25;
+            metadata.contentMatch = contentMatch;
+            if (!preparedBySession.has(sessionId)) {
+                prepared.push(metadata);
+                preparedBySession.set(sessionId, metadata);
+            }
+        }
+    }
     const capReached = candidates.length < allCandidates.length;
-    const timeBudgetReached = prepared.length < candidates.length;
+    const timeBudgetReached = metadataPrepared.length < candidates.length || contentRecall?.timeBudgetReached === true;
     const totalByProject = new Map(projects.map((project) => [project.key, 0]));
     for (const candidate of allCandidates) {
         totalByProject.set(candidate.project.key, (totalByProject.get(candidate.project.key) ?? 0) + 1);
@@ -390,7 +475,7 @@ export async function lexicalRecall(
     let notYetIndexedSessions = 0;
     let searchedSessions = 0;
 
-    for (const metadata of prepared) {
+    for (const metadata of metadataPrepared) {
         const candidate = metadata.candidate;
         if (candidate.session.first_prompt_search === null) {
             notYetIndexedSessions += 1;
@@ -405,9 +490,9 @@ export async function lexicalRecall(
     const reasons = [
         capReached ? 'recency cap' : undefined,
         timeBudgetReached ? 'time budget' : undefined,
+        contentRecall?.rowCapReached === true ? 'content row cap' : undefined,
         notYetIndexedSessions > 0 ? `${notYetIndexedSessions} not-yet-indexed` : undefined,
     ].filter((reason): reason is string => reason !== undefined);
-    const coverage = coverageLine(reasons, searchedProjects, projects.length, searchedSessions, allCandidates.length);
     const rarity = prepareRarity(prepared, query);
     const matched = prepared.flatMap((metadata) => {
         const hit = hitForSession(metadata, query, matchingMode);
@@ -423,5 +508,14 @@ export async function lexicalRecall(
         hits = rankAndFloorHits(laxMatches, rarity);
         usedLaxFallback = hits.length > 0;
     }
+    const coverage = coverageLine(
+        reasons,
+        searchedProjects,
+        projects.length,
+        searchedSessions,
+        allCandidates.length,
+        contentRecall?.coverage,
+        hits.length === 0,
+    );
     return renderBody(query, hits, coverage, renderedAt, scope, projects[0], usedLaxFallback);
 }
