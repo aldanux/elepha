@@ -2,14 +2,10 @@
 
 ## 0.3.2
 
-### Patch Changes
-
 - Make `elepha:query` match session summaries, recorded decisions, and pending items by [@aldanux](https://github.com/aldanux) in [#46](https://github.com/aldanux/elepha/pull/46)
 - Lead with the reasoning elepha preserves and update the npm package description by [@aldanux](https://github.com/aldanux) in [#45](https://github.com/aldanux/elepha/pull/45)
 
 ## 0.3.1
-
-### Patch Changes
 
 - Lead each changelog entry with what changed, and put the pull request and author after it by [@aldanux](https://github.com/aldanux) in [#25](https://github.com/aldanux/elepha/pull/25)
 - Point user-facing repository and documentation links at `aldanux/elepha` by [@aldanux](https://github.com/aldanux) in [#39](https://github.com/aldanux/elepha/pull/39)
@@ -17,15 +13,11 @@
 
 ## 0.3.0
 
-### Minor Changes
-
 - [#19](https://github.com/elepha-app/elepha/pull/19) [`8d94840`](https://github.com/elepha-app/elepha/commit/8d948400c9a368f4ec825850d9bf9f05bc0a544d) Thanks [@aldanux](https://github.com/aldanux)! - Populate existing sessions' first-prompt search index automatically in the background after the daemon starts.
 
 - [#23](https://github.com/elepha-app/elepha/pull/23) [`0574e14`](https://github.com/elepha-app/elepha/commit/0574e14fd37b0c5427a5dba00e7e299f6ad7ff88) Thanks [@aldanux](https://github.com/aldanux)! - Derive existing session titles from user-written prose while skipping command wrappers, paths, code, repeated boilerplate, and Codex history-review preambles.
 
 - [#16](https://github.com/elepha-app/elepha/pull/16) [`0ac2ffa`](https://github.com/elepha-app/elepha/commit/0ac2ffa5c70788f632f7b53897552e9bc1f65645) Thanks [@aldanux](https://github.com/aldanux)! - Show labelled partial-term results when strict recall finds no complete match.
-
-### Patch Changes
 
 - [#17](https://github.com/elepha-app/elepha/pull/17) [`21f3d79`](https://github.com/elepha-app/elepha/commit/21f3d796d6c6632cf3da82215a4224eda0c43796) Thanks [@aldanux](https://github.com/aldanux)! - Align interactive wizard questions with their options and actual capture behavior.
 
@@ -47,10 +39,8 @@
 
 ## 0.2.0
 
-### Minor Changes
-
 - 09ec4ac: Corrected duplicated and overly generic package keywords.
 
 ## 0.1.0
 
-First public release.
+- First public release.

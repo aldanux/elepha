@@ -68,6 +68,7 @@ jobs:
 
           git switch --create "$RELEASE_BRANCH"
           npx changeset version
+          perl -0pi -e 's/^### (?:Patch|Minor|Major) Changes\n\n//gm' CHANGELOG.md
 
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
