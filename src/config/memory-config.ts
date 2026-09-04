@@ -2,6 +2,7 @@
 // error, whereas an absent config keeps the documented fail-open defaults.
 
 import { readFileSync } from 'node:fs';
+import { DURABLE_CAPTURE_MAX_BYTES } from './constants.js';
 import { elephaConfigPath } from './paths.js';
 
 export type StartupMode = 'notify' | 'auto' | 'off' | 'ask';
@@ -14,6 +15,7 @@ export interface MemoryConfig {
     captureClaudeCode?: boolean;
     captureCodex?: boolean;
     durableCapture?: boolean;
+    durableCaptureMaxBytes?: number;
 }
 
 export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
@@ -24,6 +26,7 @@ export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
     captureClaudeCode: true,
     captureCodex: true,
     durableCapture: false,
+    durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };
 
 const KEYS = ['on_startup', 'on_clear', 'on_resume', 'on_compact'] as const;
@@ -58,6 +61,10 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
     }
     if (typeof settings['durable-capture'] === 'boolean') {
         output.durableCapture = settings['durable-capture'];
+    }
+    const durableCaptureMaxBytes = settings['durable-capture-max-bytes'];
+    if (typeof durableCaptureMaxBytes === 'number' && Number.isSafeInteger(durableCaptureMaxBytes) && durableCaptureMaxBytes > 0) {
+        output.durableCaptureMaxBytes = durableCaptureMaxBytes;
     }
     const memory = (parsed as { memory?: unknown }).memory;
     if (memory === undefined) {

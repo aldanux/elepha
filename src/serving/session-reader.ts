@@ -59,6 +59,7 @@ export interface AvailableStoredContentCoverage {
     complete: number;
     completeTruncated: number;
     incomplete: number;
+    evicted: number;
     neverCaptured: number;
     total: number;
 }
@@ -256,6 +257,7 @@ export class SessionReader {
             complete: 0,
             completeTruncated: 0,
             incomplete: 0,
+            evicted: 0,
             neverCaptured: 0,
             total: 0,
         };
@@ -308,6 +310,8 @@ export class SessionReader {
                 coverage.complete += 1;
             } else if (row.state === 'complete_truncated' && currentAndCovered) {
                 coverage.completeTruncated += 1;
+            } else if (row.state === 'evicted') {
+                coverage.evicted += 1;
             } else if (row.state !== null || row.has_filtered === 1) {
                 coverage.incomplete += 1;
             } else {
@@ -318,7 +322,13 @@ export class SessionReader {
             return { coverage, matches: new Map(), rowCapReached: false, timeBudgetReached: false };
         }
 
-        const activeIdsJson = JSON.stringify(activeIds);
+        // State is authoritative even if an interrupted external repair left
+        // stale FTS rows behind; evicted sessions are pre-durable search input.
+        const searchableIds = coverageRows.filter((row) => row.state !== 'evicted').map((row) => row.id);
+        if (searchableIds.length === 0) {
+            return { coverage, matches: new Map(), rowCapReached: false, timeBudgetReached: false };
+        }
+        const activeIdsJson = JSON.stringify(searchableIds);
         const ftsStatement = this.db.prepare(
             `WITH eligible(id) AS (
                  SELECT CAST(value AS INTEGER) FROM json_each(?)
@@ -493,6 +503,9 @@ export class SessionReader {
                 )
                 .get(session.id);
             return { complete: false, present: capturedRow !== undefined };
+        }
+        if (status.state === 'evicted') {
+            return { complete: false, present: false };
         }
         if (
             (status.state !== 'complete' && status.state !== 'complete_truncated') ||

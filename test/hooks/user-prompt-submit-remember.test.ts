@@ -156,7 +156,7 @@ function addDurableCopy(
     fixture: TestDatabase,
     session: ReturnType<typeof seedSession>,
     turns: Array<{ assistant?: string; tools?: string; user?: string }>,
-    state: 'complete' | 'complete_truncated' | 'disabled_gap' | null = 'complete',
+    state: 'complete' | 'complete_truncated' | 'disabled_gap' | 'evicted' | null = 'complete',
 ): void {
     const memories = fixture.db
         .prepare('SELECT id, turn_index FROM memories WHERE session_id = ? ORDER BY turn_index')
@@ -309,7 +309,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(global.split('\n').at(-2)).toBe(SELECT_HINT);
         expect(here).not.toContain('Approved remote match');
         expect(here).toContain(
-            `No recall matches found for “cross project needle” in current. Search every project with elepha:query cross project needle.\n\nPartial coverage (partial durable copies): searched 1 of 1 projects and 1 of 1 sessions. Content coverage: 0 complete, 0 complete_truncated, 0 incomplete, 1 never durably captured. Absence is not conclusive.\n\n${SELECT_HINT}`,
+            `No recall matches found for “cross project needle” in current. Search every project with elepha:query cross project needle.\n\nPartial coverage (partial durable copies): searched 1 of 1 projects and 1 of 1 sessions. Content coverage: 0 complete, 0 complete_truncated, 0 incomplete, 0 evicted, 1 never durably captured. Absence is not conclusive.\n\n${SELECT_HINT}`,
         );
         expect(here).not.toContain('\n\n\n');
         expect(here.split('\n').at(-2)).toBe(SELECT_HINT);
@@ -709,7 +709,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(oldest).toBeDefined();
         if (!oldest) return;
         const storedContentRecallFor = vi.fn(() => ({
-            coverage: { complete: 1, completeTruncated: 0, incomplete: 0, neverCaptured: total - 1, total },
+            coverage: { complete: 1, completeTruncated: 0, incomplete: 0, evicted: 0, neverCaptured: total - 1, total },
             matches: new Map([[oldest.id, { bm25: -1, texts: ['outsidecapneedle'] }]]),
             rowCapReached: false,
             timeBudgetReached: false,
@@ -889,7 +889,7 @@ describe('UserPromptSubmit lexical recall', () => {
     it('reports durable content coverage and makes partial-copy misses explicitly inconclusive', async () => {
         const fixture = createTestDb('elepha-query-content-coverage-');
         const current = addProject(fixture, 'current', 'approved');
-        const sessions = (['complete', 'complete_truncated', 'disabled_gap', null] as const).map((state, index) => {
+        const sessions = (['complete', 'complete_truncated', 'disabled_gap', 'evicted', null] as const).map((state, index) => {
             const session = addSession(fixture, current.project, current.projectPath, {
                 nativeId: `coverage-${index}`,
                 title: `Coverage session ${index}`,
@@ -917,7 +917,7 @@ describe('UserPromptSubmit lexical recall', () => {
 
         expect(result.sessionIds).toEqual([]);
         expect(result.body).toContain(
-            `Partial coverage (partial durable copies): searched 1 of 1 projects and ${sessions.length} of ${sessions.length} sessions. Content coverage: 1 complete, 1 complete_truncated, 1 incomplete, 1 never durably captured. Absence is not conclusive.`,
+            `Partial coverage (partial durable copies): searched 1 of 1 projects and ${sessions.length} of ${sessions.length} sessions. Content coverage: 1 complete, 1 complete_truncated, 1 incomplete, 1 evicted, 1 never durably captured. Absence is not conclusive.`,
         );
     });
 

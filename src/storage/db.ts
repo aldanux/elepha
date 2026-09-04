@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS durable_capture_status (
   updated_at     TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS durable_capture_usage (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0)
+);
+
 -- Session-level rollups. Additive: turn rows in memories are never deleted
 -- after rollup, and a rollup can always be rebuilt from them.
 --
@@ -200,6 +205,7 @@ CREATE TABLE IF NOT EXISTS incognito_transcripts (
 // an already-existing table.
 function migrate(db: Database.Database): void {
     migrateSessionsTable(db);
+    migrateDurableCaptureStatus(db);
 
     const projectColumns = (db.pragma('table_info(projects)') as Array<{ name: string }>).map((c) => c.name);
     if (!projectColumns.includes('git_root_commit')) {
@@ -271,6 +277,37 @@ function migrate(db: Database.Database): void {
     }
 }
 
+function migrateDurableCaptureStatus(db: Database.Database): void {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'durable_capture_status'").get() as
+        | { sql: string }
+        | undefined;
+    if (schema === undefined || schema.sql.includes("'evicted'")) {
+        return;
+    }
+
+    const rebuild = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE durable_capture_status_new (
+            session_id     INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            state          TEXT NOT NULL CHECK (state IN (${DURABLE_CAPTURE_STATES.map((state) => `'${state}'`).join(',')})),
+            filter_version INTEGER NOT NULL,
+            updated_at     TEXT NOT NULL
+          );
+          INSERT INTO durable_capture_status_new (session_id, state, filter_version, updated_at)
+          SELECT session_id, state, filter_version, updated_at FROM durable_capture_status;
+          DROP TABLE durable_capture_status;
+          ALTER TABLE durable_capture_status_new RENAME TO durable_capture_status;
+        `);
+        const violations = db.pragma('foreign_key_check');
+        if (Array.isArray(violations) && violations.length > 0) {
+            throw new Error(
+                `durable_capture_status table rebuild left ${violations.length} foreign-key violation(s): ${JSON.stringify(violations)}`,
+            );
+        }
+    });
+    rebuild();
+}
+
 function migrateDurableCaptureFts(db: Database.Database): void {
     const existed = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'filtered_turns_fts'").get() !== undefined;
     const apply = db.transaction(() => {
@@ -306,6 +343,58 @@ function migrateDurableCaptureFts(db: Database.Database): void {
         if (!existed) {
             db.exec("INSERT INTO filtered_turns_fts(filtered_turns_fts) VALUES ('rebuild')");
         }
+    });
+    apply();
+}
+
+function migrateDurableCaptureUsage(db: Database.Database): void {
+    const apply = db.transaction(() => {
+        const initialized = db.prepare('SELECT 1 FROM durable_capture_usage WHERE id = 1').get() !== undefined;
+        if (!initialized) {
+            // Existing databases pay for one full measurement here. Every
+            // later content mutation updates the ledger in the same SQLite
+            // transaction, keeping the capture hot path constant-time.
+            db.exec(`
+              INSERT INTO durable_capture_usage (id, total_bytes)
+              SELECT 1, COALESCE(SUM(
+                length(CAST(user_prompt AS BLOB)) +
+                length(CAST(assistant_response AS BLOB)) +
+                length(CAST(tool_calls AS BLOB))
+              ), 0)
+              FROM filtered_turns;
+            `);
+        }
+        db.exec(`
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_ai AFTER INSERT ON filtered_turns BEGIN
+            UPDATE durable_capture_usage
+            SET total_bytes = total_bytes +
+                length(CAST(new.user_prompt AS BLOB)) +
+                length(CAST(new.assistant_response AS BLOB)) +
+                length(CAST(new.tool_calls AS BLOB))
+            WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_ad AFTER DELETE ON filtered_turns BEGIN
+            UPDATE durable_capture_usage
+            SET total_bytes = total_bytes -
+                length(CAST(old.user_prompt AS BLOB)) -
+                length(CAST(old.assistant_response AS BLOB)) -
+                length(CAST(old.tool_calls AS BLOB))
+            WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_au AFTER UPDATE OF user_prompt, assistant_response, tool_calls ON filtered_turns BEGIN
+            UPDATE durable_capture_usage
+            SET total_bytes = total_bytes -
+                length(CAST(old.user_prompt AS BLOB)) -
+                length(CAST(old.assistant_response AS BLOB)) -
+                length(CAST(old.tool_calls AS BLOB)) +
+                length(CAST(new.user_prompt AS BLOB)) +
+                length(CAST(new.assistant_response AS BLOB)) +
+                length(CAST(new.tool_calls AS BLOB))
+            WHERE id = 1;
+          END;
+        `);
     });
     apply();
 }
@@ -465,6 +554,7 @@ function initializeDatabase(db: Database.Database, dbPath: string): Database.Dat
     db.exec(SCHEMA);
     migrate(db);
     migrateDurableCaptureFts(db);
+    migrateDurableCaptureUsage(db);
     grandfatherConsentRoots(db);
     canonicalizeConsentRoots(db);
     if (dbPath !== ':memory:') {

@@ -1,5 +1,11 @@
+import { existsSync } from 'node:fs';
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
-import { DURABLE_CAPTURE_FILTER_VERSION, type DurableCaptureState, SESSION_CHAR_BUDGET } from '../config/constants.js';
+import {
+    DURABLE_CAPTURE_FILTER_VERSION,
+    DURABLE_CAPTURE_MAX_BYTES,
+    type DurableCaptureState,
+    SESSION_CHAR_BUDGET,
+} from '../config/constants.js';
 import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import { detectShellSyntax, escapeShellSyntax } from '../security/sanitize.js';
 
@@ -95,6 +101,10 @@ export class DurableCaptureStore {
     private readonly insertFilteredTurn: Statement;
     private readonly sessionCaptureState: Statement;
     private readonly upsertStatus: Statement;
+    private readonly statusForSession: Statement;
+    private readonly totalBytes: Statement;
+    private readonly evictionCandidates: Statement;
+    private readonly deleteSessionTurns: Statement;
 
     constructor(db: Database) {
         this.insertFilteredTurn = db.prepare(
@@ -127,9 +137,32 @@ export class DurableCaptureStore {
                filter_version = excluded.filter_version,
                updated_at = excluded.updated_at`,
         );
+        this.statusForSession = db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?');
+        this.totalBytes = db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1');
+        this.evictionCandidates = db.prepare(
+            `SELECT DISTINCT s.id, s.source_path
+             FROM sessions s
+             JOIN memories m ON m.session_id = s.id
+             JOIN filtered_turns ft ON ft.memory_id = m.id
+             WHERE s.id <> ?
+             ORDER BY s.last_ingested_at, s.id`,
+        );
+        this.deleteSessionTurns = db.prepare(
+            'DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)',
+        );
     }
 
-    record(memoryId: number | bigint, sessionId: number, projection: FilteredTurnProjection, capturedAt: string): void {
+    record(
+        memoryId: number | bigint,
+        sessionId: number,
+        projection: FilteredTurnProjection,
+        capturedAt: string,
+        maxBytes = DURABLE_CAPTURE_MAX_BYTES,
+    ): boolean {
+        const status = this.statusForSession.get(sessionId) as { state: DurableCaptureState } | undefined;
+        if (status?.state === 'evicted') {
+            return false;
+        }
         const stored = projection.included
             ? boundedSanitizedProjection(projection)
             : { userPrompt: '', assistantResponse: '', toolCalls: [], omittedBeforeChars: 0, droppedToolRefCount: 0 };
@@ -147,6 +180,8 @@ export class DurableCaptureStore {
         });
         const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
         this.upsertStatus.run(sessionId, row.state, projection.filterVersion, capturedAt);
+        this.enforceMaxBytes(sessionId, maxBytes, capturedAt);
+        return true;
     }
 
     setStatus(sessionId: number, state: DurableCaptureState, updatedAt: string): void {
@@ -157,5 +192,29 @@ export class DurableCaptureStore {
         const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
         this.setStatus(sessionId, row.state, updatedAt);
         return row.state;
+    }
+
+    private enforceMaxBytes(currentSessionId: number, maxBytes: number, updatedAt: string): void {
+        let totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
+        if (totalBytes <= maxBytes) {
+            return;
+        }
+        const candidates = this.evictionCandidates.all(currentSessionId) as Array<{ id: number; source_path: string }>;
+        const recoverable: Array<{ id: number; source_path: string }> = [];
+        const unavailable: Array<{ id: number; source_path: string }> = [];
+        // Both lists retain the oldest-first SQL order. Exhausting the
+        // recoverable list first protects copies whose provider transcript
+        // has already disappeared and therefore cannot be rebuilt.
+        for (const candidate of candidates) {
+            (existsSync(candidate.source_path) ? recoverable : unavailable).push(candidate);
+        }
+        for (const victim of [...recoverable, ...unavailable]) {
+            this.deleteSessionTurns.run(victim.id);
+            this.upsertStatus.run(victim.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
+            totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
+            if (totalBytes <= maxBytes) {
+                return;
+            }
+        }
     }
 }

@@ -557,6 +557,46 @@ describe('P2.8 bounded shared episode reader', () => {
         });
     });
 
+    it('treats an evicted copy as pre-durable content for search and transcript serving', async () => {
+        const fixture = createTestDb('elepha-session-reader-evicted-');
+        await withCodexStore(fixture.directory, async (storeRoot) => {
+            const sourcePath = `${storeRoot}/evicted.jsonl`;
+            writeFileSync(sourcePath, '{}\n');
+            const project = seedProject(fixture, { path: '/tmp/project' });
+            const storedSession = seedSession(fixture, { project, nativeId: 'evicted', sourcePath });
+            captureTurns(fixture, project, storedSession, [turn(0, 'evictedsearchneedle durable response')], true);
+            fixture.db.transaction(() => {
+                fixture.db
+                    .prepare('DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                    .run(storedSession.id);
+                fixture.db.prepare("UPDATE durable_capture_status SET state = 'evicted' WHERE session_id = ?").run(storedSession.id);
+            })();
+            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
+                yield turn(0, 'source fallback response');
+            });
+            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            const servedSession = reader.sessionById(storedSession.id);
+            if (!servedSession) throw new Error('seeded evicted session was not found');
+
+            const recall = reader.storedContentRecallFor([servedSession], ['"evictedsearchneedle"'], 10, () => true);
+            expect(recall.coverage).toEqual({
+                complete: 0,
+                completeTruncated: 0,
+                incomplete: 0,
+                evicted: 1,
+                neverCaptured: 0,
+                total: 1,
+            });
+            expect(recall.matches).toEqual(new Map());
+            const fromSource = await reader.render(servedSession);
+            expect(fromSource.episode?.text).toContain('source fallback response');
+            expect(parseTurns).toHaveBeenCalledTimes(1);
+
+            unlinkSync(sourcePath);
+            await expect(reader.render(servedSession)).resolves.toEqual({ reason: 'transcript_missing' });
+        });
+    });
+
     it.each([
         {
             name: 'a missing filtered row',

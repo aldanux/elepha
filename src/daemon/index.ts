@@ -24,6 +24,7 @@ import {
     DEFAULT_IDLE_DEBOUNCE_MS,
     DEFAULT_MAX_CONCURRENT,
     DURABLE_CAPTURE_BACKFILL_BATCH_SIZE,
+    DURABLE_CAPTURE_MAX_BYTES,
     FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
@@ -210,6 +211,7 @@ export class IngestionDaemon {
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
     private readonly durableCapture: boolean;
+    private readonly durableCaptureMaxBytes: number;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
     private readonly openTranscript: ProviderTranscriptOpener;
     private readonly firstPromptSearchBackfillBatchSize: number;
@@ -259,6 +261,7 @@ export class IngestionDaemon {
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
         this.durableCapture = configResult.config.durableCapture ?? false;
+        this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
         this.store = options.store;
         this.openTranscript = options.openTranscript ?? openProviderTranscript;
         this.summarizer = options.summarizer;
@@ -449,7 +452,7 @@ export class IngestionDaemon {
 
     private async backfillDurableCapture(): Promise<void> {
         const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as Record<ToolName, SessionAdapter>;
-        const backfill = new DurableCaptureBackfillStore(this.store.database, this.store.consent);
+        const backfill = new DurableCaptureBackfillStore(this.store.database, this.store.consent, this.durableCaptureMaxBytes);
         while (!this.stopping) {
             const consentedProjectIds = new ProjectResolver(this.store.database)
                 .listConsentedStored(this.store.consent)
@@ -482,6 +485,7 @@ export class IngestionDaemon {
 
                 let parseFailed = false;
                 let writeUnauthorized = false;
+                let writeEvicted = false;
                 try {
                     const adapter = adapters[session.tool];
                     for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
@@ -516,6 +520,10 @@ export class IngestionDaemon {
                             writeUnauthorized = true;
                             break;
                         }
+                        if (result.state === 'evicted') {
+                            writeEvicted = true;
+                            break;
+                        }
                         if (result.state === 'memory_missing') {
                             parseFailed = true;
                             break;
@@ -533,7 +541,7 @@ export class IngestionDaemon {
                 if (this.stopping) {
                     return;
                 }
-                if (writeUnauthorized) {
+                if (writeUnauthorized || writeEvicted) {
                     continue;
                 }
                 backfill.finish(session, affectedSessionIds, parseFailed ? 'parse_error' : 'success', new Date().toISOString());
@@ -1206,7 +1214,7 @@ export class IngestionDaemon {
         if (this.summarizer) {
             this.trackOutcome(summary.status);
         }
-        const persisted = this.store.recordIngestedTurn(turn, meta, cut, summary, this.durableCapture);
+        const persisted = this.store.recordIngestedTurn(turn, meta, cut, summary, this.durableCapture, this.durableCaptureMaxBytes);
         if (!persisted) {
             return false;
         }

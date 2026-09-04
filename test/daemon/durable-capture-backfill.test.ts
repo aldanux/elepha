@@ -4,6 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DURABLE_CAPTURE_FILTER_VERSION } from '../../src/config/constants.js';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
+import { filterTurn } from '../../src/rendering/filtered-turn.js';
+import { type DurableCaptureBackfillSession, DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
@@ -67,6 +69,56 @@ function enabledConfig() {
 
 describe('daemon durable capture backfill', () => {
     afterEach(() => vi.unstubAllEnvs());
+
+    it('enforces the configured byte cap while backfilling sessions', () => {
+        const fixture = createTestDb('elepha-durable-backfill-cap-');
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const firstPath = path.join(fixture.directory, 'first.jsonl');
+        const secondPath = path.join(fixture.directory, 'second.jsonl');
+        writeFileSync(firstPath, '{}\n');
+        writeFileSync(secondPath, '{}\n');
+        const first = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'first', sourcePath: firstPath });
+        const second = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'second', sourcePath: secondPath });
+        seedMemory(fixture, { project, session: first });
+        seedMemory(fixture, { project, session: second });
+        fixture.db.prepare('UPDATE sessions SET last_ingested_at = ? WHERE id = ?').run('2026-01-01T00:00:00.000Z', first.id);
+        fixture.db.prepare('UPDATE sessions SET last_ingested_at = ? WHERE id = ?').run('2026-01-02T00:00:00.000Z', second.id);
+        const store = new DurableCaptureBackfillStore(fixture.db, fixture.store.consent, 300);
+        const backfillSession = (session: typeof first): DurableCaptureBackfillSession => ({
+            id: session.id,
+            projectId: session.project_id,
+            tool: session.tool,
+            nativeId: session.native_id,
+            sourcePath: session.source_path,
+        });
+        for (const session of [first, second]) {
+            const candidate = backfillSession(session);
+            const work = store.begin(candidate, NOW);
+            expect(work?.missingTurnIndexes).toEqual(new Set([0]));
+            const parsed = parsedTurn(session.source_path, session.native_id, 0);
+            parsed.userMessage = `${session.native_id}-${'x'.repeat(200)}`;
+            parsed.toolCalls = [];
+            expect(store.record(candidate, 0, filterTurn(parsed), NOW)).toEqual({ state: 'recorded', sessionId: session.id });
+            store.finish(candidate, new Set([session.id]), 'success', NOW);
+        }
+
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(first.id)).toEqual({
+            state: 'evicted',
+        });
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(second.id)).toEqual({
+            state: 'complete',
+        });
+        expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
+        expect(
+            (fixture.db.prepare('SELECT total_bytes FROM durable_capture_usage').get() as { total_bytes: number }).total_bytes,
+        ).toBeLessThanOrEqual(300);
+        expect(store.begin(backfillSession(first), NOW)).toBeUndefined();
+        store.finish(backfillSession(first), new Set([first.id]), 'parse_error', NOW);
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(first.id)).toEqual({
+            state: 'evicted',
+        });
+    });
 
     it('runs after the startup sweep, fills historical memories without synthesis, and marks a missing source unavailable', async () => {
         const fixture = createTestDb('elepha-durable-backfill-');

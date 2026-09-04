@@ -334,7 +334,9 @@ function coverageLine(
         return undefined;
     }
     const partialDurableCopies =
-        contentCoverage === undefined ? 0 : contentCoverage.completeTruncated + contentCoverage.incomplete + contentCoverage.neverCaptured;
+        contentCoverage === undefined
+            ? 0
+            : contentCoverage.completeTruncated + contentCoverage.incomplete + contentCoverage.evicted + contentCoverage.neverCaptured;
     const allReasons = [...reasons, partialDurableCopies > 0 ? 'partial durable copies' : undefined].filter(
         (reason): reason is string => reason !== undefined,
     );
@@ -345,7 +347,7 @@ function coverageLine(
     const durableCoverage =
         contentCoverage === undefined || contentCoverage.total === 0
             ? undefined
-            : `Content coverage: ${contentCoverage.complete} complete, ${contentCoverage.completeTruncated} complete_truncated, ${contentCoverage.incomplete} incomplete, ${contentCoverage.neverCaptured} never durably captured.`;
+            : `Content coverage: ${contentCoverage.complete} complete, ${contentCoverage.completeTruncated} complete_truncated, ${contentCoverage.incomplete} incomplete, ${contentCoverage.evicted} evicted, ${contentCoverage.neverCaptured} never durably captured.`;
     const inconclusive = absenceIsInconclusive && allReasons.length > 0 ? 'Absence is not conclusive.' : undefined;
     return [scanCoverage, durableCoverage, inconclusive].filter((part): part is string => part !== undefined).join(' ');
 }

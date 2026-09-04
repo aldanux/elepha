@@ -3,6 +3,7 @@
 
 import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
@@ -222,8 +223,15 @@ export class MemoryStore {
         return this.turns.getLastIngestedAt();
     }
 
-    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput, durableCapture = false): boolean {
-        return this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture);
+    recordTurn(
+        turn: ParsedTurn,
+        sessionDbId: number,
+        projectId: number,
+        summary: SummarizationOutput,
+        durableCapture = false,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+    ): boolean {
+        return this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes);
     }
 
     // Creates the project/session and records one live turn as one SQLite
@@ -236,6 +244,7 @@ export class MemoryStore {
         startNextSegment: boolean,
         summary: SummarizationOutput,
         durableCapture = false,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
     ): { project: ProjectRow; session: SessionRow; inserted: boolean } | undefined {
         const resolved = this.resolveTurnGitValues(turn, startNextSegment);
         const write = this.db.transaction(() => {
@@ -260,7 +269,7 @@ export class MemoryStore {
             return {
                 project,
                 session,
-                inserted: this.turns.recordTurnInTransaction(turn, session.id, project.id, summary, durableCapture),
+                inserted: this.turns.recordTurnInTransaction(turn, session.id, project.id, summary, durableCapture, durableCaptureMaxBytes),
             };
         });
         return write();

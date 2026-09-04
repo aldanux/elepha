@@ -16,6 +16,7 @@ export const SQLITE_MINIMUM_DATABASE_BYTES = 512;
 export const CHARS_PER_TOKEN = 4;
 export const SESSION_TOKEN_BUDGET = 20_000;
 export const SESSION_CHAR_BUDGET = SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN;
+export const DURABLE_CAPTURE_MAX_BYTES = 1024 * 1024 * 1024;
 export const DURABLE_CAPTURE_FILTER_VERSION = 1;
 export const DURABLE_CAPTURE_STATES = [
     'complete',
@@ -26,6 +27,7 @@ export const DURABLE_CAPTURE_STATES = [
     'parse_error',
     'revoked',
     'incognito',
+    'evicted',
 ] as const;
 export type DurableCaptureState = (typeof DURABLE_CAPTURE_STATES)[number];
 export const MAX_GET_SESSION_LAST_N = 500;

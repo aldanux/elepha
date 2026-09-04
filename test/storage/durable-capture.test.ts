@@ -1,8 +1,11 @@
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DURABLE_CAPTURE_FILTER_VERSION, SESSION_CHAR_BUDGET } from '../../src/config/constants.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { createTestDb, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 function turn(overrides: Partial<ParsedTurn> = {}): ParsedTurn {
     return {
@@ -157,5 +160,106 @@ describe('durable capture storage', () => {
             user_prompt: 'y'.repeat(SESSION_CHAR_BUDGET - 1),
             omitted_before_chars: 11,
         });
+    });
+
+    it('evicts whole oldest recoverable sessions first and keeps the byte ledger exact', () => {
+        const testDb = createTestDb('elepha-durable-cap-');
+        const project = seedProject(testDb);
+        const gone = seedSession(testDb, {
+            project,
+            nativeId: 'oldest-gone',
+            sourcePath: path.join(testDb.directory, 'oldest-gone.jsonl'),
+        });
+        const recoverablePath = path.join(testDb.directory, 'newer-recoverable.jsonl');
+        writeFileSync(recoverablePath, '{}\n');
+        const recoverable = seedSession(testDb, { project, nativeId: 'newer-recoverable', sourcePath: recoverablePath });
+        const current = seedSession(testDb, {
+            project,
+            nativeId: 'current',
+            sourcePath: path.join(testDb.directory, 'current.jsonl'),
+        });
+        const capture = (session: typeof gone, marker: string, chars: number, cap?: number, turnIndex = 0): void => {
+            expect(
+                testDb.store.recordTurn(
+                    turn({
+                        sessionId: session.native_id,
+                        sourcePath: session.source_path,
+                        projectPath: project.path,
+                        turnIndex,
+                        cursor: `${turnIndex}`,
+                        userMessage: `${marker}-${'x'.repeat(chars)}`,
+                        assistantText: '',
+                        toolCalls: [],
+                    }),
+                    session.id,
+                    project.id,
+                    summary,
+                    true,
+                    cap,
+                ),
+            ).toBe(true);
+        };
+        capture(gone, 'goneuniqueneedle', 400);
+        capture(recoverable, 'recoverableuniqueneedle', 400);
+        testDb.db.prepare('UPDATE sessions SET last_ingested_at = ? WHERE id = ?').run('2026-01-01T00:00:00.000Z', gone.id);
+        testDb.db.prepare('UPDATE sessions SET last_ingested_at = ? WHERE id = ?').run('2026-01-02T00:00:00.000Z', recoverable.id);
+        seedRollup(testDb, { project, session: recoverable, decisions: [{ what: 'retain rollup', why: 'pre-durable fallback' }] });
+        const cap = (testDb.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number })
+            .total_bytes;
+
+        capture(current, 'currentuniqueneedle', 100, cap);
+
+        expect(testDb.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(recoverable.id)).toEqual({
+            state: 'evicted',
+        });
+        expect(testDb.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(gone.id)).toEqual({
+            state: 'complete',
+        });
+        expect(testDb.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(current.id)).toEqual({
+            state: 'complete',
+        });
+        expect(
+            testDb.db
+                .prepare('SELECT COUNT(*) AS count FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                .get(recoverable.id),
+        ).toEqual({ count: 0 });
+        expect(testDb.db.prepare('SELECT COUNT(*) AS count FROM memories WHERE session_id = ?').get(recoverable.id)).toEqual({ count: 1 });
+        expect(testDb.db.prepare('SELECT COUNT(*) AS count FROM session_rollups WHERE session_id = ?').get(recoverable.id)).toEqual({
+            count: 1,
+        });
+        testDb.db.exec('CREATE VIRTUAL TABLE temp.evicted_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+        expect(
+            testDb.db
+                .prepare('SELECT COUNT(*) AS count FROM temp.evicted_terms WHERE doc IN (SELECT id FROM memories WHERE session_id = ?)')
+                .get(recoverable.id),
+        ).toEqual({ count: 0 });
+        expect(
+            testDb.db
+                .prepare("SELECT COUNT(*) AS count FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'recoverableuniqueneedle'")
+                .get(),
+        ).toEqual({ count: 0 });
+        const usage = testDb.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number };
+        const fresh = testDb.db
+            .prepare(
+                `SELECT COALESCE(SUM(
+                   length(CAST(user_prompt AS BLOB)) +
+                   length(CAST(assistant_response AS BLOB)) +
+                   length(CAST(tool_calls AS BLOB))
+                 ), 0) AS total_bytes
+                 FROM filtered_turns`,
+            )
+            .get() as { total_bytes: number };
+        expect(usage).toEqual(fresh);
+        expect(usage.total_bytes).toBeLessThanOrEqual(cap);
+
+        capture(recoverable, 'resumedaftereviction', 50, cap, 1);
+        expect(testDb.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(recoverable.id)).toEqual({
+            state: 'evicted',
+        });
+        expect(
+            testDb.db
+                .prepare('SELECT COUNT(*) AS count FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                .get(recoverable.id),
+        ).toEqual({ count: 0 });
     });
 });

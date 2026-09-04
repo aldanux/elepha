@@ -71,7 +71,46 @@ describe('sessions table migration', () => {
             'filter_version',
             'updated_at',
         ]);
+        expect((db.pragma('table_info(durable_capture_usage)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+            'id',
+            'total_bytes',
+        ]);
         db.close();
+    });
+
+    it('rebuilds the pre-evicted durable capture status constraint and preserves existing coverage', () => {
+        const directory = withGrantableTestDir('elepha-durable-status-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          INSERT INTO projects (path, first_seen_at, last_seen_at)
+          VALUES ('/legacy', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+          INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
+          VALUES ('codex', 'legacy', 1, '/legacy.jsonl', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+          DROP TABLE durable_capture_status;
+          CREATE TABLE durable_capture_status (
+            session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            state TEXT NOT NULL CHECK (state IN ('complete','complete_truncated','disabled_gap','backfilling','source_unavailable','parse_error','revoked','incognito')),
+            filter_version INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+          INSERT INTO durable_capture_status VALUES (1, 'complete', 1, '2026-01-01T00:00:00.000Z');
+        `);
+        prior.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect(migrated.prepare('SELECT * FROM durable_capture_status').get()).toEqual({
+            session_id: 1,
+            state: 'complete',
+            filter_version: 1,
+            updated_at: '2026-01-01T00:00:00.000Z',
+        });
+        expect(() => migrated.prepare("UPDATE durable_capture_status SET state = 'evicted' WHERE session_id = 1").run()).not.toThrow();
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT state FROM durable_capture_status').get()).toEqual({ state: 'evicted' });
+        reopened.close();
     });
 
     it('creates durable capture FTS objects, rebuilds pre-existing rows once, and remains idempotent on reopen', () => {
@@ -94,6 +133,10 @@ describe('sessions table migration', () => {
           DROP TRIGGER filtered_turns_ad;
           DROP TRIGGER filtered_turns_au;
           DROP TABLE filtered_turns_fts;
+          DROP TRIGGER filtered_turns_usage_ai;
+          DROP TRIGGER filtered_turns_usage_ad;
+          DROP TRIGGER filtered_turns_usage_au;
+          DROP TABLE durable_capture_usage;
         `);
         existing.close();
 
@@ -115,6 +158,18 @@ describe('sessions table migration', () => {
         expect(migrated.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'needle'").all()).toEqual([
             { rowid: 1 },
         ]);
+        expect(migrated.prepare('SELECT total_bytes FROM durable_capture_usage').get()).toEqual(
+            migrated
+                .prepare(
+                    `SELECT SUM(
+                       length(CAST(user_prompt AS BLOB)) +
+                       length(CAST(assistant_response AS BLOB)) +
+                       length(CAST(tool_calls AS BLOB))
+                     ) AS total_bytes
+                     FROM filtered_turns`,
+                )
+                .get(),
+        );
         migrated.close();
 
         const reopened = openUnmanagedDb(dbPath);

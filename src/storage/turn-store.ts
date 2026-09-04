@@ -1,4 +1,5 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
+import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
 import { filterTurn } from '../rendering/filtered-turn.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';
@@ -155,8 +156,17 @@ export class TurnStore {
     // silent data loss). For deliberately overwriting an already-stored turn
     // with a re-summarized result, use reingestTurn instead - IGNORE here
     // would silently discard the fix.
-    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput, durableCapture = false): boolean {
-        const run = this.db.transaction(() => this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture));
+    recordTurn(
+        turn: ParsedTurn,
+        sessionDbId: number,
+        projectId: number,
+        summary: SummarizationOutput,
+        durableCapture = false,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+    ): boolean {
+        const run = this.db.transaction(() =>
+            this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes),
+        );
         return run();
     }
 
@@ -167,6 +177,7 @@ export class TurnStore {
         projectId: number,
         summary: SummarizationOutput,
         durableCapture = false,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
     ): boolean {
         if (this.stmts.isTranscriptPurged.get(turn.tool, turn.sessionId) !== undefined) {
             return false;
@@ -186,7 +197,7 @@ export class TurnStore {
             has_external_content: turn.hasExternalContent ? 1 : 0,
         });
         if (info.changes > 0 && durableCapture) {
-            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now);
+            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now, durableCaptureMaxBytes);
         }
         this.sessions.advanceSessionCursorAt(sessionDbId, turn.cursor, now);
         this.sessions.updateTrailingState(sessionDbId, turn);

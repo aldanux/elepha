@@ -1,4 +1,5 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import type { FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import type { ToolName } from '../types/index.js';
 import type { ConsentStore } from './consent-store.js';
@@ -19,6 +20,7 @@ export interface DurableCaptureBackfillWork {
 export type DurableCaptureBackfillRecordResult =
     | { state: 'recorded'; sessionId: number }
     | { state: 'already_recorded'; sessionId: number }
+    | { state: 'evicted' }
     | { state: 'unauthorized' }
     | { state: 'memory_missing' };
 
@@ -34,6 +36,7 @@ export class DurableCaptureBackfillStore {
     constructor(
         private readonly db: Database,
         private readonly consent: ConsentStore,
+        private readonly maxBytes = DURABLE_CAPTURE_MAX_BYTES,
     ) {
         this.durableCapture = new DurableCaptureStore(db);
     }
@@ -59,7 +62,7 @@ export class DurableCaptureBackfillStore {
                                LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
                                WHERE m.session_id = s.id AND ft.memory_id IS NULL
                            )
-                           AND (dcs.state IS NULL OR dcs.state NOT IN ('source_unavailable', 'parse_error', 'revoked', 'incognito'))
+                           AND (dcs.state IS NULL OR dcs.state NOT IN ('source_unavailable', 'parse_error', 'revoked', 'incognito', 'evicted'))
                        )
                    )
                  ORDER BY s.id
@@ -87,6 +90,12 @@ export class DurableCaptureBackfillStore {
     begin(session: DurableCaptureBackfillSession, updatedAt: string): DurableCaptureBackfillWork | undefined {
         const begin = this.db.transaction(() => {
             if (!this.isAuthorizedSession(session)) {
+                return undefined;
+            }
+            const status = this.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id) as
+                | { state: string }
+                | undefined;
+            if (status?.state === 'evicted') {
                 return undefined;
             }
             const missing = this.db
@@ -131,7 +140,9 @@ export class DurableCaptureBackfillStore {
             if (existing !== undefined) {
                 return { state: 'already_recorded', sessionId: memory.session_id };
             }
-            this.durableCapture.record(memory.memory_id, memory.session_id, projection, capturedAt);
+            if (!this.durableCapture.record(memory.memory_id, memory.session_id, projection, capturedAt, this.maxBytes)) {
+                return { state: 'evicted' };
+            }
             // DurableCaptureStore computes live coverage after every insert;
             // keep interrupted backfills distinguishable until the pass makes
             // its terminal coverage check.
@@ -152,6 +163,12 @@ export class DurableCaptureBackfillStore {
                 return;
             }
             for (const sessionId of sessionIds) {
+                const status = this.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(sessionId) as
+                    | { state: string }
+                    | undefined;
+                if (status?.state === 'evicted') {
+                    continue;
+                }
                 const identity = this.db
                     .prepare(
                         `SELECT s.tool, s.native_id, p.path AS project_path
