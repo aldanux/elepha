@@ -13,7 +13,7 @@ Run the onboarding wizard after installation:
 elepha init
 ```
 
-The wizard detects local sessions from supported AI coding tools and discovers eligible 
+The wizard detects local sessions from supported AI coding tools and discovers eligible
 Git projects, and asks whether you want to approve whole workspace folders or individual
 projects. Folder mode covers projects already inside the selected folder and discovers
 new projects there automatically. Individual mode gives you a project-by-project
@@ -47,7 +47,7 @@ From inside a project, `elepha consent grant --here` grants the current director
 Choose either a path or `--here`, never both.
 
 Revoking a root stops new capture for that scope but keeps its existing memory
-searchable:
+searchable, including any durable conversation copy and its indexed search terms:
 
 ```console
 elepha consent revoke /path/to/workspace
@@ -65,6 +65,13 @@ capture service has discovered but that you have not approved or revoked yet.
 
 Revocation is intentionally non-destructive. To remove memory already stored for a
 project, use the separate workflow in [Deleting memory](purge.md).
+
+Purge and incognito handling are destructive to the durable copy. A confirmed purge
+deletes the selected sessions' filtered turns, durable coverage rows, and full-text
+search terms. When elepha observes a session under an explicit denial, its incognito
+veto removes the same durable copy and search terms for that native transcript. A
+later grant does not backfill that deliberately private period. Revocation alone does
+none of these deletions.
 
 ## Prune stale consent roots
 

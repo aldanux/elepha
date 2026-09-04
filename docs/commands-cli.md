@@ -50,15 +50,32 @@ Full guide: [docs/configuration.md](configuration.md).
 | `elepha config set <key> <value>` | Store one setting override. More details in [docs/configuration.md](configuration.md#read-and-change-one-setting).                             |
 | `elepha config unset <key>`       | Remove an override and return to the effective default. More details in [docs/configuration.md](configuration.md#read-and-change-one-setting). |
 
+## Privacy & read lock
+
+Paranoid mode is an optional passphrase gate over memory reads. Capture continues
+while memory is locked. Run passphrase-taking commands in a controlling terminal; the
+passphrase is read interactively and is not accepted as an argument.
+
+| Command                   | Description                                                                  |
+|---------------------------|------------------------------------------------------------------------------|
+| `elepha paranoid enable`  | Set and confirm a passphrase, enable paranoid mode, and lock memory reads.   |
+| `elepha unlock`           | Prompt for the passphrase in a controlling terminal and unlock memory reads. |
+| `elepha lock`             | Lock memory reads without stopping capture.                                  |
+| `elepha paranoid disable` | Verify the passphrase, disable paranoid mode, and leave reads unlocked.      |
+
+The gate protects a stolen or copied database and memory on a shared unlocked
+machine. It does not protect against malware already running as your user, which can
+access the same installation key and files as elepha.
+
 ## Storage & backups
 
 Full guide: [docs/storage.md](storage.md). Deletion guide: [docs/purge.md](purge.md).
 
 | Command                                                                    | Description                                                                                                                                                                                                                                             |
 |----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha backup [--all \| --project <pathOrName>] [--out <path>] [--force]` | Export all memory or one project to a portable SQLite file. More details in [docs/storage.md](storage.md#create-a-backup).                                                                                                                              |
-| `elepha restore [file] [--skip-confirmation]`                              | Replace the active database from a validated complete backup. More details in [docs/storage.md](storage.md#restore-the-complete-database).                                                                                                              |
-| `elepha import [file] [--overwrite] [--skip-confirmation]`                 | Merge eligible backup sessions, optionally replacing matches. More details in [docs/storage.md](storage.md#merge-a-backup).                                                                                                                             |
+| `elepha backup [--all \| --project <pathOrName>] [--out <path>] [--force]` | Export all memory or one project to a same-installation encrypted SQLite file. More details in [docs/storage.md](storage.md#create-a-backup).                                                                                                           |
+| `elepha restore [file] [--skip-confirmation]`                              | Replace the active database from a validated complete backup; current encrypted backups require the same installation key. More details in [docs/storage.md](storage.md#restore-the-complete-database).                                                 |
+| `elepha import [file] [--overwrite] [--skip-confirmation]`                 | Merge eligible sessions from a plaintext export, optionally replacing matches; encrypted input is rejected. More details in [docs/storage.md](storage.md#merge-a-backup).                                                                               |
 | `elepha purge [scope] [--apply] [--skip-confirmation]`                     | Preview or delete memory using `--project <pathOrName>`, `--newer-than <durationOrDate>`, `--older-than <durationOrDate>`, `--external-agent-imports`, `--orphan`, `--revoked`, or `--all`. More details in [docs/purge.md](purge.md#choose-one-scope). |
 
 ## Maintenance

@@ -5,15 +5,19 @@
     "keywords": [
         "claude-code",
         "codex",
-        "coding-agent",
+        "mcp",
         "ai-memory",
         "agent-memory",
+        "coding-agent",
+        "memory",
         "session-memory",
         "session-history",
         "context-management",
         "developer-tools",
         "cli",
-        "local-first"
+        "local-first",
+        "privacy",
+        "sqlite"
     ],
     "homepage": "https://github.com/aldanux/elepha#readme",
     "bugs": {

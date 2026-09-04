@@ -21,6 +21,7 @@ the built-in default.
 | `update-check`        | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls the background check for a newer elepha release. `ELEPHA_NO_UPDATE_CHECK` disables the check for one invocation without changing the stored preference.                                                    |
 | `capture-claude-code` | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of Claude Code sessions. At least one capture tool must remain enabled.                                                                                                                            |
 | `capture-codex`       | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of Codex sessions. At least one capture tool must remain enabled.                                                                                                                                  |
+| `durable-capture`     | `true`, `false`, `1`, `0`, `on`, `off` | `false`  | Stores sanitized conversation copies for provider-independent content search and session revival. Restart the capture service after changing it.                                                                   |
 | `query-matching`      | `strict`, `lax`                        | `strict` | Controls how closely recall results must match a multi-term query. A query that returns nothing under `strict` may return relevant partial matches under `lax`; the normal ranking and quality filters still apply. |
 
 ## Read and change one setting
@@ -43,3 +44,31 @@ that remains, normally the built-in default. To restore the default update behav
 ```console
 elepha config unset update-check
 ```
+
+## Durable store size
+
+`durable-capture-max-bytes` caps the total stored user prompts, assistant responses,
+and path-bearing tool-call references kept by durable capture. It defaults to
+1,073,741,824 bytes (1 GiB) and accepts a positive safe integer number of bytes.
+
+This key is read from `$ELEPHA_HOME/config.json` by the capture service but is not a
+CLI-managed setting: it does not appear in `elepha config list`, and `elepha config
+get/set/unset` do not accept it. Add it to the top-level JSON object directly, keeping
+any existing keys:
+
+```json
+{
+    "durable-capture": true,
+    "durable-capture-max-bytes": 1073741824
+}
+```
+
+Restart the service after editing the value:
+
+```console
+elepha restart
+```
+
+When the stored content exceeds the cap, elepha evicts the oldest sessions' copies,
+starting with sessions whose original transcript still exists. Invalid or absent
+values leave the 1 GiB default in effect.

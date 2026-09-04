@@ -6,7 +6,7 @@
 </p>
 
 <p align="center"><b>Your tools can read the diff. They cannot read why.</b></p>
-<p align="center">elepha is a local memory layer over the session transcripts Claude Code and Codex already write to disk. It keeps the reasoning and gives it back inside the chat you are already in.</p>
+<p align="center">elepha reads the full sessions Claude Code and Codex already write to disk — nothing to save, nothing added to your repo — and gives the real conversation back inside the chat you're in.</p>
 
 <p align="center">
   <a href="#supported-tools-and-platforms"><img src="https://img.shields.io/badge/supported%20tools-Claude%20Code%20(CLI%20%C2%B7%20Desktop)%20%C2%B7%20Codex%20(CLI%20%C2%B7%20Desktop)-2ab7d4" alt="supported tools: Claude Code (CLI, Desktop), Codex (CLI, Desktop)"></a>
@@ -26,8 +26,12 @@ _The elepha demo video shows Codex stopping mid-task, then Claude Code resuming 
 - **The part git does not keep** — Commits and diffs record what changed. The transcript
   holds why: the approach you rejected, the constraint that forced it, the thing you left
   unfinished.
-- **Nothing to write** — No notes, no vault, no file to keep current. The transcripts
-  already exist; **elepha** reads them.
+- **Nothing to write** — Other tools capture only what the AI remembers to save, or what
+  a hook happens to catch. **elepha** reads the raw transcript your tool already wrote to
+  disk, so it can't miss a recorded session — and `elepha:last` brings the real
+  conversation back, not a distilled note. No notes, no vault, nothing to keep current.
+- **No key of your own** — passive capture, search and recall need no AI provider key,
+  and pulling a past session back into your chat costs fewer tokens than pasting it by hand.
 - **Not a wrapper** — Keep using your tool directly; **elepha** never sits in front of it.
 - **Repository-clean** — Adds nothing to your repositories, and never modifies the
   original transcripts.
@@ -50,10 +54,9 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 **elepha** supports **Claude Code** and **Codex**, each in both the desktop app and the CLI, with memory shared across all of them. Support
 for more transcript-writing AI coding tools is planned.
 
-It runs on **macOS**, **Linux**, and **Windows through WSL**, with **Node.js 22.12 or newer**. Native Windows is not supported.
+It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 
-The original transcripts are never modified, so memory can always be rebuilt. That matters while **elepha** is still pre-1.0: its storage
-schema and command surface can change between releases.
+The original transcripts are never modified. Turn on durable capture (off by default) and **elepha** keeps its own encrypted copy of the reasoning, so it survives even if your tool later prunes its own history — see [protecting and moving memory](docs/storage.md).
 
 ## Documentation
 
@@ -72,7 +75,7 @@ schema and command surface can change between releases.
 
 1. **Reads local transcripts in the background.** It watches the session files that supported tools already write, limited to projects and folders you approve.
 2. **Builds one searchable local memory.** It organizes eligible sessions in one local database.
-3. **Recalls inside your current chat.** Find a session with `elepha:query`, open it with `elepha:select:<n>`, or go straight to the latest with `elepha:last`. Search looks at session titles and how you opened each session; at what a session concluded where it has a rollup; and, for sessions recorded with durable capture, at the stored filtered conversation. It never reads raw transcripts, thinking, tool output, or fetched external content, and it searches the local index, not the provider's files at query time. Opening a session brings the whole conversation back.
+3. **Recalls inside your current chat.** Find a session with `elepha:query`, open it with `elepha:select:<n>`, or jump to the latest with `elepha:last`. Search runs over the local index — never raw transcripts, thinking, or tool output — and opening a session brings the whole conversation back.
 
 <!-- In-chat demo placeholder: show elepha:list and elepha:last recalling a real session. -->
 
@@ -106,9 +109,10 @@ is explicit; if you configure an external synthesis provider, the turns sent for
 
 - **Consent-gated** — you choose which projects or workspace folders **elepha** may capture.
 - **Transcript-safe** — the original session files are never modified.
-- **It can forget** — purge a transcript and it stays purged, revoke a folder, or work with capture off.
-- **One local database** — memory lives at `~/.elepha/elepha.db` and can be rebuilt from retained transcripts; back it up to keep consent
-  and deletion history.
+- **Encrypted at rest** — the whole database is encrypted, with the key kept in your OS secret store (or a private key file where none exists).
+- **Optional passphrase lock** — paranoid mode gates memory reads while capture keeps running; it guards a stolen or copied database and a shared unlocked machine, not malware already running as your user.
+- **It can forget** — purge a transcript and it stays purged, revoke a folder, or run with capture off.
+- **One local database** — memory lives at `~/.elepha/elepha.db`; back it up for same-machine recovery.
 
 ## License and links
 
