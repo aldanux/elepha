@@ -5,6 +5,7 @@ import { DURABLE_CAPTURE_FILTER_VERSION } from '../../src/config/constants.js';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { filterTurn } from '../../src/rendering/filtered-turn.js';
+import { openProviderTranscript } from '../../src/security/provider-transcript.js';
 import { type DurableCaptureBackfillSession, DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
@@ -293,6 +294,79 @@ describe('daemon durable capture backfill', () => {
                 .all(),
         ).toEqual([{ turn_index: 0 }, { turn_index: 1 }]);
     });
+
+    it.each(['iterator return', 'extra streamed turn', 'handle close'] as const)(
+        'finishes already-covered backfill when shutdown starts at %s',
+        async (boundary) => {
+            const fixture = createTestDb('elepha-durable-backfill-stop-complete-');
+            const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+            const providerRoot = path.join(claudeConfigDir, 'projects');
+            mkdirSync(providerRoot, { recursive: true });
+            vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+            const project = seedProject(fixture);
+            fixture.store.consent.grant(project.path);
+            const sourcePath = path.join(providerRoot, 'complete.jsonl');
+            writeFileSync(sourcePath, '{}\n');
+            const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'complete', sourcePath });
+            seedMemory(fixture, { project, session, turnIndex: 0 });
+            let stopped: Promise<void> | undefined;
+            let stateBeforeStop: unknown;
+            let rowsBeforeStop: unknown;
+            const requestStop = () => {
+                stateBeforeStop = fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id);
+                rowsBeforeStop = fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get();
+                stopped = daemon.stop();
+            };
+            const daemon = new IngestionDaemon({
+                store: fixture.store,
+                adapters: [
+                    {
+                        ...adapterFor(new Map(), []),
+                        async *parseTurns(openedPath, sinceCursor, options) {
+                            expect(openedPath).toBe(sourcePath);
+                            expect(sinceCursor).toBeUndefined();
+                            expect(options?.handle).toBeDefined();
+                            yield parsedTurn(sourcePath, 'complete', 0);
+                            if (boundary !== 'handle close') {
+                                requestStop();
+                            }
+                            if (boundary === 'extra streamed turn') {
+                                yield parsedTurn(sourcePath, 'complete', 1);
+                            }
+                        },
+                    },
+                ],
+                openTranscript: async (tool, source) => {
+                    const opened = await openProviderTranscript(tool, source);
+                    if (!('reason' in opened) && boundary === 'handle close') {
+                        const close = opened.handle.close.bind(opened.handle);
+                        opened.handle.close = async () => {
+                            requestStop();
+                            await close();
+                        };
+                    }
+                    return opened;
+                },
+                watchRoots: [],
+                heartbeatPath: path.join(fixture.directory, 'heartbeat.json'),
+                updateCheck: () => undefined,
+                readConfig: enabledConfig,
+            });
+            daemon.start();
+            try {
+                await waitFor(() => stopped !== undefined);
+                await stopped;
+                expect(stateBeforeStop).toEqual({ state: 'backfilling' });
+                expect(rowsBeforeStop).toEqual({ count: 1 });
+                expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+                    state: 'complete',
+                });
+                expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
+            } finally {
+                await daemon.stop();
+            }
+        },
+    );
 
     it('rechecks consent inside the filtered-turn transaction and retries after consent returns', async () => {
         const fixture = createTestDb('elepha-durable-backfill-consent-');

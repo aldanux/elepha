@@ -493,7 +493,7 @@ export class IngestionDaemon {
                         handle: opened.handle,
                     })) {
                         if (this.stopping) {
-                            return;
+                            break;
                         }
                         if (turn.tool !== session.tool || turn.sessionId !== session.nativeId) {
                             parseFailed = true;
@@ -538,7 +538,10 @@ export class IngestionDaemon {
                     await opened.handle.close();
                 }
 
-                if (this.stopping) {
+                // Shutdown may arrive after the last row commits but before
+                // iterator/handle cleanup finishes. Finalize covered work;
+                // leave interrupted work resumable without reading more turns.
+                if (this.stopping && work.missingTurnIndexes.size > 0) {
                     return;
                 }
                 if (writeUnauthorized || writeEvicted) {
