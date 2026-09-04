@@ -13,6 +13,9 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { PRIVATE_DIR_MODE } from '../config/constants.js';
+import { errorMessage } from './error.js';
+
+const ATOMIC_COPY_TEMPORARY_SUFFIXES = ['', '-wal', '-shm', '-journal'] as const;
 
 // Creates a directory and ensures it is private even when it already existed.
 export function ensurePrivateDir(dir: string): void {
@@ -75,10 +78,34 @@ export function atomicCopyPrivateFile(source: string, destination: string, mode:
     })();
     ensurePrivateDir(path.dirname(target));
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-    copyFileSync(source, temporary);
-    chmodSync(temporary, mode);
-    renameSync(temporary, target);
-    chmodSync(target, mode);
+    try {
+        copyFileSync(source, temporary);
+        chmodSync(temporary, mode);
+        renameSync(temporary, target);
+        chmodSync(target, mode);
+    } catch (error: unknown) {
+        const cleanupFailures: unknown[] = [];
+        // Attempt every companion even after one unlink fails so the aggregate reports the primary error and the minimum residue remains.
+        for (const suffix of ATOMIC_COPY_TEMPORARY_SUFFIXES) {
+            try {
+                unlinkSync(`${temporary}${suffix}`);
+            } catch (cleanupError: unknown) {
+                if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+                    cleanupFailures.push(cleanupError);
+                }
+            }
+        }
+        if (cleanupFailures.length > 0) {
+            throw new AggregateError(
+                [error, ...cleanupFailures],
+                `Atomic copy failed for ${destination}: ${errorMessage(error)}. Temporary cleanup also failed: ${cleanupFailures
+                    .map(errorMessage)
+                    .join('; ')}`,
+                { cause: error },
+            );
+        }
+        throw error;
+    }
 }
 
 // Read JSON only when the complete file can be read and parsed.

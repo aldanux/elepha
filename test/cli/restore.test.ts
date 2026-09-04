@@ -1025,6 +1025,70 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
     });
 
+    it('cleans the exact randomized install temporary when destination rename fails', async () => {
+        const active = createTestDb('elepha-restore-rename-failure-active-');
+        const candidate = createTestDb('elepha-restore-rename-failure-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const backupBytes = readFileSync(backup);
+        const restoreTemp = isolateRestoreTemp();
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalRenameSync = mutableFs.renameSync;
+        const primaryError = new Error('injected restore destination rename failure') as NodeJS.ErrnoException;
+        primaryError.code = 'EISDIR';
+        let exactTemporary: string | undefined;
+        mutableFs.renameSync = ((oldPath, newPath) => {
+            const oldName = String(oldPath);
+            if (
+                exactTemporary === undefined &&
+                String(newPath) === active.dbPath &&
+                oldName.startsWith(`${active.dbPath}.${process.pid}.`) &&
+                oldName.endsWith('.tmp')
+            ) {
+                exactTemporary = oldName;
+                for (const suffix of ['-wal', '-shm', '-journal']) {
+                    writeFileSync(`${exactTemporary}${suffix}`, `temporary ${suffix}`);
+                }
+                throw primaryError;
+            }
+            return originalRenameSync(oldPath, newPath);
+        }) as typeof import('node:fs').renameSync;
+        syncBuiltinESMExports();
+
+        let caught: unknown;
+        try {
+            await runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            });
+        } catch (error) {
+            caught = error;
+        } finally {
+            mutableFs.renameSync = originalRenameSync;
+            syncBuiltinESMExports();
+        }
+
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toContain('Restore failed and the previous database was rolled back from');
+        expect((caught as Error).message).toContain(primaryError.message);
+        expect(exactTemporary?.startsWith(`${active.dbPath}.${process.pid}.`)).toBe(true);
+        expect(exactTemporary?.endsWith('.tmp')).toBe(true);
+        for (const suffix of ['', '-wal', '-shm', '-journal']) {
+            expect(existsSync(`${exactTemporary}${suffix}`)).toBe(false);
+        }
+        expect(readFileSync(active.dbPath)).toEqual(activeBytes);
+        expect(statSync(active.dbPath).mode & 0o777).toBe(0o600);
+        expect(readFileSync(backup)).toEqual(backupBytes);
+        expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        expect(hasLifecycleIntent(active.dbPath)).toBe(false);
+        expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
+    });
+
     it('cleans and verifies the lifecycle-owned physical companions before releasing rollback ownership', async () => {
         const active = createTestDb('elepha-restore-physical-rollback-active-');
         const candidate = createTestDb('elepha-restore-physical-rollback-candidate-');
