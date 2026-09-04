@@ -14,6 +14,7 @@ import {
 import { codexSessionsRoot } from '../../src/config/paths.js';
 import { detectShellSyntax, stripShellSyntax } from '../../src/security/sanitize.js';
 import { writeBackup } from '../../src/storage/backup.js';
+import { rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import type { ProjectRow } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
@@ -1311,6 +1312,9 @@ describe('elepha import', () => {
             throw new Error('project did not resolve');
         }
         const backup = path.join(backupSource.directory, 'project.db');
+        backupSource.db.pragma('journal_mode = DELETE');
+        rekeyDatabaseConnection(backupSource.db, FIXED_KEY);
+        backupSource.db.pragma('journal_mode = WAL');
         exportProject(backupSource.db, resolution.project, backup, FIXED_KEY);
         active.close();
         backupSource.close();

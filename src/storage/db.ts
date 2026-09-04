@@ -469,6 +469,10 @@ function migrateSessionsTable(db: Database.Database): void {
 
 const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
 
+export function isPlaintextDatabaseHeader(bytes: Uint8Array): boolean {
+    return bytes.byteLength === SQLITE_PLAINTEXT_HEADER.length && SQLITE_PLAINTEXT_HEADER.equals(bytes);
+}
+
 export interface ManagedDatabaseOpenOptions {
     readonly?: boolean;
     fileMustExist?: boolean;
@@ -522,7 +526,7 @@ export function hasPlaintextDatabaseHeader(dbPath: string): boolean {
     try {
         const header = Buffer.alloc(DATABASE_HEADER_BYTES);
         const bytesRead = readSync(descriptor, header, 0, header.length, 0);
-        return bytesRead === SQLITE_PLAINTEXT_HEADER.length && header.equals(SQLITE_PLAINTEXT_HEADER);
+        return isPlaintextDatabaseHeader(header.subarray(0, bytesRead));
     } finally {
         closeSync(descriptor);
     }

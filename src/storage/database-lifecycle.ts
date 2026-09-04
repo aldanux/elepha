@@ -141,6 +141,22 @@ export interface DatabaseLifecycleIdentity {
     };
 }
 
+export interface SQLiteFileIdentitySeal {
+    dev: bigint;
+    ino: bigint;
+    ctimeNs: bigint;
+    nlink: bigint;
+}
+
+export interface SQLitePathOpenSeal {
+    readonly descriptor: number;
+    readonly sqlitePath: string;
+    confirmOpen(database: Database.Database, schemaName?: string): void;
+    captureMutationState(): DatabasePathMutationState;
+    assertCurrent(expectedMutationState: DatabasePathMutationState): void;
+    release(): void;
+}
+
 function noFollowFlag(): number {
     return fsConstants.O_NOFOLLOW ?? 0;
 }
@@ -199,7 +215,7 @@ function inspectDatabaseIdentity(databasePath: string): DatabaseFileIdentity {
     }
     let descriptor: number;
     try {
-        descriptor = openSync(physicalPath, fsConstants.O_RDONLY | noFollowFlag());
+        descriptor = openSync(physicalPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | noFollowFlag());
     } catch {
         throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database cannot be opened for identity inspection: ${databasePath}`);
     }
@@ -290,7 +306,7 @@ function closeProofDatabases(databases: readonly Database.Database[]): unknown[]
     return failures;
 }
 
-interface DatabasePathMutationState {
+export interface DatabasePathMutationState {
     fileCtimeNs: bigint;
     fileNlink: bigint;
 }
@@ -411,7 +427,7 @@ function openAuthorizedDescriptor(
     let descriptor: number;
     try {
         descriptor = expected.exists
-            ? openSync(physicalPath, fsConstants.O_RDONLY | noFollowFlag())
+            ? openSync(physicalPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | noFollowFlag())
             : openSync(physicalPath, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollowFlag(), PRIVATE_FILE_MODE);
     } catch {
         throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database cannot be pinned for SQLite identity proof: ${databasePath}`);
@@ -575,7 +591,7 @@ function retainUnprovenDatabaseProof(database: Database.Database, pinned: Author
     };
 }
 
-function assertSQLiteOpenSealed(pinned: AuthorizedDescriptor, databasePath: string): void {
+function assertSQLiteOpenSealed(pinned: AuthorizedDescriptor, databasePath: string, checkAncestorMutationState = true): void {
     const current = inspectDatabaseIdentity(databasePath);
     if (!sameDatabaseIdentity(pinned.identity, current)) {
         throw databasePathMutationError(databasePath);
@@ -611,7 +627,7 @@ function assertSQLiteOpenSealed(pinned: AuthorizedDescriptor, databasePath: stri
             }
             return { ctimeNs: opened.ctimeNs, mtimeNs: opened.mtimeNs };
         });
-        if (process.platform === 'darwin') {
+        if (process.platform === 'darwin' && checkAncestorMutationState) {
             for (let index = 0; index + 1 < pinned.directories.length; index++) {
                 const before = pinned.directories[index];
                 const after = directoryAfter[index];
@@ -633,12 +649,93 @@ function assertSQLiteOpenSealed(pinned: AuthorizedDescriptor, databasePath: stri
     }
 }
 
-function assertSQLiteCanonicalFilename(database: Database.Database, pinned: AuthorizedDescriptor, databasePath: string): void {
+function assertSQLiteCanonicalFilename(
+    database: Database.Database,
+    pinned: AuthorizedDescriptor,
+    databasePath: string,
+    schemaName = 'main',
+): void {
     const databases = database.pragma('database_list') as Array<{ seq?: unknown; name?: unknown; file?: unknown }>;
-    const main = databases.find((entry) => entry.seq === 0 && entry.name === 'main');
-    if (main === undefined || typeof main.file !== 'string' || path.resolve(main.file) !== pinned.physicalPath) {
+    const opened = databases.find((entry) => entry.name === schemaName && (schemaName !== 'main' || entry.seq === 0));
+    if (opened === undefined || typeof opened.file !== 'string' || path.resolve(opened.file) !== pinned.physicalPath) {
         throw databasePathMutationError(databasePath);
     }
+}
+
+function expectedSQLiteFileError(pinned: AuthorizedDescriptor, expected: SQLiteFileIdentitySeal, databasePath: string): unknown {
+    try {
+        if (pinned.descriptor === undefined) {
+            return lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite open mutation seal is incomplete for ${databasePath}`);
+        }
+        const opened = fstatSync(pinned.descriptor, { bigint: true });
+        if (
+            !opened.isFile() ||
+            opened.dev !== expected.dev ||
+            opened.ino !== expected.ino ||
+            opened.ctimeNs !== expected.ctimeNs ||
+            opened.nlink !== expected.nlink
+        ) {
+            return databasePathMutationError(databasePath);
+        }
+        return undefined;
+    } catch (error) {
+        return error;
+    }
+}
+
+// Backup/export code precreates an empty private inode, then asks SQLite to
+// open that exact object. Keep C01's file and ancestor descriptors pinned so
+// the caller can validate database_list before admitting any key, read, or
+// write through the SQLite handle.
+export function pinSQLitePathForOpen(databasePath: string, expected: SQLiteFileIdentitySeal): SQLitePathOpenSeal {
+    const lifecycleIdentity: DatabaseFileIdentity = {
+        exists: true,
+        dev: String(expected.dev),
+        ino: String(expected.ino),
+    };
+    const pinned = openAuthorizedDescriptor(
+        databasePath,
+        lifecycleIdentity,
+        () => undefined,
+        () => undefined,
+    );
+    const expectedError = expectedSQLiteFileError(pinned, expected, databasePath);
+    if (expectedError !== undefined) {
+        const cleanupFailures = closeAuthorizedDescriptor(pinned);
+        if (cleanupFailures.length > 0) {
+            throw new AggregateError(
+                [expectedError, ...cleanupFailures],
+                `SQLite identity descriptor validation and cleanup both failed for ${databasePath}`,
+                { cause: expectedError },
+            );
+        }
+        throw expectedError;
+    }
+    const descriptor = pinned.descriptor;
+    assertLifecycle(descriptor !== undefined, DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite open mutation seal is incomplete for ${databasePath}`);
+    return {
+        descriptor,
+        sqlitePath: pinned.sqlitePath,
+        confirmOpen: (database, schemaName = 'main') => {
+            assertSQLiteOpenSealed(pinned, databasePath);
+            assertSQLiteCanonicalFilename(database, pinned, databasePath, schemaName);
+        },
+        captureMutationState: () => databasePathMutationState(descriptor),
+        assertCurrent: (expectedMutationState) => {
+            pinned.mutationState = expectedMutationState;
+            // Once confirmOpen has bound SQLite to the intended object, its
+            // own page writes legitimately change the leaf and unrelated
+            // sibling activity may change adjacent ancestor timestamps. The
+            // post-write check still seals descriptor/path identities and the
+            // caller-supplied leaf mutation state without treating those
+            // unrelated directory changes as a new SQLite open.
+            assertSQLiteOpenSealed(pinned, databasePath, false);
+        },
+        release: () => {
+            const failures = closeAuthorizedDescriptor(pinned);
+            assertNoCleanupFailures(failures, `SQLite identity seal cleanup failed for ${databasePath}`);
+        },
+    };
 }
 
 function databaseIdentityGuard(

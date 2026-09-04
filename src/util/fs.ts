@@ -40,11 +40,6 @@ export function ensureCreatedDirsPrivate(dir: string): void {
     }
 }
 
-// Applies a restrictive mode to an already-written private file.
-export function setPrivateFileMode(file: string, mode: number): void {
-    chmodSync(file, mode);
-}
-
 // Atomically replace a file without replacing a symlink that points at it.
 export function atomicWrite(file: string, text: string, mode: number): void {
     const target = (() => {
