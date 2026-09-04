@@ -11,6 +11,7 @@ import { assertNoShellSyntax, escapeShellSyntax } from '../security/sanitize.js'
 import { servedContextInstructions } from '../serving/instructions.js';
 import { endedAt, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { ConsentStore } from '../storage/consent-store.js';
+import { isMemoryLocked, LOCKED_MCP_RESULT, LOCKED_MEMORY_MESSAGE } from '../storage/paranoid-gate.js';
 import { type ProjectCandidate, type ProjectResolution, ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { isSubstantive, jsonArrayLength, readSessionByNaturalKey, type ServedSession } from '../storage/session-read-model.js';
 import { isToolName, type SessionAdapter, type ToolName } from '../types/index.js';
@@ -92,6 +93,9 @@ export class ElephaMcpService implements McpToolHandlers {
     }
 
     listProjects(): McpToolResult {
+        if (isMemoryLocked(this.db)) {
+            return this.lockedResponse();
+        }
         const resolver = new ProjectResolver(this.db);
         const reader = this.newReader();
         const consented = resolver.listConsented(this.consent);
@@ -123,6 +127,9 @@ export class ElephaMcpService implements McpToolHandlers {
     }
 
     listSessions(input: ListSessionsInput): McpToolResult {
+        if (isMemoryLocked(this.db)) {
+            return this.lockedResponse();
+        }
         const resolver = new ProjectResolver(this.db);
         const resolved = this.resolveProject(input.project, resolver);
         if ('response' in resolved) {
@@ -161,6 +168,9 @@ export class ElephaMcpService implements McpToolHandlers {
     }
 
     async getSession(input: GetSessionInput): Promise<McpToolResult> {
+        if (isMemoryLocked(this.db)) {
+            return this.lockedResponse();
+        }
         const session = this.findStoredSession(input.id);
         if (session === undefined) {
             return this.unknownSession(input.id);
@@ -176,6 +186,9 @@ export class ElephaMcpService implements McpToolHandlers {
             .some((set) => set.projectIds.includes(session.project_id));
         if (!stillConsented) {
             return this.unknownSession(input.id);
+        }
+        if (isMemoryLocked(this.db)) {
+            return this.lockedResponse();
         }
         if (read.episode === undefined) {
             return this.transcriptMissing(input.id, project);
@@ -213,6 +226,10 @@ export class ElephaMcpService implements McpToolHandlers {
             return this.unknownProject(value);
         }
         return { project: resolved.project };
+    }
+
+    private lockedResponse(): McpToolResult {
+        return this.responses.result(LOCKED_MEMORY_MESSAGE, { ...LOCKED_MCP_RESULT });
     }
 
     private unknownProject(query: string): { response: McpToolResult } {

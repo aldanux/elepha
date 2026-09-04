@@ -1,0 +1,319 @@
+import { chmodSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { refuseLockedCliRead } from '../../src/cli/read-gate.js';
+import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
+import { RollupService } from '../../src/daemon/rollup-service.js';
+import { runSessionStart } from '../../src/hooks/session-start.js';
+import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
+import { ElephaMcpService } from '../../src/mcp/tools.js';
+import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
+import { SessionReader } from '../../src/serving/session-reader.js';
+import type { DatabaseEncryptionRuntime } from '../../src/storage/database-encryption.js';
+import { openDb } from '../../src/storage/db.js';
+import { DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
+import { MemoryStore } from '../../src/storage/memory-store.js';
+import {
+    disableParanoidMode,
+    enableParanoidMode,
+    isMemoryLocked,
+    LOCKED_CONTENT_COVERAGE,
+    LOCKED_MCP_RESULT,
+    LOCKED_MEMORY_MESSAGE,
+    lockMemory,
+    paranoidStatePath,
+    unlockMemory,
+} from '../../src/storage/paranoid-gate.js';
+import { ProjectResolver } from '../../src/storage/project-resolver.js';
+import { RollupStore } from '../../src/storage/rollup-store.js';
+import type { ParsedTurn } from '../../src/types/index.js';
+import { withGrantableTestDir } from '../helpers/tmp.js';
+
+const PASSPHRASE = 'correct horse battery staple';
+const FIXED_KEY = Buffer.alloc(32, 7);
+const NOW = '2026-09-04T00:00:00.000Z';
+
+function encryptionRuntime(directory: string): DatabaseEncryptionRuntime {
+    return {
+        platform: 'linux',
+        env: { CI: '1' },
+        randomBytes: () => Buffer.from(FIXED_KEY),
+        randomUUID: () => '11111111-1111-4111-8111-111111111111',
+        keyFilePath: () => path.join(directory, 'elepha.keydata'),
+    };
+}
+
+function turn(nativeId: string, sourcePath: string, projectPath: string, turnIndex: number, content: string): ParsedTurn {
+    return {
+        tool: 'codex',
+        sessionId: nativeId,
+        sourcePath,
+        projectPath,
+        turnIndex,
+        startedAt: NOW,
+        endedAt: NOW,
+        userMessage: `prompt ${content}`,
+        assistantText: `response ${content}`,
+        toolCalls: [],
+        cursor: `${turnIndex}`,
+        hasExternalContent: false,
+        resumeMarkerBefore: false,
+    };
+}
+
+async function fixture() {
+    const directory = withGrantableTestDir('elepha-paranoid-');
+    const dbPath = path.join(directory, 'elepha.db');
+    const projectPath = path.join(directory, 'project');
+    const sourcePath = path.join(directory, 'session.jsonl');
+    const runtime = encryptionRuntime(directory);
+    const db = await openDb(dbPath, { encryption: runtime });
+    const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+    const project = store.upsertProject(projectPath);
+    store.consent.grant(projectPath);
+    const session = store.upsertSession('codex', 'locked-session', project.id, sourcePath, { customTitle: 'Locked session' });
+    expect(
+        store.recordTurn(
+            turn(session.native_id, sourcePath, projectPath, 0, 'before lock'),
+            session.id,
+            project.id,
+            {
+                decisions: [],
+                pending_items: [],
+                status: 'ok',
+            },
+            true,
+        ),
+    ).toBe(true);
+    const projectSet = new ProjectResolver(db, { resolveGitRoot: () => null })
+        .listStored()
+        .find((set) => set.projectIds.includes(project.id));
+    if (projectSet === undefined) {
+        throw new Error('seeded project set was not found');
+    }
+    const served = new SessionReader(db).sessionsFor(projectSet)[0];
+    if (served === undefined) {
+        throw new Error('seeded session was not found');
+    }
+    return { db, dbPath, directory, project, projectPath, projectSet, runtime, served, session, sourcePath, store };
+}
+
+function codexHookText(result: { output: Record<string, unknown> } | { reason: string }): string | undefined {
+    if (!('output' in result)) {
+        return undefined;
+    }
+    const specific = result.output.hookSpecificOutput as Record<string, unknown>;
+    return typeof specific.additionalContext === 'string' ? specific.additionalContext : undefined;
+}
+
+describe('paranoid read gate', () => {
+    it('locks every serving surface, permits writes, and reveals captured-during-lock content only after unlock', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(statSync(paranoidStatePath(seeded.dbPath)).mode & 0o777).toBe(0o600);
+        expect(JSON.parse(readFileSync(paranoidStatePath(seeded.dbPath), 'utf8'))).toMatchObject({
+            mode: 'paranoid',
+            epoch: 1,
+            state: 'locked',
+        });
+        expect(() => enableParanoidMode(seeded.db, 'replacement passphrase')).toThrow('Paranoid mode is already enabled.');
+        const cliOutput: string[] = [];
+        expect(refuseLockedCliRead(seeded.db, (message) => cliOutput.push(message))).toBe(true);
+        expect(cliOutput).toEqual([LOCKED_MEMORY_MESSAGE]);
+
+        const reader = new SessionReader(seeded.db);
+        const prepare = vi.spyOn(seeded.db, 'prepare');
+        await expect(reader.render(seeded.served)).resolves.toEqual({
+            state: 'locked',
+            reason: 'locked',
+            content_coverage: LOCKED_CONTENT_COVERAGE,
+        });
+        expect(prepare).not.toHaveBeenCalled();
+
+        const query = tokenizeRecallQuery('before lock');
+        if (query === undefined) {
+            throw new Error('query unexpectedly empty');
+        }
+        await expect(lexicalRecall(reader, [seeded.projectSet], query, 'global', undefined, undefined, 'lax')).resolves.toEqual({
+            body: LOCKED_MEMORY_MESSAGE,
+            sessionIds: [],
+            state: 'locked',
+            content_coverage: LOCKED_CONTENT_COVERAGE,
+        });
+
+        const mcp = new ElephaMcpService(seeded.db);
+        const publicId = Buffer.from(JSON.stringify({ tool: 'codex', nativeId: seeded.session.native_id, segmentIndex: 0 })).toString(
+            'base64url',
+        );
+        for (const response of [
+            mcp.listProjects(),
+            mcp.listSessions({ project: seeded.projectPath }),
+            await mcp.getSession({ id: publicId }),
+        ]) {
+            expect(response.content).toEqual([{ type: 'text', text: LOCKED_MEMORY_MESSAGE }]);
+            expect(response.structuredContent).toEqual(LOCKED_MCP_RESULT);
+        }
+
+        const startup = await runSessionStart(
+            JSON.stringify({
+                session_id: 'current',
+                cwd: seeded.projectPath,
+                hook_event_name: 'SessionStart',
+                source: 'startup',
+                model: 'gpt-5.6',
+                permission_mode: 'default',
+            }),
+            'codex',
+            {
+                dbPath: seeded.dbPath,
+                openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
+                readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG } }),
+            },
+        );
+        expect(codexHookText(startup)).toBe(LOCKED_MEMORY_MESSAGE);
+        const prompt = await runUserPromptSubmit(
+            JSON.stringify({
+                session_id: 'current',
+                cwd: seeded.projectPath,
+                hook_event_name: 'UserPromptSubmit',
+                prompt: 'elepha:list',
+                model: 'gpt-5.6',
+                permission_mode: 'default',
+            }),
+            'codex',
+            {
+                dbPath: seeded.dbPath,
+                openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
+            },
+        );
+        expect(codexHookText(prompt)).toBe(LOCKED_MEMORY_MESSAGE);
+
+        expect(
+            seeded.store.recordTurn(
+                turn(seeded.session.native_id, seeded.sourcePath, seeded.projectPath, 1, 'during lock'),
+                seeded.session.id,
+                seeded.project.id,
+                {
+                    decisions: [],
+                    pending_items: [],
+                    status: 'ok',
+                },
+                true,
+            ),
+        ).toBe(true);
+
+        const historical = seeded.store.upsertSession(
+            'codex',
+            'backfill-session',
+            seeded.project.id,
+            path.join(seeded.directory, 'backfill.jsonl'),
+        );
+        expect(
+            seeded.store.recordTurn(
+                turn(historical.native_id, historical.source_path, seeded.projectPath, 0, 'backfill'),
+                historical.id,
+                seeded.project.id,
+                {
+                    decisions: [],
+                    pending_items: [],
+                    status: 'ok',
+                },
+            ),
+        ).toBe(true);
+        const backfill = new DurableCaptureBackfillStore(seeded.db, seeded.store.consent);
+        const candidate = backfill.listCandidates([seeded.project.id], 10).find((item) => item.id === historical.id);
+        if (candidate === undefined) {
+            throw new Error('backfill candidate was not found');
+        }
+        expect(backfill.begin(candidate, NOW)?.missingTurnIndexes).toEqual(new Set([0]));
+        expect(
+            backfill.record(
+                candidate,
+                0,
+                {
+                    filterVersion: 1,
+                    included: true,
+                    userPrompt: 'backfilled prompt',
+                    assistantResponse: 'backfilled response',
+                    toolCalls: [],
+                    omittedToolCallCount: 0,
+                },
+                NOW,
+            ),
+        ).toEqual({ state: 'recorded', sessionId: historical.id });
+        backfill.finish(candidate, new Set([historical.id]), 'success', NOW);
+
+        const purged = seeded.store.upsertSession(
+            'codex',
+            'purged-session',
+            seeded.project.id,
+            path.join(seeded.directory, 'purged.jsonl'),
+        );
+        expect(
+            seeded.store.recordTurn(
+                turn(purged.native_id, purged.source_path, seeded.projectPath, 0, 'purged'),
+                purged.id,
+                seeded.project.id,
+                {
+                    decisions: [],
+                    pending_items: [],
+                    status: 'ok',
+                },
+                true,
+            ),
+        ).toBe(true);
+        const purgePlan = seeded.store.planPurge({ projectIds: [seeded.project.id] });
+        const onlyPurged = {
+            ...purgePlan,
+            sessions: purgePlan.sessions.filter((session) => session.id === purged.id),
+            emptiedProjects: [],
+        };
+        expect(seeded.store.applyPurgePlan(onlyPurged, NOW).sessions.map((session) => session.id)).toEqual([purged.id]);
+
+        const provider = { rollup: vi.fn(), merge: vi.fn() };
+        const rollup = new RollupService({ store: seeded.store, rollups: new RollupStore(seeded.db), provider });
+        await expect(rollup.rollupSession(seeded.session, 'primary', null, 'final')).resolves.toEqual({
+            wrote: false,
+            complete: false,
+            deferred: 'locked',
+        });
+        expect(provider.rollup).not.toHaveBeenCalled();
+        expect(provider.merge).not.toHaveBeenCalled();
+
+        expect(unlockMemory(seeded.db, 'wrong passphrase')).toBe('incorrect');
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+        expect(isMemoryLocked(seeded.db)).toBe(false);
+        const rendered = await new SessionReader(seeded.db).render(seeded.served);
+        expect(rendered.episode?.text).toContain('response during lock');
+
+        expect(lockMemory(seeded.db)).toBe('locked');
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(disableParanoidMode(seeded.db, 'wrong passphrase')).toBe('incorrect');
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(disableParanoidMode(seeded.db, PASSPHRASE)).toBe('disabled');
+        expect(isMemoryLocked(seeded.db)).toBe(false);
+        expect(JSON.parse(readFileSync(paranoidStatePath(seeded.dbPath), 'utf8'))).toMatchObject({
+            mode: 'default',
+            epoch: 4,
+            state: 'unlocked',
+        });
+        seeded.db.close();
+    });
+
+    it('treats a hand-edited state with a bad HMAC as locked', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        const file = paranoidStatePath(seeded.dbPath);
+        const state = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+        state.state = 'unlocked';
+        writeFileSync(file, `${JSON.stringify(state)}\n`);
+        chmodSync(file, 0o600);
+
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        await expect(new SessionReader(seeded.db).render(seeded.served)).resolves.toMatchObject({ state: 'locked', reason: 'locked' });
+        seeded.db.close();
+    });
+});

@@ -24,6 +24,7 @@ import { endedAt, hasRealContent, newestActivity, SessionReader, surfaceLabel, t
 import { ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
+import { isMemoryLocked, LOCKED_MEMORY_MESSAGE } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookSource, type HookTool, parsePayload, readStdin, type SessionStartPayload } from './common.js';
@@ -31,6 +32,7 @@ import { appendHookLog } from './hook-log.js';
 
 export interface SessionStartDependencies {
     dbPath?: string;
+    openDatabase?: typeof openDb;
     now?: () => number;
     log?: (line: string) => void;
     projectResolver?: (db: Database.Database) => ProjectResolver;
@@ -229,11 +231,15 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         }
         // Hooks must see additive schema migrations before selecting a live
         // session. `openDb` is idempotent and refuses no existing data.
-        db = await openDb(dbPath);
+        db = await (dependencies.openDatabase ?? openDb)(dbPath);
     } catch {
         return { reason: 'database_unavailable' };
     }
     try {
+        if (isMemoryLocked(db)) {
+            log(sessionLogLine(tool, payload, 'served locked'));
+            return { output: envelope(tool, LOCKED_MEMORY_MESSAGE, notifyChannel(tool)) };
+        }
         const project = consentedProject(db, payload.cwd);
         if (!project) {
             let canonicalCwd: string;
@@ -330,6 +336,10 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         body = withDaemonHealthWarning(body, now, dependencies.daemonHealth ?? classifyDaemonHealth);
         body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
         body = escapeShellSyntax(body);
+        if (isMemoryLocked(db)) {
+            log(sessionLogLine(tool, payload, 'served locked'));
+            return { output: envelope(tool, LOCKED_MEMORY_MESSAGE, notifyChannel(tool)) };
+        }
         const injectionId = buildInjectionId();
         const output = effective === 'auto' ? wrap('brief', injectionId, body) : body;
         const store = new MemoryStore(db);

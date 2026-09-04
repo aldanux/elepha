@@ -2,6 +2,7 @@ import type { Command } from 'commander';
 import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { parseSince, type Stats } from '../../storage/stats.js';
+import { refuseLockedCliRead } from '../read-gate.js';
 
 export function registerStats(program: Command): void {
     program
@@ -11,7 +12,12 @@ export function registerStats(program: Command): void {
         )
         .option('--since <window>', 'time window: "24h", "7d", "30m", or an ISO date', '24h')
         .action(async (opts: { since: string }) => {
-            const store = new MemoryStore(await openDb());
+            const db = await openDb();
+            if (refuseLockedCliRead(db)) {
+                db.close();
+                return;
+            }
+            const store = new MemoryStore(db);
             const sinceIso = parseSince(opts.since);
             printStats(store.getStats(sinceIso));
         });

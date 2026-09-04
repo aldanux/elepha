@@ -22,6 +22,7 @@ import {
     renderRawTurn,
 } from '../rendering/raw-turn-renderer.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
+import { isMemoryLocked, LOCKED_CONTENT_COVERAGE, type LockedContentCoverage, memoryServeState } from '../storage/paranoid-gate.js';
 import type { ProjectSet } from '../storage/project-resolver.js';
 import {
     isSubstantive,
@@ -54,13 +55,15 @@ export interface StoredTurnRecallFields {
 
 export type StoredSessionRecallFields = Map<number, StoredTurnRecallFields>;
 
-export interface StoredContentCoverage {
+export interface AvailableStoredContentCoverage {
     complete: number;
     completeTruncated: number;
     incomplete: number;
     neverCaptured: number;
     total: number;
 }
+
+export type StoredContentCoverage = AvailableStoredContentCoverage | LockedContentCoverage;
 
 export interface StoredContentMatch {
     bm25: number;
@@ -113,6 +116,8 @@ interface TurnCollection {
     omittedBefore?: number;
     retentionHighWater?: { turns: number; renderedChars: number };
     reason?: string;
+    state?: 'locked';
+    content_coverage?: LockedContentCoverage;
 }
 
 interface SourceTurnCollection extends TurnCollection {
@@ -215,11 +220,18 @@ export class SessionReader {
         this.adapters = adapters;
     }
 
+    serveState(): 'locked' | 'unlocked' {
+        return memoryServeState(this.db);
+    }
+
     // Memoized per reader instance, the same pattern as ProjectResolver.list:
     // one operation's repeated reads of a project share a single load. A
     // long-lived caller constructs a fresh reader per request so later
     // requests observe daemon writes.
     sessionsFor(project: ProjectSet): ServedSession[] {
+        if (isMemoryLocked(this.db)) {
+            return [];
+        }
         const key = project.projectIds.join(',');
         const cached = this.sessionsMemo.get(key);
         if (cached !== undefined) {
@@ -236,8 +248,11 @@ export class SessionReader {
         perComponentRowCap: number,
         withinBudget: () => boolean,
     ): StoredContentRecall {
+        if (isMemoryLocked(this.db)) {
+            return { coverage: LOCKED_CONTENT_COVERAGE, matches: new Map(), rowCapReached: false, timeBudgetReached: false };
+        }
         const requestedIds = [...new Set([...sessions].map((session) => session.id))];
-        const emptyCoverage: StoredContentCoverage = {
+        const emptyCoverage: AvailableStoredContentCoverage = {
             complete: 0,
             completeTruncated: 0,
             incomplete: 0,
@@ -377,6 +392,9 @@ export class SessionReader {
     }
 
     sessionAggregatesFor(projects: readonly ProjectSet[]): ProjectSessionAggregate[] {
+        if (isMemoryLocked(this.db)) {
+            return [];
+        }
         const projectIds = [...new Set(projects.flatMap((project) => project.projectIds))];
         return readProjectSessionAggregates(this.db, projectIds);
     }
@@ -385,6 +403,9 @@ export class SessionReader {
     // sets in one newest-first query. The caller owns the consent boundary;
     // this reader only combines its internal project ids.
     recentConsentedSessions(projects: readonly ProjectSet[]): ServedSession[] {
+        if (isMemoryLocked(this.db)) {
+            return [];
+        }
         const projectIds = [...new Set(projects.flatMap((project) => project.projectIds))].sort((a, b) => a - b);
         if (projectIds.length === 0) {
             return [];
@@ -404,6 +425,9 @@ export class SessionReader {
     }
 
     sessionById(id: number): ServedSession | undefined {
+        if (isMemoryLocked(this.db)) {
+            return undefined;
+        }
         return readSessionById(this.db, id);
     }
 
@@ -420,7 +444,7 @@ export class SessionReader {
     storedRecallFieldsFor(sessions: Iterable<Pick<ServedSession, 'id'>>): Map<number, StoredSessionRecallFields> {
         const ids = [...new Set([...sessions].map((session) => session.id))];
         const bySession = new Map(ids.map((id) => [id, new Map<number, StoredTurnRecallFields>()]));
-        if (ids.length === 0) {
+        if (ids.length === 0 || isMemoryLocked(this.db)) {
             return bySession;
         }
         const rows = this.db
@@ -558,7 +582,13 @@ export class SessionReader {
         storedIndexes?: ReadonlySet<number>,
         bounds?: TurnCollectionBounds,
     ): Promise<TurnCollection> {
+        if (isMemoryLocked(this.db)) {
+            return { state: 'locked', reason: 'locked', content_coverage: LOCKED_CONTENT_COVERAGE };
+        }
         const { sourceUnavailable: _, ...result } = await this.sourceTurns(session, signal, storedIndexes, bounds);
+        if (isMemoryLocked(this.db)) {
+            return { state: 'locked', reason: 'locked', content_coverage: LOCKED_CONTENT_COVERAGE };
+        }
         return result;
     }
 
@@ -591,6 +621,9 @@ export class SessionReader {
                 handle,
                 signal,
             })) {
+                if (isMemoryLocked(this.db)) {
+                    return { reason: 'locked' };
+                }
                 if (signal?.aborted) {
                     return { reason: 'deadline' };
                 }
@@ -656,7 +689,15 @@ export class SessionReader {
         lastN?: number,
         signal?: AbortSignal,
         charBudget: number = SESSION_CHAR_BUDGET,
-    ): Promise<{ episode?: BoundedEpisode; reason?: string }> {
+    ): Promise<{
+        episode?: BoundedEpisode;
+        reason?: string;
+        state?: 'locked';
+        content_coverage?: LockedContentCoverage;
+    }> {
+        if (isMemoryLocked(this.db)) {
+            return { state: 'locked', reason: 'locked', content_coverage: LOCKED_CONTENT_COVERAGE };
+        }
         const nonce = randomUUID();
         const boundedLastN = lastN === undefined ? undefined : Math.min(Math.max(1, Math.trunc(lastN)), MAX_GET_SESSION_LAST_N);
         const durable = this.durableTurns(session, { lastN: boundedLastN, charBudget, nonce }, signal);
@@ -669,12 +710,18 @@ export class SessionReader {
             };
         }
         const parsed = await this.sourceTurns(session, signal, undefined, { lastN: boundedLastN, charBudget, nonce });
+        if (isMemoryLocked(this.db)) {
+            return { state: 'locked', reason: 'locked', content_coverage: LOCKED_CONTENT_COVERAGE };
+        }
         return parsed.turns === undefined
             ? { reason: parsed.sourceUnavailable && durable.present ? 'durable_capture_incomplete' : parsed.reason }
             : { episode: boundedRender(parsed.turns, boundedLastN, charBudget, nonce, parsed.omittedBefore) };
     }
 
     aggregate(project: ProjectSet): { files: string[]; surfaces: string[]; lastActivity: string | null } {
+        if (isMemoryLocked(this.db)) {
+            return { files: [], surfaces: [], lastActivity: null };
+        }
         const rows = this.sessionsFor(project).filter(isSubstantive).slice(0, AUTO_BRIEF_AGGREGATE_SESSION_LIMIT);
         const ids = rows.map((row) => row.id);
         if (ids.length === 0) {

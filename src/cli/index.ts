@@ -18,6 +18,7 @@ import { registerInspect } from './commands/inspect.js';
 import { registerInstall } from './commands/install.js';
 import { registerInternal } from './commands/internal.js';
 import { registerMcp } from './commands/mcp.js';
+import { registerParanoid } from './commands/paranoid.js';
 import { registerProjects } from './commands/projects.js';
 import { registerPurge } from './commands/purge.js';
 import { registerReingest } from './commands/reingest.js';
@@ -58,6 +59,7 @@ registerUninstall(program);
 registerInit(program);
 registerSelfUpdate(program);
 registerStart(program);
+registerParanoid(program);
 
 registerInternal(program);
 registerMcp(program);

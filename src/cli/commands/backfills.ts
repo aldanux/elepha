@@ -9,6 +9,7 @@ import {
     type FirstPromptSearchPlan,
     planFirstPromptSearchBackfill,
 } from '../../storage/first-prompt-search-backfill.js';
+import { isMemoryLocked } from '../../storage/paranoid-gate.js';
 import { applyRenderedCharsBackfill, planRenderedCharsBackfill, type RenderedCharsPlan } from '../../storage/rendered-chars-backfill.js';
 import { applyRootCommitBackfill, planRootCommitBackfill, type RootCommitBackfillPlan } from '../../storage/root-commit-backfill.js';
 import { applySessionFieldsBackfill, planSessionFieldsBackfill, type SessionFieldsPlan } from '../../storage/session-fields-backfill.js';
@@ -122,7 +123,10 @@ export function registerBackfills(program: Command): void {
                 db,
                 operationLabel: 'backfill first prompt search',
                 plan: () => planFirstPromptSearchBackfill(db, adapters),
-                describe: printFirstPromptSearchPlan,
+                describe: (plan) =>
+                    isMemoryLocked(db)
+                        ? printLockedTranscriptBackfillPlan('first-prompt search document', plan)
+                        : printFirstPromptSearchPlan(plan),
                 isEmpty: (plan) => plan.changes.length === 0,
                 confirm: undefined,
                 messages: {
@@ -168,7 +172,8 @@ export function registerBackfills(program: Command): void {
                 db,
                 operationLabel: 'backfill session titles',
                 plan: () => planSessionTitleBackfill(db, adapters),
-                describe: printSessionTitlePlan,
+                describe: (plan) =>
+                    isMemoryLocked(db) ? printLockedTranscriptBackfillPlan('session title', plan) : printSessionTitlePlan(plan),
                 isEmpty: (plan) => plan.changes.length === 0,
                 confirm: undefined,
                 messages: { dryRun: '\nDry run only - nothing was written. Re-run with --apply to store these exact titles.' },
@@ -205,7 +210,8 @@ export function registerBackfills(program: Command): void {
                 db,
                 operationLabel: 'backfill custom titles',
                 plan: () => planCustomTitleBackfill(db, adapters),
-                describe: printCustomTitlePlan,
+                describe: (plan) =>
+                    isMemoryLocked(db) ? printLockedTranscriptBackfillPlan('custom session title', plan) : printCustomTitlePlan(plan),
                 isEmpty: (plan) => plan.changes.length === 0,
                 confirm: undefined,
                 messages: { dryRun: '\nDry run only - nothing was written. Re-run with --apply to store these exact titles.' },
@@ -274,6 +280,16 @@ export function registerBackfills(program: Command): void {
                 },
             });
         });
+}
+
+function printLockedTranscriptBackfillPlan(
+    label: string,
+    plan: { changes: readonly unknown[]; sessionsScanned: number; sessionsMissingTranscript: number },
+): void {
+    console.log(
+        `${plan.changes.length} ${label} change(s) of ${plan.sessionsScanned} session(s) scanned; ` +
+            `${plan.sessionsMissingTranscript} transcript(s) unavailable. Details hidden while elepha memory is locked.`,
+    );
 }
 
 function printRootCommitPlan(plan: RootCommitBackfillPlan): void {

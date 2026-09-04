@@ -5,6 +5,7 @@ import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver } from '../../storage/project-resolver.js';
 import { isLiveProjectPath, isTempProjectPath } from '../project-path.js';
+import { refuseLockedCliRead } from '../read-gate.js';
 
 export function registerProjects(program: Command): void {
     program
@@ -12,7 +13,12 @@ export function registerProjects(program: Command): void {
         .description('List all projects with captured memory')
         .option('--all', 'include missing and temporary project paths')
         .action(async (opts: { all?: boolean }) => {
-            const store = new MemoryStore(await openDb());
+            const db = await openDb();
+            if (refuseLockedCliRead(db)) {
+                db.close();
+                return;
+            }
+            const store = new MemoryStore(db);
             const sessionCounts = store.sessionCountsByProject();
             const projects = new ProjectResolver(store.database).list();
             const countSessions = (projectIds: readonly number[]): number =>

@@ -13,6 +13,7 @@ import { SummarizerCallLog } from '../../summarizer/call-log.js';
 import { estimateCostUsd } from '../../summarizer/pricing.js';
 import { createConfiguredSynthesisProviders } from '../../summarizer/provider-config.js';
 import type { SessionAdapter, ToolName } from '../../types/index.js';
+import { refuseLockedCliRead } from '../read-gate.js';
 
 const REBUILD_PREVIEW_OUTPUT_TOKENS_PER_SESSION = 512;
 
@@ -28,6 +29,12 @@ export function registerRollup(program: Command): void {
         .option('--apply', 'run a --rebuild after showing its estimated cost')
         .option('--limit <n>', 'stop after N sessions', '0')
         .action(async (opts: { all: boolean; rebuild: boolean; apply: boolean; limit: string }) => {
+            const gateDb = await openDb();
+            if (refuseLockedCliRead(gateDb)) {
+                gateDb.close();
+                return;
+            }
+            gateDb.close();
             let store: MemoryStore | undefined;
             let candidates: SessionRow[] | undefined;
             // A multi-batch rebuild reprocesses a session from scratch across

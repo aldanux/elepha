@@ -52,6 +52,7 @@ import type { ConsentState } from '../storage/consent-store.js';
 import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
 import type { MemoryStore } from '../storage/memory-store.js';
+import { isMemoryLocked } from '../storage/paranoid-gate.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
@@ -1290,7 +1291,7 @@ export class IngestionDaemon {
     // and 'final' once the transcript has gone idle - but 'final' is only ever
     // a heuristic, and any later turn returns the session to 'live'.
     private async refreshRollup(adapter: SessionAdapter, filePath: string, nativeId: string, state: 'live' | 'final'): Promise<void> {
-        if (!this.rollupService) {
+        if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return;
         }
 
@@ -1310,7 +1311,7 @@ export class IngestionDaemon {
         classification: SessionClassification | undefined,
         state: 'live' | 'final',
     ): Promise<void> {
-        if (!this.rollupService) {
+        if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return;
         }
 
@@ -1340,7 +1341,7 @@ export class IngestionDaemon {
     // that finished during downtime would sit 'live' forever, since no further
     // file event will ever arrive for it.
     async sweepIdleSessions(now = Date.now()): Promise<number> {
-        if (!this.rollupService) {
+        if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return 0;
         }
         let closed = 0;

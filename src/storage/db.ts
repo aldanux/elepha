@@ -9,6 +9,7 @@ import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from './database-encryption.js';
 import { assertDatabaseMigrationInactive } from './database-migration.js';
+import { registerParanoidDatabase } from './paranoid-gate.js';
 
 export function defaultDbPath(): string {
     const override = process.env.ELEPHA_DB_PATH?.trim();
@@ -471,6 +472,7 @@ export async function openManagedDatabase(
     });
     try {
         if (key !== undefined) {
+            registerParanoidDatabase(db, dbPath, key);
             db.pragma("cipher='chacha20'");
             const rawKey = Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
             try {

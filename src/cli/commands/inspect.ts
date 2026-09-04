@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { openDb } from '../../storage/db.js';
 import { type MemoryRow, MemoryStore } from '../../storage/memory-store.js';
+import { refuseLockedCliRead } from '../read-gate.js';
 
 export function registerInspect(program: Command): void {
     program
@@ -9,7 +10,12 @@ export function registerInspect(program: Command): void {
         .argument('<project>', 'project path, path suffix, or display name')
         .option('-n, --limit <n>', 'number of recent turns to show', '10')
         .action(async (query: string, opts: { limit: string }) => {
-            const store = new MemoryStore(await openDb());
+            const db = await openDb();
+            if (refuseLockedCliRead(db)) {
+                db.close();
+                return;
+            }
+            const store = new MemoryStore(db);
             const project = store.findProject(query);
             if (!project) {
                 console.error(`No project matching "${query}". Known projects:`);

@@ -14,6 +14,7 @@ import {
 } from '../config/constants.js';
 import type { QueryMatchingMode } from '../config/settings.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
+import { LOCKED_CONTENT_COVERAGE, LOCKED_MEMORY_MESSAGE, type LockedContentCoverage } from '../storage/paranoid-gate.js';
 import type { ProjectSet } from '../storage/project-resolver.js';
 import { relativeTime } from '../util/relative-time.js';
 import { DISPLAY_VERBATIM_INSTRUCTIONS, SELECT_HINT, servedContextInstructions } from './instructions.js';
@@ -53,9 +54,11 @@ interface RecallHit {
     sessionId: number;
 }
 
-interface LexicalRecallResult {
+export interface LexicalRecallResult {
     body: string;
     sessionIds: number[];
+    state?: 'locked';
+    content_coverage?: LockedContentCoverage;
 }
 
 interface Match {
@@ -324,6 +327,9 @@ function coverageLine(
     contentCoverage: StoredContentCoverage | undefined,
     absenceIsInconclusive: boolean,
 ): string | undefined {
+    if (contentCoverage !== undefined && 'state' in contentCoverage) {
+        return undefined;
+    }
     if (reasons.length === 0 && (contentCoverage === undefined || contentCoverage.total === 0)) {
         return undefined;
     }
@@ -417,6 +423,14 @@ export async function lexicalRecall(
     relativeNow: number | undefined,
     matchingMode: QueryMatchingMode,
 ): Promise<LexicalRecallResult> {
+    if (typeof reader.serveState === 'function' && reader.serveState() === 'locked') {
+        return {
+            body: LOCKED_MEMORY_MESSAGE,
+            sessionIds: [],
+            state: 'locked',
+            content_coverage: LOCKED_CONTENT_COVERAGE,
+        };
+    }
     const scanClock = now ?? Date.now;
     const allCandidates = projects
         .flatMap((project) => reader.sessionsFor(project).map((session) => ({ project, session })))

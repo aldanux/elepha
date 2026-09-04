@@ -21,6 +21,7 @@ import { endedAt, type ServedSession, SessionReader, surfaceLabel, titleOf } fro
 import { ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
+import { isMemoryLocked, LOCKED_MEMORY_MESSAGE } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
@@ -37,6 +38,7 @@ export type UserPromptCommand =
 
 export interface UserPromptSubmitDependencies {
     dbPath?: string;
+    openDatabase?: typeof openDb;
     configPath?: string;
     now?: () => number;
     log?: (line: string) => void;
@@ -192,12 +194,16 @@ export async function runUserPromptSubmit(
             log(promptLogLine(tool, payload, 'failed reason=database_unavailable'));
             return { reason: 'database_unavailable' };
         }
-        db = await openDb(dbPath);
+        db = await (dependencies.openDatabase ?? openDb)(dbPath);
     } catch {
         log(promptLogLine(tool, payload, 'failed reason=database_unavailable'));
         return { reason: 'database_unavailable' };
     }
     try {
+        if (isMemoryLocked(db)) {
+            log(promptLogLine(tool, payload, 'served locked'));
+            return { output: envelope(LOCKED_MEMORY_MESSAGE) };
+        }
         const reader = new SessionReader(db);
         const store = new MemoryStore(db);
         const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
@@ -262,6 +268,10 @@ export async function runUserPromptSubmit(
             commandOutput = result.body;
             shownSessionIds = result.shownSessionIds;
             storeShownSessionIds = command?.kind === 'list';
+        }
+        if (isMemoryLocked(db)) {
+            log(promptLogLine(tool, payload, 'served locked'));
+            return { output: envelope(LOCKED_MEMORY_MESSAGE) };
         }
         const body = escapeShellSyntax(commandOutput);
         const injectionId = buildInjectionId();

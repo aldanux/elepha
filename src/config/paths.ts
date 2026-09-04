@@ -17,6 +17,7 @@ import path from 'node:path';
 import type { ToolName } from '../types/index.js';
 import {
     DEFAULT_ELEPHA_SERVICE_LABEL,
+    PARANOID_STATE_FILE_NAME,
     REFUSED_ABSOLUTE_PROJECT_ROOTS,
     REFUSED_HOME_PROJECT_ROOTS,
     TEMPORARY_PROJECT_ROOTS,
@@ -114,6 +115,7 @@ export function elephaPaths(home = homedir()): {
     heartbeat: string;
     migrationLock: string;
     migrationManifest: string;
+    paranoid: string;
     updateCheckState: string;
     updateAvailable: string;
     stdout: string;
@@ -138,6 +140,7 @@ export function elephaPaths(home = homedir()): {
         heartbeat: path.join(root, 'daemon.heartbeat.json'),
         migrationLock: path.join(root, 'database-migration.lock'),
         migrationManifest: path.join(root, 'database-migration.json'),
+        paranoid: path.join(root, PARANOID_STATE_FILE_NAME),
         updateCheckState: path.join(root, 'update-check.json'),
         updateAvailable: path.join(root, 'update-available.json'),
         stdout: path.join(logDir, 'daemon.stdout.log'),
