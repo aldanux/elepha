@@ -1,13 +1,14 @@
 // SQLite connection + schema management. Single local DB file, zero config.
 
-import { closeSync, existsSync, constants as fsConstants, mkdirSync, openSync, readSync } from 'node:fs';
+import { closeSync, existsSync, constants as fsConstants, mkdirSync, openSync, readSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { DATABASE_HEADER_BYTES, DURABLE_CAPTURE_STATES } from '../config/constants.js';
-import { elephaHome } from '../config/paths.js';
+import { elephaHome, samePath } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from './database-encryption.js';
+import { assertDatabaseMigrationInactive } from './database-migration.js';
 
 export function defaultDbPath(): string {
     const override = process.env.ELEPHA_DB_PATH?.trim();
@@ -393,6 +394,25 @@ function hasPlaintextHeader(dbPath: string): boolean {
     }
 }
 
+function isPrimaryDatabasePath(dbPath: string): boolean {
+    const primary = defaultDbPath();
+    if (samePath(path.resolve(dbPath), path.resolve(primary))) {
+        return true;
+    }
+    try {
+        return samePath(realpathSync(dbPath), realpathSync(primary));
+    } catch {
+        try {
+            return samePath(
+                path.join(realpathSync(path.dirname(dbPath)), path.basename(dbPath)),
+                path.join(realpathSync(path.dirname(primary)), path.basename(primary)),
+            );
+        } catch {
+            return false;
+        }
+    }
+}
+
 function initializeDatabase(db: Database.Database, dbPath: string): Database.Database {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
@@ -432,6 +452,9 @@ export async function openManagedDatabase(
 ): Promise<Database.Database> {
     if (dbPath === ':memory:') {
         return new Database(dbPath);
+    }
+    if (isPrimaryDatabasePath(dbPath)) {
+        assertDatabaseMigrationInactive();
     }
     const existed = existsSync(dbPath);
     if (!existed && (options.readonly || options.fileMustExist)) {

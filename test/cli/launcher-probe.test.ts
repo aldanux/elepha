@@ -29,7 +29,16 @@ describe('launcher probe', () => {
             mkdirSync(packDirectory);
             npm(['run', 'build']);
             const [{ filename }] = JSON.parse(npm(['pack', '--json', '--pack-destination', packDirectory])) as Array<{ filename: string }>;
-            npm(['install', '--global', '--prefix', prefix, '--no-audit', '--no-fund', path.join(packDirectory, filename)]);
+            npm([
+                'install',
+                '--global',
+                '--prefix',
+                prefix,
+                '--ignore-scripts',
+                '--no-audit',
+                '--no-fund',
+                path.join(packDirectory, filename),
+            ]);
 
             const bin = path.join(prefix, 'bin', 'elepha');
             const packageJson = path.join(prefix, 'lib', 'node_modules', 'elepha', 'package.json');

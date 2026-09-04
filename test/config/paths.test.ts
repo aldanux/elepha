@@ -46,6 +46,8 @@ describe('isolated elepha paths', () => {
         expect(explicit).toMatchObject({
             root: '/Users/test/.elepha',
             heartbeat: '/Users/test/.elepha/daemon.heartbeat.json',
+            migrationLock: '/Users/test/.elepha/database-migration.lock',
+            migrationManifest: '/Users/test/.elepha/database-migration.json',
             launchAgent: '/Users/test/Library/LaunchAgents/com.elepha.daemon.plist',
         });
         expect(explicit.launchAgent).not.toContain(`${explicit.root}/`);

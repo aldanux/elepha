@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import {
     closeSync,
     existsSync,
+    fchmodSync,
     constants as fsConstants,
     fstatSync,
     fsyncSync,
@@ -23,15 +24,15 @@ export const DATABASE_ENCRYPTION_METADATA_FILE = 'encryption.json';
 export const DATABASE_KEY_FILE = 'elepha.key';
 const DBUS_NO_AUTO_START_FLAG = 0x02;
 
-type EncryptionBackend = 'keyring' | 'key-file';
+export type EncryptionBackend = 'keyring' | 'key-file';
 
-interface EncryptionMetadata {
+export interface EncryptionMetadata {
     installationId: string;
     backend: EncryptionBackend;
     mode: 'default';
 }
 
-interface KeyringEntry {
+export interface KeyringEntry {
     setSecret(secret: Uint8Array, signal?: AbortSignal | null): Promise<void>;
     getSecret(signal?: AbortSignal | null): Promise<Uint8Array | null | undefined>;
     deleteCredential(signal?: AbortSignal | null): Promise<boolean>;
@@ -84,7 +85,7 @@ function assertPrivateRegularFile(file: string, opened: ReturnType<typeof fstatS
     }
 }
 
-function readPrivateFile(file: string): Buffer | undefined {
+export function readPrivateFile(file: string): Buffer | undefined {
     let descriptor: number;
     try {
         descriptor = openSync(file, fsConstants.O_RDONLY | noFollowFlag());
@@ -103,7 +104,7 @@ function readPrivateFile(file: string): Buffer | undefined {
     }
 }
 
-function fsyncDirectory(directory: string): void {
+export function fsyncDirectory(directory: string): void {
     const descriptor = openSync(directory, fsConstants.O_RDONLY);
     try {
         fsyncSync(descriptor);
@@ -123,7 +124,9 @@ function failPrivateFileInstallation(temporary: string, file: string, error: unk
     throw error;
 }
 
-function writePrivateFileAtomic(file: string, contents: Buffer): void {
+// Replacement is reserved for durable journal transitions; key and metadata
+// callers retain the default create-only behavior.
+export function writePrivateFileAtomic(file: string, contents: Buffer, replace = false): void {
     const directory = path.dirname(file);
     mkdirSync(directory, { recursive: true, mode: PRIVATE_DIR_MODE });
     const temporary = path.join(directory, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
@@ -135,6 +138,7 @@ function writePrivateFileAtomic(file: string, contents: Buffer): void {
             fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollowFlag(),
             PRIVATE_FILE_MODE,
         );
+        fchmodSync(descriptor, PRIVATE_FILE_MODE);
         writeFileSync(descriptor, contents);
         fsyncSync(descriptor);
         temporaryIdentity = fstatSync(descriptor);
@@ -146,7 +150,7 @@ function writePrivateFileAtomic(file: string, contents: Buffer): void {
         }
         failPrivateFileInstallation(temporary, file, error);
     }
-    if (existsSync(file)) {
+    if (!replace && existsSync(file)) {
         failPrivateFileInstallation(temporary, file, new Error(`Refusing to replace existing encryption file: ${file}`));
     }
     try {
@@ -171,7 +175,7 @@ function writePrivateFileAtomic(file: string, contents: Buffer): void {
     }
 }
 
-function readMetadata(file: string): EncryptionMetadata | undefined {
+export function readEncryptionMetadata(file: string): EncryptionMetadata | undefined {
     const contents = readPrivateFile(file);
     if (contents === undefined) {
         return undefined;
@@ -325,7 +329,7 @@ async function defaultLinuxSecretServiceProbe(): Promise<boolean> {
     }
 }
 
-async function selectBackend(runtime: DatabaseEncryptionRuntime): Promise<EncryptionBackend> {
+export async function selectBackend(runtime: DatabaseEncryptionRuntime): Promise<EncryptionBackend> {
     const platform = runtime.platform ?? process.platform;
     const env = runtime.env ?? process.env;
     if (platform === 'darwin' || platform === 'win32') {
@@ -345,7 +349,7 @@ async function selectBackend(runtime: DatabaseEncryptionRuntime): Promise<Encryp
     }
 }
 
-async function keyringSecret(metadata: EncryptionMetadata, creating: boolean, runtime: DatabaseEncryptionRuntime): Promise<Buffer> {
+export async function keyringSecret(metadata: EncryptionMetadata, creating: boolean, runtime: DatabaseEncryptionRuntime): Promise<Buffer> {
     const entry = await (runtime.createKeyringEntry ?? defaultKeyringEntry)(DATABASE_CREDENTIAL_SERVICE, metadata.installationId);
     const existing = await withTimeout((signal) => entry.getSecret(signal));
     if (existing != null) {
@@ -368,7 +372,7 @@ async function keyringSecret(metadata: EncryptionMetadata, creating: boolean, ru
     return key;
 }
 
-function keyFileSecret(file: string, creating: boolean, runtime: DatabaseEncryptionRuntime): Buffer {
+export function keyFileSecret(file: string, creating: boolean, runtime: DatabaseEncryptionRuntime): Buffer {
     const existing = readPrivateFile(file);
     if (existing !== undefined) {
         if (existing.length !== DATABASE_KEY_BYTES) {
@@ -387,7 +391,7 @@ function keyFileSecret(file: string, creating: boolean, runtime: DatabaseEncrypt
 export async function databaseKey(databasePath: string, creating: boolean, runtime: DatabaseEncryptionRuntime = {}): Promise<Buffer> {
     const paths = encryptionPaths(databasePath);
     const keyPath = runtime.keyFilePath?.(databasePath) ?? paths.key;
-    let metadata = readMetadata(paths.metadata);
+    let metadata = readEncryptionMetadata(paths.metadata);
     if (metadata === undefined) {
         if (!creating) {
             throw new Error(`Encryption metadata is missing for the encrypted elepha database: ${paths.metadata}`);
@@ -400,6 +404,70 @@ export async function databaseKey(databasePath: string, creating: boolean, runti
         writePrivateFileAtomic(paths.metadata, Buffer.from(`${JSON.stringify(metadata)}\n`, 'utf8'));
     }
     return metadata.backend === 'keyring' ? keyringSecret(metadata, creating, runtime) : keyFileSecret(keyPath, creating, runtime);
+}
+
+export async function readStoredDatabaseKey(
+    databasePath: string,
+    metadata: EncryptionMetadata,
+    runtime: DatabaseEncryptionRuntime = {},
+): Promise<Buffer | undefined> {
+    const keyPath = runtime.keyFilePath?.(databasePath) ?? encryptionPaths(databasePath).key;
+    if (metadata.backend === 'key-file') {
+        const key = readPrivateFile(keyPath);
+        if (key !== undefined && key.length !== DATABASE_KEY_BYTES) {
+            throw new Error(`Stored elepha database key has ${key.length} bytes; expected ${DATABASE_KEY_BYTES}: ${keyPath}`);
+        }
+        return key;
+    }
+    const entry = await (runtime.createKeyringEntry ?? defaultKeyringEntry)(DATABASE_CREDENTIAL_SERVICE, metadata.installationId);
+    const stored = await withTimeout((signal) => entry.getSecret(signal));
+    if (stored == null) {
+        return undefined;
+    }
+    const key = Buffer.from(stored);
+    if (key.length !== DATABASE_KEY_BYTES) {
+        throw new Error(`Stored elepha database key has ${key.length} bytes; expected ${DATABASE_KEY_BYTES}.`);
+    }
+    return key;
+}
+
+export async function storeDatabaseKey(
+    databasePath: string,
+    metadata: EncryptionMetadata,
+    key: Buffer,
+    runtime: DatabaseEncryptionRuntime = {},
+): Promise<void> {
+    if (key.length !== DATABASE_KEY_BYTES) {
+        throw new Error(`Refusing to store an elepha database key with ${key.length} bytes; expected ${DATABASE_KEY_BYTES}.`);
+    }
+    const existing = await readStoredDatabaseKey(databasePath, metadata, runtime);
+    if (existing !== undefined) {
+        const matches = existing.equals(key);
+        existing.fill(0);
+        if (!matches) {
+            throw new Error('Refusing to replace a different stored elepha database key.');
+        }
+        return;
+    }
+    if (metadata.backend === 'keyring') {
+        const entry = await (runtime.createKeyringEntry ?? defaultKeyringEntry)(DATABASE_CREDENTIAL_SERVICE, metadata.installationId);
+        await withTimeout((signal) => entry.setSecret(key, signal));
+        return;
+    }
+    const keyPath = runtime.keyFilePath?.(databasePath) ?? encryptionPaths(databasePath).key;
+    writePrivateFileAtomic(keyPath, key);
+}
+
+export function writeEncryptionMetadata(databasePath: string, metadata: EncryptionMetadata): void {
+    const metadataPath = encryptionPaths(databasePath).metadata;
+    const existing = readEncryptionMetadata(metadataPath);
+    if (existing !== undefined) {
+        if (JSON.stringify(existing) !== JSON.stringify(metadata)) {
+            throw new Error(`Refusing to replace different encryption metadata: ${metadataPath}`);
+        }
+        return;
+    }
+    writePrivateFileAtomic(metadataPath, Buffer.from(`${JSON.stringify(metadata)}\n`, 'utf8'));
 }
 
 export function encryptionMetadataPath(databasePath: string): string {

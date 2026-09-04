@@ -112,6 +112,8 @@ export function elephaPaths(home = homedir()): {
     installTransaction: string;
     launchFailure: string;
     heartbeat: string;
+    migrationLock: string;
+    migrationManifest: string;
     updateCheckState: string;
     updateAvailable: string;
     stdout: string;
@@ -134,6 +136,8 @@ export function elephaPaths(home = homedir()): {
         installTransaction: path.join(serviceDir, 'install-transaction.json'),
         launchFailure: path.join(serviceDir, 'launch-failure.json'),
         heartbeat: path.join(root, 'daemon.heartbeat.json'),
+        migrationLock: path.join(root, 'database-migration.lock'),
+        migrationManifest: path.join(root, 'database-migration.json'),
         updateCheckState: path.join(root, 'update-check.json'),
         updateAvailable: path.join(root, 'update-available.json'),
         stdout: path.join(logDir, 'daemon.stdout.log'),

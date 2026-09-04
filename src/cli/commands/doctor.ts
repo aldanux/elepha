@@ -1,7 +1,9 @@
 import type { Command } from 'commander';
 import { runDoctor } from '../../install/doctor.js';
+import { serviceBackend } from '../../install/service-backend.js';
 import { ConsentStore } from '../../storage/consent-store.js';
-import { openDb } from '../../storage/db.js';
+import { databaseMigrationIsActive, recoverPrimaryDatabaseMigration } from '../../storage/database-migration.js';
+import { defaultDbPath, openDb } from '../../storage/db.js';
 
 export function registerDoctor(program: Command): void {
     program
@@ -11,6 +13,10 @@ export function registerDoctor(program: Command): void {
             let approvedRoots = 0;
             let databaseError: unknown;
             try {
+                if (databaseMigrationIsActive()) {
+                    serviceBackend().stop();
+                    await recoverPrimaryDatabaseMigration(defaultDbPath());
+                }
                 approvedRoots = new ConsentStore(await openDb()).countApproved();
             } catch (error) {
                 databaseError = error;

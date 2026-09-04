@@ -30,8 +30,9 @@ describe('elepha start', () => {
         const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
         const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
         const start = vi.spyOn(IngestionDaemon.prototype, 'start');
+        const migrateDatabase = vi.fn(async () => undefined);
         const program = new Command();
-        registerStart(program);
+        registerStart(program, { migrateDatabase });
         openUnmanagedDb(defaultDbPath()).close();
 
         await program.parseAsync(['node', 'elepha', 'start']);
@@ -41,5 +42,6 @@ describe('elepha start', () => {
         expect(log).toHaveBeenCalledWith(expect.stringContaining('elepha init'));
         expect(error).not.toHaveBeenCalled();
         expect(start).not.toHaveBeenCalled();
+        expect(migrateDatabase).toHaveBeenCalledWith(defaultDbPath());
     });
 });

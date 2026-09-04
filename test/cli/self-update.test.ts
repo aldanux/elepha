@@ -52,6 +52,7 @@ describe('elepha self-update', () => {
 
         expect(stdout).toEqual([formatSelfUpdateCurrentMessage('1.2.3')]);
         expect(stderr).toEqual([]);
+        expect(mocks.openDb).not.toHaveBeenCalled();
         expect(process.exitCode).toBeUndefined();
     });
 
@@ -62,6 +63,7 @@ describe('elepha self-update', () => {
 
         expect(stdout).toEqual([formatSelfUpdateUpdatedMessage('1.2.3', '1.2.4')]);
         expect(stderr).toEqual([]);
+        expect(mocks.selfUpdate).toHaveBeenCalledWith({ readApprovedRoots: expect.any(Function) });
         expect(process.exitCode).toBeUndefined();
     });
 });

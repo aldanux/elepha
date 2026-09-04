@@ -18,8 +18,9 @@ export function registerSelfUpdate(program: Command): void {
         .description('Update the global build, restart capture, and verify the daemon is healthy')
         .action(async () => {
             try {
-                const approvedRoots = new ConsentStore(await openDb()).countApproved();
-                const result = selfUpdate({ approvedRoots });
+                const result = await selfUpdate({
+                    readApprovedRoots: async () => new ConsentStore(await openDb()).countApproved(),
+                });
                 if (result.status === 'current') {
                     console.log(formatSelfUpdateCurrentMessage(result.version));
                     return;

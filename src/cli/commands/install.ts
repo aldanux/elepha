@@ -1,8 +1,10 @@
 import * as clack from '@clack/prompts';
 import type { Command } from 'commander';
 import { type InstallPhaseReporter, installElepha } from '../../install/installer.js';
+import { type ServiceBackend, serviceBackend } from '../../install/service-backend.js';
 import { ConsentStore } from '../../storage/consent-store.js';
-import { openDb } from '../../storage/db.js';
+import { migratePrimaryDatabaseToEncrypted } from '../../storage/database-migration.js';
+import { defaultDbPath, openDb } from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
 import { printInstallation } from '../shared.js';
 
@@ -38,15 +40,44 @@ export function registerInstall(program: Command): void {
 }
 
 async function runInstall(): Promise<void> {
+    let service: ServiceBackend | undefined;
+    let priorService: ReturnType<ServiceBackend['status']> | undefined;
     try {
+        service = serviceBackend();
+        priorService = service.status();
+        service.stop();
+        await migratePrimaryDatabaseToEncrypted(defaultDbPath());
         const onPhase = createInstallProgressReporter();
         const runtime = {
             approvedRoots: new ConsentStore(await openDb()).countApproved(),
+            service,
             ...(onPhase ? { onPhase } : {}),
         };
         printInstallation(installElepha(undefined, runtime), 'install');
     } catch (error) {
+        if (service !== undefined && priorService !== undefined) {
+            try {
+                restoreService(service, priorService);
+            } catch (restoreError) {
+                console.error(`Install failed and the prior capture service could not be restored: ${errorMessage(restoreError)}`);
+            }
+        }
         console.error(errorMessage(error));
         process.exitCode = 1;
+    }
+}
+
+function restoreService(service: ServiceBackend, prior: ReturnType<ServiceBackend['status']>): void {
+    service.stop();
+    if (prior.disabled || prior.unknown) {
+        service.disable();
+        return;
+    }
+    service.enable();
+    if (prior.loaded) {
+        service.start();
+        if (!service.waitForHealthy()) {
+            throw service.healthFailure();
+        }
     }
 }

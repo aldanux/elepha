@@ -2,4 +2,4 @@
 "elepha": minor
 ---
 
-Encrypt new elepha databases at rest in default mode; existing databases open unchanged. Raises the minimum Node.js to 22.12.0.
+Encrypt new elepha databases at rest and atomically migrate existing plaintext primaries in default mode. Raises the minimum Node.js to 22.12.0.
