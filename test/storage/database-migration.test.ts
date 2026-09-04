@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3-multiple-ciphers';
@@ -424,6 +425,68 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
             rollbackPath: string;
         };
         expect(readFileSync(dbPath)).toEqual(readFileSync(manifest.rollbackPath));
+
+        const recovered = runtime(directory);
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovered)).resolves.toEqual({ status: 'migrated' });
+        await assertEncryptedOpenable(dbPath, recovered);
+    });
+
+    it('cleans the exact plaintext rollback restore temporary when its rename fails', async () => {
+        const { directory, dbPath } = fixture('elepha-database-rollback-restore-rename-failure-');
+        const failed = runtime(directory, {
+            swapDatabase: () => {
+                throw new Error('encrypted swap refused');
+            },
+        });
+        const primaryError = new Error('injected rollback restore rename failure') as NodeJS.ErrnoException;
+        primaryError.code = 'EISDIR';
+        const legacyRestoreTemporary = path.join(directory, `.${path.basename(dbPath)}.${MIGRATION_ID}.restore.tmp`);
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalRenameSync = mutableFs.renameSync;
+        let exactTemporary: string | undefined;
+        let copiedHeader: string | undefined;
+        let rollbackBytesBeforeFailure: Buffer | undefined;
+        mutableFs.renameSync = ((oldPath, newPath) => {
+            if (String(newPath) === dbPath) {
+                exactTemporary = String(oldPath);
+                copiedHeader = readFileSync(exactTemporary).subarray(0, 16).toString('binary');
+                const manifest = JSON.parse(readFileSync(failed.statePaths?.manifest ?? '', 'utf8')) as { rollbackPath: string };
+                rollbackBytesBeforeFailure = readFileSync(manifest.rollbackPath);
+                for (const suffix of ['-wal', '-shm', '-journal']) {
+                    writeFileSync(`${exactTemporary}${suffix}`, `temporary ${suffix}`);
+                }
+                throw primaryError;
+            }
+            return originalRenameSync(oldPath, newPath);
+        }) as typeof import('node:fs').renameSync;
+        syncBuiltinESMExports();
+
+        let caught: unknown;
+        try {
+            await migratePrimaryDatabaseToEncrypted(dbPath, failed);
+        } catch (error) {
+            caught = error;
+        } finally {
+            mutableFs.renameSync = originalRenameSync;
+            syncBuiltinESMExports();
+        }
+
+        expect(caught).toBe(primaryError);
+        if (exactTemporary === undefined || copiedHeader === undefined || rollbackBytesBeforeFailure === undefined) {
+            throw new Error('Rollback restore rename failpoint was not reached.');
+        }
+        expect(copiedHeader).toBe('SQLite format 3\0');
+        const restoreTemporaries = [...new Set([legacyRestoreTemporary, exactTemporary])];
+        expect(
+            restoreTemporaries
+                .flatMap((temporary) => ['', '-wal', '-shm', '-journal'].map((suffix) => `${temporary}${suffix}`))
+                .filter(existsSync),
+        ).toEqual([]);
+        const manifest = JSON.parse(readFileSync(failed.statePaths?.manifest ?? '', 'utf8')) as { rollbackPath: string };
+        expect(existsSync(manifest.rollbackPath)).toBe(true);
+        expect(readFileSync(manifest.rollbackPath)).toEqual(rollbackBytesBeforeFailure);
+        expect(readFileSync(dbPath)).toEqual(rollbackBytesBeforeFailure);
+        assertPlaintextOpenable(dbPath);
 
         const recovered = runtime(directory);
         await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovered)).resolves.toEqual({ status: 'migrated' });

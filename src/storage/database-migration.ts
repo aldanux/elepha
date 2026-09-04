@@ -33,6 +33,7 @@ import {
 } from '../config/constants.js';
 import { elephaPaths } from '../config/paths.js';
 import { errorMessage } from '../util/error.js';
+import { atomicCopyPrivateFile } from '../util/fs.js';
 import {
     type DatabaseEncryptionRuntime,
     type EncryptionBackend,
@@ -720,12 +721,8 @@ function restorePlaintextCanonical(manifest: DatabaseMigrationManifest, runtime:
     if (!existsSync(manifest.rollbackPath) || hashFile(manifest.rollbackPath) !== manifest.originalSha256) {
         throw new Error('Cannot restore the plaintext database because its byte-exact rollback copy is unavailable.');
     }
-    const temporary = path.join(
-        path.dirname(manifest.sourcePath),
-        `.${path.basename(manifest.sourcePath)}.${manifest.migrationId}.restore.tmp`,
-    );
-    copyFileDurably(manifest.rollbackPath, temporary);
-    renameSync(temporary, manifest.sourcePath);
+    atomicCopyPrivateFile(manifest.rollbackPath, manifest.sourcePath, PRIVATE_FILE_MODE);
+    syncFile(manifest.sourcePath);
     fsyncDirectory(path.dirname(manifest.sourcePath));
     if (hashFile(manifest.sourcePath) !== manifest.originalSha256) {
         throw new Error('Restored plaintext database failed SHA-256 verification.');
