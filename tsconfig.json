@@ -10,7 +10,8 @@
         "skipLibCheck": true,
         "typeRoots": ["./src/types", "./node_modules/@types"],
         "declaration": false,
-        "sourceMap": true
+        "sourceMap": true,
+        "inlineSources": true
     },
     "include": ["src"]
 }
