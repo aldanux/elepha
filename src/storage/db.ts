@@ -1,6 +1,6 @@
 // SQLite connection + schema management. Single local DB file, zero config.
 
-import { closeSync, existsSync, constants as fsConstants, mkdirSync, openSync, readSync, realpathSync } from 'node:fs';
+import { closeSync, constants as fsConstants, mkdirSync, openSync, readSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { DATABASE_HEADER_BYTES, DURABLE_CAPTURE_STATES } from '../config/constants.js';
@@ -8,6 +8,15 @@ import { elephaHome, samePath } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from './database-encryption.js';
+import {
+    acquireSharedDatabaseLifecycle,
+    assertExclusiveDatabaseLifecycle,
+    type ExclusiveDatabaseLifecycleLease,
+    holdExclusiveDatabaseLifecycleUntilClose,
+    holdSharedDatabaseLifecycleUntilClose,
+    requireManagedDatabaseCheckpointOnClose,
+    type SharedDatabaseLifecycleLease,
+} from './database-lifecycle.js';
 import { assertDatabaseMigrationInactive } from './database-migration.js';
 import { registerParanoidDatabase } from './paranoid-gate.js';
 
@@ -464,6 +473,41 @@ export interface ManagedDatabaseOpenOptions {
     readonly?: boolean;
     fileMustExist?: boolean;
     encryption?: DatabaseEncryptionRuntime;
+    lifecycle?: ExclusiveDatabaseLifecycleLease;
+}
+
+function releaseLifecycleAfterFailure(lease: SharedDatabaseLifecycleLease, error: unknown): never {
+    try {
+        lease.release();
+    } catch (releaseError) {
+        throw new AggregateError([error, releaseError], 'Managed database initialization and lifecycle release both failed.');
+    }
+    throw error;
+}
+
+function closeDatabaseAfterFailure(db: Database.Database, error: unknown): never {
+    try {
+        db.close();
+    } catch (closeError) {
+        throw new AggregateError([error, closeError], 'Managed database initialization and close both failed.');
+    }
+    throw error;
+}
+
+function requireManagedDatabaseLifecycle(
+    lifecycle: SharedDatabaseLifecycleLease | ExclusiveDatabaseLifecycleLease | undefined,
+    dbPath: string,
+): SharedDatabaseLifecycleLease | ExclusiveDatabaseLifecycleLease {
+    if (lifecycle === undefined) {
+        throw new Error(`Managed database lifecycle was not acquired for ${dbPath}`);
+    }
+    return lifecycle;
+}
+
+function assertManagedDatabaseExistsWhenRequired(exists: boolean, options: ManagedDatabaseOpenOptions, dbPath: string): void {
+    if (!exists && (options.readonly || options.fileMustExist)) {
+        throw new Error(`Managed elepha database does not exist: ${dbPath}`);
+    }
 }
 
 function prepareDatabaseDirectory(dbPath: string): void {
@@ -488,7 +532,7 @@ function rawDatabaseKey(key: Buffer): Buffer {
     return Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
 }
 
-export function keyDatabaseConnection(db: Database.Database, key: Buffer): void {
+function applyDatabaseKey(db: Database.Database, key: Buffer): void {
     db.pragma("cipher='chacha20'");
     const rawKey = rawDatabaseKey(key);
     try {
@@ -496,6 +540,10 @@ export function keyDatabaseConnection(db: Database.Database, key: Buffer): void 
     } finally {
         rawKey.fill(0);
     }
+}
+
+export function keyDatabaseConnection(db: Database.Database, key: Buffer): void {
+    applyDatabaseKey(db, key);
     // SQLite3MC validates a key only when the database is first read.
     db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
 }
@@ -582,46 +630,86 @@ export function openUnmanagedDb(dbPath: string = ':memory:'): Database.Database 
     }
 }
 
+// Pin relative paths before entering this function so awaited key-store work
+// cannot redirect later filesystem, SQLite, or initialization operations.
+async function openManagedDatabaseAtPinnedPath(dbPath: string, options: ManagedDatabaseOpenOptions): Promise<Database.Database> {
+    if (dbPath === ':memory:') {
+        return new Database(dbPath);
+    }
+    const sharedLease = options.lifecycle === undefined ? acquireSharedDatabaseLifecycle(dbPath) : undefined;
+    let leaseAttached = false;
+    let db: Database.Database | undefined;
+    let key: Buffer | undefined;
+    try {
+        if (options.lifecycle !== undefined) {
+            assertExclusiveDatabaseLifecycle(options.lifecycle, dbPath);
+        }
+        const lifecycle = requireManagedDatabaseLifecycle(options.lifecycle ?? sharedLease, dbPath);
+        if (isPrimaryDatabasePath(dbPath)) {
+            assertDatabaseMigrationInactive();
+        }
+        const databaseIdentity = lifecycle.captureDatabaseIdentity();
+        const existed = databaseIdentity.exists;
+        assertManagedDatabaseExistsWhenRequired(existed, options, dbPath);
+        if (!options.readonly) {
+            prepareDatabaseDirectory(dbPath);
+        }
+        const plaintext = existed && hasPlaintextDatabaseHeader(dbPath);
+        databaseIdentity.assertCurrent();
+        key = plaintext ? undefined : await databaseKey(dbPath, !existed, options.encryption);
+        databaseIdentity.assertCurrent();
+        const opened = databaseIdentity.openDatabase(
+            (physicalPath) =>
+                new Database(physicalPath, {
+                    ...(options.readonly ? { readonly: true } : {}),
+                    ...(options.fileMustExist ? { fileMustExist: true } : {}),
+                }),
+        );
+        db = opened.database;
+        if (sharedLease !== undefined) {
+            holdSharedDatabaseLifecycleUntilClose(db, sharedLease);
+            leaseAttached = true;
+        } else if (options.lifecycle !== undefined) {
+            holdExclusiveDatabaseLifecycleUntilClose(db, options.lifecycle);
+        }
+        if (key !== undefined) {
+            applyDatabaseKey(db, key);
+        }
+        db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+        requireManagedDatabaseCheckpointOnClose(db);
+        if (key === undefined) {
+            return db;
+        }
+        try {
+            registerParanoidDatabase(db, dbPath, key);
+        } finally {
+            key.fill(0);
+            key = undefined;
+        }
+        return db;
+    } catch (error) {
+        let failure = error;
+        key?.fill(0);
+        if (db !== undefined) {
+            try {
+                db.close();
+            } catch (closeError) {
+                failure = new AggregateError([error, closeError], 'Managed database initialization and close both failed.');
+            }
+        }
+        if (sharedLease !== undefined && !leaseAttached) {
+            return releaseLifecycleAfterFailure(sharedLease, failure);
+        }
+        throw failure;
+    }
+}
+
 export async function openManagedDatabase(
     dbPath: string = defaultDbPath(),
     options: ManagedDatabaseOpenOptions = {},
 ): Promise<Database.Database> {
-    if (dbPath === ':memory:') {
-        return new Database(dbPath);
-    }
-    if (isPrimaryDatabasePath(dbPath)) {
-        assertDatabaseMigrationInactive();
-    }
-    const existed = existsSync(dbPath);
-    if (!existed && (options.readonly || options.fileMustExist)) {
-        throw new Error(`Managed elepha database does not exist: ${dbPath}`);
-    }
-    if (!options.readonly) {
-        prepareDatabaseDirectory(dbPath);
-    }
-    const plaintext = existed && hasPlaintextDatabaseHeader(dbPath);
-    const key = plaintext ? undefined : await databaseKey(dbPath, !existed, options.encryption);
-    const db = new Database(dbPath, {
-        ...(options.readonly ? { readonly: true } : {}),
-        ...(options.fileMustExist ? { fileMustExist: true } : {}),
-    });
-    try {
-        if (key !== undefined) {
-            registerParanoidDatabase(db, dbPath, key);
-            try {
-                keyDatabaseConnection(db, key);
-            } finally {
-                key.fill(0);
-            }
-        } else {
-            // This is also the proof point for plaintext opens.
-            db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
-        }
-        return db;
-    } catch (error) {
-        db.close();
-        throw error;
-    }
+    const databasePath = dbPath === ':memory:' ? dbPath : path.resolve(dbPath);
+    return openManagedDatabaseAtPinnedPath(databasePath, options);
 }
 
 export function openDb(dbPath: ':memory:'): Database.Database;
@@ -633,12 +721,12 @@ export function openDb(
     if (dbPath === ':memory:') {
         return openUnmanagedDb(dbPath);
     }
-    return openManagedDatabase(dbPath, options).then((db) => {
+    const databasePath = path.resolve(dbPath);
+    return openManagedDatabaseAtPinnedPath(databasePath, options).then((db) => {
         try {
-            return initializeDatabase(db, dbPath);
+            return initializeDatabase(db, databasePath);
         } catch (error) {
-            db.close();
-            throw error;
+            return closeDatabaseAfterFailure(db, error);
         }
     });
 }

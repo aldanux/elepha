@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, mkdtempSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
+import { createReadStream, existsSync, lstatSync, mkdtempSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
@@ -9,6 +9,11 @@ import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../in
 import { writeBackup } from '../../storage/backup.js';
 import { validateCandidateSemantics } from '../../storage/candidate-validator.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from '../../storage/database-encryption.js';
+import {
+    type ExclusiveDatabaseLifecycleLease,
+    withExclusiveDatabaseLifecycle,
+    withSharedDatabaseLifecycle,
+} from '../../storage/database-lifecycle.js';
 import {
     defaultDbPath,
     hasPlaintextDatabaseHeader,
@@ -41,6 +46,7 @@ const TOMBSTONE_TABLES = [
     { table: 'purged_transcripts', timestampColumn: 'purged_at' },
     { table: 'incognito_transcripts', timestampColumn: 'tombstoned_at' },
 ] as const;
+const DATABASE_COMPANION_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
 
 type TombstoneTable = (typeof TOMBSTONE_TABLES)[number]['table'];
 type TranscriptTombstones = Record<TombstoneTable, TranscriptIdentity[]>;
@@ -242,8 +248,12 @@ function printPreview(dbPath: string, candidatePath: string, counts: RestoreCoun
     );
 }
 
-async function checkpointActiveDatabase(dbPath: string, encryption?: DatabaseEncryptionRuntime): Promise<Database.Database> {
-    const db = await openManagedDatabase(dbPath, { fileMustExist: true, encryption });
+async function checkpointActiveDatabase(
+    dbPath: string,
+    lifecycle: ExclusiveDatabaseLifecycleLease,
+    encryption?: DatabaseEncryptionRuntime,
+): Promise<Database.Database> {
+    const db = await openManagedDatabase(dbPath, { fileMustExist: true, encryption, lifecycle });
     db.pragma('wal_checkpoint(TRUNCATE)');
     return db;
 }
@@ -270,9 +280,10 @@ async function activeTranscriptTombstones(dbPath: string, encryption?: DatabaseE
 async function unionTranscriptTombstones(
     dbPath: string,
     tombstones: TranscriptTombstones,
+    lifecycle: ExclusiveDatabaseLifecycleLease,
     encryption?: DatabaseEncryptionRuntime,
 ): Promise<void> {
-    const restored = await openDb(dbPath, { encryption });
+    const restored = await openDb(dbPath, { encryption, lifecycle });
     try {
         const recordedAt = new Date().toISOString();
         restored.transaction(() => {
@@ -312,24 +323,46 @@ async function unionTranscriptTombstones(
     }
 }
 
-function removeStaleSidecars(dbPath: string): void {
-    for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+function removeAndVerifyDatabaseCompanions(dbPath: string, lifecycle: ExclusiveDatabaseLifecycleLease): void {
+    // SQLite derives companions from its physical filename, which differs from
+    // the configured path when the final component is a symlink.
+    const physicalDatabaseFilename = lifecycle.resolvePhysicalDatabaseFilename();
+    const companions = [
+        ...new Set(
+            [dbPath, physicalDatabaseFilename].flatMap((databaseFilename) =>
+                DATABASE_COMPANION_SUFFIXES.map((suffix) => `${databaseFilename}${suffix}`),
+            ),
+        ),
+    ];
+    for (const companion of companions) {
         try {
-            unlinkSync(sidecar);
+            unlinkSync(companion);
         } catch (error: unknown) {
             if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
                 throw error;
             }
         }
     }
+    for (const companion of companions) {
+        try {
+            lstatSync(companion);
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                continue;
+            }
+            throw error;
+        }
+        throw new Error(`managed database companion remained after cleanup: ${companion}`);
+    }
 }
 
 async function verifyRestoredDatabase(
     dbPath: string,
     expectedCounts: RestoreCounts,
+    lifecycle: ExclusiveDatabaseLifecycleLease,
     encryption?: DatabaseEncryptionRuntime,
 ): Promise<void> {
-    const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption });
+    const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
     try {
         const errors = verifyDatabase(restored, expectedCounts);
         if (errors.length > 0) {
@@ -340,10 +373,22 @@ async function verifyRestoredDatabase(
     }
 }
 
+function assertInstalledRestoreHash(installedHash: string, stagedHash: string): void {
+    if (installedHash !== stagedHash) {
+        throw new Error('Installed database hash does not match the validated backup.');
+    }
+}
+
+function assertRolledBackRestoreHash(rolledBackHash: string, snapshotHash: string): void {
+    if (rolledBackHash !== snapshotHash) {
+        throw new Error('Rolled-back database hash does not match the pre-restore snapshot.');
+    }
+}
+
 // Restore replaces the database file atomically after validation, so its apply
 // step cannot use the SQL-transaction destructive-operation runner.
 export async function runRestoreOperation(candidatePath: string, runtime: RestoreRuntime = {}): Promise<RestoreResult> {
-    const dbPath = runtime.dbPath ?? defaultDbPath();
+    const dbPath = path.resolve(runtime.dbPath ?? defaultDbPath());
     if (!existsSync(candidatePath)) {
         throw new Error(`Backup file not found: ${candidatePath}`);
     }
@@ -356,7 +401,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             if (statSync(stagedPath).size < SQLITE_MINIMUM_DATABASE_BYTES) {
                 throw new Error(`Not a valid SQLite backup at ${candidatePath}.`);
             }
-            candidateKey = await databaseKey(dbPath, false, runtime.encryption);
+            candidateKey = await withSharedDatabaseLifecycle(dbPath, () => databaseKey(dbPath, false, runtime.encryption));
         }
         const counts = inspectCandidate(stagedPath, candidatePath, candidateKey);
         const stagedHash = await sha256File(stagedPath);
@@ -373,47 +418,58 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             return { cancelled: true };
         }
 
-        if (!existsSync(dbPath)) {
-            throw new Error(`No active elepha database exists at ${dbPath}; nothing can be snapshotted before restore.`);
-        }
-        const active = await checkpointActiveDatabase(dbPath, runtime.encryption);
-        let snapshotPath: string;
-        try {
-            snapshotPath = (runtime.writeBackup ?? writeBackup)(active, dbPath);
-        } finally {
-            active.close();
-        }
-        try {
-            atomicCopyPrivateFile(stagedPath, dbPath, PRIVATE_FILE_MODE);
-        } catch (error) {
-            throw new RestoreApplyError(snapshotPath, error);
-        }
-        try {
-            const installedHash = await sha256File(dbPath);
-            if (installedHash !== stagedHash) {
-                //noinspection ExceptionCaughtLocallyJS
-                throw new Error('Installed database hash does not match the validated backup.');
+        return await withExclusiveDatabaseLifecycle(dbPath, async (lifecycle) => {
+            const currentHealth = (runtime.daemonHealth ?? currentDaemonHealth)();
+            if (currentHealth.healthy) {
+                throw new Error(`Refusing restore while the daemon is running (${currentHealth.state}). Run elepha pause first.`);
             }
-            removeStaleSidecars(dbPath);
-            await verifyRestoredDatabase(dbPath, counts, runtime.encryption);
-            await unionTranscriptTombstones(dbPath, tombstones, runtime.encryption);
-            // Read-only verification can create fresh empty WAL bookkeeping files;
-            // remove them too so no sidecar from before the replacement can survive.
-            removeStaleSidecars(dbPath);
-        } catch (restoreError) {
+            if (currentHealth.state.startsWith('STUCK') && currentHealth.state !== health.state) {
+                console.error(`Daemon appears stuck (${currentHealth.state}); proceeding — it is not writing.`);
+            }
+            if (!existsSync(dbPath)) {
+                throw new Error(`No active elepha database exists at ${dbPath}; nothing can be snapshotted before restore.`);
+            }
+            const active = await checkpointActiveDatabase(dbPath, lifecycle, runtime.encryption);
+            let snapshotPath: string;
             try {
-                atomicCopyPrivateFile(snapshotPath, dbPath, PRIVATE_FILE_MODE);
-                removeStaleSidecars(dbPath);
-            } catch (rollbackError) {
-                throw new RestoreApplyError(
-                    snapshotPath,
-                    new Error(`Rollback failed: ${errorMessage(rollbackError)}. Original restore error: ${errorMessage(restoreError)}`),
+                snapshotPath = (runtime.writeBackup ?? writeBackup)(active, dbPath);
+            } finally {
+                active.close();
+            }
+            const snapshotHash = await sha256File(snapshotPath);
+            lifecycle.beginReplacement();
+            try {
+                lifecycle.assertReplacementReady();
+                atomicCopyPrivateFile(stagedPath, dbPath, PRIVATE_FILE_MODE);
+                const installedHash = await sha256File(dbPath);
+                assertInstalledRestoreHash(installedHash, stagedHash);
+                removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
+                await verifyRestoredDatabase(dbPath, counts, lifecycle, runtime.encryption);
+                await unionTranscriptTombstones(dbPath, tombstones, lifecycle, runtime.encryption);
+                // Read-only verification can create fresh empty WAL bookkeeping files;
+                // remove them too so no sidecar from before the replacement can survive.
+                removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
+                lifecycle.completeReplacement();
+            } catch (restoreError) {
+                try {
+                    lifecycle.assertReplacementReady();
+                    atomicCopyPrivateFile(snapshotPath, dbPath, PRIVATE_FILE_MODE);
+                    assertRolledBackRestoreHash(await sha256File(dbPath), snapshotHash);
+                    removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
+                    lifecycle.completeReplacement();
+                } catch (rollbackError) {
+                    throw new RestoreApplyError(
+                        snapshotPath,
+                        new Error(`Rollback failed: ${errorMessage(rollbackError)}. Original restore error: ${errorMessage(restoreError)}`),
+                    );
+                }
+                throw new Error(
+                    `Restore failed and the previous database was rolled back from ${snapshotPath}: ${errorMessage(restoreError)}`,
                 );
             }
-            throw new Error(`Restore failed and the previous database was rolled back from ${snapshotPath}: ${errorMessage(restoreError)}`);
-        }
-        console.log(`Restored ${dbPath} from ${candidatePath}. Pre-restore snapshot: ${snapshotPath}`);
-        return { cancelled: false, snapshotPath };
+            console.log(`Restored ${dbPath} from ${candidatePath}. Pre-restore snapshot: ${snapshotPath}`);
+            return { cancelled: false, snapshotPath };
+        });
     } finally {
         candidateKey?.fill(0);
         removeTemporaryDatabase(stagedPath, stagedDirectory);

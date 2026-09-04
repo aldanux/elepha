@@ -62,6 +62,15 @@ export const REMEMBER_MATCH_SCORES = {
 export const DATABASE_KEY_BYTES = 32;
 export const DATABASE_HEADER_BYTES = 16;
 export const DATABASE_KEYRING_TIMEOUT_MS = 5_000;
+export const DATABASE_LIFECYCLE_ACQUIRE_TIMEOUT_MS = 5_000;
+export const DATABASE_LIFECYCLE_POLL_MS = 25;
+export const DATABASE_LIFECYCLE_RECORD_MAX_BYTES = 4_096;
+// Millisecond-aligned leaf ctime cannot prove that an unlink/link ABA changed metadata.
+export const DATABASE_LIFECYCLE_COARSE_TIMESTAMP_QUANTUM_NS = 1_000_000n;
+export const DATABASE_LIFECYCLE_EXCLUSIVE_OWNER_PUBLICATION_ATTEMPTS = 3;
+// Retries absorb brief leaf-path mutation races; every uncertain
+// SQLite handle is closed before retry, and the fixed bound fails closed.
+export const DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS = 8;
 export const PARANOID_SCRYPT_N = 131_072;
 export const PARANOID_SCRYPT_R = 8;
 export const PARANOID_SCRYPT_P = 1;

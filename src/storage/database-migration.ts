@@ -45,6 +45,7 @@ import {
     writeEncryptionMetadata,
     writePrivateFileAtomic,
 } from './database-encryption.js';
+import { type ExclusiveDatabaseLifecycleLease, withExclusiveDatabaseLifecycle } from './database-lifecycle.js';
 
 export const DATABASE_MIGRATION_IN_PROGRESS = 'migration_in_progress';
 
@@ -323,6 +324,22 @@ function transitionManifest(
     return next;
 }
 
+function rebaseUnfrozenManifest(manifestPath: string, manifest: DatabaseMigrationManifest): DatabaseMigrationManifest {
+    if (manifest.stage !== 'quiesced' || existsSync(manifest.rollbackPath)) {
+        return manifest;
+    }
+    const currentSha256 = hashFile(manifest.sourcePath);
+    if (currentSha256 === manifest.originalSha256) {
+        return manifest;
+    }
+    // A quiesced manifest precedes the immutable rollback snapshot. If the
+    // original owner stopped in that narrow window, a later acknowledged
+    // write becomes the new baseline instead of being overwritten by recovery.
+    const rebased = { ...manifest, originalSha256: currentSha256 };
+    writeManifest(manifestPath, manifest.sourcePath, rebased);
+    return rebased;
+}
+
 function assertSupportedRuntime(runtime: DatabaseMigrationRuntime): void {
     const platform = runtime.platform ?? process.platform;
     const arch = runtime.arch ?? process.arch;
@@ -458,19 +475,27 @@ function assertNoHotJournal(databasePath: string): void {
     }
 }
 
+function assertPlaintextCheckpointReady(result: { busy: number }): void {
+    if (result.busy !== 0) {
+        throw new Error('Refusing database migration because the WAL checkpoint is busy.');
+    }
+}
+
+function assertPlaintextDeleteJournalMode(journalMode: unknown): void {
+    if (journalMode !== 'delete') {
+        throw new Error(`Database migration could not switch SQLite to DELETE journal mode (observed ${String(journalMode)}).`);
+    }
+}
+
 function quiescePlaintextDatabase(databasePath: string, runtime: DatabaseMigrationRuntime): Database.Database {
     const db = new Database(databasePath, { fileMustExist: true, timeout: 0 });
     try {
         db.pragma('busy_timeout = 0');
         db.exec('BEGIN EXCLUSIVE');
         db.exec('ROLLBACK');
-        if (checkpointResult(db).busy !== 0) {
-            throw new Error('Refusing database migration because the WAL checkpoint is busy.');
-        }
+        assertPlaintextCheckpointReady(checkpointResult(db));
         const journalMode = db.pragma('journal_mode = DELETE', { simple: true });
-        if (journalMode !== 'delete') {
-            throw new Error(`Database migration could not switch SQLite to DELETE journal mode (observed ${String(journalMode)}).`);
-        }
+        assertPlaintextDeleteJournalMode(journalMode);
         assertNoHotJournal(databasePath);
         db.exec('BEGIN EXCLUSIVE');
         assertIntegrity(db, 'Quiesced plaintext database');
@@ -493,14 +518,18 @@ function closePlaintextDatabase(db: Database.Database, runtime: DatabaseMigratio
     hit(runtime, 'after_plaintext_closed');
 }
 
+function assertRegularMigrationCopySource(descriptor: number, source: string): void {
+    if (!fstatSync(descriptor).isFile()) {
+        throw new Error(`Database migration copy source is not a regular file: ${source}`);
+    }
+}
+
 function copyFileDurably(source: string, destination: string): void {
     removeFile(destination);
     const sourceDescriptor = openSync(source, fsConstants.O_RDONLY | noFollowFlag());
     let destinationDescriptor: number | undefined;
     try {
-        if (!fstatSync(sourceDescriptor).isFile()) {
-            throw new Error(`Database migration copy source is not a regular file: ${source}`);
-        }
+        assertRegularMigrationCopySource(sourceDescriptor, source);
         destinationDescriptor = openSync(
             destination,
             fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollowFlag(),
@@ -616,11 +645,17 @@ async function storedMigrationKey(
     return key;
 }
 
-function cleanupUncommittedMigration(manifestPath: string, manifest: DatabaseMigrationManifest, runtime: DatabaseMigrationRuntime): void {
+function cleanupUncommittedMigration(
+    manifestPath: string,
+    manifest: DatabaseMigrationManifest,
+    runtime: DatabaseMigrationRuntime,
+    completeReplacement: () => void,
+): void {
     removeFile(manifest.sidecarPath);
     removeFile(manifest.rollbackPath);
     fsyncDirectory(path.dirname(manifest.sourcePath));
     hit(runtime, 'after_uncommitted_artifacts_removed');
+    completeReplacement();
     removeFile(manifestPath);
     fsyncDirectory(path.dirname(manifestPath));
     hit(runtime, 'after_manifest_removed');
@@ -646,7 +681,6 @@ async function commitKey(
             );
         }
         if (stored === undefined) {
-            cleanupUncommittedMigration(manifestPath, manifest, runtime);
             return undefined;
         }
         const matches = keyMatchesManifest(stored, manifest);
@@ -658,7 +692,6 @@ async function commitKey(
     hit(runtime, 'after_key_stored');
     const readBack = await readStoredDatabaseKey(manifest.sourcePath, metadata, runtime);
     if (readBack === undefined) {
-        cleanupUncommittedMigration(manifestPath, manifest, runtime);
         return undefined;
     }
     if (!readBack.equals(key)) {
@@ -710,6 +743,7 @@ function swapCanonical(
     manifestPath: string,
     manifest: DatabaseMigrationManifest,
     runtime: DatabaseMigrationRuntime,
+    completeReplacement: () => void,
 ): DatabaseMigrationManifest {
     try {
         (runtime.swapDatabase ?? renameSync)(manifest.sidecarPath, manifest.sourcePath);
@@ -717,6 +751,7 @@ function swapCanonical(
     } catch (error) {
         restorePlaintextCanonical(manifest, runtime);
         const rolledBack = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
+        completeReplacement();
         throw new Error(
             `Encrypted database swap failed; restored the plaintext database and retained its committed key: ${errorMessage(error)}`,
             {
@@ -794,6 +829,7 @@ async function resumeFromPlaintext(
     initialManifest: DatabaseMigrationManifest,
     db: Database.Database,
     runtime: DatabaseMigrationRuntime,
+    completeReplacement: () => void,
 ): Promise<DatabaseMigrationResult> {
     let manifest = initialManifest;
     let key: Buffer | undefined;
@@ -811,8 +847,8 @@ async function resumeFromPlaintext(
         if (manifest.stage === 'sidecar_encrypted') {
             key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
             if (key === undefined) {
-                cleanupUncommittedMigration(manifestPath, manifest, runtime);
                 closePlaintextDatabase(db, runtime);
+                cleanupUncommittedMigration(manifestPath, manifest, runtime, completeReplacement);
                 return { status: 'recovered-plaintext' };
             }
             writeEncryptionMetadata(manifest.sourcePath, encryptionMetadata(manifest));
@@ -851,6 +887,7 @@ async function resumeFromPlaintext(
             const committed = await commitKey(manifestPath, manifest, key, runtime);
             if (committed === undefined) {
                 closePlaintextDatabase(db, runtime);
+                cleanupUncommittedMigration(manifestPath, manifest, runtime, completeReplacement);
                 return { status: 'recovered-plaintext' };
             }
             manifest = committed;
@@ -876,9 +913,10 @@ async function resumeFromPlaintext(
         manifest = transitionManifest(manifestPath, manifest, 'plaintext_closed', runtime);
         removeInactiveWalFiles(manifest.sourcePath, runtime);
         manifest = transitionManifest(manifestPath, manifest, 'wal_cleaned', runtime);
-        manifest = swapCanonical(manifestPath, manifest, runtime);
+        manifest = swapCanonical(manifestPath, manifest, runtime, completeReplacement);
         manifest = finalVerify(manifestPath, manifest, key, runtime);
         manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
+        completeReplacement();
         finalizeMigration(manifestPath, manifest, runtime);
         return { status: 'migrated' };
     } finally {
@@ -896,13 +934,16 @@ async function resumeManifest(
     manifestPath: string,
     manifest: DatabaseMigrationManifest,
     runtime: DatabaseMigrationRuntime,
+    completeReplacement: () => void,
 ): Promise<DatabaseMigrationResult> {
     if (manifest.stage === 'verified') {
+        completeReplacement();
         finalizeMigration(manifestPath, manifest, runtime);
         return { status: 'migrated' };
     }
     if (manifest.stage === 'committed_verified') {
         manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
+        completeReplacement();
         finalizeMigration(manifestPath, manifest, runtime);
         return { status: 'migrated' };
     }
@@ -911,12 +952,13 @@ async function resumeManifest(
         manifest = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
     }
     if (hasPlaintextHeader(manifest.sourcePath)) {
+        manifest = rebaseUnfrozenManifest(manifestPath, manifest);
         if (hashFile(manifest.sourcePath) !== manifest.originalSha256) {
             restorePlaintextCanonical(manifest, runtime);
             manifest = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
         }
         const plaintext = quiescePlaintextDatabase(manifest.sourcePath, runtime);
-        return resumeFromPlaintext(manifestPath, manifest, plaintext, runtime);
+        return resumeFromPlaintext(manifestPath, manifest, plaintext, runtime, completeReplacement);
     }
     const key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
     if (key === undefined) {
@@ -941,6 +983,7 @@ async function resumeManifest(
         }
         manifest = finalVerify(manifestPath, manifest, key, runtime);
         manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
+        completeReplacement();
         finalizeMigration(manifestPath, manifest, runtime);
         return { status: 'migrated' };
     } finally {
@@ -961,20 +1004,39 @@ async function withMigrationLock(
     }
 }
 
+function activeMigrationRecoveryId(databasePath: string, runtime: DatabaseMigrationRuntime): string | undefined {
+    return readManifest(statePaths(runtime).manifest, databasePath)?.migrationId;
+}
+
 export async function recoverPrimaryDatabaseMigration(
     databasePath: string,
     runtime: DatabaseMigrationRuntime = {},
 ): Promise<DatabaseMigrationResult> {
+    const pinnedDatabasePath = path.resolve(databasePath);
     assertSupportedRuntime(runtime);
     if (!databaseMigrationIsActive(runtime)) {
         return { status: 'no-active-migration' };
     }
+    const recoveryId = activeMigrationRecoveryId(pinnedDatabasePath, runtime);
+    return withExclusiveDatabaseLifecycle(
+        pinnedDatabasePath,
+        (lifecycle) => recoverPrimaryDatabaseMigrationUnderLifecycle(pinnedDatabasePath, runtime, lifecycle),
+        recoveryId,
+    );
+}
+
+async function recoverPrimaryDatabaseMigrationUnderLifecycle(
+    databasePath: string,
+    runtime: DatabaseMigrationRuntime,
+    lifecycle: ExclusiveDatabaseLifecycleLease,
+): Promise<DatabaseMigrationResult> {
     return withMigrationLock(runtime, async (manifestPath) => {
         const manifest = readManifest(manifestPath, databasePath);
         if (manifest === undefined) {
             return { status: 'no-active-migration' };
         }
-        return resumeManifest(manifestPath, manifest, runtime);
+        lifecycle.beginReplacement(manifest.migrationId);
+        return resumeManifest(manifestPath, manifest, runtime, () => lifecycle.completeReplacement());
     });
 }
 
@@ -982,57 +1044,67 @@ export async function migratePrimaryDatabaseToEncrypted(
     databasePath: string,
     runtime: DatabaseMigrationRuntime = {},
 ): Promise<DatabaseMigrationResult> {
+    const pinnedDatabasePath = path.resolve(databasePath);
     assertSupportedRuntime(runtime);
-    if (databaseMigrationIsActive(runtime)) {
-        const recovered = await recoverPrimaryDatabaseMigration(databasePath, runtime);
-        if (recovered.status !== 'no-active-migration') {
-            return recovered;
-        }
-    }
-    if (!existsSync(databasePath)) {
-        return { status: 'no-database' };
-    }
-    if (!hasPlaintextHeader(databasePath)) {
-        return { status: 'already-encrypted' };
-    }
-    preflightPlaintextDatabase(databasePath, runtime);
-    return withMigrationLock(runtime, async (manifestPath) => {
-        const interrupted = readManifest(manifestPath, databasePath);
-        if (interrupted !== undefined) {
-            return resumeManifest(manifestPath, interrupted, runtime);
-        }
-        if (!hasPlaintextHeader(databasePath)) {
-            return { status: 'already-encrypted' };
-        }
-        const plaintext = quiescePlaintextDatabase(databasePath, runtime);
-        try {
-            const migrationId = (runtime.randomUUID ?? randomUUID)();
-            const artifacts = migrationArtifactPaths(path.resolve(databasePath), migrationId);
-            const backend = await selectBackend(runtime);
-            const installationId = (runtime.randomUUID ?? randomUUID)();
-            const manifest: DatabaseMigrationManifest = {
-                version: 1,
-                migrationId,
-                backend,
-                installationId,
-                sourcePath: path.resolve(databasePath),
-                originalSha256: hashFile(databasePath),
-                rollbackPath: artifacts.rollback,
-                sidecarPath: artifacts.sidecar,
-                keySha256: null,
-                stage: 'quiesced',
-            };
-            writeManifest(manifestPath, databasePath, manifest);
-            hit(runtime, 'after_manifest_quiesced');
-            return await resumeFromPlaintext(manifestPath, manifest, plaintext, runtime);
-        } catch (error) {
-            if (plaintext.open) {
-                if (plaintext.inTransaction) {
-                    plaintext.exec('ROLLBACK');
+    const recoveryId = activeMigrationRecoveryId(pinnedDatabasePath, runtime);
+    return withExclusiveDatabaseLifecycle(
+        pinnedDatabasePath,
+        async (lifecycle) => {
+            if (databaseMigrationIsActive(runtime)) {
+                const recovered = await recoverPrimaryDatabaseMigrationUnderLifecycle(pinnedDatabasePath, runtime, lifecycle);
+                if (recovered.status !== 'no-active-migration') {
+                    return recovered;
                 }
-                plaintext.close();
             }
-            throw error;
-        }
-    });
+            if (!existsSync(pinnedDatabasePath)) {
+                return { status: 'no-database' };
+            }
+            if (!hasPlaintextHeader(pinnedDatabasePath)) {
+                return { status: 'already-encrypted' };
+            }
+            preflightPlaintextDatabase(pinnedDatabasePath, runtime);
+            return withMigrationLock(runtime, async (manifestPath) => {
+                const interrupted = readManifest(manifestPath, pinnedDatabasePath);
+                if (interrupted !== undefined) {
+                    lifecycle.beginReplacement(interrupted.migrationId);
+                    return resumeManifest(manifestPath, interrupted, runtime, () => lifecycle.completeReplacement());
+                }
+                if (!hasPlaintextHeader(pinnedDatabasePath)) {
+                    return { status: 'already-encrypted' };
+                }
+                const plaintext = quiescePlaintextDatabase(pinnedDatabasePath, runtime);
+                try {
+                    const migrationId = (runtime.randomUUID ?? randomUUID)();
+                    const artifacts = migrationArtifactPaths(pinnedDatabasePath, migrationId);
+                    const backend = await selectBackend(runtime);
+                    const installationId = (runtime.randomUUID ?? randomUUID)();
+                    const manifest: DatabaseMigrationManifest = {
+                        version: 1,
+                        migrationId,
+                        backend,
+                        installationId,
+                        sourcePath: pinnedDatabasePath,
+                        originalSha256: hashFile(pinnedDatabasePath),
+                        rollbackPath: artifacts.rollback,
+                        sidecarPath: artifacts.sidecar,
+                        keySha256: null,
+                        stage: 'quiesced',
+                    };
+                    writeManifest(manifestPath, pinnedDatabasePath, manifest);
+                    hit(runtime, 'after_manifest_quiesced');
+                    lifecycle.beginReplacement(manifest.migrationId);
+                    return await resumeFromPlaintext(manifestPath, manifest, plaintext, runtime, () => lifecycle.completeReplacement());
+                } catch (error) {
+                    if (plaintext.open) {
+                        if (plaintext.inTransaction) {
+                            plaintext.exec('ROLLBACK');
+                        }
+                        plaintext.close();
+                    }
+                    throw error;
+                }
+            });
+        },
+        recoveryId,
+    );
 }

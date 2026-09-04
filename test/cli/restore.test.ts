@@ -1,5 +1,18 @@
-import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
+import {
+    copyFileSync,
+    existsSync,
+    linkSync,
+    mkdirSync,
+    readdirSync,
+    readFileSync,
+    statSync,
+    symlinkSync,
+    unlinkSync,
+    writeFileSync,
+} from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,17 +21,47 @@ import { REQUIRED_RESTORE_TABLES, runRestoreOperation } from '../../src/cli/comm
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { writeBackup } from '../../src/storage/backup.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
-import { openKeyedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
+import { DATABASE_LIFECYCLE_AMBIGUOUS, DATABASE_LIFECYCLE_BUSY, databaseLifecyclePaths } from '../../src/storage/database-lifecycle.js';
+import { openKeyedDatabase, openManagedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
-import { withTempDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const elephaCli = path.join(repositoryRoot, 'src', 'cli', 'index.ts');
+const restoreModule = new URL('../../src/cli/commands/restore.ts', import.meta.url).href;
 const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
+const RESTORE_KILL_PADDING_BYTES = 64 * 1024 * 1024;
+const RESTORE_KILL_DEADLINE_MS = 10_000;
+
+function lifecycleIntentFiles(dbPath: string): string[] {
+    const directory = databaseLifecyclePaths(dbPath).exclusive;
+    if (!existsSync(directory)) {
+        return [];
+    }
+    return readdirSync(directory).map((entry) => path.join(directory, entry));
+}
+
+function hasLifecycleIntent(dbPath: string): boolean {
+    return lifecycleIntentFiles(dbPath).length > 0;
+}
+
+function removeLifecycleIntents(dbPath: string): void {
+    for (const file of lifecycleIntentFiles(dbPath)) {
+        unlinkSync(file);
+    }
+}
+
+async function killChild(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) {
+        return;
+    }
+    child.kill('SIGKILL');
+    await once(child, 'exit');
+}
 
 function encryptionRuntime(): DatabaseEncryptionRuntime {
     return {
@@ -386,6 +429,192 @@ describe('elepha restore', () => {
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
     });
 
+    it('pins a relative active database path before confirmation can change cwd', async () => {
+        const directoryA = withGrantableTestDir('elepha-restore-relative-a-');
+        const directoryB = withGrantableTestDir('elepha-restore-relative-b-');
+        const candidate = createTestDb('elepha-restore-relative-candidate-');
+        const activeA = path.join(directoryA, 'relative.db');
+        const activeB = path.join(directoryB, 'relative.db');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(activeA, 'a-before');
+        populate(activeB, 'b-before');
+        populate(candidate.dbPath, 'candidate');
+        fullBackup(candidate.dbPath, backup);
+        candidate.close();
+        const originalCwd = process.cwd();
+        let confirmationChangedCwd = false;
+
+        try {
+            process.chdir(directoryA);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: 'relative.db',
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    confirm: async () => {
+                        process.chdir(directoryB);
+                        confirmationChangedCwd = true;
+                        return true;
+                    },
+                }),
+            ).resolves.toMatchObject({ cancelled: false });
+        } finally {
+            process.chdir(originalCwd);
+        }
+
+        expect({ confirmationChangedCwd, activeA: sessionNativeIds(activeA), activeB: sessionNativeIds(activeB) }).toEqual({
+            confirmationChangedCwd: true,
+            activeA: ['session-candidate'],
+            activeB: ['session-b-before'],
+        });
+    });
+
+    it('never lets a confirmation-time managed opener acknowledge a write to the replaced inode', async () => {
+        const active = createTestDb('elepha-restore-opener-race-active-');
+        const candidate = createTestDb('elepha-restore-opener-race-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const openerPath = path.join(active.directory, 'active-hard-link.db');
+        linkSync(active.dbPath, openerPath);
+        const originalIdentity = statSync(active.dbPath);
+        let opener: Database.Database | undefined;
+        let writeStarted = false;
+        let writeDetached: boolean | undefined;
+        let laterOpenerBlocked = false;
+        let intentWatcher: Promise<void> | undefined;
+        let resolveWrite!: () => void;
+        let rejectWrite!: (error: unknown) => void;
+        const writeCompleted = new Promise<void>((resolve, reject) => {
+            resolveWrite = resolve;
+            rejectWrite = reject;
+        });
+        const writeThroughOpener = (): void => {
+            if (writeStarted || opener === undefined) {
+                return;
+            }
+            writeStarted = true;
+            try {
+                const result = opener.prepare("UPDATE projects SET display_name = 'acknowledged by retained opener' WHERE id = 1").run();
+                expect(result.changes).toBe(1);
+                const currentIdentity = statSync(active.dbPath);
+                writeDetached = currentIdentity.dev !== originalIdentity.dev || currentIdentity.ino !== originalIdentity.ino;
+                opener.close();
+                opener = undefined;
+                resolveWrite();
+            } catch (error) {
+                rejectWrite(error);
+            }
+        };
+        const watchExclusiveIntent = async (): Promise<void> => {
+            while (!writeStarted) {
+                if (hasLifecycleIntent(active.dbPath)) {
+                    await expect(openManagedDatabase(active.dbPath, { fileMustExist: true })).rejects.toThrow(DATABASE_LIFECYCLE_BUSY);
+                    laterOpenerBlocked = true;
+                    writeThroughOpener();
+                    return;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+        };
+
+        try {
+            const result = await runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                confirm: async () => {
+                    opener = await openManagedDatabase(openerPath, { fileMustExist: true });
+                    intentWatcher = watchExclusiveIntent();
+                    return true;
+                },
+                writeBackup: (db, dbPath) => {
+                    const snapshot = writeBackup(db, dbPath);
+                    setImmediate(writeThroughOpener);
+                    return snapshot;
+                },
+            });
+            await Promise.all([writeCompleted, intentWatcher]);
+
+            expect(result.cancelled).toBe(false);
+            expect(laterOpenerBlocked).toBe(true);
+            expect(writeDetached).toBe(false);
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-after']);
+        } finally {
+            opener?.close();
+        }
+    });
+
+    it('keeps a killed post-install restore ambiguous until completion can be verified', async () => {
+        const active = createTestDb('elepha-restore-killed-after-install-active-');
+        const candidate = createTestDb('elepha-restore-killed-after-install-candidate-');
+        const restoreTemp = withGrantableTestDir('elepha-restore-killed-after-install-temp-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before-kill');
+        populate(candidate.dbPath, 'after-kill');
+        active.db
+            .prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)')
+            .run('codex', 'must-stay-purged', '2026-08-02T00:00:00.000Z');
+        candidate.db.exec('CREATE TABLE restore_kill_padding (bytes BLOB NOT NULL)');
+        candidate.db.prepare('INSERT INTO restore_kill_padding (bytes) VALUES (zeroblob(?))').run(RESTORE_KILL_PADDING_BYTES);
+        active.close();
+        candidate.close();
+        fullBackup(candidate.dbPath, backup);
+        const originalIdentity = statSync(active.dbPath);
+        const source = `const { runRestoreOperation } = await import(${JSON.stringify(restoreModule)});
+await runRestoreOperation(${JSON.stringify(backup)}, {
+    dbPath: ${JSON.stringify(active.dbPath)},
+    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+});`;
+        const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', source], {
+            cwd: repositoryRoot,
+            env: { ...process.env, TMPDIR: restoreTemp },
+            stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        let stderr = '';
+        child.stderr?.setEncoding('utf8');
+        child.stderr?.on('data', (chunk: string) => {
+            stderr += chunk;
+        });
+        const exit = once(child, 'exit');
+
+        try {
+            const deadline = Date.now() + RESTORE_KILL_DEADLINE_MS;
+            let replacementObserved = false;
+            while (Date.now() < deadline && child.exitCode === null && child.signalCode === null) {
+                const currentIdentity = statSync(active.dbPath);
+                if (currentIdentity.dev !== originalIdentity.dev || currentIdentity.ino !== originalIdentity.ino) {
+                    replacementObserved = true;
+                    child.kill('SIGKILL');
+                    break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 1));
+            }
+            expect(replacementObserved, stderr).toBe(true);
+            const [, signal] = await exit;
+            expect(signal).toBe('SIGKILL');
+
+            const installedDb = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+            try {
+                const count = installedDb
+                    .prepare("SELECT COUNT(*) AS count FROM purged_transcripts WHERE tool = 'codex' AND native_id = 'must-stay-purged'")
+                    .get() as { count: number };
+                expect(count.count).toBe(0);
+            } finally {
+                installedDb.close();
+            }
+            await expect(
+                openManagedDatabase(active.dbPath, { fileMustExist: true }).then((db) => {
+                    db.close();
+                }),
+            ).rejects.toThrow(DATABASE_LIFECYCLE_AMBIGUOUS);
+        } finally {
+            await killChild(child);
+            removeLifecycleIntents(active.dbPath);
+        }
+    }, 15_000);
+
     it('carries active purge and incognito tombstones created after the backup and reports both counts', async () => {
         const active = createTestDb('elepha-restore-active-');
         const candidate = createTestDb('elepha-restore-candidate-');
@@ -695,6 +924,35 @@ describe('elepha restore', () => {
         expect(readdirSync(active.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
     });
 
+    it('rechecks daemon state under exclusive intent after confirmation', async () => {
+        const active = createTestDb('elepha-restore-daemon-confirmation-active-');
+        const candidate = createTestDb('elepha-restore-daemon-confirmation-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const before = readFileSync(active.dbPath);
+        let healthChecks = 0;
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () =>
+                    healthChecks++ === 0
+                        ? { state: 'NOT RUNNING', healthy: false }
+                        : { state: 'RUNNING (pid 1, heartbeat 0s ago)', healthy: true },
+                confirm: async () => true,
+            }),
+        ).rejects.toThrow('elepha pause');
+
+        expect(healthChecks).toBe(2);
+        expect(readFileSync(active.dbPath)).toEqual(before);
+        expect(hasLifecycleIntent(active.dbPath)).toBe(false);
+        expect(readdirSync(active.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
+    });
+
     it('cancels before snapshot/replacement and restores with --skip-confirmation without calling a prompt', async () => {
         const active = createTestDb('elepha-restore-active-');
         const candidate = createTestDb('elepha-restore-candidate-');
@@ -739,12 +997,17 @@ describe('elepha restore', () => {
         const before = readFileSync(active.dbPath);
         const restoreTemp = isolateRestoreTemp();
         let snapshotPath: string | undefined;
+        let blockedOpenerCheck: Promise<void> | undefined;
 
         await expect(
             runRestoreOperation(backup, {
                 dbPath: active.dbPath,
                 daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
                 writeBackup: (db, dbPath) => {
+                    expect(hasLifecycleIntent(dbPath)).toBe(true);
+                    blockedOpenerCheck = expect(openManagedDatabase(dbPath, { fileMustExist: true })).rejects.toThrow(
+                        DATABASE_LIFECYCLE_BUSY,
+                    );
                     snapshotPath = writeBackup(db, dbPath);
                     const stagedDirectories = stagedRestoreDirectories(restoreTemp);
                     expect(stagedDirectories).toHaveLength(1);
@@ -754,10 +1017,212 @@ describe('elepha restore', () => {
             }),
         ).rejects.toThrow('Installed database hash does not match the validated backup');
 
+        await blockedOpenerCheck;
         expect(snapshotPath).toBeDefined();
         expect(existsSync(snapshotPath!)).toBe(true);
         expect(readFileSync(active.dbPath)).toEqual(before);
+        expect(hasLifecycleIntent(active.dbPath)).toBe(false);
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
+    });
+
+    it('cleans and verifies the lifecycle-owned physical companions before releasing rollback ownership', async () => {
+        const active = createTestDb('elepha-restore-physical-rollback-active-');
+        const candidate = createTestDb('elepha-restore-physical-rollback-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const activeAlias = path.join(active.directory, 'active-link.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        symlinkSync(active.dbPath, activeAlias);
+        const physicalWal = `${active.dbPath}-wal`;
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalUnlinkSync = mutableFs.unlinkSync;
+        let physicalCompanionRecreated = false;
+        let ownershipHeldDuringFault = false;
+        mutableFs.unlinkSync = ((file) => {
+            if (String(file) === physicalWal && !physicalCompanionRecreated) {
+                try {
+                    originalUnlinkSync(file);
+                } catch (error: unknown) {
+                    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                        throw error;
+                    }
+                }
+                writeFileSync(physicalWal, 'recreated during cleanup');
+                physicalCompanionRecreated = true;
+                ownershipHeldDuringFault = hasLifecycleIntent(activeAlias);
+                return;
+            }
+            return originalUnlinkSync(file);
+        }) as typeof import('node:fs').unlinkSync;
+        syncBuiltinESMExports();
+
+        try {
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: activeAlias,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                }),
+            ).rejects.toThrow('managed database companion remained after cleanup');
+        } finally {
+            mutableFs.unlinkSync = originalUnlinkSync;
+            syncBuiltinESMExports();
+        }
+
+        expect(physicalCompanionRecreated).toBe(true);
+        expect(ownershipHeldDuringFault).toBe(true);
+        for (const databasePath of [activeAlias, active.dbPath]) {
+            for (const suffix of ['-wal', '-shm', '-journal']) {
+                expect(existsSync(`${databasePath}${suffix}`)).toBe(false);
+            }
+        }
+        expect(hasLifecycleIntent(activeAlias)).toBe(false);
+        expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        await expect(openManagedDatabase(activeAlias, { fileMustExist: true }).then((database) => database.close())).resolves.toBeDefined();
+    });
+
+    it('rolls back while retaining exclusive ownership when install reports an error after replacement', async () => {
+        const active = createTestDb('elepha-restore-post-rename-error-active-');
+        const candidate = createTestDb('elepha-restore-post-rename-error-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const originalIdentity = statSync(active.dbPath);
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalChmodSync = mutableFs.chmodSync;
+        let errorInjectedAfterReplacement = false;
+        mutableFs.chmodSync = ((file, mode) => {
+            if (file === active.dbPath && !errorInjectedAfterReplacement) {
+                const currentIdentity = statSync(active.dbPath);
+                if (currentIdentity.dev !== originalIdentity.dev || currentIdentity.ino !== originalIdentity.ino) {
+                    errorInjectedAfterReplacement = true;
+                    const error = new Error('simulated post-replacement chmod failure') as NodeJS.ErrnoException;
+                    error.code = 'EIO';
+                    throw error;
+                }
+            }
+            return originalChmodSync(file, mode);
+        }) as typeof import('node:fs').chmodSync;
+        syncBuiltinESMExports();
+
+        try {
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                }),
+            ).rejects.toThrow('simulated post-replacement chmod failure');
+        } finally {
+            mutableFs.chmodSync = originalChmodSync;
+            syncBuiltinESMExports();
+        }
+
+        expect(errorInjectedAfterReplacement).toBe(true);
+        expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        expect(hasLifecycleIntent(active.dbPath)).toBe(false);
+    });
+
+    it('does not roll back through a post-install connection whose close is unproven', async () => {
+        const active = createTestDb('elepha-restore-verification-close-failure-active-');
+        const candidate = createTestDb('elepha-restore-verification-close-failure-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const originalClose = Database.prototype.close;
+        let closeFailureInjected = false;
+        let failedDatabase: Database.Database | undefined;
+        Database.prototype.close = function () {
+            const main = (this.pragma('database_list') as Array<{ seq: number; file: string }>).find((entry) => entry.seq === 0);
+            const installedCandidate =
+                main !== undefined &&
+                path.resolve(main.file) === path.resolve(active.dbPath) &&
+                this.prepare("SELECT 1 FROM sessions WHERE native_id = 'session-after'").get() !== undefined;
+            if (!closeFailureInjected && installedCandidate) {
+                closeFailureInjected = true;
+                failedDatabase = this;
+                throw new Error('simulated post-install SQLite close failure');
+            }
+            return originalClose.call(this);
+        };
+
+        try {
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                }),
+            ).rejects.toThrow('managed database connections remain open');
+
+            expect(closeFailureInjected).toBe(true);
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-after']);
+            expect(hasLifecycleIntent(active.dbPath)).toBe(true);
+            await expect(openManagedDatabase(active.dbPath, { fileMustExist: true })).rejects.toThrow(DATABASE_LIFECYCLE_AMBIGUOUS);
+        } finally {
+            Database.prototype.close = originalClose;
+            if (failedDatabase?.open) {
+                failedDatabase.close();
+            }
+            removeLifecycleIntents(active.dbPath);
+        }
+    });
+
+    it('leaves failed rollback ownership durable so unverified bytes cannot be reopened', async () => {
+        const active = createTestDb('elepha-restore-rollback-copy-error-active-');
+        const candidate = createTestDb('elepha-restore-rollback-copy-error-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const restoreTemp = isolateRestoreTemp();
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalCopyFileSync = mutableFs.copyFileSync;
+        let rollbackFailureInjected = false;
+        mutableFs.copyFileSync = ((source, destination, mode) => {
+            if (String(source).includes('.bak-')) {
+                rollbackFailureInjected = true;
+                const error = new Error('simulated rollback copy failure') as NodeJS.ErrnoException;
+                error.code = 'EIO';
+                throw error;
+            }
+            return originalCopyFileSync(source, destination, mode);
+        }) as typeof import('node:fs').copyFileSync;
+        syncBuiltinESMExports();
+
+        try {
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    writeBackup: (db, dbPath) => {
+                        const snapshot = writeBackup(db, dbPath);
+                        const stagedDirectories = stagedRestoreDirectories(restoreTemp);
+                        writeFileSync(path.join(restoreTemp, stagedDirectories[0]!, 'candidate.db'), 'changed after validation');
+                        return snapshot;
+                    },
+                }),
+            ).rejects.toThrow('simulated rollback copy failure');
+        } finally {
+            mutableFs.copyFileSync = originalCopyFileSync;
+            syncBuiltinESMExports();
+        }
+
+        expect(rollbackFailureInjected).toBe(true);
+        expect(hasLifecycleIntent(active.dbPath)).toBe(true);
+        await expect(openManagedDatabase(active.dbPath, { fileMustExist: true }).then((database) => database.close())).rejects.toThrow(
+            DATABASE_LIFECYCLE_AMBIGUOUS,
+        );
+
+        removeLifecycleIntents(active.dbPath);
     });
 
     it('accepts an older sessions schema when the current migration can bring it forward', async () => {
