@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -59,14 +59,14 @@ describe('elepha backfill-rendered-chars', () => {
         const backupName = readdirSync(directory).find((name) => name.startsWith('elepha.db.bak-'));
         expect(backupName).toBeDefined();
 
-        const backup = openDb(path.join(directory, backupName!));
+        const backup = openUnmanagedDb(path.join(directory, backupName!));
         expect(backup.prepare('SELECT rendered_chars, rendered_turns FROM sessions').get()).toEqual({
             rendered_chars: 0,
             rendered_turns: 0,
         });
         backup.close();
 
-        const appliedDb = openDb(dbPath);
+        const appliedDb = openUnmanagedDb(dbPath);
         const current = appliedDb.prepare('SELECT rendered_chars, rendered_turns FROM sessions').get() as {
             rendered_chars: number;
             rendered_turns: number;

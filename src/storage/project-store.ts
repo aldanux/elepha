@@ -1,5 +1,5 @@
 import path from 'node:path';
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { gitRemoteGetUrlOrigin, gitRevParseShowToplevel, gitRootCommit } from '../security/subprocess-allowlist.js';
 
 export interface ProjectRow {

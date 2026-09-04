@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { DAEMON_LOG_ROTATE_MAX_BYTES } from '../../src/daemon/log-rotation.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 
@@ -35,7 +35,7 @@ describe('IngestionDaemon log growth bounds', () => {
         );
         const logs: string[] = [];
         const daemon = new IngestionDaemon({
-            store: new MemoryStore(openDb(':memory:')),
+            store: new MemoryStore(openUnmanagedDb(':memory:')),
             watchRoots: [root],
             heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
             log: (message) => logs.push(message),
@@ -62,7 +62,7 @@ describe('IngestionDaemon log growth bounds', () => {
         writeFileSync(`${stderr}.1`, 'older stderr archive');
 
         const daemon = new IngestionDaemon({
-            store: new MemoryStore(openDb(':memory:')),
+            store: new MemoryStore(openUnmanagedDb(':memory:')),
             watchRoots: [root],
             heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
             daemonLogPaths: { stdout, stderr },

@@ -1,13 +1,14 @@
 import { existsSync } from 'node:fs';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { backupDatabaseAndReport } from '../storage/backup.js';
-import { defaultDbPath, type openDb } from '../storage/db.js';
+import { defaultDbPath } from '../storage/db.js';
 import { withCapturePaused } from './shared.js';
 
 type MaybePromise<T> = T | Promise<T>;
 
 export interface DestructiveOpOptions<Plan> {
     applyRequested: boolean;
-    db: ReturnType<typeof openDb>;
+    db: Database.Database;
     // Human-readable verb used if the live daemon prevents mutation.
     operationLabel?: string;
     plan(): MaybePromise<Plan>;

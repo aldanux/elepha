@@ -9,7 +9,7 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { printPurgePlan } from '../../src/cli/shared.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type PurgeScope } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
@@ -49,7 +49,7 @@ describe('purge', () => {
     let rollups: RollupStore;
 
     beforeEach(() => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
     });
@@ -198,7 +198,7 @@ describe('purge', () => {
         ];
 
         for (const [index, scenario] of cases.entries()) {
-            const caseStore = new MemoryStore(openDb(':memory:'));
+            const caseStore = new MemoryStore(openUnmanagedDb(':memory:'));
             const selected = caseStore.upsertProject(`/Users/test/selected-window-${index}`);
             const outside = caseStore.upsertProject(`/Users/test/outside-window-${index}`);
             const matched = caseStore.upsertSession('codex', `matched-${index}`, selected.id, `/tmp/matched-${index}.jsonl`);
@@ -254,7 +254,7 @@ describe('purge', () => {
         const dbPath = path.join(directory, 'elepha.db');
         const previousDbPath = process.env.ELEPHA_DB_PATH;
         process.env.ELEPHA_DB_PATH = dbPath;
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const fileStore = new MemoryStore(db);
         const fileRollups = new RollupStore(db);
         const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);

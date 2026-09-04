@@ -50,7 +50,7 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 **elepha** supports **Claude Code** and **Codex**, each in both the desktop app and the CLI, with memory shared across all of them. Support
 for more transcript-writing AI coding tools is planned.
 
-It runs on **macOS**, **Linux**, and **Windows through WSL**, with **Node.js 22 or newer**. Native Windows is not supported.
+It runs on **macOS**, **Linux**, and **Windows through WSL**, with **Node.js 22.12 or newer**. Native Windows is not supported.
 
 The original transcripts are never modified, so memory can always be rebuilt. That matters while **elepha** is still pre-1.0: its storage
 schema and command surface can change between releases.

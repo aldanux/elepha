@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { PURGE_HERE_UNCONSENTED } from '../../src/cli/purge-wizard.js';
 import { consentedProject } from '../../src/hooks/common.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -60,7 +60,7 @@ function runTtyPurgeCli(dbPath: string, input: string, ...args: string[]) {
 }
 
 function databaseRows(dbPath: string): Record<string, unknown[]> {
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     try {
         const tables = db
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
@@ -91,7 +91,7 @@ describe('elepha purge orphan project scope', () => {
         process.env.ELEPHA_DB_PATH = dbPath;
         process.env.ELEPHA_HOME = path.join(directory, 'isolated-elepha-home');
         process.exitCode = undefined;
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const project = store.upsertProject(path.join(directory, 'selected-project'));
         const appliedSession = store.upsertSession('codex', 'applied-session', project.id, path.join(directory, 'applied.jsonl'));
@@ -155,7 +155,7 @@ describe('elepha purge orphan project scope', () => {
         const livePath = path.join(projectDirectory, 'live-project');
         mkdirSync(tempPath);
         mkdirSync(livePath);
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const temp = store.upsertProject(tempPath);
         const missing = store.upsertProject(missingPath);
@@ -179,7 +179,7 @@ describe('elepha purge orphan project scope', () => {
             expect(orphanDryRun.stdout).toContain(
                 "This is a preview — nothing was deleted. This clears elepha's memory only — your original AI coding session history on disk is untouched. Re-run with --apply to delete (a backup is saved first).",
             );
-            let verified = openDb(dbPath);
+            let verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).getProjectById(temp.id)).toBeDefined();
             verified.close();
 
@@ -189,7 +189,7 @@ describe('elepha purge orphan project scope', () => {
             expect(orphanApply.stdout).toContain("Deleted 2 session(s) across 2 project(s) from elepha's memory.");
             expect(orphanApply.stdout).not.toContain('Delete these');
             expect(orphanApply.stdout).not.toContain('Verified: nothing matching this scope remains.');
-            verified = openDb(dbPath);
+            verified = openUnmanagedDb(dbPath);
             const verifiedStore = new MemoryStore(verified);
             expect(verifiedStore.getProjectById(temp.id)).toBeUndefined();
             expect(verifiedStore.getProjectById(missing.id)).toBeUndefined();
@@ -206,7 +206,7 @@ describe('elepha purge orphan project scope', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-durable-'));
         const dbPath = path.join(directory, 'elepha.db');
         const projectPath = path.join(directory, 'durable-project');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const project = store.upsertProject(projectPath);
         const session = store.upsertSession('codex', 'durable-cli-purge', project.id, path.join(directory, 'durable.jsonl'));
@@ -238,7 +238,7 @@ describe('elepha purge orphan project scope', () => {
 
             expect(result.status, result.stderr).toBe(0);
             expect(result.stdout).toContain('Stored conversation copy: 1 filtered turn(s), ');
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             expect(verified.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
             expect(verified.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
             expect(
@@ -258,7 +258,7 @@ describe('elepha purge orphan project scope', () => {
         const revokedPath = path.join(deniedRoot, 'revoked-project');
         const activePath = path.join(deniedRoot, 'active-project');
         const pendingPath = path.join(projectDirectory, 'pending-project');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const revoked = store.upsertProject(revokedPath);
         const active = store.upsertProject(activePath);
@@ -280,7 +280,7 @@ describe('elepha purge orphan project scope', () => {
 
             const applied = runPurgeCli(dbPath, '--revoked', '--apply');
             expect(applied.status).toBe(0);
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             const verifiedStore = new MemoryStore(verified);
             expect(verifiedStore.getProjectById(revoked.id)).toBeUndefined();
             expect(verifiedStore.getProjectById(active.id)).toBeDefined();
@@ -298,7 +298,7 @@ describe('elepha purge orphan project scope', () => {
         const dbPath = path.join(directory, 'elepha.db');
         const selectedPath = path.join(directory, 'selected-project');
         const retainedPath = path.join(directory, 'retained-project');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const selected = store.upsertProject(selectedPath);
         const retained = store.upsertProject(retainedPath);
@@ -316,7 +316,7 @@ describe('elepha purge orphan project scope', () => {
             expect(result.status).toBe(0);
             expect(result.stdout).toContain("Deleted 1 session(s) across 1 project(s) from elepha's memory.");
 
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             const verifiedStore = new MemoryStore(verified);
             expect(verifiedStore.findSession('codex', selectedOld.native_id)).toBeUndefined();
             expect(verifiedStore.findSession('codex', selectedNew.native_id)).toBeDefined();
@@ -336,7 +336,7 @@ describe('elepha purge orphan project scope', () => {
         const retainedRoot = path.join(projectDirectory, 'retained-project');
         mkdirSync(projectSubdirectory, { recursive: true });
         mkdirSync(retainedRoot);
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const project = store.upsertProject(projectRoot);
         const projectSubdirectoryRow = store.upsertProject(projectSubdirectory);
@@ -361,7 +361,7 @@ describe('elepha purge orphan project scope', () => {
                 expect(result.stderr).toContain(PURGE_HERE_UNCONSENTED);
             }
 
-            let verified = openDb(dbPath);
+            let verified = openUnmanagedDb(dbPath);
             let verifiedStore = new MemoryStore(verified);
             expect(verifiedStore.findSession('codex', projectSession.native_id)).toBeDefined();
             expect(verifiedStore.findSession('codex', projectSubdirectorySession.native_id)).toBeDefined();
@@ -371,7 +371,7 @@ describe('elepha purge orphan project scope', () => {
             const result = runPurgeCliFrom(projectSubdirectory, dbPath, '--here', '--apply');
             expect(result.status, result.stderr).toBe(0);
 
-            verified = openDb(dbPath);
+            verified = openUnmanagedDb(dbPath);
             verifiedStore = new MemoryStore(verified);
             expect(verifiedStore.findSession('codex', projectSession.native_id)).toBeUndefined();
             expect(verifiedStore.findSession('codex', projectSubdirectorySession.native_id)).toBeUndefined();
@@ -386,7 +386,7 @@ describe('elepha purge orphan project scope', () => {
     it('rejects invalid selector combinations without mutating any database row', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
         const dbPath = path.join(directory, 'elepha.db');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const project = store.upsertProject(repositoryRoot);
         store.upsertSession('codex', 'retained-session', project.id, path.join(directory, 'retained.jsonl'));
@@ -431,7 +431,7 @@ describe('elepha purge orphan project scope', () => {
     it('rejects empty project queries without mutating any database row', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
         const dbPath = path.join(directory, 'elepha.db');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const project = store.upsertProject(repositoryRoot);
         store.upsertSession('codex', 'retained-session', project.id, path.join(directory, 'retained.jsonl'));
@@ -470,7 +470,7 @@ describe('elepha purge orphan project scope', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
         const dbPath = path.join(directory, 'elepha.db');
         const missingPath = path.join(directory, 'missing-project');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const project = store.upsertProject(missingPath);
         store.upsertSession('codex', 'missing-session', project.id, path.join(directory, 'missing.jsonl'));
@@ -486,18 +486,18 @@ describe('elepha purge orphan project scope', () => {
                 cancelled.stdout.indexOf("Delete elepha's memory"),
             );
             expect(cancelled.stdout).toContain('Cancelled — nothing was deleted.');
-            let verified = openDb(dbPath);
+            let verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).getProjectById(project.id)).toBeDefined();
             verified.close();
 
             const confirmed = runTtyPurgeCli(dbPath, 'yes\n', '--orphan', '--apply');
             expect(confirmed.status).toBe(0);
             expect(confirmed.stdout).toContain("Deleted 1 session(s) across 1 project(s) from elepha's memory.");
-            verified = openDb(dbPath);
+            verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).getProjectById(project.id)).toBeUndefined();
             verified.close();
 
-            verified = openDb(dbPath);
+            verified = openUnmanagedDb(dbPath);
             const bypassedProject = new MemoryStore(verified).upsertProject(path.join(directory, 'second-missing-project'));
             new MemoryStore(verified).upsertSession(
                 'codex',
@@ -510,7 +510,7 @@ describe('elepha purge orphan project scope', () => {
             const bypassed = runTtyPurgeCli(dbPath, '', '--orphan', '--apply', '--skip-confirmation');
             expect(bypassed.status).toBe(0);
             expect(bypassed.stdout).not.toContain('Delete these');
-            verified = openDb(dbPath);
+            verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).getProjectById(bypassedProject.id)).toBeUndefined();
             verified.close();
         } finally {

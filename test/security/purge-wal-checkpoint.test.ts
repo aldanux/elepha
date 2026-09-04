@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
@@ -35,7 +35,7 @@ describe('purge WAL checkpoint', () => {
     it('truncates the WAL file after purging', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-wal-'));
         const dbPath = path.join(root, 'elepha.db');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
 
         const cwd = path.join(root, 'workspace');

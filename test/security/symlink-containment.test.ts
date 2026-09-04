@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
 
@@ -112,7 +112,7 @@ describe('symlink containment', () => {
         writeFileSync(readableFile, ccTurnLines(readableCwd, 'readable', 'a real request'));
 
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(readableCwd);
         store.consent.grant(crossStoreCwd);
         store.consent.grant(sameStoreCwd);

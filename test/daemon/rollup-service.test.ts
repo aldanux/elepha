@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { RollupService, watermarkStillMatches } from '../../src/daemon/rollup-service.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type SessionRow } from '../../src/storage/memory-store.js';
 import { ROLLUP_VERSION, RollupStore } from '../../src/storage/rollup-store.js';
 import type { RollupTurnInput } from '../../src/summarizer/rollup-prompt.js';
@@ -50,10 +50,10 @@ describe('RollupService', () => {
     let service: RollupService;
     let session: SessionRow;
     let projectId: number;
-    let db: ReturnType<typeof openDb>;
+    let db: ReturnType<typeof openUnmanagedDb>;
 
     beforeEach(() => {
-        db = openDb(':memory:');
+        db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
         provider = new StubProvider();
@@ -251,7 +251,7 @@ describe('RollupService', () => {
 
 describe('watermarkStillMatches', () => {
     it('reports a mismatch when another writer has advanced the watermark since it was read', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const rollups = new RollupStore(db);
         const project = store.upsertProject('/repo');

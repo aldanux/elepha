@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { SummarizerCallLog } from '../../src/summarizer/call-log.js';
 
 function mode(p: string): number {
@@ -19,7 +19,7 @@ describe('~/.elepha permissions', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-perms-'));
         const dbPath = path.join(root, '.elepha', 'elepha.db');
 
-        openDb(dbPath);
+        openUnmanagedDb(dbPath);
 
         expect(mode(path.dirname(dbPath))).toBe(0o700);
         expect(mode(dbPath)).toBe(0o600);
@@ -29,7 +29,7 @@ describe('~/.elepha permissions', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-perms-'));
         const dbPath = path.join(root, '.elepha', 'elepha.db');
 
-        openDb(dbPath);
+        openUnmanagedDb(dbPath);
 
         const walPath = `${dbPath}-wal`;
         const shmPath = `${dbPath}-shm`;

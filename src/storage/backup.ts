@@ -7,7 +7,7 @@
 
 import { chmodSync, copyFileSync, readdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { BACKUP_KEEP, PRIVATE_FILE_MODE } from '../config/constants.js';
 
 const BACKUP_MARKER = '.bak-';

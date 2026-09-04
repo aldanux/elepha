@@ -1,4 +1,4 @@
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { DURABLE_CAPTURE_FILTER_VERSION, type DurableCaptureState, SESSION_CHAR_BUDGET } from '../config/constants.js';
 import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import { detectShellSyntax, escapeShellSyntax } from '../security/sanitize.js';

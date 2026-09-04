@@ -1,4 +1,4 @@
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { dedupePaths } from '../config/paths.js';
 import { filterTurn } from '../rendering/filtered-turn.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';

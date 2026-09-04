@@ -17,7 +17,7 @@ import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { readHeartbeat } from '../../src/daemon/heartbeat.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openProviderTranscript } from '../../src/security/provider-transcript.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SessionAdapter, SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
 
@@ -123,7 +123,7 @@ describe('IngestionDaemon end-to-end', () => {
 
         const heartbeatPath = path.join(root, 'daemon.heartbeat.json');
 
-        const store1 = new MemoryStore(openDb(dbPath));
+        const store1 = new MemoryStore(openUnmanagedDb(dbPath));
         store1.consent.grant(cwd);
         const summarizer1 = new StubSummarizer();
         const daemon1 = new IngestionDaemon({
@@ -150,7 +150,7 @@ describe('IngestionDaemon end-to-end', () => {
         await daemon1.stop();
 
         // Restart: fresh daemon + fresh MemoryStore instance over the same DB file.
-        const store2 = new MemoryStore(openDb(dbPath));
+        const store2 = new MemoryStore(openUnmanagedDb(dbPath));
         const summarizer2 = new StubSummarizer();
         const daemon2 = new IngestionDaemon({
             store: store2,
@@ -191,7 +191,7 @@ describe('IngestionDaemon end-to-end', () => {
         const sessionFile = path.join(projectDir, `${nativeId}.jsonl`);
         writeFileSync(sessionFile, ccTurnLines(cwd, nativeId, 0, 'first request', 'first reply', undefined, '2026-08-01T00:00:00.000Z'));
 
-        const storeA = new MemoryStore(openDb(dbPath));
+        const storeA = new MemoryStore(openUnmanagedDb(dbPath));
         storeA.consent.grant(cwd);
         const initialDaemon = new IngestionDaemon({
             store: storeA,
@@ -227,7 +227,7 @@ describe('IngestionDaemon end-to-end', () => {
         };
         const summarizerA = blockingSummarizer();
         const summarizerB = blockingSummarizer();
-        const storeB = new MemoryStore(openDb(dbPath));
+        const storeB = new MemoryStore(openUnmanagedDb(dbPath));
         const errors: string[] = [];
         const daemonA = new IngestionDaemon({
             store: storeA,
@@ -277,7 +277,7 @@ describe('IngestionDaemon end-to-end', () => {
         ).toEqual([{ segment_index: 0 }, { segment_index: 1 }]);
         expect(Number(storeA.findSession('claude-code', nativeId)?.cursor?.split('|')[0])).toBe(statSync(sessionFile).size);
 
-        const restartStore = new MemoryStore(openDb(dbPath));
+        const restartStore = new MemoryStore(openUnmanagedDb(dbPath));
         const restartSummarizer = new StubSummarizer();
         const restartDaemon = new IngestionDaemon({
             store: restartStore,
@@ -332,7 +332,7 @@ describe('IngestionDaemon end-to-end', () => {
         const watchRoots = [path.join(root, '.claude', 'projects')];
         const heartbeatPath = path.join(root, 'daemon.heartbeat.json');
 
-        const store = new MemoryStore(openDb(dbPath));
+        const store = new MemoryStore(openUnmanagedDb(dbPath));
         store.consent.grant(cwd);
         const summarizer = new StubSummarizer();
         const daemon = new IngestionDaemon({
@@ -357,7 +357,7 @@ describe('IngestionDaemon end-to-end', () => {
         root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-signal-'));
         const heartbeatPath = path.join(root, 'daemon.heartbeat.json');
         const daemon = new IngestionDaemon({
-            store: new MemoryStore(openDb(path.join(root, 'elepha.db'))),
+            store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
             watchRoots: [root],
             heartbeatPath,
             watcherUsePolling: true,
@@ -400,7 +400,7 @@ describe('IngestionDaemon end-to-end', () => {
         };
         const daemon = scanSeam(
             new IngestionDaemon({
-                store: new MemoryStore(openDb(':memory:')),
+                store: new MemoryStore(openUnmanagedDb(':memory:')),
                 watchRoots: [storeRoot],
                 openTranscript: (tool, candidate) =>
                     openProviderTranscript(tool, candidate, {
@@ -468,7 +468,7 @@ describe('IngestionDaemon end-to-end', () => {
             })();
             const daemon = scanSeam(
                 new IngestionDaemon({
-                    store: new MemoryStore(openDb(':memory:')),
+                    store: new MemoryStore(openUnmanagedDb(':memory:')),
                     idleDebounceMs: 25,
                     watchRoots: [root],
                 }),

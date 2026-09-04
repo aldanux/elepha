@@ -7,11 +7,11 @@ export function registerDoctor(program: Command): void {
     program
         .command('doctor')
         .description('Diagnose capture recovery prerequisites and restart only a down or stuck daemon')
-        .action(() => {
+        .action(async () => {
             let approvedRoots = 0;
             let databaseError: unknown;
             try {
-                approvedRoots = new ConsentStore(openDb()).countApproved();
+                approvedRoots = new ConsentStore(await openDb()).countApproved();
             } catch (error) {
                 databaseError = error;
             }

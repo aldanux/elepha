@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { individualCandidates } from '../../src/cli/init-wizard.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from '../../src/storage/consent-store.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
 
@@ -19,7 +19,7 @@ function consentFixture(prefix: string): string {
     return fixture;
 }
 
-function insertHistoricalProject(db: ReturnType<typeof openDb>, projectPath: string, suffix: string): void {
+function insertHistoricalProject(db: ReturnType<typeof openUnmanagedDb>, projectPath: string, suffix: string): void {
     const project = db
         .prepare(
             `INSERT INTO projects (path, display_name, first_seen_at, last_seen_at)
@@ -140,7 +140,7 @@ describe('consent roots', () => {
         mkdirSync(path.join(stableRoot, 'project'), { recursive: true });
         symlinkSync(physicalApprovedRoot, approvedRoot);
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const approved = store.consent.grant(approvedRoot);
         store.consent.grant(stableRoot);
@@ -167,14 +167,14 @@ describe('consent roots', () => {
         const canonicalPhysicalRoot = realpathSync(physicalRoot);
         const canonicalUnrelatedRoot = realpathSync(unrelatedRoot);
 
-        const legacy = openDb(dbPath);
+        const legacy = openUnmanagedDb(dbPath);
         const insert = legacy.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)');
         insert.run('01J00000000000000000000001', `${canonicalPhysicalRoot}/`, 'approved', '2026-08-01T00:00:00.000Z', 'grandfathered');
         insert.run('01J00000000000000000000002', canonicalPhysicalRoot, 'denied', '2026-08-02T00:00:00.000Z', 'cli');
         insert.run('01J00000000000000000000003', canonicalUnrelatedRoot, 'approved', '2026-08-03T00:00:00.000Z', 'discovery');
         legacy.close();
 
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         expect(store.consent.list()).toEqual([
             {
@@ -207,7 +207,7 @@ describe('consent roots', () => {
         const canonicalPhysicalRoot = realpathSync(physicalRoot);
         const alternateSpelling = `${canonicalPhysicalRoot}/`;
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)').run(
             '01J00000000000000000000001',
             alternateSpelling,
@@ -230,7 +230,7 @@ describe('consent roots', () => {
 
     it('chooses canonical winners by explicit source, then decision time, then ulid', () => {
         const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-consent-winner-order-'));
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const insert = db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)');
 
         const sourceRoot = path.join(fixture, 'source-root');
@@ -277,7 +277,7 @@ describe('consent roots', () => {
         const canonicalWork = realpathSync(work);
         const missingCwd = path.join(canonicalWork, 'not-yet-created');
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         store.consent.grant(alias);
 
@@ -306,7 +306,7 @@ describe('consent roots', () => {
         const fixture = consentFixture('consent-refused-home-');
         const alias = path.join(fixture, 'home-link');
         symlinkSync(homedir(), alias);
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
 
         try {
@@ -323,7 +323,7 @@ describe('consent roots', () => {
     });
 
     it('returns an existing explicit decision for a refused root unchanged', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const home = realpathSync(homedir());
         const decision = {
             ulid: '01J00000000000000000000007',
@@ -344,7 +344,7 @@ describe('consent roots', () => {
     });
 
     it('re-granting an approved folder preserves denied descendant projects', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const folder = '/root/folder';
         const project = `${folder}/proj`;
@@ -359,7 +359,7 @@ describe('consent roots', () => {
     });
 
     it('lets a denied child override an approved ancestor in consent and wizard candidates', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const folder = '/root/folder';
         const project = `${folder}/proj`;
@@ -402,7 +402,7 @@ describe('consent roots', () => {
     });
 
     it('grandfathers one group root per ProjectSet, denies temporary roots, and preserves every turn row', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         insertHistoricalProject(db, '/Users/test/elepha-ext', 'ext-root');
         insertHistoricalProject(db, '/Users/test/elepha-ext/extension/src', 'ext-child');
         insertHistoricalProject(db, '/private/tmp/claude-501/scratchpad/hooktest', 'temporary');
@@ -427,7 +427,7 @@ describe('consent roots', () => {
         const projectRoot = path.join(fixture, 'historical-project');
         mkdirSync(projectRoot);
 
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         insertHistoricalProject(db, projectRoot, 'historical');
         const store = new MemoryStore(db);
         const granted = store.consent.grant(projectRoot);
@@ -435,7 +435,7 @@ describe('consent roots', () => {
         expect(store.consent.list()).toEqual([]);
         db.close();
 
-        const reopened = openDb(dbPath);
+        const reopened = openUnmanagedDb(dbPath);
         expect(new MemoryStore(reopened).consent.list()).toEqual([]);
         reopened.close();
     });
@@ -446,12 +446,12 @@ describe('consent roots', () => {
         const projectRoot = path.join(fixture, 'historical-project');
         mkdirSync(projectRoot);
 
-        const legacy = openDb(dbPath);
+        const legacy = openUnmanagedDb(dbPath);
         insertHistoricalProject(legacy, projectRoot, 'historical');
         legacy.prepare('DELETE FROM meta WHERE key = ?').run(CONSENT_GRANDFATHERED_AT_KEY);
         legacy.close();
 
-        const firstOpen = openDb(dbPath);
+        const firstOpen = openUnmanagedDb(dbPath);
         expect(new MemoryStore(firstOpen).consent.list()).toEqual([
             expect.objectContaining({ path: realpathSync(projectRoot), state: 'approved', source: 'grandfathered' }),
         ]);
@@ -463,7 +463,7 @@ describe('consent roots', () => {
         firstOpen.prepare('DELETE FROM consent_roots').run();
         firstOpen.close();
 
-        const secondOpen = openDb(dbPath);
+        const secondOpen = openUnmanagedDb(dbPath);
         expect(new MemoryStore(secondOpen).consent.list()).toEqual([]);
         expect(secondOpen.prepare('SELECT value FROM meta WHERE key = ?').get(CONSENT_GRANDFATHERED_AT_KEY)).toEqual(marker);
         secondOpen.close();
@@ -475,13 +475,13 @@ describe('consent roots', () => {
         const projectRoot = path.join(fixture, 'historical-project');
         mkdirSync(projectRoot);
 
-        const legacy = openDb(dbPath);
+        const legacy = openUnmanagedDb(dbPath);
         insertHistoricalProject(legacy, projectRoot, 'historical');
         new MemoryStore(legacy).consent.grant(projectRoot);
         legacy.prepare('DELETE FROM meta WHERE key = ?').run(CONSENT_GRANDFATHERED_AT_KEY);
         legacy.close();
 
-        const migrated = openDb(dbPath);
+        const migrated = openUnmanagedDb(dbPath);
         expect(new MemoryStore(migrated).consent.list()).toEqual([
             expect.objectContaining({ path: realpathSync(projectRoot), state: 'approved', source: 'cli' }),
         ]);
@@ -493,13 +493,13 @@ describe('consent roots', () => {
         migrated.prepare('DELETE FROM consent_roots').run();
         migrated.close();
 
-        const reopened = openDb(dbPath);
+        const reopened = openUnmanagedDb(dbPath);
         expect(new MemoryStore(reopened).consent.list()).toEqual([]);
         reopened.close();
     });
 
     it('keeps the turn-level consent check as a no-persistence fallback without creating a post-parse pending root', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const logs: string[] = [];
         const daemon = new IngestionDaemon({ store, adapters: [new FixedAdapter()], log: (line) => logs.push(line) }) as unknown as {
@@ -521,7 +521,7 @@ describe('consent roots', () => {
     });
 
     it('warns once per transcript through the deduplicated daemon warning path when a later turn climbs above the approved root', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const logs: string[] = [];
         const daemon = new IngestionDaemon({ store, adapters: [new FixedAdapter()], log: (line) => logs.push(line) }) as unknown as {
@@ -550,7 +550,7 @@ describe('consent roots', () => {
     });
 
     it('tombstones a denied turn without recording any project, session, or memory', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const logs: string[] = [];
         const daemon = new IngestionDaemon({ store, adapters: [new FixedAdapter()], log: (line) => logs.push(line) }) as unknown as {
@@ -575,7 +575,7 @@ describe('consent roots', () => {
     });
 
     it('purges every descendant project row when a consent root is revoked', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const root = '/Users/test/revoked-root';
         const child = `${root}/packages/app`;
@@ -591,7 +591,7 @@ describe('consent roots', () => {
     });
 
     it('backfills a newly approved root in capture-only mode', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-backfill-'));
         const claudeConfigDir = path.join(directory, '.claude');
@@ -619,7 +619,7 @@ describe('consent roots', () => {
         mkdirSync(watchRoot, { recursive: true });
         writeFileSync(transcript, `${JSON.stringify({ cwd: unapproved })}\nthis body is deliberately not JSON\n`);
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const adapter = new ConsentGateAdapter(unapproved, true);
         const daemon = new IngestionDaemon({ store, adapters: [adapter], watchRoots: [watchRoot] }) as unknown as ScanFileSeam;
@@ -649,7 +649,7 @@ describe('consent roots', () => {
         writeFileSync(toolInternalTranscript, `${JSON.stringify({ cwd: toolInternalCwd })}\n`);
         writeFileSync(missingTranscript, `${JSON.stringify({ cwd: missingCwd })}\n`);
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const toolInternalAdapter = new ConsentGateAdapter(toolInternalCwd, true);
         const missingAdapter = new ConsentGateAdapter(missingCwd, true);
@@ -687,7 +687,7 @@ describe('consent roots', () => {
         writeFileSync(approvedTranscript, `${JSON.stringify({ cwd: approved })}\n`);
         writeFileSync(outsideTranscript, `${JSON.stringify({ cwd: outside })}\nthis body must not be parsed\n`);
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         store.consent.grant(approved);
         const approvedAdapter = new ConsentGateAdapter(approved);

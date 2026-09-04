@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { applyCustomTitleBackfill, planCustomTitleBackfill } from '../../src/storage/custom-title-backfill.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import { applySessionTitleBackfill, planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter, ToolName } from '../../src/types/index.js';
@@ -111,7 +111,7 @@ describe('session-title backfill', () => {
         copyFileSync(CUSTOM_TITLE, customTitleSource);
         copyFileSync(FRAME_LINK, frameLinkSource);
 
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         db.prepare(
             `INSERT INTO projects (id, path, first_seen_at, last_seen_at)
              VALUES (1, '/repo', '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z')`,
@@ -174,7 +174,7 @@ describe('session-title backfill', () => {
         expect((await planSessionTitleBackfill(db, adapters)).changes).toHaveLength(0);
         db.close();
 
-        const customDb = openDb(':memory:');
+        const customDb = openUnmanagedDb(':memory:');
         customDb
             .prepare(
                 `INSERT INTO projects (id, path, first_seen_at, last_seen_at) VALUES (1, '/tmp/proj', '2026-08-16T00:00:00.000Z', '2026-08-16T00:00:00.000Z')`,

@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { exportAll } from '../../src/cli/commands/backup.js';
 import { runRestoreOperation } from '../../src/cli/commands/restore.js';

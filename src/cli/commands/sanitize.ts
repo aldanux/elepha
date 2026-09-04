@@ -12,7 +12,7 @@ export function registerSanitize(program: Command): void {
         )
         .option('--apply', 'actually rewrite the affected fields (default is a dry run that only prints them)')
         .action(async (opts: { apply: boolean }) => {
-            const db = openDb();
+            const db = await openDb();
 
             // Preview before acting, every time - including under --apply, and
             // with the actual before/after text rather than a count. A backfill

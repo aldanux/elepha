@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { MINIMUM_NODE_VERSION } from '../../src/config/constants.js';
 import { daemonHealth, managedLauncherHealth } from '../../src/install/health-checks.js';
 import { defaultLaunchdServicePaths, LaunchdBackend } from '../../src/install/launchd-backend.js';
 import { renderLauncher } from '../../src/install/launcher.js';
@@ -69,7 +70,7 @@ describe('shared installation health checks', () => {
             command: '/usr/local/bin/elepha',
             node: '/usr/local/bin/node',
         } as const;
-        service.install(renderLauncher(backend, 22), backend);
+        service.install(renderLauncher(backend, MINIMUM_NODE_VERSION), backend);
 
         expect(managedLauncherHealth(service)).toEqual({ healthy: true, detail: 'managed launcher is valid' });
         writeFileSync(paths.launcher, '# modified\n');

@@ -7,7 +7,7 @@
 // fills in.
 
 import { beforeEach, describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { hydrateTurnDecisions, MemoryStore } from '../../src/storage/memory-store.js';
 import { parseOutput } from '../../src/summarizer/haiku-provider.js';
 import type { ParsedTurn } from '../../src/types/index.js';
@@ -71,7 +71,7 @@ describe('storage round-trip', () => {
     let store: MemoryStore;
 
     beforeEach(() => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         const project = store.upsertProject('/repo');
         store.upsertSession('claude-code', 's1', project.id, '/tmp/s1.jsonl');

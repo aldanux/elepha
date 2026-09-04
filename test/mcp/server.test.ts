@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { GET_SESSION_DEADLINE_MS, MAX_GET_SESSION_LAST_N } from '../../src/config/constants.js';
 import { PACKAGE_VERSION } from '../../src/config/version.js';
@@ -14,7 +14,7 @@ import { omissionMarker } from '../../src/rendering/raw-turn-renderer.js';
 import { dataBlockClose, dataBlockOpen } from '../../src/serving/instructions.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
@@ -85,7 +85,7 @@ function schemaHash(dbPath: string): string {
 }
 
 describe('elepha MCP server surface', () => {
-    const databases: Array<ReturnType<typeof openDb>> = [];
+    const databases: Array<ReturnType<typeof openUnmanagedDb>> = [];
     let previousCodexHome: string | undefined;
 
     afterEach(() => {
@@ -276,7 +276,7 @@ describe('elepha MCP server surface', () => {
         pauseNextRender = true;
         const inFlight = service.getSession({ id: publicId });
         await renderStarted;
-        const revokingDb = openDb(fixture.dbPath);
+        const revokingDb = openUnmanagedDb(fixture.dbPath);
         new ConsentStore(revokingDb).revoke(projectPath);
         revokingDb.close();
         resumeRender();
@@ -308,7 +308,7 @@ describe('elepha MCP server surface', () => {
     });
 
     it('keeps every empty and failure state distinct while serving a raw episode without internal IDs', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         databases.push(db);
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-'));
         previousCodexHome = process.env.CODEX_HOME;
@@ -552,12 +552,12 @@ describe('elepha MCP server surface', () => {
         expect(text(overflow)).not.toContain('## Turn 40');
     });
 
-    it('opens the serving database read-only', () => {
+    it('opens the serving database read-only', async () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-read-only-'));
         const dbPath = path.join(root, 'elepha.db');
-        const writable = openDb(dbPath);
+        const writable = openUnmanagedDb(dbPath);
         writable.close();
-        const readOnly = openMcpReadOnlyDatabase(dbPath);
+        const readOnly = await openMcpReadOnlyDatabase(dbPath);
         expect(() =>
             readOnly.prepare("INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/tmp/x', 'x', 'x')").run(),
         ).toThrow(/readonly/i);
@@ -580,7 +580,7 @@ describe('elepha MCP server surface', () => {
         const beforeSchema = schemaHash(dbPath);
         const beforeBytes = createHash('sha256').update(readFileSync(dbPath)).digest('hex');
         const beforeMode = statSync(root).mode;
-        const database = openMcpReadOnlyDatabase(dbPath);
+        const database = await openMcpReadOnlyDatabase(dbPath);
         const server = createMcpServerForDatabase(database);
         const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
         const client = new Client({ name: 'mcp-schema-refusal-test', version: '1.0.0' });

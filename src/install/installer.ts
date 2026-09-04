@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { parse } from 'smol-toml';
-import { MINIMUM_NODE_MAJOR, PRIVATE_FILE_MODE } from '../config/constants.js';
+import { MINIMUM_NODE_VERSION, PRIVATE_FILE_MODE } from '../config/constants.js';
 import { claudeMcpPath, claudeSettingsPath, codexConfigPath, elephaHome } from '../config/paths.js';
 import { transformClaudeHook, transformCodexHook } from '../hooks/installer.js';
 import { transformClaudeMcp, transformCodexMcp } from '../mcp/installer.js';
@@ -266,12 +266,12 @@ export function installElepha(
         ? detectLauncherBackend({
               packageRoot: resolved.packageRoot,
               sourceBin: resolved.bin,
-              minimumNodeMajor: MINIMUM_NODE_MAJOR,
+              minimumNodeVersion: MINIMUM_NODE_VERSION,
               home: runtime.home,
           })
         : undefined;
     const launcher = service?.launcherPath ?? resolved.bin;
-    const servicePlan = service && backend ? { service, backend, launcherText: renderLauncher(backend, MINIMUM_NODE_MAJOR) } : undefined;
+    const servicePlan = service && backend ? { service, backend, launcherText: renderLauncher(backend, MINIMUM_NODE_VERSION) } : undefined;
     // Rendering is part of preflight. Keep this invariant outside the
     // compensating block: no client config, service artifact, or journal has
     // been mutated at this point.

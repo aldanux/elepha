@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import type { ProjectRow } from '../../src/storage/memory-store.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -34,7 +34,7 @@ describe('elepha rekey-projects --apply', () => {
         expect(gitInit.status).toBe(0);
         const gitRoot = spawnSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim();
 
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const now = new Date().toISOString();
         const root = db
             .prepare(
@@ -68,7 +68,7 @@ describe('elepha rekey-projects --apply', () => {
             expect(result.stdout).toContain(`Backed up ${dbPath} to `);
             expect(readdirSync(directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(true);
 
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             const projects = verified.prepare('SELECT * FROM projects').all() as ProjectRow[];
             expect(projects).toEqual([expect.objectContaining({ path: gitRoot, display_name: 'repo', git_root: gitRoot })]);
             expect(verified.prepare('SELECT project_id FROM sessions ORDER BY native_id').all()).toEqual([
@@ -90,7 +90,7 @@ describe('elepha rekey-projects --apply', () => {
         mkdirSync(subdirectory, { recursive: true });
         expect(spawnSync('git', ['init', '--quiet', repo], { encoding: 'utf8' }).status).toBe(0);
 
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const now = new Date().toISOString();
         db.prepare(
             'INSERT INTO projects (path, display_name, git_root, git_remote, first_seen_at, last_seen_at) VALUES (?, ?, NULL, NULL, ?, ?)',
@@ -106,7 +106,7 @@ describe('elepha rekey-projects --apply', () => {
             expect(result.status).toBe(0);
             expect(result.stdout).toContain('=== PROJECT RE-KEY DRY RUN (nothing written) ===');
             expect(readdirSync(directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             expect(verified.prepare('SELECT id FROM projects').all()).toHaveLength(2);
             verified.close();
         } finally {
@@ -122,7 +122,7 @@ describe('elepha rekey-projects --apply', () => {
         mkdirSync(subdirectory, { recursive: true });
         expect(spawnSync('git', ['init', '--quiet', repo], { encoding: 'utf8' }).status).toBe(0);
 
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const now = new Date().toISOString();
         for (const project of [repo, subdirectory]) {
             db.prepare(
@@ -140,7 +140,7 @@ describe('elepha rekey-projects --apply', () => {
             expect(result.status).toBe(1);
             expect(result.stderr).toContain('Refusing rekey-projects --apply while the daemon is running');
             expect(readdirSync(directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             expect(verified.prepare('SELECT id FROM projects').all()).toHaveLength(2);
             verified.close();
         } finally {

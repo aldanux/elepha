@@ -4,12 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     selfUpdate: vi.fn(),
     countApproved: vi.fn(() => 1),
-    openDb: vi.fn(() => ({})),
+    openDb: vi.fn(async () => ({})),
 }));
 
 vi.mock('../../src/install/self-update.js', () => ({ selfUpdate: mocks.selfUpdate }));
 vi.mock('../../src/storage/consent-store.js', () => ({
     ConsentStore: class {
+        //noinspection JSUnusedGlobalSymbols
         countApproved(): number {
             return mocks.countApproved();
         }

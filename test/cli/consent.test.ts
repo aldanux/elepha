@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { isRefusedProjectRoot } from '../../src/config/paths.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -119,7 +119,7 @@ function claudeTranscript(cwd: string, sessionId: string): string {
 }
 
 function counts(dbPath: string): { sessions: number; turns: number } {
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     try {
         return {
             sessions: (db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number }).count,
@@ -142,13 +142,14 @@ describe('elepha consent grant/revoke', () => {
         const canonicalRoot = realpathSync(root);
         mkdirSync(path.dirname(transcript), { recursive: true });
         writeFileSync(transcript, claudeTranscript(canonicalRoot, sessionId));
+        openUnmanagedDb(dbPath).close();
 
         try {
             const result = runConsentCli(dbPath, 'grant', { here: true, cwd: canonicalRoot });
 
             expect(result.status).toBe(0);
             expect(result.stdout).toContain(`Granted ${canonicalRoot}; backfilled 1 turn(s) without synthesis.`);
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             const store = new MemoryStore(verified);
             expect(store.consent.list()).toEqual([expect.objectContaining({ path: canonicalRoot, state: 'approved', source: 'cli' })]);
             expect(store.findSession('claude-code', sessionId)).toBeDefined();
@@ -168,7 +169,7 @@ describe('elepha consent grant/revoke', () => {
         const pendingRoot = path.join(projectDirectory, 'pending-root');
         mkdirSync(root);
         const canonicalRoot = realpathSync(root);
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         store.consent.grant(canonicalRoot);
         store.consent.recordPending(pendingRoot);
@@ -207,7 +208,7 @@ describe('elepha consent grant/revoke', () => {
             expect(pendingResult.status).toBe(0);
             expect(counts(dbPath)).toEqual(before);
 
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             const verifiedStore = new MemoryStore(verified);
             expect(verifiedStore.findSession('codex', 'captured-session')).toBeDefined();
             expect(verifiedStore.consent.list()).toEqual(
@@ -257,7 +258,7 @@ describe('elepha consent prune', () => {
         mkdirSync(stillMissingRoot);
         const canonicalReturnedRoot = realpathSync(returnedRoot);
         const canonicalStillMissingRoot = realpathSync(stillMissingRoot);
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const selected = [store.consent.recordPending(canonicalReturnedRoot), store.consent.recordPending(canonicalStillMissingRoot)];
         db.close();
@@ -274,7 +275,7 @@ describe('elepha consent prune', () => {
             expect(applied.stderr).toContain(canonicalReturnedRoot);
             expect(applied.stderr).toContain('Nothing was removed.');
             expect(applied.stderr).toContain('Re-run elepha consent prune to see a fresh preview.');
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             expect(new Set(new MemoryStore(verified).consent.list().map((root) => root.ulid))).toEqual(
                 new Set(selected.map((root) => root.ulid)),
             );
@@ -299,7 +300,7 @@ describe('elepha consent prune', () => {
         const canonicalMissingRoot = realpathSync(missingRoot);
         const canonicalLiveRoot = realpathSync(liveRoot);
         const canonicalRefusedRoot = realpathSync(refusedRoot);
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         store.consent.recordPending(canonicalMissingRoot);
         store.consent.grant(canonicalLiveRoot);
@@ -340,7 +341,7 @@ describe('elepha consent prune', () => {
             expect(preview.stdout).toContain('nothing was deleted');
             expect(preview.stdout).toContain('Re-run with --apply');
             expect(counts(dbPath)).toEqual(beforeMemory);
-            const afterPreview = openDb(dbPath);
+            const afterPreview = openUnmanagedDb(dbPath);
             expect(new MemoryStore(afterPreview).consent.list()).toHaveLength(3);
             afterPreview.close();
 
@@ -350,7 +351,7 @@ describe('elepha consent prune', () => {
             expect(applied.stdout).toContain('Removed 2 consent root(s).');
             expect(applied.stdout).toContain('elepha purge --orphan');
             expect(counts(dbPath)).toEqual(beforeMemory);
-            const verified = openDb(dbPath);
+            const verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).consent.list()).toEqual([
                 expect.objectContaining({ path: canonicalLiveRoot, state: 'approved' }),
             ]);

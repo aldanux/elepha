@@ -4,10 +4,11 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { PACKAGE_VERSION } from '../config/constants.js';
 import { SERVER_INSTRUCTIONS } from '../serving/instructions.js';
-import { defaultDbPath } from '../storage/db.js';
+import type { DatabaseEncryptionRuntime } from '../storage/database-encryption.js';
+import { defaultDbPath, openManagedDatabase } from '../storage/db.js';
 import { ElephaMcpService, mcpToolDefinitions } from './tools.js';
 
 export { SERVER_INSTRUCTIONS } from '../serving/instructions.js';
@@ -101,12 +102,15 @@ function registerTools(server: McpServer, tools: ReturnType<typeof mcpToolDefini
 
 // Starts the only network-facing transport. stdout remains reserved for JSON-RPC.
 export async function serveMcp(dbPath: string = defaultDbPath()): Promise<void> {
-    const db = openMcpReadOnlyDatabase(dbPath);
+    const db = await openMcpReadOnlyDatabase(dbPath);
     const server = createMcpServerForDatabase(db);
     await server.connect(new StdioServerTransport());
 }
 
 // Read-only connection seam used by the stdio server and its write-proof test.
-export function openMcpReadOnlyDatabase(dbPath: string = defaultDbPath()): Database.Database {
-    return new Database(dbPath, { readonly: true, fileMustExist: true });
+export function openMcpReadOnlyDatabase(
+    dbPath: string = defaultDbPath(),
+    encryption?: DatabaseEncryptionRuntime,
+): Promise<Database.Database> {
+    return openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption });
 }

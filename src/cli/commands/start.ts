@@ -12,10 +12,10 @@ export function registerStart(program: Command): void {
     program
         .command('start', { hidden: true })
         .description('Run the ingestion daemon in the foreground, watching sessions from supported AI coding tools')
-        .action(() => {
+        .action(async () => {
             const log = (msg: string) => console.log(msg);
             const logError = (msg: string) => console.error(msg);
-            const db = openDb();
+            const db = await openDb();
             const store = new MemoryStore(db);
             if (store.consent.list('approved').length === 0) {
                 console.log('capture is awaiting consent; run `elepha init` to choose projects, nothing to do, exiting.');

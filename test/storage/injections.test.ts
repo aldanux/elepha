@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 
 describe('Rule 4 injections storage', () => {
     it('creates injections and its session index in a fresh schema', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
 
         expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'injections'").get()).toEqual({
             name: 'injections',
@@ -15,7 +15,7 @@ describe('Rule 4 injections storage', () => {
     });
 
     it('records normalized bodies idempotently and scopes lookups to an eligible session and time', () => {
-        const store = new MemoryStore(openDb(':memory:'));
+        const store = new MemoryStore(openUnmanagedDb(':memory:'));
         const input = {
             tool: 'claude-code' as const,
             nativeSessionId: 'session-a',

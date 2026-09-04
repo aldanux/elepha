@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     installElepha: vi.fn(),
-    openDb: vi.fn(() => ({})),
+    openDb: vi.fn(async () => ({})),
     printInstallation: vi.fn(),
     spinner: vi.fn(),
 }));

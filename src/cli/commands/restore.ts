@@ -2,13 +2,13 @@ import { createHash } from 'node:crypto';
 import { createReadStream, existsSync, mkdtempSync, rmdirSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { PRIVATE_FILE_MODE } from '../../config/constants.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
 import { writeBackup } from '../../storage/backup.js';
 import { validateCandidateSemantics } from '../../storage/candidate-validator.js';
-import { defaultDbPath, openDb } from '../../storage/db.js';
+import { defaultDbPath, openDb, openManagedDatabase, openUnmanagedDb } from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
 import { atomicCopyPrivateFile } from '../../util/fs.js';
 import { runRestoreWizard } from '../restore-wizard.js';
@@ -140,7 +140,7 @@ function verifyStagedSchema(stagedPath: string): void {
     let staged: Database.Database | undefined;
     let canonical: Database.Database | undefined;
     try {
-        staged = openDb(stagedPath);
+        staged = openUnmanagedDb(stagedPath);
         canonical = openDb(':memory:');
         const errors = schemaDifferences(staged, canonical);
         if (errors.length > 0) {
@@ -230,18 +230,18 @@ function printPreview(dbPath: string, candidatePath: string, counts: RestoreCoun
     );
 }
 
-function checkpointActiveDatabase(dbPath: string): Database.Database {
-    const db = new Database(dbPath);
+async function checkpointActiveDatabase(dbPath: string): Promise<Database.Database> {
+    const db = await openManagedDatabase(dbPath, { fileMustExist: true });
     db.pragma('wal_checkpoint(TRUNCATE)');
     return db;
 }
 
-function activeTranscriptTombstones(dbPath: string): TranscriptTombstones {
+async function activeTranscriptTombstones(dbPath: string): Promise<TranscriptTombstones> {
     const tombstones: TranscriptTombstones = { purged_transcripts: [], incognito_transcripts: [] };
     if (!existsSync(dbPath)) {
         return tombstones;
     }
-    const active = new Database(dbPath, { readonly: true, fileMustExist: true });
+    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true });
     try {
         for (const { table } of TOMBSTONE_TABLES) {
             const exists = active.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
@@ -255,8 +255,8 @@ function activeTranscriptTombstones(dbPath: string): TranscriptTombstones {
     }
 }
 
-function unionTranscriptTombstones(dbPath: string, tombstones: TranscriptTombstones): void {
-    const restored = openDb(dbPath);
+async function unionTranscriptTombstones(dbPath: string, tombstones: TranscriptTombstones): Promise<void> {
+    const restored = await openDb(dbPath);
     try {
         const recordedAt = new Date().toISOString();
         restored.transaction(() => {
@@ -308,8 +308,8 @@ function removeStaleSidecars(dbPath: string): void {
     }
 }
 
-function verifyRestoredDatabase(dbPath: string, expectedCounts: RestoreCounts): void {
-    const restored = new Database(dbPath, { readonly: true, fileMustExist: true });
+async function verifyRestoredDatabase(dbPath: string, expectedCounts: RestoreCounts): Promise<void> {
+    const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true });
     try {
         const errors = verifyDatabase(restored, expectedCounts);
         if (errors.length > 0) {
@@ -340,7 +340,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         if (health.state.startsWith('STUCK')) {
             console.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
         }
-        const tombstones = activeTranscriptTombstones(dbPath);
+        const tombstones = await activeTranscriptTombstones(dbPath);
         printPreview(dbPath, candidatePath, counts, tombstones);
         if (runtime.confirm && !(await runtime.confirm())) {
             return { cancelled: true };
@@ -349,7 +349,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         if (!existsSync(dbPath)) {
             throw new Error(`No active elepha database exists at ${dbPath}; nothing can be snapshotted before restore.`);
         }
-        const active = checkpointActiveDatabase(dbPath);
+        const active = await checkpointActiveDatabase(dbPath);
         let snapshotPath: string;
         try {
             snapshotPath = (runtime.writeBackup ?? writeBackup)(active, dbPath);
@@ -368,8 +368,8 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 throw new Error('Installed database hash does not match the validated backup.');
             }
             removeStaleSidecars(dbPath);
-            verifyRestoredDatabase(dbPath, counts);
-            unionTranscriptTombstones(dbPath, tombstones);
+            await verifyRestoredDatabase(dbPath, counts);
+            await unionTranscriptTombstones(dbPath, tombstones);
             // Read-only verification can create fresh empty WAL bookkeeping files;
             // remove them too so no sidecar from before the replacement can survive.
             removeStaleSidecars(dbPath);

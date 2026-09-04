@@ -2,7 +2,7 @@
 // source_path comes from the consented database row and adapters own parsing.
 
 import { existsSync, realpathSync } from 'node:fs';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import {
     AUTO_BRIEF_CHAR_BUDGET,
     AUTO_BRIEF_MAX_AGE_MS,
@@ -229,7 +229,7 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         }
         // Hooks must see additive schema migrations before selecting a live
         // session. `openDb` is idempotent and refuses no existing data.
-        db = openDb(dbPath);
+        db = await openDb(dbPath);
     } catch {
         return { reason: 'database_unavailable' };
     }

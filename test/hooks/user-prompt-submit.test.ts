@@ -8,7 +8,7 @@ import { parseUserPromptCommand, runUserPromptSubmit } from '../../src/hooks/use
 import { terminalHandoff } from '../../src/markers.js';
 import { OPEN } from '../../src/security/sentinel.js';
 import { dataBlockClose, dataBlockOpen, HELP, SELECT_HINT, servedContextInstructions } from '../../src/serving/instructions.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
@@ -95,7 +95,7 @@ function addProjectSession(
         sourcePath?: string;
     },
 ): void {
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     const project = db
         .prepare('INSERT INTO projects (path, display_name, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)')
         .run(projectPath, path.basename(projectPath), timestamp, timestamp);

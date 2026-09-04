@@ -2,7 +2,7 @@
 // and the 20k newest-first budget; callers own their transport/envelopes.
 
 import { randomUUID } from 'node:crypto';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { defaultAdapters } from '../adapters/index.js';
 import {
     AUTO_BRIEF_AGGREGATE_FILE_LIMIT,

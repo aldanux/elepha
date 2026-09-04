@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import {
     applyManualMerge,
@@ -88,7 +88,7 @@ function codexFixture(options: { markerBeforeSecond?: boolean } = {}): string {
 }
 
 function seed(options: { markerBeforeSecond?: boolean; missingSource?: boolean; outsideStore?: boolean } = {}) {
-    const db = openDb(':memory:');
+    const db = openUnmanagedDb(':memory:');
     const dir = realpathSync(
         options.outsideStore
             ? mkdtempSync(path.join(tmpdir(), 'elepha-resegment-outside-'))
@@ -122,7 +122,7 @@ function seed(options: { markerBeforeSecond?: boolean; missingSource?: boolean; 
     return { db, sourcePath };
 }
 
-function insertRollup(db: ReturnType<typeof openDb>, sessionId: number, parentSessionId: number | null = null): void {
+function insertRollup(db: ReturnType<typeof openUnmanagedDb>, sessionId: number, parentSessionId: number | null = null): void {
     db.prepare(
         `INSERT INTO session_rollups
          (session_id, project_id, tool, title, summary, decisions, pending_items, files_touched, turn_count,
@@ -134,7 +134,7 @@ function insertRollup(db: ReturnType<typeof openDb>, sessionId: number, parentSe
     ).run(sessionId, parentSessionId);
 }
 
-function resegmentationState(db: ReturnType<typeof openDb>): Record<string, unknown> {
+function resegmentationState(db: ReturnType<typeof openUnmanagedDb>): Record<string, unknown> {
     const correctionsTableExists =
         db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'segment_corrections'").get() !== undefined;
     return {
@@ -146,7 +146,7 @@ function resegmentationState(db: ReturnType<typeof openDb>): Record<string, unkn
     };
 }
 
-function failSessionUpdate(db: ReturnType<typeof openDb>, message: string): void {
+function failSessionUpdate(db: ReturnType<typeof openUnmanagedDb>, message: string): void {
     db.exec(`
       CREATE TEMP TRIGGER fail_resegmentation_session_update
       BEFORE UPDATE ON sessions
@@ -156,7 +156,7 @@ function failSessionUpdate(db: ReturnType<typeof openDb>, message: string): void
     `);
 }
 
-function failMemoryUpdate(db: ReturnType<typeof openDb>, message: string): void {
+function failMemoryUpdate(db: ReturnType<typeof openUnmanagedDb>, message: string): void {
     db.exec(`
       CREATE TEMP TRIGGER fail_resegmentation_memory_update
       BEFORE UPDATE ON memories

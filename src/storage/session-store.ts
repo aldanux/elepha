@@ -1,4 +1,4 @@
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
 import { gitRevListCountHead } from '../security/subprocess-allowlist.js';

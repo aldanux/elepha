@@ -1,7 +1,7 @@
 // Canonical hydrated read model for served sessions. SQL storage details stay
 // here so serving consumers share one shape instead of re-declaring row types.
 
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import type { SessionRowSurface, ToolName } from '../types/index.js';
 
 export interface ServedSession {

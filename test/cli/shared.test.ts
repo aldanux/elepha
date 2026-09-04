@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CAPTURE_PAUSE_DEADLINE_MS } from '../../src/config/constants.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
-import type { openDb } from '../../src/storage/db.js';
+import type { openUnmanagedDb } from '../../src/storage/db.js';
 
 const { backupDatabaseAndReport, daemonHealth, defaultDbPath, serviceBackend } = vi.hoisted(() => ({
     backupDatabaseAndReport: vi.fn(),
@@ -59,7 +59,7 @@ function fakeService(calls: string[]): ServiceBackend {
 
 describe('prepareDestructiveApply daemon liveness gate', () => {
     let root: string;
-    let db: ReturnType<typeof openDb>;
+    let db: ReturnType<typeof openUnmanagedDb>;
     let error: ReturnType<typeof vi.spyOn>;
     let log: ReturnType<typeof vi.spyOn>;
 
@@ -68,7 +68,7 @@ describe('prepareDestructiveApply daemon liveness gate', () => {
         const dbPath = path.join(root, 'elepha.db');
         defaultDbPath.mockReturnValue(dbPath);
         writeFileSync(dbPath, 'database');
-        db = { pragma: vi.fn() } as unknown as ReturnType<typeof openDb>;
+        db = { pragma: vi.fn() } as unknown as ReturnType<typeof openUnmanagedDb>;
         error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
         log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
         vi.clearAllMocks();

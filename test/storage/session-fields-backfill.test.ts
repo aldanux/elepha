@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { applySessionFieldsBackfill, planSessionFieldsBackfill } from '../../src/storage/session-fields-backfill.js';
 import type { SessionAdapter, ToolName } from '../../src/types/index.js';
@@ -51,7 +51,7 @@ describe('session-fields-backfill', () => {
 
     afterEach(() => vi.unstubAllEnvs());
 
-    function seedSession(db: ReturnType<typeof openDb>, sourcePath: string, nativeId = 'sess-1') {
+    function seedSession(db: ReturnType<typeof openUnmanagedDb>, sourcePath: string, nativeId = 'sess-1') {
         const store = new MemoryStore(db);
         const project = store.upsertProject('/tmp/proj');
         const session = store.upsertSession('claude-code', nativeId, project.id, sourcePath);
@@ -63,7 +63,7 @@ describe('session-fields-backfill', () => {
     }
 
     it('dry run (plan) writes nothing', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const session = seedSession(db, filePath);
         const plan = await planSessionFieldsBackfill(db, adapters);
         expect(plan.changes.length).toBeGreaterThan(0);
@@ -73,7 +73,7 @@ describe('session-fields-backfill', () => {
     });
 
     it('apply is transactional and populates surface/git_branch/kind', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const session = seedSession(db, filePath);
         const plan = await applySessionFieldsBackfill(db, adapters);
         expect(plan.changes.length).toBeGreaterThan(0);
@@ -89,7 +89,7 @@ describe('session-fields-backfill', () => {
     });
 
     it('unavailable transcripts leave fields NULL without aborting the rest of the batch', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const missingPath = path.join(claudeProjects, 'does-not-exist.jsonl');
         expect(existsSync(missingPath)).toBe(false);
         const missingSession = seedSession(db, missingPath, 'sess-missing');
@@ -124,7 +124,7 @@ describe('session-fields-backfill', () => {
     });
 
     it('re-running apply is idempotent (no duplicate memory updates, same end state)', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         seedSession(db, filePath);
         const first = await applySessionFieldsBackfill(db, adapters);
         const second = await applySessionFieldsBackfill(db, adapters);
@@ -134,7 +134,7 @@ describe('session-fields-backfill', () => {
     });
 
     it('derives surface/kind/git_branch for a Codex session from session_meta (originator + git.branch), not per-line fields', async () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const codexFilePath = path.join(codexSessions, 'codex-sess-1.jsonl');
         writeFileSync(codexFilePath, CODEX_FIXTURE);
 

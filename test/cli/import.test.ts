@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { exportAll, exportProject } from '../../src/cli/commands/backup.js';
 import { IMPORTED_TABLES, reportImportError, runImportOperation } from '../../src/cli/commands/import.js';

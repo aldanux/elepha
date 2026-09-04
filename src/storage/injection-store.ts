@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { normalizeForNearVerbatim } from '../security/self-ingestion.js';
 import type { ToolName } from '../types/index.js';
 

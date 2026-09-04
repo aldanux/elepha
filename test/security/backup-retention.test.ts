@@ -6,7 +6,7 @@
 import { copyFileSync, existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { backupDatabaseAndReport, pruneBackups, writeBackup } from '../../src/storage/backup.js';
 

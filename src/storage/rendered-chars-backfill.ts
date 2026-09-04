@@ -2,7 +2,7 @@
 // raw-turn renderer used at ingestion. It is transcript-only: no summarizer
 // call and no retained text.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { isReadableProviderSource } from '../config/paths.js';
 import { renderedChars, renderedTurns } from '../rendering/raw-turn-renderer.js';
 import type { ParsedTurn, SessionAdapter, ToolName } from '../types/index.js';

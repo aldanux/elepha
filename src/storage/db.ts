@@ -1,12 +1,13 @@
 // SQLite connection + schema management. Single local DB file, zero config.
 
-import { mkdirSync } from 'node:fs';
+import { closeSync, existsSync, constants as fsConstants, mkdirSync, openSync, readSync } from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
-import { DURABLE_CAPTURE_STATES } from '../config/constants.js';
+import Database from 'better-sqlite3-multiple-ciphers';
+import { DATABASE_HEADER_BYTES, DURABLE_CAPTURE_STATES } from '../config/constants.js';
 import { elephaHome } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
+import { type DatabaseEncryptionRuntime, databaseKey } from './database-encryption.js';
 
 export function defaultDbPath(): string {
     const override = process.env.ELEPHA_DB_PATH?.trim();
@@ -366,12 +367,33 @@ function migrateSessionsTable(db: Database.Database): void {
     db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
 }
 
-export function openDb(dbPath: string = defaultDbPath()): Database.Database {
+const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
+
+export interface ManagedDatabaseOpenOptions {
+    readonly?: boolean;
+    fileMustExist?: boolean;
+    encryption?: DatabaseEncryptionRuntime;
+}
+
+function prepareDatabaseDirectory(dbPath: string): void {
     if (dbPath !== ':memory:') {
         mkdirSync(path.dirname(dbPath), { recursive: true });
         hardenDir(path.dirname(dbPath));
     }
-    const db = new Database(dbPath);
+}
+
+function hasPlaintextHeader(dbPath: string): boolean {
+    const descriptor = openSync(dbPath, fsConstants.O_RDONLY);
+    try {
+        const header = Buffer.alloc(DATABASE_HEADER_BYTES);
+        const bytesRead = readSync(descriptor, header, 0, header.length, 0);
+        return bytesRead === SQLITE_PLAINTEXT_HEADER.length && header.equals(SQLITE_PLAINTEXT_HEADER);
+    } finally {
+        closeSync(descriptor);
+    }
+}
+
+function initializeDatabase(db: Database.Database, dbPath: string): Database.Database {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
     db.exec(SCHEMA);
@@ -389,4 +411,77 @@ export function openDb(dbPath: string = defaultDbPath()): Database.Database {
         hardenFile(`${dbPath}-shm`);
     }
     return db;
+}
+
+// Foreign/transient databases are deliberately unkeyed. Primary database
+// callers must use openDb() or openManagedDatabase() instead.
+export function openUnmanagedDb(dbPath: string = ':memory:'): Database.Database {
+    prepareDatabaseDirectory(dbPath);
+    const db = new Database(dbPath);
+    try {
+        return initializeDatabase(db, dbPath);
+    } catch (error) {
+        db.close();
+        throw error;
+    }
+}
+
+export async function openManagedDatabase(
+    dbPath: string = defaultDbPath(),
+    options: ManagedDatabaseOpenOptions = {},
+): Promise<Database.Database> {
+    if (dbPath === ':memory:') {
+        return new Database(dbPath);
+    }
+    const existed = existsSync(dbPath);
+    if (!existed && (options.readonly || options.fileMustExist)) {
+        throw new Error(`Managed elepha database does not exist: ${dbPath}`);
+    }
+    if (!options.readonly) {
+        prepareDatabaseDirectory(dbPath);
+    }
+    const plaintext = existed && hasPlaintextHeader(dbPath);
+    const key = plaintext ? undefined : await databaseKey(dbPath, !existed, options.encryption);
+    const db = new Database(dbPath, {
+        ...(options.readonly ? { readonly: true } : {}),
+        ...(options.fileMustExist ? { fileMustExist: true } : {}),
+    });
+    try {
+        if (key !== undefined) {
+            db.pragma("cipher='chacha20'");
+            const rawKey = Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
+            try {
+                db.key(rawKey);
+            } finally {
+                rawKey.fill(0);
+                key.fill(0);
+            }
+        }
+        // SQLite3MC does not validate a key until it reads the database. This
+        // query is the proof point for both encrypted and plaintext opens.
+        db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+        return db;
+    } catch (error) {
+        db.close();
+        throw error;
+    }
+}
+
+export function openDb(dbPath: ':memory:'): Database.Database;
+export function openDb(dbPath?: string, options?: ManagedDatabaseOpenOptions): Promise<Database.Database>;
+export function openDb(
+    dbPath: string = defaultDbPath(),
+    options: ManagedDatabaseOpenOptions = {},
+): Database.Database | Promise<Database.Database> {
+    if (dbPath === ':memory:') {
+        return openUnmanagedDb(dbPath);
+    }
+    return openManagedDatabase(dbPath, options).then((db) => {
+        try {
+            return initializeDatabase(db, dbPath);
+        } catch (error) {
+            db.close();
+            throw error;
+        }
+    });
 }

@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { MINIMUM_NODE_MAJOR } from '../config/constants.js';
+import { MINIMUM_NODE_VERSION } from '../config/constants.js';
 import { updateAvailablePath } from '../config/paths.js';
 import {
     npmInstallGlobalElepha,
@@ -27,7 +27,7 @@ export interface SelfUpdateRuntime {
     platform?: NodeJS.Platform;
     resolveInstalledBin?: () => ResolvedElephaBin;
     readPackageVersion?: (packageRoot: string) => string;
-    detectBackend?: (options: { packageRoot: string; sourceBin: string; minimumNodeMajor: number }) => LauncherBackend;
+    detectBackend?: (options: { packageRoot: string; sourceBin: string; minimumNodeVersion: string }) => LauncherBackend;
     npm?: SelfUpdateNpm;
     service?: ServiceBackend;
     approvedRoots: number;
@@ -61,7 +61,7 @@ export async function installedAndLatestElephaVersionAsync(
     const backend = (runtime.detectBackend ?? detectLauncherBackend)({
         packageRoot: resolved.packageRoot,
         sourceBin: resolved.bin,
-        minimumNodeMajor: MINIMUM_NODE_MAJOR,
+        minimumNodeVersion: MINIMUM_NODE_VERSION,
     });
     const latestVersion = await npmViewElephaLatestAsync(npmInvocationForBackend(backend));
     return { installedVersion, latestVersion };
@@ -108,7 +108,7 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
     const backend = (runtime.detectBackend ?? detectLauncherBackend)({
         packageRoot: resolved.packageRoot,
         sourceBin: resolved.bin,
-        minimumNodeMajor: MINIMUM_NODE_MAJOR,
+        minimumNodeVersion: MINIMUM_NODE_VERSION,
     });
     const npm = runtime.npm ?? defaultNpm(backend);
     const service = runtime.service ?? serviceBackend({ platform });

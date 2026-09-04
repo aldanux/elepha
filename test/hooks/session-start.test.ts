@@ -15,7 +15,7 @@ import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { CLOSE, OPEN, open } from '../../src/security/sentinel.js';
 import { dataBlockClose, dataBlockOpen, servedContextInstructions } from '../../src/serving/instructions.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 
@@ -53,7 +53,7 @@ function seededDb(
 } {
     const dir = mkdtempSync(path.join(tmpdir(), 'elepha-hook-'));
     const dbPath = path.join(dir, 'elepha.db');
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     const cwd = process.cwd();
     const now = new Date(NOW - (options.ageMs ?? 0)).toISOString();
     db.prepare('INSERT INTO projects (id, path, display_name, first_seen_at, last_seen_at) VALUES (1, ?, ?, ?, ?)').run(
@@ -107,7 +107,7 @@ function addSession(
         projectId?: number;
     },
 ): void {
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     const session = db
         .prepare(
             "INSERT INTO sessions (tool, native_id, segment_index, project_id, source_path, started_at, last_ingested_at, surface, git_branch, git_commit_count, last_turn_at, title) VALUES (?, ?, 0, ?, ?, ?, ?, ?, 'main', 100, ?, 'Stored real session')",
@@ -123,7 +123,7 @@ function addSession(
 }
 
 function addProject(dbPath: string, projectPath: string, consented: boolean): number {
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     const project = db
         .prepare('INSERT INTO projects (path, display_name, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)')
         .run(projectPath, path.basename(projectPath), new Date(NOW).toISOString(), new Date(NOW).toISOString());
@@ -471,7 +471,7 @@ describe('P2.8 SessionStart hook', () => {
         const { dbPath, cwd } = seededDb({ gitCommitCount: 100 });
         const sourcePath = path.join(codexSessionsRoot(), 'wide-rollout.jsonl');
         writeFileSync(sourcePath, wideCodexTranscript(10));
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         db.prepare('UPDATE sessions SET source_path = ? WHERE id = 1').run(sourcePath);
         const insert = db.prepare(
             "INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at, summarizer_status) VALUES (1, 1, ?, 'codex', ?, '[]', '[]', '[]', ?, 'ok')",
@@ -565,7 +565,7 @@ describe('P2.8 SessionStart hook', () => {
             [false, 'no_consented_sessions'],
         ] as const) {
             const { dbPath, cwd } = seededDb();
-            const db = openDb(dbPath);
+            const db = openUnmanagedDb(dbPath);
             if (recallable) db.prepare('DELETE FROM memories WHERE turn_index = 1').run();
             else db.exec('DELETE FROM memories; UPDATE sessions SET title = NULL, custom_title = NULL');
             db.close();
@@ -589,7 +589,7 @@ describe('P2.8 SessionStart hook', () => {
                 const { dbPath } = seededDb();
                 const cwd = realpathSync(path.join(process.cwd(), '..'));
                 if (state === 'denied') {
-                    const db = openDb(dbPath);
+                    const db = openUnmanagedDb(dbPath);
                     new MemoryStore(db).consent.revoke(cwd);
                     db.close();
                 }
@@ -603,7 +603,7 @@ describe('P2.8 SessionStart hook', () => {
                 await expect(runSessionStart(input, tool, { dbPath, now: () => NOW, readConfig: () => NOTIFY_CONFIG })).resolves.toEqual(
                     first,
                 );
-                const db = openDb(dbPath);
+                const db = openUnmanagedDb(dbPath);
                 expect(db.prepare('SELECT nudged_at FROM consent_roots WHERE path = ?').get(cwd)).toEqual({ nudged_at: null });
                 db.close();
             }
@@ -628,7 +628,7 @@ describe('P2.8 SessionStart hook', () => {
 
         const emptyDbPath = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-capture-off-zero-')), 'elepha.db');
         const emptyCwd = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-capture-off-project-')));
-        openDb(emptyDbPath).close();
+        openUnmanagedDb(emptyDbPath).close();
         const emptyResult = await runSessionStart(sessionStartPayload(emptyCwd, 'capture-off-session'), 'codex', {
             dbPath: emptyDbPath,
             now: () => NOW,
@@ -649,7 +649,7 @@ describe('P2.8 SessionStart hook', () => {
     it('keeps refused HOME roots out of consent while still emitting recall guidance without a grant hint', async () => {
         const { dbPath } = seededDb();
         const cwd = realpathSync(homedir());
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const before = db.prepare('SELECT ulid, path, state, decided_at, source FROM consent_roots ORDER BY path').all();
         db.close();
 
@@ -659,7 +659,7 @@ describe('P2.8 SessionStart hook', () => {
             readConfig: () => NOTIFY_CONFIG,
         });
 
-        const reopened = openDb(dbPath);
+        const reopened = openUnmanagedDb(dbPath);
         expect(reopened.prepare('SELECT ulid, path, state, decided_at, source FROM consent_roots ORDER BY path').all()).toEqual(before);
         reopened.close();
         expect(hookText(result, 'codex')).toBe('🐘 elepha · 1 sessions · capture off · type elepha:list to recall');
@@ -925,7 +925,7 @@ describe('P2.8 SessionStart hook', () => {
             });
             await renderStarted;
 
-            const revokingDb = openDb(dbPath);
+            const revokingDb = openUnmanagedDb(dbPath);
             new MemoryStore(revokingDb).consent.revoke(cwd);
             revokingDb.close();
             releaseRender();
@@ -934,7 +934,7 @@ describe('P2.8 SessionStart hook', () => {
             expect(result).toEqual({ reason: 'project_unavailable_or_unconsented' });
             expect(JSON.stringify(result)).not.toContain('## Turn');
             expect(writeInjection).not.toHaveBeenCalled();
-            const verificationDb = openDb(dbPath);
+            const verificationDb = openUnmanagedDb(dbPath);
             expect(verificationDb.prepare('SELECT COUNT(*) AS count FROM injections').get()).toEqual({ count: 0 });
             verificationDb.close();
             expect(log).toContain(

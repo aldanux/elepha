@@ -73,7 +73,7 @@ export function registerConsent(program: Command): void {
 
     consent.action(async () => {
         try {
-            process.exitCode = await runInit({ store: new MemoryStore(openDb()), entry: 'consent' });
+            process.exitCode = await runInit({ store: new MemoryStore(await openDb()), entry: 'consent' });
         } catch (error) {
             console.error(errorMessage(error));
             process.exitCode = 1;
@@ -83,8 +83,8 @@ export function registerConsent(program: Command): void {
     consent
         .command('list')
         .description('List every approved, denied, and pending memory root')
-        .action(() => {
-            const roots = new ConsentStore(openDb()).list();
+        .action(async () => {
+            const roots = new ConsentStore(await openDb()).list();
             if (roots.length === 0) {
                 console.log('No consent roots recorded.');
                 return;
@@ -97,8 +97,8 @@ export function registerConsent(program: Command): void {
     consent
         .command('pending')
         .description('List roots seen by the daemon but not yet approved')
-        .action(() => {
-            const roots = new ConsentStore(openDb()).list('pending');
+        .action(async () => {
+            const roots = new ConsentStore(await openDb()).list('pending');
             if (roots.length === 0) {
                 console.log('No pending consent roots.');
                 return;
@@ -114,7 +114,7 @@ export function registerConsent(program: Command): void {
         .option('--apply', 'actually remove the listed consent roots (default is a dry run that only prints the plan)')
         .option('--skip-confirmation', 'remove without the confirmation prompt')
         .action(async (options: ConsentPruneOptions) => {
-            const db = openDb();
+            const db = await openDb();
             const store = new ConsentStore(db);
             let verificationFailed = false;
             await runDestructiveOp({
@@ -220,7 +220,7 @@ export function registerConsent(program: Command): void {
                 process.exitCode = 1;
                 return;
             }
-            const db = openDb();
+            const db = await openDb();
             const consentStore = new ConsentStore(db);
             const store = new MemoryStore(db);
             const consentRoot = consentStore.grant(root);
@@ -247,12 +247,12 @@ export function registerConsent(program: Command): void {
         .description('Revoke consent for a root without deleting its captured memory')
         .argument('[path]', 'memory root to revoke')
         .option('--here', 'use the current working directory as the memory root')
-        .action((rootPath: string | undefined, options: ConsentPathOptions) => {
+        .action(async (rootPath: string | undefined, options: ConsentPathOptions) => {
             const root = resolveConsentPath(rootPath, options);
             if (root === undefined) {
                 return;
             }
-            const db = openDb();
+            const db = await openDb();
             const consentStore = new ConsentStore(db);
             const revoked = consentStore.revoke(root);
             try {

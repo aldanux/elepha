@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { mergeRollupContent, ROLLUP_VERSION, RollupStore, type RollupWrite } from '../../src/storage/rollup-store.js';
 
@@ -30,7 +30,7 @@ describe('RollupStore', () => {
     let rollups: RollupStore;
 
     beforeEach(() => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
         const project = store.upsertProject('/repo');
@@ -87,7 +87,7 @@ describe('RollupStore.listSessions', () => {
     let projectId: number;
 
     beforeEach(() => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
         projectId = store.upsertProject('/repo').id;

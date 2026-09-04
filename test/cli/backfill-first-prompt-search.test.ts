@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import { planFirstPromptSearchBackfill } from '../../src/storage/first-prompt-search-backfill.js';
 import type { SessionAdapter, ToolName } from '../../src/types/index.js';
@@ -63,7 +63,7 @@ describe('elepha backfill-first-prompt-search', () => {
         expect(help.stdout).toContain('Rows stay body-unsearchable by');
         expect(help.stdout).toContain('elepha:query until this backfill succeeds');
         expect(readdirSync(dryRunFixture.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(false);
-        const dryRunDb = openDb(dryRunFixture.dbPath);
+        const dryRunDb = openUnmanagedDb(dryRunFixture.dbPath);
         expect(dryRunDb.prepare('SELECT first_prompt_search FROM sessions').get()).toEqual({ first_prompt_search: null });
         dryRunDb.close();
 
@@ -79,7 +79,7 @@ describe('elepha backfill-first-prompt-search', () => {
         expect(applied.stdout).toContain(`first_prompt_search: stale value -> ${firstPromptSearch(PROMPT)}`);
         expect(applied.stdout).toContain('Wrote first_prompt_search for 1 session(s).');
         expect(readdirSync(appliedFixture.directory).some((name) => name.startsWith('elepha.db.bak-'))).toBe(true);
-        const appliedDb = openDb(appliedFixture.dbPath);
+        const appliedDb = openUnmanagedDb(appliedFixture.dbPath);
         expect(appliedDb.prepare('SELECT first_prompt_search FROM sessions').get()).toEqual({
             first_prompt_search: firstPromptSearch(PROMPT),
         });

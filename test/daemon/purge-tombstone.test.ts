@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService, openMcpReadOnlyDatabase } from '../../src/mcp/server.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
@@ -71,7 +71,7 @@ describe('D53 purge tombstones', () => {
         process.env.CODEX_HOME = codexHome;
 
         const initialLogs: string[] = [];
-        const store = new MemoryStore(openDb(dbPath), { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        const store = new MemoryStore(openUnmanagedDb(dbPath), { resolveGitRoot: () => null, resolveGitRemote: () => null });
         store.consent.grant(project);
         daemon = new IngestionDaemon({
             store,
@@ -124,7 +124,7 @@ describe('D53 purge tombstones', () => {
         store.database.close();
 
         const restartLogs: string[] = [];
-        const restartedStore = new MemoryStore(openDb(dbPath), { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        const restartedStore = new MemoryStore(openUnmanagedDb(dbPath), { resolveGitRoot: () => null, resolveGitRemote: () => null });
         daemon = new IngestionDaemon({
             store: restartedStore,
             watchRoots: [sessionsRoot],
@@ -139,7 +139,7 @@ describe('D53 purge tombstones', () => {
         expect(restartLogs).toContain(`[elepha] startup sweep: scanned 1 file(s), ingested 0 turn(s), skipped 1 file(s) (purged: 1)`);
 
         const publicId = Buffer.from(JSON.stringify({ tool: 'codex', nativeId: NATIVE_ID, segmentIndex: 0 })).toString('base64url');
-        const mcpDb = openMcpReadOnlyDatabase(dbPath);
+        const mcpDb = await openMcpReadOnlyDatabase(dbPath);
         const mcp = new ElephaMcpService(mcpDb);
         const listed = mcp.listSessions({ project, include_all: true });
         expect(text(listed)).toContain('Retained session');

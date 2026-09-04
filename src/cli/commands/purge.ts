@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { CodexAdapter } from '../../adapters/codex.js';
 import { BACKUP_KEEP } from '../../config/constants.js';
@@ -87,7 +88,7 @@ export function registerPurge(program: Command): void {
                     process.exitCode = 1;
                     return;
                 }
-                const db = openDb();
+                const db = await openDb();
                 const store = new MemoryStore(db);
                 process.exitCode = await runPurgeWizard({
                     store,
@@ -102,7 +103,7 @@ export function registerPurge(program: Command): void {
                 return;
             }
 
-            const db = openDb();
+            const db = await openDb();
             if (opts.externalAgentImports) {
                 await runExternalAgentImportPurge(db, { applyRequested: opts.apply });
                 return;
@@ -215,7 +216,7 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
     return proceeded && !cancelled && !verificationFailed;
 }
 
-async function runExternalAgentImportPurge(db: ReturnType<typeof openDb>, options: ExternalAgentImportOperationOptions): Promise<boolean> {
+async function runExternalAgentImportPurge(db: Database.Database, options: ExternalAgentImportOperationOptions): Promise<boolean> {
     const adapter = new CodexAdapter();
     const plan = await planExternalAgentImportPurge(db, adapter);
     printExternalImportPurgePlan(plan);

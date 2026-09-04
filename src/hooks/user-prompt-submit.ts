@@ -2,7 +2,7 @@
 // by SessionReader; this hook never reads a transcript itself.
 
 import { existsSync } from 'node:fs';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { ELEPHA_LIST_DEFAULT_LIMIT, ELEPHA_LIST_MAX_LIMIT } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { terminalHandoff } from '../markers.js';
@@ -192,7 +192,7 @@ export async function runUserPromptSubmit(
             log(promptLogLine(tool, payload, 'failed reason=database_unavailable'));
             return { reason: 'database_unavailable' };
         }
-        db = openDb(dbPath);
+        db = await openDb(dbPath);
     } catch {
         log(promptLogLine(tool, payload, 'failed reason=database_unavailable'));
         return { reason: 'database_unavailable' };

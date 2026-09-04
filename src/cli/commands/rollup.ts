@@ -40,7 +40,7 @@ export function registerRollup(program: Command): void {
             // against: 9 of 10 sessions aborted this way in one run, $1.66 spent
             // for no progress).
             if (opts.rebuild) {
-                const rebuildStore = new MemoryStore(openDb());
+                const rebuildStore = new MemoryStore(await openDb());
                 store = rebuildStore;
                 candidates = rebuildStore.listSessionsForRollupRebuild(ROLLUP_VERSION);
                 if (!opts.apply) {
@@ -75,7 +75,7 @@ export function registerRollup(program: Command): void {
                 process.exitCode = 1;
                 return;
             }
-            const activeStore = store ?? new MemoryStore(openDb());
+            const activeStore = store ?? new MemoryStore(await openDb());
             const rollups = new RollupStore(activeStore.database);
             const callLog = new SummarizerCallLog();
             const service = new RollupService({

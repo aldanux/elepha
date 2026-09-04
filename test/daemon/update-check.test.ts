@@ -7,7 +7,7 @@ import { setSetting, unsetSetting } from '../../src/config/settings.js';
 import { HEARTBEAT_INTERVAL_MS, readHeartbeat } from '../../src/daemon/heartbeat.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { readUpdateAvailable, runUpdateCheck, updateCheckEnabled } from '../../src/daemon/update-check.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 
 const { queryVersions } = vi.hoisted(() => ({ queryVersions: vi.fn() }));
@@ -120,7 +120,7 @@ describe('daemon update check', () => {
         try {
             setSetting('update-check', 'false');
             const disabledDaemon = new IngestionDaemon({
-                store: new MemoryStore(openDb(path.join(root, 'disabled.db'))),
+                store: new MemoryStore(openUnmanagedDb(path.join(root, 'disabled.db'))),
                 watchRoots: [root],
                 heartbeatPath: path.join(root, 'disabled.heartbeat.json'),
                 watcherUsePolling: true,
@@ -134,7 +134,7 @@ describe('daemon update check', () => {
 
             unsetSetting('update-check');
             const enabledDaemon = new IngestionDaemon({
-                store: new MemoryStore(openDb(path.join(root, 'enabled.db'))),
+                store: new MemoryStore(openUnmanagedDb(path.join(root, 'enabled.db'))),
                 watchRoots: [root],
                 heartbeatPath: path.join(root, 'enabled.heartbeat.json'),
                 watcherUsePolling: true,
@@ -258,7 +258,7 @@ describe('daemon update check', () => {
             releaseQuery = resolve;
         });
         const daemon = new IngestionDaemon({
-            store: new MemoryStore(openDb(path.join(root, 'elepha.db'))),
+            store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
             watchRoots: [root],
             heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
             watcherUsePolling: true,
@@ -285,7 +285,7 @@ describe('daemon update check', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-update-daemon-'));
         let calls = 0;
         const daemon = new IngestionDaemon({
-            store: new MemoryStore(openDb(path.join(root, 'elepha.db'))),
+            store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
             watchRoots: [root],
             heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
             watcherUsePolling: true,

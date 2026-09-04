@@ -19,7 +19,7 @@
 // caught instead by the read-time assertion when it reaches an assembled
 // brief.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 
 export interface SanitizeChange {

@@ -7,7 +7,7 @@
 // reported and skipped; there is no silent branch/files-only fallback.
 
 import { existsSync } from 'node:fs';
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths, isWithinProviderStore } from '../config/paths.js';

@@ -6,7 +6,7 @@ import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { wrap } from '../../src/security/sentinel.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter, SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
 
@@ -104,7 +104,7 @@ describe('Rule 4 self-ingestion guard', () => {
         writeFileSync(file, transcript(wrap('brief', '01J00000000000000000000000', 'Do not re-ingest this context.')));
 
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         const adapter = new Adapter((message) => logs.push(message));
         const daemon = new IngestionDaemon({ store, adapters: [adapter], watchRoots: [watchRoot], log: (message) => logs.push(message) });
@@ -129,7 +129,7 @@ describe('Rule 4 self-ingestion guard', () => {
         mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, claudeTranscript(wrap('brief', '01J00000000000000000000000', 'Do not re-ingest this context.')));
 
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         expect(store.isTranscriptPurged('claude-code', SESSION)).toBe(false);
         const adapter = new ClaudeCodeAdapter();
@@ -157,7 +157,7 @@ describe('Rule 4 self-ingestion guard', () => {
         const watchRoot = path.join(root, '.claude', 'projects');
         const file = path.join(watchRoot, 'project', `${SESSION}.jsonl`);
         mkdirSync(path.dirname(file), { recursive: true });
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         const logs: string[] = [];
         const adapter = new ClaudeCodeAdapter((message) => logs.push(message));
@@ -183,7 +183,7 @@ describe('Rule 4 self-ingestion guard', () => {
         mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, codexTranscript('Continue the current task.', additionalContext));
 
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         const summarizer = new CountingSummarizer();
         const adapter = new CodexAdapter();
@@ -197,7 +197,7 @@ describe('Rule 4 self-ingestion guard', () => {
     it.each(['claude-code', 'codex'] as const)(
         'drops an eligible near-verbatim quote for %s before summary or memory persistence and advances the existing cursor',
         async (tool) => {
-            const store = new MemoryStore(openDb(':memory:'));
+            const store = new MemoryStore(openUnmanagedDb(':memory:'));
             store.consent.grant(PROJECT);
             const project = store.upsertProject(PROJECT);
             const session = store.upsertSession(tool, SESSION, project.id, '/tmp/rule4.jsonl');

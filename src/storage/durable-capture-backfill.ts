@@ -1,4 +1,4 @@
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import type { FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import type { ToolName } from '../types/index.js';
 import type { ConsentStore } from './consent-store.js';

@@ -16,7 +16,7 @@
 // way, and distinguishing "absent" from "present but unreadable" for
 // reporting isn't worth the extra surface.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths, isReadableProviderSource } from '../config/paths.js';

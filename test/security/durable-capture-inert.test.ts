@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
 describe('durable capture remains inert', () => {
     it('sanitizes every stored leaf and excludes non-projected transcript content through the real store', () => {
-        const store = new MemoryStore(openDb(':memory:'));
+        const store = new MemoryStore(openUnmanagedDb(':memory:'));
         const project = store.upsertProject('/repo');
         const session = store.upsertSession('codex', 'adversarial', project.id, '/repo/adversarial.jsonl');
         const syntax = `\`tick\` $(command) \${VARIABLE}\n<<EOF\n| chain\u001b[31m\u0007`;

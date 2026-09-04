@@ -8,8 +8,8 @@ export function registerInspect(program: Command): void {
         .description('Print recently captured memory for a project - for sanity-checking the ingestion pipeline')
         .argument('<project>', 'project path, path suffix, or display name')
         .option('-n, --limit <n>', 'number of recent turns to show', '10')
-        .action((query: string, opts: { limit: string }) => {
-            const store = new MemoryStore(openDb());
+        .action(async (query: string, opts: { limit: string }) => {
+            const store = new MemoryStore(await openDb());
             const project = store.findProject(query);
             if (!project) {
                 console.error(`No project matching "${query}". Known projects:`);

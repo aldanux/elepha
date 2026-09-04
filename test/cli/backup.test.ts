@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it, vi } from 'vitest';
 import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard.js';
 import { exportAll, exportProject, listFullBackups } from '../../src/cli/commands/backup.js';

@@ -49,10 +49,9 @@ import { filterTurn } from '../rendering/filtered-turn.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
 import { isNearVerbatim, turnText } from '../security/self-ingestion.js';
 import type { ConsentState } from '../storage/consent-store.js';
-import { openDb } from '../storage/db.js';
 import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
-import { MemoryStore } from '../storage/memory-store.js';
+import type { MemoryStore } from '../storage/memory-store.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
@@ -139,7 +138,7 @@ export function watchRoots(): string[] {
 }
 
 export interface DaemonOptions {
-    store?: MemoryStore;
+    store: MemoryStore;
     summarizer?: SummarizationProvider;
     adapters?: SessionAdapter[];
     idleDebounceMs?: number;
@@ -249,7 +248,7 @@ export class IngestionDaemon {
         { size: number; mtimeMs: number; scannedTo: number; customTitle: string | undefined }
     >();
 
-    constructor(options: DaemonOptions = {}) {
+    constructor(options: DaemonOptions) {
         this.log = options.log ?? (() => {});
         this.logError = options.logError ?? console.error;
         const configResult = (options.readConfig ?? readMemoryConfig)();
@@ -259,7 +258,7 @@ export class IngestionDaemon {
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
         this.durableCapture = configResult.config.durableCapture ?? false;
-        this.store = options.store ?? new MemoryStore(openDb());
+        this.store = options.store;
         this.openTranscript = options.openTranscript ?? openProviderTranscript;
         this.summarizer = options.summarizer;
         const warnUnknownLine = deduplicateDaemonUnknownLineWarnings(this.log);

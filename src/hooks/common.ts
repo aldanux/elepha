@@ -4,7 +4,7 @@
 // unconsented project and never one of multiple consented candidates.
 
 import { realpathSync } from 'node:fs';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { HOOK_PAYLOAD_MAX_CHARS } from '../config/constants.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';

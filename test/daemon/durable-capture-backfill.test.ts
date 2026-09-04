@@ -320,7 +320,8 @@ describe('daemon durable capture backfill', () => {
         await waitFor(
             () =>
                 movedDuringParse &&
-                (fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get() as { count: number }).count === 1,
+                (fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(moved.id) as { state: string })
+                    .state === 'complete',
         );
         await daemon.stop();
 

@@ -56,6 +56,9 @@ export const REMEMBER_MATCH_SCORES = {
 } as const;
 
 // Storage and session segmentation
+export const DATABASE_KEY_BYTES = 32;
+export const DATABASE_HEADER_BYTES = 16;
+export const DATABASE_KEYRING_TIMEOUT_MS = 5_000;
 export const MAX_TITLE_CHARS = 72;
 export const TRAILING_FILES_CAP = 50;
 export const SEGMENT_UNCONDITIONAL_GAP_HOURS = 7 * 24;
@@ -127,7 +130,7 @@ export const TEMPORARY_PROJECT_ROOTS = ['/tmp', '/private/tmp', '/var/folders', 
 export const PRIVATE_FILE_MODE = 0o600;
 export const PRIVATE_DIR_MODE = 0o700;
 export const PRIVATE_UMASK_MASK = 0o077;
-export const MINIMUM_NODE_MAJOR = 22;
+export const MINIMUM_NODE_VERSION = '22.12.0';
 export const DEFAULT_ELEPHA_SERVICE_LABEL = 'com.elepha.daemon';
 export const PLIST_THROTTLE_INTERVAL_SECONDS = 30;
 export const PLIST_UMASK = 63;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DURABLE_CAPTURE_FILTER_VERSION, SESSION_CHAR_BUDGET } from '../../src/config/constants.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
@@ -29,7 +29,7 @@ function turn(overrides: Partial<ParsedTurn> = {}): ParsedTurn {
 const summary = { decisions: [], pending_items: [], status: 'not_configured' as const };
 
 function fixture(): { store: MemoryStore; projectId: number; sessionId: number } {
-    const store = new MemoryStore(openDb(':memory:'));
+    const store = new MemoryStore(openUnmanagedDb(':memory:'));
     const project = store.upsertProject('/repo');
     const session = store.upsertSession('codex', 'durable-session', project.id, '/repo/session.jsonl');
     return { store, projectId: project.id, sessionId: session.id };

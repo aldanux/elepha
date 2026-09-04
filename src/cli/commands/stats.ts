@@ -10,8 +10,8 @@ export function registerStats(program: Command): void {
             'Dogfooding instrumentation: ingestion volume, summarizer noise rate, pending_items accumulation, files_touched miss rate',
         )
         .option('--since <window>', 'time window: "24h", "7d", "30m", or an ISO date', '24h')
-        .action((opts: { since: string }) => {
-            const store = new MemoryStore(openDb());
+        .action(async (opts: { since: string }) => {
+            const store = new MemoryStore(await openDb());
             const sinceIso = parseSince(opts.since);
             printStats(store.getStats(sinceIso));
         });

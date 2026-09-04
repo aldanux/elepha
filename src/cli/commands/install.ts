@@ -37,11 +37,11 @@ export function registerInstall(program: Command): void {
     hook.command('install').action(runInstall);
 }
 
-function runInstall(): void {
+async function runInstall(): Promise<void> {
     try {
         const onPhase = createInstallProgressReporter();
         const runtime = {
-            approvedRoots: new ConsentStore(openDb()).countApproved(),
+            approvedRoots: new ConsentStore(await openDb()).countApproved(),
             ...(onPhase ? { onPhase } : {}),
         };
         printInstallation(installElepha(undefined, runtime), 'install');

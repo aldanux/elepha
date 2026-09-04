@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mcpResponseShaper } from '../../src/mcp/server.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { detectShellSyntax, escapeShellSyntax } from '../../src/security/sanitize.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
 
 class FixtureAdapter implements SessionAdapter {
@@ -59,7 +59,7 @@ function leafStrings(value: unknown): string[] {
 }
 
 describe('MCP response shell-syntax net', () => {
-    const databases: ReturnType<typeof openDb>[] = [];
+    const databases: ReturnType<typeof openUnmanagedDb>[] = [];
     let previousCodexHome: string | undefined;
 
     afterEach(() => {
@@ -74,7 +74,7 @@ describe('MCP response shell-syntax net', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-project-sanitize-'));
         const projectPath = path.join(root, '$(project)');
         mkdirSync(projectPath);
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         databases.push(db);
         db.prepare(
             `INSERT INTO projects (path, display_name, first_seen_at, last_seen_at)
@@ -101,7 +101,7 @@ describe('MCP response shell-syntax net', () => {
         const gitBranch = 'feature/`whoami`';
         const startedAt = '2026-08-24T00:00:00.000Z\x1b[32m';
         const endedAt = '2026-08-24T00:01:00.000Z\x07';
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         databases.push(db);
         const projectId = Number(
             db
@@ -160,7 +160,7 @@ describe('MCP response shell-syntax net', () => {
         mkdirSync(path.dirname(sourcePath), { recursive: true });
         mkdirSync(projectPath);
         writeFileSync(sourcePath, '{}\n');
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         databases.push(db);
         const projectId = Number(
             db

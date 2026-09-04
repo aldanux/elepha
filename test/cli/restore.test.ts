@@ -1,13 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { exportAll, exportProject } from '../../src/cli/commands/backup.js';
 import { REQUIRED_RESTORE_TABLES, runRestoreOperation } from '../../src/cli/commands/restore.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { writeBackup } from '../../src/storage/backup.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
@@ -129,7 +129,7 @@ function sessionNativeIds(dbPath: string): string[] {
 }
 
 function populate(dbPath: string, suffix: string): void {
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
     const project = store.upsertProject(path.join(path.dirname(dbPath), `project-${suffix}`));
     const session = store.upsertSession('codex', `session-${suffix}`, project.id, path.join(path.dirname(dbPath), `${suffix}.jsonl`));
@@ -172,7 +172,7 @@ function populate(dbPath: string, suffix: string): void {
 }
 
 function fullBackup(sourcePath: string, destination: string): void {
-    const db = openDb(sourcePath);
+    const db = openUnmanagedDb(sourcePath);
     try {
         exportAll(db, destination);
     } finally {
@@ -341,7 +341,7 @@ describe('elepha restore', () => {
             log.mockRestore();
         }
 
-        const store = new MemoryStore(openDb(active.dbPath));
+        const store = new MemoryStore(openUnmanagedDb(active.dbPath));
         try {
             expect(store.isTranscriptPurged('codex', 'purged-post-backup')).toBe(true);
             expect(store.isTranscriptIncognito('codex', 'incognito-post-backup')).toBe(true);
@@ -428,7 +428,7 @@ describe('elepha restore', () => {
             }),
         ).resolves.toMatchObject({ cancelled: false });
 
-        const restored = openDb(active.dbPath);
+        const restored = openUnmanagedDb(active.dbPath);
         try {
             expect(
                 restored
@@ -489,7 +489,7 @@ describe('elepha restore', () => {
             }),
         ).resolves.toMatchObject({ cancelled: false });
 
-        const store = new MemoryStore(openDb(active.dbPath));
+        const store = new MemoryStore(openUnmanagedDb(active.dbPath));
         try {
             const projectPath = `/Users/test/elepha-restore-${path.basename(active.directory)}`;
             store.consent.grant(projectPath);
@@ -707,7 +707,7 @@ describe('elepha restore', () => {
             }),
         ).resolves.toMatchObject({ cancelled: false });
         expect(sessionNativeIds(active.dbPath)).toEqual(['legacy-session']);
-        const restored = openDb(active.dbPath);
+        const restored = openUnmanagedDb(active.dbPath);
         try {
             expect((restored.pragma('table_info(sessions)') as Array<{ name: string }>).map((column) => column.name)).toContain(
                 'segment_index',

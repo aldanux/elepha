@@ -22,7 +22,7 @@ import {
 import { lexicalRecall, STRICT_RECALL_FALLBACK_NOTICE, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { type ServedSession, SessionReader } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { TestDatabase } from '../helpers/db.js';
@@ -345,22 +345,26 @@ describe('UserPromptSubmit lexical recall', () => {
         const writeInjection = vi.fn(() => true);
         const log: string[] = [];
 
-        queueMicrotask(() => {
-            const revokingDb = openDb(fixture.dbPath);
+        const revokeDuringRecall = () => {
+            const revokingDb = openUnmanagedDb(fixture.dbPath);
             new ConsentStore(revokingDb).revoke(remote.projectPath);
             revokingDb.close();
-        });
+        };
         const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query revocation race needle'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW,
             writeInjection,
             log: (line) => log.push(line),
+            projectResolver: (db) => {
+                queueMicrotask(revokeDuringRecall);
+                return new ProjectResolver(db);
+            },
         });
 
         expect(result).toEqual({ reason: 'project_unavailable_or_unconsented' });
         expect(JSON.stringify(result)).not.toContain('Revoked global transcript result');
         expect(writeInjection).not.toHaveBeenCalled();
-        const verificationDb = openDb(fixture.dbPath);
+        const verificationDb = openUnmanagedDb(fixture.dbPath);
         expect(verificationDb.prepare('SELECT COUNT(*) AS count FROM injections').get()).toEqual({ count: 0 });
         verificationDb.close();
         expect(log).toContain('user-prompt-submit codex session_id=current-session: discarded reason=project_unavailable_or_unconsented');
@@ -378,14 +382,21 @@ describe('UserPromptSubmit lexical recall', () => {
         fixture.close();
         const log: string[] = [];
 
-        queueMicrotask(() => {
-            const revokingDb = openDb(fixture.dbPath);
+        const revokeDuringRecall = () => {
+            const revokingDb = openUnmanagedDb(fixture.dbPath);
             new ConsentStore(revokingDb).revoke(current.projectPath);
             revokingDb.close();
-        });
+        };
+        let revocationScheduled = false;
         const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query:here local revocation needle'), 'codex', {
             dbPath: fixture.dbPath,
-            now: () => NOW,
+            now: () => {
+                if (!revocationScheduled) {
+                    revocationScheduled = true;
+                    queueMicrotask(revokeDuringRecall);
+                }
+                return NOW;
+            },
             log: (line) => log.push(line),
         });
 
@@ -394,7 +405,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(body).toBe(`${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`);
         expect(context).not.toContain('Revoked here transcript result');
         expect(context).not.toContain('stale local answer');
-        const verificationDb = openDb(fixture.dbPath);
+        const verificationDb = openUnmanagedDb(fixture.dbPath);
         expect(verificationDb.prepare('SELECT body FROM injections').all()).toEqual([{ body }]);
         verificationDb.close();
         expect(log).toContain('user-prompt-submit codex session_id=current-session: discarded reason=project_unavailable_or_unconsented');
@@ -465,7 +476,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(openedContext).toContain('second cross-project answer');
         expect(openedContext).not.toContain('first current-project answer');
 
-        const db = openDb(fixture.dbPath);
+        const db = openUnmanagedDb(fixture.dbPath);
         db.prepare("UPDATE consent_roots SET state = 'denied' WHERE path = ?").run(remote.projectPath);
         db.close();
         const blocked = await runUserPromptSubmit(payload(current.projectPath, 'elepha:select:2'), 'codex', {
@@ -827,7 +838,7 @@ describe('UserPromptSubmit lexical recall', () => {
         });
         expect(contextOf(servedBeforeRevoke)).toContain('scopedcontentneedle');
 
-        const revokeDb = openDb(fixture.dbPath);
+        const revokeDb = openUnmanagedDb(fixture.dbPath);
         const copyBeforeRevoke = revokeDb
             .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
             .all(revokedSession.id);
@@ -855,7 +866,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(revokedContext).not.toContain('Incognito durable work');
         expect(revokedContext).not.toContain('Revoked durable work');
 
-        const grantDb = openDb(fixture.dbPath);
+        const grantDb = openUnmanagedDb(fixture.dbPath);
         new ConsentStore(grantDb).grant(revoked.projectPath);
         expect(
             grantDb

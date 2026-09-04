@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { describe, expect, it, vi } from 'vitest';
 import { registerProjects } from '../../src/cli/commands/projects.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -11,7 +11,7 @@ describe('elepha projects', () => {
         const pending = withGrantableTestDir('projects-pending-');
         const denied = withGrantableTestDir('projects-denied-');
         const dbPath = `${withGrantableTestDir('projects-db-')}/elepha.db`;
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         store.consent.grant(approved);
         store.consent.recordPending(pending);

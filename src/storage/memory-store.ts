@@ -2,7 +2,7 @@
 // Data concerns live in dedicated stores; this class preserves the existing API.
 
 import path from 'node:path';
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';

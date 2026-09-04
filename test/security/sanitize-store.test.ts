@@ -2,10 +2,10 @@
 // the transforms; these prove the choke points are actually wired, which is the
 // difference between a stated rule and one enforced in code.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { mergeRollupContent, RollupStore, type RollupWrite } from '../../src/storage/rollup-store.js';
 import { applySanitize, planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
@@ -57,7 +57,7 @@ describe('Rule 3 choke points', () => {
     let rollups: RollupStore;
 
     beforeEach(() => {
-        db = openDb(':memory:');
+        db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
         const project = store.upsertProject('/repo');
@@ -135,7 +135,7 @@ describe('Rule 3 backfill', () => {
     let db: Database;
 
     beforeEach(() => {
-        db = openDb(':memory:');
+        db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const project = store.upsertProject('/repo');
         store.upsertSession('claude-code', 's1', project.id, '/tmp/s1.jsonl');

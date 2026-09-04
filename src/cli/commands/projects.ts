@@ -11,8 +11,8 @@ export function registerProjects(program: Command): void {
         .command('projects')
         .description('List all projects with captured memory')
         .option('--all', 'include missing and temporary project paths')
-        .action((opts: { all?: boolean }) => {
-            const store = new MemoryStore(openDb());
+        .action(async (opts: { all?: boolean }) => {
+            const store = new MemoryStore(await openDb());
             const sessionCounts = store.sessionCountsByProject();
             const projects = new ProjectResolver(store.database).list();
             const countSessions = (projectIds: readonly number[]): number =>

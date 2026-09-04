@@ -1,7 +1,7 @@
 import { mkdirSync, symlinkSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -31,7 +31,7 @@ describe('ingest tombstone write guard', () => {
     let store: MemoryStore;
 
     beforeEach(() => {
-        store = new MemoryStore(openDb(':memory:'));
+        store = new MemoryStore(openUnmanagedDb(':memory:'));
     });
 
     it.each(['purged', 'incognito'] as const)('does not recreate a %s transcript after the early scan gate', (blocker) => {
@@ -94,7 +94,7 @@ describe('ingest tombstone write guard', () => {
 
     it('uses the same denied-consent guard for ordinary and dropped turns', () => {
         for (const path of ['ordinary', 'dropped'] as const) {
-            const guardedStore = new MemoryStore(openDb(':memory:'));
+            const guardedStore = new MemoryStore(openUnmanagedDb(':memory:'));
             const turn = makeTurn({ sessionId: `denied-${path}`, projectPath: `/Users/test/denied-${path}` });
             guardedStore.consent.revoke(turn.projectPath);
 

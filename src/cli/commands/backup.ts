@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { copyFileSync, existsSync, lstatSync, renameSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { PRIVATE_FILE_MODE, USER_BACKUPS_DIR_NAME } from '../../config/constants.js';
 import { canonicalizeExisting, elephaHome, normalizeForCompare } from '../../config/paths.js';
@@ -55,7 +55,7 @@ export function registerBackup(program: Command): void {
             }
 
             const dbPath = defaultDbPath();
-            const db = openDb(dbPath);
+            const db = await openDb(dbPath);
             const store = new MemoryStore(db);
             const defaultOutput = (project?: ProjectSet) => {
                 const generated = defaultBackupPath(project);
