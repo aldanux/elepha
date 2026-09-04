@@ -1,14 +1,22 @@
 import { createHash } from 'node:crypto';
-import { createReadStream, existsSync, mkdtempSync, rmdirSync, unlinkSync } from 'node:fs';
+import { createReadStream, existsSync, mkdtempSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
-import { PRIVATE_FILE_MODE } from '../../config/constants.js';
+import { PRIVATE_FILE_MODE, SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
 import { writeBackup } from '../../storage/backup.js';
 import { validateCandidateSemantics } from '../../storage/candidate-validator.js';
-import { defaultDbPath, openDb, openManagedDatabase, openUnmanagedDb } from '../../storage/db.js';
+import { type DatabaseEncryptionRuntime, databaseKey } from '../../storage/database-encryption.js';
+import {
+    defaultDbPath,
+    hasPlaintextDatabaseHeader,
+    openDb,
+    openKeyedDatabase,
+    openManagedDatabase,
+    openUnmanagedDb,
+} from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
 import { atomicCopyPrivateFile } from '../../util/fs.js';
 import { runRestoreWizard } from '../restore-wizard.js';
@@ -43,6 +51,7 @@ interface RestoreCommandOptions {
 
 export interface RestoreRuntime {
     dbPath?: string;
+    encryption?: DatabaseEncryptionRuntime;
     daemonHealth?: () => DaemonHealth;
     writeBackup?: (db: Database.Database, dbPath: string) => string;
     confirm?: () => Promise<boolean>;
@@ -136,11 +145,11 @@ function removeTemporaryDatabase(dbPath: string, directory: string): void {
 }
 
 // Opens the staged backup so accepted older backups receive the same idempotent migrations as the active database.
-function verifyStagedSchema(stagedPath: string): void {
+function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
     let staged: Database.Database | undefined;
     let canonical: Database.Database | undefined;
     try {
-        staged = openUnmanagedDb(stagedPath);
+        staged = encryptionKey === undefined ? openUnmanagedDb(stagedPath) : openKeyedDatabase(stagedPath, encryptionKey);
         canonical = openDb(':memory:');
         const errors = schemaDifferences(staged, canonical);
         if (errors.length > 0) {
@@ -179,12 +188,15 @@ function verifyDatabase(db: Database.Database, expectedCounts: RestoreCounts): s
     return errors;
 }
 
-function inspectCandidate(stagedPath: string, candidatePath: string): RestoreCounts {
+function inspectCandidate(stagedPath: string, candidatePath: string, encryptionKey?: Buffer): RestoreCounts {
     let candidate: Database.Database | undefined;
     let counts: RestoreCounts | undefined;
     let validationError: string | undefined;
     try {
-        candidate = new Database(stagedPath, { readonly: true, fileMustExist: true });
+        candidate =
+            encryptionKey === undefined
+                ? new Database(stagedPath, { readonly: true, fileMustExist: true })
+                : openKeyedDatabase(stagedPath, encryptionKey, { readonly: true, fileMustExist: true });
         const missing = missingRequiredTables(candidate);
         if (missing.length > 0) {
             validationError = `Backup is incomplete (missing required table(s): ${missing.join(', ')}). Project exports cannot be restored; use the future elepha import command instead.`;
@@ -206,7 +218,7 @@ function inspectCandidate(stagedPath: string, candidatePath: string): RestoreCou
     if (counts === undefined) {
         throw new Error(`Not a valid SQLite backup at ${candidatePath}.`);
     }
-    verifyStagedSchema(stagedPath);
+    verifyStagedSchema(stagedPath, encryptionKey);
     return counts;
 }
 
@@ -230,18 +242,18 @@ function printPreview(dbPath: string, candidatePath: string, counts: RestoreCoun
     );
 }
 
-async function checkpointActiveDatabase(dbPath: string): Promise<Database.Database> {
-    const db = await openManagedDatabase(dbPath, { fileMustExist: true });
+async function checkpointActiveDatabase(dbPath: string, encryption?: DatabaseEncryptionRuntime): Promise<Database.Database> {
+    const db = await openManagedDatabase(dbPath, { fileMustExist: true, encryption });
     db.pragma('wal_checkpoint(TRUNCATE)');
     return db;
 }
 
-async function activeTranscriptTombstones(dbPath: string): Promise<TranscriptTombstones> {
+async function activeTranscriptTombstones(dbPath: string, encryption?: DatabaseEncryptionRuntime): Promise<TranscriptTombstones> {
     const tombstones: TranscriptTombstones = { purged_transcripts: [], incognito_transcripts: [] };
     if (!existsSync(dbPath)) {
         return tombstones;
     }
-    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true });
+    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption });
     try {
         for (const { table } of TOMBSTONE_TABLES) {
             const exists = active.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
@@ -255,8 +267,12 @@ async function activeTranscriptTombstones(dbPath: string): Promise<TranscriptTom
     }
 }
 
-async function unionTranscriptTombstones(dbPath: string, tombstones: TranscriptTombstones): Promise<void> {
-    const restored = await openDb(dbPath);
+async function unionTranscriptTombstones(
+    dbPath: string,
+    tombstones: TranscriptTombstones,
+    encryption?: DatabaseEncryptionRuntime,
+): Promise<void> {
+    const restored = await openDb(dbPath, { encryption });
     try {
         const recordedAt = new Date().toISOString();
         restored.transaction(() => {
@@ -308,8 +324,12 @@ function removeStaleSidecars(dbPath: string): void {
     }
 }
 
-async function verifyRestoredDatabase(dbPath: string, expectedCounts: RestoreCounts): Promise<void> {
-    const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true });
+async function verifyRestoredDatabase(
+    dbPath: string,
+    expectedCounts: RestoreCounts,
+    encryption?: DatabaseEncryptionRuntime,
+): Promise<void> {
+    const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption });
     try {
         const errors = verifyDatabase(restored, expectedCounts);
         if (errors.length > 0) {
@@ -329,9 +349,16 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
     }
     const stagedDirectory = mkdtempSync(path.join(tmpdir(), 'elepha-restore-'));
     const stagedPath = path.join(stagedDirectory, 'candidate.db');
+    let candidateKey: Buffer | undefined;
     try {
         atomicCopyPrivateFile(candidatePath, stagedPath, PRIVATE_FILE_MODE);
-        const counts = inspectCandidate(stagedPath, candidatePath);
+        if (!hasPlaintextDatabaseHeader(stagedPath)) {
+            if (statSync(stagedPath).size < SQLITE_MINIMUM_DATABASE_BYTES) {
+                throw new Error(`Not a valid SQLite backup at ${candidatePath}.`);
+            }
+            candidateKey = await databaseKey(dbPath, false, runtime.encryption);
+        }
+        const counts = inspectCandidate(stagedPath, candidatePath, candidateKey);
         const stagedHash = await sha256File(stagedPath);
         const health = (runtime.daemonHealth ?? currentDaemonHealth)();
         if (health.healthy) {
@@ -340,7 +367,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         if (health.state.startsWith('STUCK')) {
             console.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
         }
-        const tombstones = await activeTranscriptTombstones(dbPath);
+        const tombstones = await activeTranscriptTombstones(dbPath, runtime.encryption);
         printPreview(dbPath, candidatePath, counts, tombstones);
         if (runtime.confirm && !(await runtime.confirm())) {
             return { cancelled: true };
@@ -349,7 +376,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         if (!existsSync(dbPath)) {
             throw new Error(`No active elepha database exists at ${dbPath}; nothing can be snapshotted before restore.`);
         }
-        const active = await checkpointActiveDatabase(dbPath);
+        const active = await checkpointActiveDatabase(dbPath, runtime.encryption);
         let snapshotPath: string;
         try {
             snapshotPath = (runtime.writeBackup ?? writeBackup)(active, dbPath);
@@ -368,8 +395,8 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 throw new Error('Installed database hash does not match the validated backup.');
             }
             removeStaleSidecars(dbPath);
-            await verifyRestoredDatabase(dbPath, counts);
-            await unionTranscriptTombstones(dbPath, tombstones);
+            await verifyRestoredDatabase(dbPath, counts, runtime.encryption);
+            await unionTranscriptTombstones(dbPath, tombstones, runtime.encryption);
             // Read-only verification can create fresh empty WAL bookkeeping files;
             // remove them too so no sidecar from before the replacement can survive.
             removeStaleSidecars(dbPath);
@@ -388,6 +415,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         console.log(`Restored ${dbPath} from ${candidatePath}. Pre-restore snapshot: ${snapshotPath}`);
         return { cancelled: false, snapshotPath };
     } finally {
+        candidateKey?.fill(0);
         removeTemporaryDatabase(stagedPath, stagedDirectory);
     }
 }

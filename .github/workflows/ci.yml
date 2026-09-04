@@ -64,8 +64,11 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies from prebuilt packages
+        run: npm ci --ignore-scripts
+
+      - name: Smoke check encrypted SQLite prebuild
+        run: node .github/scripts/encrypted-sqlite-smoke.mjs
 
       - name: Build
         run: npm run build

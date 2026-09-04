@@ -384,7 +384,7 @@ function prepareDatabaseDirectory(dbPath: string): void {
     }
 }
 
-function hasPlaintextHeader(dbPath: string): boolean {
+export function hasPlaintextDatabaseHeader(dbPath: string): boolean {
     const descriptor = openSync(dbPath, fsConstants.O_RDONLY);
     try {
         const header = Buffer.alloc(DATABASE_HEADER_BYTES);
@@ -392,6 +392,51 @@ function hasPlaintextHeader(dbPath: string): boolean {
         return bytesRead === SQLITE_PLAINTEXT_HEADER.length && header.equals(SQLITE_PLAINTEXT_HEADER);
     } finally {
         closeSync(descriptor);
+    }
+}
+
+function rawDatabaseKey(key: Buffer): Buffer {
+    return Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
+}
+
+export function keyDatabaseConnection(db: Database.Database, key: Buffer): void {
+    db.pragma("cipher='chacha20'");
+    const rawKey = rawDatabaseKey(key);
+    try {
+        db.key(rawKey);
+    } finally {
+        rawKey.fill(0);
+    }
+    // SQLite3MC validates a key only when the database is first read.
+    db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+}
+
+export function rekeyDatabaseConnection(db: Database.Database, key: Buffer): void {
+    db.pragma("cipher='chacha20'");
+    const rawKey = rawDatabaseKey(key);
+    try {
+        db.rekey(rawKey);
+    } finally {
+        rawKey.fill(0);
+    }
+    db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+}
+
+export function openKeyedDatabase(
+    dbPath: string,
+    key: Buffer,
+    options: { readonly?: boolean; fileMustExist?: boolean } = {},
+): Database.Database {
+    const db = new Database(dbPath, {
+        ...(options.readonly ? { readonly: true } : {}),
+        ...(options.fileMustExist ? { fileMustExist: true } : {}),
+    });
+    try {
+        keyDatabaseConnection(db, key);
+        return db;
+    } catch (error) {
+        db.close();
+        throw error;
     }
 }
 
@@ -464,7 +509,7 @@ export async function openManagedDatabase(
     if (!options.readonly) {
         prepareDatabaseDirectory(dbPath);
     }
-    const plaintext = existed && hasPlaintextHeader(dbPath);
+    const plaintext = existed && hasPlaintextDatabaseHeader(dbPath);
     const key = plaintext ? undefined : await databaseKey(dbPath, !existed, options.encryption);
     const db = new Database(dbPath, {
         ...(options.readonly ? { readonly: true } : {}),
@@ -473,18 +518,15 @@ export async function openManagedDatabase(
     try {
         if (key !== undefined) {
             registerParanoidDatabase(db, dbPath, key);
-            db.pragma("cipher='chacha20'");
-            const rawKey = Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
             try {
-                db.key(rawKey);
+                keyDatabaseConnection(db, key);
             } finally {
-                rawKey.fill(0);
                 key.fill(0);
             }
+        } else {
+            // This is also the proof point for plaintext opens.
+            db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
         }
-        // SQLite3MC does not validate a key until it reads the database. This
-        // query is the proof point for both encrypted and plaintext opens.
-        db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
         return db;
     } catch (error) {
         db.close();

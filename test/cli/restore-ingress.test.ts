@@ -1,8 +1,7 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { copyFileSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
-import { exportAll } from '../../src/cli/commands/backup.js';
 import { runRestoreOperation } from '../../src/cli/commands/restore.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession, type TestDatabase } from '../helpers/db.js';
 
@@ -32,7 +31,8 @@ describe('restore semantic ingress validation', () => {
         seedCandidate(active, 'live-session');
         seedCandidate(candidate, 'candidate-session');
         const backup = path.join(candidate.directory, 'full.db');
-        exportAll(candidate.db, backup);
+        candidate.db.pragma('wal_checkpoint(TRUNCATE)');
+        copyFileSync(candidate.dbPath, backup);
         active.close();
         candidate.close();
 

@@ -12,6 +12,7 @@ export const DOCS_URL = 'https://github.com/aldanux/elepha#readme';
 export { PACKAGE_VERSION } from './version.js';
 export const BACKUP_KEEP = 5;
 export const USER_BACKUPS_DIR_NAME = 'backups';
+export const SQLITE_MINIMUM_DATABASE_BYTES = 512;
 export const CHARS_PER_TOKEN = 4;
 export const SESSION_TOKEN_BUDGET = 20_000;
 export const SESSION_CHAR_BUDGET = SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN;

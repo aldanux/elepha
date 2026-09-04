@@ -3,12 +3,15 @@
 // of exactly the data the user asked to erase, and (before this fix) at the
 // process umask - world-readable. Undercuts "revocation = deletion."
 
-import { copyFileSync, existsSync, mkdtempSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { backupDatabaseAndReport, pruneBackups, writeBackup } from '../../src/storage/backup.js';
+import { openKeyedDatabase, rekeyDatabaseConnection } from '../../src/storage/db.js';
+
+const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
 
 function mode(p: string): number {
     return statSync(p).mode & 0o777;
@@ -120,6 +123,35 @@ describe('backupDatabaseAndReport', () => {
         expect(existsSync(backupPath)).toBe(true);
         expect(messages).toEqual([`\nBacked up ${dbPath} to ${backupPath}.`, 'Pruned 1 older backup(s), keeping the 5 most recent.']);
         expect(readdirSync(root).filter((file) => file.includes('.bak-'))).toHaveLength(5);
+        db.close();
+    });
+
+    it('copies encrypted bytes and removes stale plaintext managed snapshots', () => {
+        const root = mkdtempSync(path.join(tmpdir(), 'elepha-encrypted-backup-'));
+        const dbPath = path.join(root, 'elepha.db');
+        const db = new Database(dbPath);
+        db.exec("CREATE TABLE records (value TEXT NOT NULL); INSERT INTO records VALUES ('encrypted')");
+        rekeyDatabaseConnection(db, FIXED_KEY);
+        db.pragma('journal_mode = WAL');
+
+        const plaintextBackup = `${dbPath}.bak-1999-01-01`;
+        const stale = new Database(plaintextBackup);
+        stale.exec("CREATE TABLE leaked (value TEXT NOT NULL); INSERT INTO leaked VALUES ('plaintext')");
+        stale.close();
+        const messages: string[] = [];
+
+        const backupPath = backupDatabaseAndReport(db, dbPath, (message) => messages.push(message));
+
+        expect(existsSync(plaintextBackup)).toBe(false);
+        expect(readFileSync(backupPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        const unkeyed = new Database(backupPath, { readonly: true });
+        expect(() => unkeyed.prepare('SELECT name FROM sqlite_master').all()).toThrow();
+        unkeyed.close();
+        const verified = openKeyedDatabase(backupPath, FIXED_KEY, { readonly: true });
+        expect(verified.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+        expect(verified.prepare('SELECT value FROM records').get()).toEqual({ value: 'encrypted' });
+        verified.close();
+        expect(messages).toContain('Removed 1 plaintext managed backup(s).');
         db.close();
     });
 });

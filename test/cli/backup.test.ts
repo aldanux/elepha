@@ -1,4 +1,3 @@
-import { spawnSync } from 'node:child_process';
 import {
     chmodSync,
     existsSync,
@@ -16,28 +15,15 @@ import { PassThrough } from 'node:stream';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it, vi } from 'vitest';
 import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard.js';
-import { exportAll, exportProject, listFullBackups } from '../../src/cli/commands/backup.js';
+import { defaultBackupPath, exportAll, exportProject, listFullBackups } from '../../src/cli/commands/backup.js';
 import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
+import { openKeyedDatabase } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
-const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
-const elephaCli = path.join(repositoryRoot, 'src', 'cli', 'index.ts');
-
-function runBackupCli(dbPath: string, ...args: string[]) {
-    return spawnSync(process.execPath, [tsxCli, elephaCli, 'backup', ...args], {
-        cwd: repositoryRoot,
-        encoding: 'utf8',
-        env: {
-            ...process.env,
-            ELEPHA_DB_PATH: dbPath,
-            ELEPHA_HOME: path.join(path.dirname(dbPath), 'isolated-elepha-home'),
-            ELEPHA_ENV_FILE: path.join(path.dirname(dbPath), 'missing.env'),
-        },
-    });
-}
+const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
 
 function seedExportFixture() {
     const fixture = createTestDb('elepha-backup-');
@@ -151,11 +137,15 @@ describe('elepha backup exports', () => {
     });
 
     it.each([
-        ['--all', (fixture: ReturnType<typeof seedExportFixture>, destination: string) => exportAll(fixture.fixture.db, destination, true)],
+        [
+            '--all',
+            (fixture: ReturnType<typeof seedExportFixture>, destination: string) =>
+                exportAll(fixture.fixture.db, destination, FIXED_KEY, true),
+        ],
         [
             '--project',
             (fixture: ReturnType<typeof seedExportFixture>, destination: string) =>
-                exportProject(fixture.fixture.db, fixture.project, destination, true),
+                exportProject(fixture.fixture.db, fixture.project, destination, FIXED_KEY, true),
         ],
     ])('refuses the active database as the %s destination directly and through a symlinked parent', (_scope, exportBackup) => {
         const fixture = seedExportFixture();
@@ -177,11 +167,12 @@ describe('elepha backup exports', () => {
         const { fixture, project, other } = seedExportFixture();
         const output = path.join(fixture.directory, 'project-export.db');
 
-        fixture.close();
-        const result = runBackupCli(fixture.dbPath, '--project', 'elepha', '--out', output);
-        expect(result.status).toBe(0);
-        expect(result.stdout).toContain(`Backup written to ${output}.`);
-        const exported = new Database(output, { readonly: true });
+        exportProject(fixture.db, project, output, FIXED_KEY);
+        expect(readFileSync(output).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        const unkeyed = new Database(output, { readonly: true });
+        expect(() => unkeyed.prepare('SELECT name FROM sqlite_master').all()).toThrow();
+        unkeyed.close();
+        const exported = openKeyedDatabase(output, FIXED_KEY, { readonly: true });
         try {
             expect(exported.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()).toEqual([
                 { name: 'memories' },
@@ -210,11 +201,13 @@ describe('elepha backup exports', () => {
         const { fixture } = seedExportFixture();
         const output = path.join(fixture.directory, 'full-export.db');
 
-        fixture.close();
-        const result = runBackupCli(fixture.dbPath, '--all', '--out', output);
-        expect(result.status).toBe(0);
+        exportAll(fixture.db, output, FIXED_KEY);
         const source = new Database(fixture.dbPath, { readonly: true });
-        const exported = new Database(output, { readonly: true });
+        expect(readFileSync(output).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        const unkeyed = new Database(output, { readonly: true });
+        expect(() => unkeyed.prepare('SELECT name FROM sqlite_master').all()).toThrow();
+        unkeyed.close();
+        const exported = openKeyedDatabase(output, FIXED_KEY, { readonly: true });
         try {
             expect(allTableCounts(exported)).toEqual(allTableCounts(source));
             expect(statSync(output).mode & 0o777).toBe(0o600);
@@ -227,9 +220,9 @@ describe('elepha backup exports', () => {
     it('atomically overwrites an existing destination for full and project exports', () => {
         const exporters = [
             (fixture: ReturnType<typeof seedExportFixture>, destination: string, force = false) =>
-                exportAll(fixture.fixture.db, destination, force),
+                exportAll(fixture.fixture.db, destination, FIXED_KEY, force),
             (fixture: ReturnType<typeof seedExportFixture>, destination: string, force = false) =>
-                exportProject(fixture.fixture.db, fixture.project, destination, force),
+                exportProject(fixture.fixture.db, fixture.project, destination, FIXED_KEY, force),
         ];
 
         for (const exportBackup of exporters) {
@@ -255,7 +248,7 @@ describe('elepha backup exports', () => {
         writeFileSync(output, original);
         fixture.db.exec('DROP TABLE session_rollups');
 
-        expect(() => exportProject(fixture.db, project, output, true)).toThrow(/no such table: session_rollups/);
+        expect(() => exportProject(fixture.db, project, output, FIXED_KEY, true)).toThrow(/no such table: session_rollups/);
         expect(readFileSync(output)).toEqual(original);
         expect(temporaryFilesFor(output)).toEqual([]);
     });
@@ -266,13 +259,13 @@ describe('elepha backup exports', () => {
         const original = Buffer.from('keep the previous full backup');
         vi.spyOn(fixture.db, 'pragma').mockReturnValue([{ busy: 1 }] as never);
 
-        expect(() => exportAll(fixture.db, output)).toThrow(
+        expect(() => exportAll(fixture.db, output, FIXED_KEY)).toThrow(
             "Backup aborted: WAL checkpoint did not complete (the daemon may be writing) — run 'elepha pause' or retry.",
         );
         expect(existsSync(output)).toBe(false);
 
         writeFileSync(output, original);
-        expect(() => exportAll(fixture.db, output, true)).toThrow(/WAL checkpoint did not complete/);
+        expect(() => exportAll(fixture.db, output, FIXED_KEY, true)).toThrow(/WAL checkpoint did not complete/);
         expect(readFileSync(output)).toEqual(original);
         expect(temporaryFilesFor(output)).toEqual([]);
     });
@@ -285,9 +278,9 @@ describe('elepha backup exports', () => {
         fixture.db.prepare('UPDATE sessions SET title = ? WHERE native_id = ?').run('committed in wal', 'primary-session');
         expect(statSync(`${fixture.dbPath}-wal`).size).toBeGreaterThan(0);
 
-        exportAll(fixture.db, output);
+        exportAll(fixture.db, output, FIXED_KEY);
 
-        const exported = new Database(output, { readonly: true });
+        const exported = openKeyedDatabase(output, FIXED_KEY, { readonly: true });
         try {
             expect(exported.prepare('SELECT title FROM sessions WHERE native_id = ?').get('primary-session')).toEqual({
                 title: 'committed in wal',
@@ -305,10 +298,9 @@ describe('elepha backup exports', () => {
         const sharedOutput = path.join(shared, 'backup.db');
         const createdOutput = path.join(fixture.directory, 'created', 'nested', 'backup.db');
 
-        fixture.close();
-        expect(runBackupCli(fixture.dbPath, '--all', '--out', sharedOutput).status).toBe(0);
+        exportAll(fixture.db, sharedOutput, FIXED_KEY);
         expect(statSync(shared).mode & 0o777).toBe(0o755);
-        expect(runBackupCli(fixture.dbPath, '--all', '--out', createdOutput).status).toBe(0);
+        exportAll(fixture.db, createdOutput, FIXED_KEY);
         expect(statSync(path.dirname(createdOutput)).mode & 0o777).toBe(0o700);
         expect(statSync(path.dirname(path.dirname(createdOutput))).mode & 0o777).toBe(0o700);
         expect(statSync(createdOutput).mode & 0o777).toBe(0o600);
@@ -322,10 +314,9 @@ describe('elepha backup exports', () => {
         writeFileSync(target, original);
         symlinkSync(target, destination);
 
-        fixture.close();
-        const result = runBackupCli(fixture.dbPath, '--all', '--out', destination, '--force');
-        expect(result.status).toBe(1);
-        expect(result.stderr).toContain(`refusing to write a backup through a symlink: ${destination}`);
+        expect(() => exportAll(fixture.db, destination, FIXED_KEY, true)).toThrow(
+            `refusing to write a backup through a symlink: ${destination}`,
+        );
         expect(readFileSync(target)).toEqual(original);
         expect(lstatSync(destination).isSymbolicLink()).toBe(true);
     }, 15000);
@@ -333,15 +324,22 @@ describe('elepha backup exports', () => {
     it('writes a full export to the default elepha backups directory', () => {
         const { fixture } = seedExportFixture();
         const expectedDirectory = path.join(fixture.directory, 'isolated-elepha-home', 'backups');
+        const previousHome = process.env.ELEPHA_HOME;
+        process.env.ELEPHA_HOME = path.join(fixture.directory, 'isolated-elepha-home');
 
-        fixture.close();
-        const result = runBackupCli(fixture.dbPath, '--all');
-        expect(result.status, result.stderr).toBe(0);
-        const written = result.stdout.match(/Backup written to (.+)\./)?.[1];
-        expect(written).toBeDefined();
-        expect(path.dirname(written ?? '')).toBe(expectedDirectory);
-        expect(statSync(written ?? '').mode & 0o777).toBe(0o600);
-        expect(statSync(expectedDirectory).mode & 0o777).toBe(0o700);
+        try {
+            const written = defaultBackupPath();
+            exportAll(fixture.db, written, FIXED_KEY);
+            expect(path.dirname(written)).toBe(expectedDirectory);
+            expect(statSync(written).mode & 0o777).toBe(0o600);
+            expect(statSync(expectedDirectory).mode & 0o777).toBe(0o700);
+        } finally {
+            if (previousHome === undefined) {
+                delete process.env.ELEPHA_HOME;
+            } else {
+                process.env.ELEPHA_HOME = previousHome;
+            }
+        }
     }, 15000);
 
     it('selects a consolidated project and writes its export through the fakeable wizard seam', async () => {
@@ -365,11 +363,11 @@ describe('elepha backup exports', () => {
                 backupAll: async () => {
                     throw new Error('all memory was not selected');
                 },
-                backupProject: async (selected, destination) => exportProject(fixture.db, selected, destination),
+                backupProject: async (selected, destination) => exportProject(fixture.db, selected, destination, FIXED_KEY),
             }),
         ).resolves.toBe(0);
 
-        const exported = new Database(output, { readonly: true });
+        const exported = openKeyedDatabase(output, FIXED_KEY, { readonly: true });
         try {
             expect(exported.prepare('SELECT id FROM projects ORDER BY id').all()).toEqual(project.projectIds.map((id) => ({ id })));
             expect(prompts.select).toHaveBeenNthCalledWith(1, {

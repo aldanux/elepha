@@ -5,7 +5,8 @@ import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { PRIVATE_FILE_MODE, USER_BACKUPS_DIR_NAME } from '../../config/constants.js';
 import { canonicalizeExisting, elephaHome, normalizeForCompare } from '../../config/paths.js';
-import { defaultDbPath, openDb } from '../../storage/db.js';
+import { databaseKey } from '../../storage/database-encryption.js';
+import { defaultDbPath, hasPlaintextDatabaseHeader, openDb, openKeyedDatabase, rekeyDatabaseConnection } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver, type ProjectSet } from '../../storage/project-resolver.js';
 import { ensureCreatedDirsPrivate, listRegularFiles, setPrivateFileMode } from '../../util/fs.js';
@@ -32,11 +33,11 @@ export interface FullBackup {
     bytes: number;
 }
 
-// Registers portable, user-requested database exports. Safety snapshots remain in storage/backup.ts.
+// Registers user-requested, installation-keyed exports. Safety snapshots remain in storage/backup.ts.
 export function registerBackup(program: Command): void {
     program
         .command('backup')
-        .description('Export elepha memory to a portable SQLite file')
+        .description('Back up elepha memory for recovery on this installation')
         .option('--all', 'export the whole elepha database')
         .option('--project <pathOrName>', 'export one consolidated project set')
         .option('--out <path>', 'write to this file or directory instead of ~/.elepha/backups')
@@ -57,24 +58,27 @@ export function registerBackup(program: Command): void {
             const dbPath = defaultDbPath();
             const db = await openDb(dbPath);
             const store = new MemoryStore(db);
+            let encryptionKey: Buffer | undefined;
             const defaultOutput = (project?: ProjectSet) => {
                 const generated = defaultBackupPath(project);
                 return opts.out === undefined ? generated : resolveOutput(opts.out, generated);
             };
             try {
+                const exportKey = await databaseKey(dbPath, false);
+                encryptionKey = exportKey;
                 if (scopes === 0) {
                     process.exitCode = await runBackupWizard({
                         store,
                         defaultOutput,
-                        backupAll: async (output) => exportAll(db, resolveOutput(output, defaultOutput()), opts.force),
+                        backupAll: async (output) => exportAll(db, resolveOutput(output, defaultOutput()), exportKey, opts.force),
                         backupProject: async (project, output) =>
-                            exportProject(db, project, resolveOutput(output, defaultOutput(project)), opts.force),
+                            exportProject(db, project, resolveOutput(output, defaultOutput(project)), exportKey, opts.force),
                     });
                     return;
                 }
 
                 if (opts.all) {
-                    const written = exportAll(db, resolveOutput(opts.out, defaultOutput()), opts.force);
+                    const written = exportAll(db, resolveOutput(opts.out, defaultOutput()), exportKey, opts.force);
                     console.log(`Backup written to ${written}.`);
                     return;
                 }
@@ -94,10 +98,12 @@ export function registerBackup(program: Command): void {
                     db,
                     resolution.project,
                     resolveOutput(opts.out, defaultOutput(resolution.project)),
+                    exportKey,
                     opts.force,
                 );
                 console.log(`Backup written to ${written}.`);
             } finally {
+                encryptionKey?.fill(0);
                 db.close();
             }
         });
@@ -149,7 +155,7 @@ export function resolveOutput(output: string | undefined, defaultPath: string): 
 }
 
 // Full exports retain the source database bytes after a WAL checkpoint, unlike pruned safety snapshots.
-export function exportAll(db: Database.Database, destination: string, force = false): string {
+export function exportAll(db: Database.Database, destination: string, encryptionKey: Buffer, force = false): string {
     if (db.name === ':memory:') {
         throw new Error('A full backup requires an on-disk database.');
     }
@@ -159,12 +165,24 @@ export function exportAll(db: Database.Database, destination: string, force = fa
     if (checkpoint?.busy !== 0) {
         throw new Error("Backup aborted: WAL checkpoint did not complete (the daemon may be writing) — run 'elepha pause' or retry.");
     }
-    replaceDestination(destination, (temporary) => copyFileSync(db.name, temporary));
+    replaceDestination(destination, (temporary) => {
+        copyFileSync(db.name, temporary);
+        if (hasPlaintextDatabaseHeader(temporary)) {
+            encryptExport(temporary, encryptionKey);
+        }
+        verifyEncryptedExport(temporary, encryptionKey, []);
+    });
     return destination;
 }
 
 // Exports exactly one resolved ProjectSet and the four portable tables that reference it.
-export function exportProject(source: Database.Database, project: ProjectSet, destination: string, force = false): string {
+export function exportProject(
+    source: Database.Database,
+    project: ProjectSet,
+    destination: string,
+    encryptionKey: Buffer,
+    force = false,
+): string {
     refuseActiveDatabaseDestination(source.name, destination);
     prepareDestination(destination, force);
     replaceDestination(destination, (temporary) => {
@@ -180,8 +198,45 @@ export function exportProject(source: Database.Database, project: ProjectSet, de
         } finally {
             target.close();
         }
+        encryptExport(temporary, encryptionKey);
+        verifyEncryptedExport(temporary, encryptionKey, EXPORTED_TABLES);
     });
     return destination;
+}
+
+function encryptExport(databasePath: string, encryptionKey: Buffer): void {
+    const db = new Database(databasePath, { fileMustExist: true });
+    try {
+        const journalMode = db.pragma('journal_mode = DELETE', { simple: true });
+        if (journalMode !== 'delete') {
+            throw new Error(`Backup could not enter DELETE journal mode (observed ${String(journalMode)}).`);
+        }
+        rekeyDatabaseConnection(db, encryptionKey);
+    } finally {
+        db.close();
+    }
+}
+
+function verifyEncryptedExport(databasePath: string, encryptionKey: Buffer, expectedTables: readonly string[]): void {
+    if (hasPlaintextDatabaseHeader(databasePath)) {
+        throw new Error('Backup encryption verification found a plaintext SQLite header.');
+    }
+    const db = openKeyedDatabase(databasePath, encryptionKey, { readonly: true, fileMustExist: true });
+    try {
+        const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
+        if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
+            throw new Error(`Backup failed integrity_check: ${integrity.map((row) => row.integrity_check).join('; ')}`);
+        }
+        const tables = new Set(
+            (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name),
+        );
+        const missing = expectedTables.filter((table) => !tables.has(table));
+        if (missing.length > 0) {
+            throw new Error(`Backup is incomplete (missing required table(s): ${missing.join(', ')}).`);
+        }
+    } finally {
+        db.close();
+    }
 }
 
 function refuseActiveDatabaseDestination(activeDatabase: string, destination: string): void {

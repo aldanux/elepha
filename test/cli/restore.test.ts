@@ -3,11 +3,12 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFi
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { exportAll, exportProject } from '../../src/cli/commands/backup.js';
+import { exportAll } from '../../src/cli/commands/backup.js';
 import { REQUIRED_RESTORE_TABLES, runRestoreOperation } from '../../src/cli/commands/restore.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { writeBackup } from '../../src/storage/backup.js';
-import { openUnmanagedDb } from '../../src/storage/db.js';
+import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
+import { openKeyedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
@@ -17,6 +18,28 @@ import { withTempDir } from '../helpers/tmp.js';
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const elephaCli = path.join(repositoryRoot, 'src', 'cli', 'index.ts');
+const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
+
+function encryptionRuntime(): DatabaseEncryptionRuntime {
+    return {
+        platform: 'linux',
+        env: { CI: '1' },
+        randomBytes: () => Buffer.from(FIXED_KEY),
+        randomUUID: () => '11111111-1111-4111-8111-111111111111',
+        keyFilePath: (dbPath) => path.join(path.dirname(dbPath), 'restore.keydata'),
+    };
+}
+
+async function encryptDatabase(dbPath: string, runtime: DatabaseEncryptionRuntime): Promise<void> {
+    const key = await databaseKey(dbPath, true, runtime);
+    const db = new Database(dbPath, { fileMustExist: true });
+    try {
+        rekeyDatabaseConnection(db, key);
+    } finally {
+        db.close();
+        key.fill(0);
+    }
+}
 
 class ReingestionProbeAdapter implements SessionAdapter {
     readonly tool = 'codex' as const;
@@ -174,7 +197,8 @@ function populate(dbPath: string, suffix: string): void {
 function fullBackup(sourcePath: string, destination: string): void {
     const db = openUnmanagedDb(sourcePath);
     try {
-        exportAll(db, destination);
+        db.pragma('wal_checkpoint(TRUNCATE)');
+        copyFileSync(sourcePath, destination);
     } finally {
         db.close();
     }
@@ -237,6 +261,54 @@ function replaceWithLegacySessionsTable(db: Database.Database): void {
 }
 
 describe('elepha restore', () => {
+    it('restores an encrypted full export with identical schema and row counts using the installation key', async () => {
+        const active = createTestDb('elepha-restore-encrypted-active-');
+        const candidate = createTestDb('elepha-restore-encrypted-candidate-');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        active.db.exec('DELETE FROM purged_transcripts');
+        active.close();
+        candidate.close();
+        const runtime = encryptionRuntime();
+        await encryptDatabase(active.dbPath, runtime);
+        await encryptDatabase(candidate.dbPath, runtime);
+        const backup = path.join(candidate.directory, 'full-encrypted.db');
+        const candidateDb = openKeyedDatabase(candidate.dbPath, FIXED_KEY);
+        const expectedSchema = candidateDb.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all();
+        const expectedCounts = Object.fromEntries(
+            REQUIRED_RESTORE_TABLES.map((table) => [
+                table,
+                Number((candidateDb.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
+            ]),
+        );
+        exportAll(candidateDb, backup, FIXED_KEY);
+        candidateDb.close();
+
+        const result = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            encryption: runtime,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+        });
+
+        expect(readFileSync(active.dbPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        const unkeyed = new Database(active.dbPath, { readonly: true });
+        expect(() => unkeyed.prepare('SELECT name FROM sqlite_master').all()).toThrow();
+        unkeyed.close();
+        const restored = openKeyedDatabase(active.dbPath, FIXED_KEY, { readonly: true });
+        expect(restored.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+        expect(restored.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all()).toEqual(expectedSchema);
+        expect(
+            Object.fromEntries(
+                REQUIRED_RESTORE_TABLES.map((table) => [
+                    table,
+                    Number((restored.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
+                ]),
+            ),
+        ).toEqual(expectedCounts);
+        restored.close();
+        expect(result.snapshotPath).toBeDefined();
+        expect(readFileSync(result.snapshotPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+    });
     afterEach(() => vi.unstubAllEnvs());
 
     it('restores candidate rows, preserves active purge tombstones, snapshots the current database, and removes stale sidecars', () => {
@@ -525,7 +597,18 @@ describe('elepha restore', () => {
         const resolution = new ProjectResolver(source.db).resolve(project.path);
         if (!('project' in resolution) || resolution.project === null) throw new Error('project did not resolve');
         const partial = path.join(source.directory, 'project.db');
-        exportProject(source.db, resolution.project, partial);
+        source.db.pragma('wal_checkpoint(TRUNCATE)');
+        copyFileSync(source.dbPath, partial);
+        const partialDb = new Database(partial);
+        try {
+            for (const table of REQUIRED_RESTORE_TABLES.filter(
+                (table) => !['projects', 'sessions', 'memories', 'session_rollups'].includes(table),
+            )) {
+                partialDb.exec(`DROP TABLE "${table}"`);
+            }
+        } finally {
+            partialDb.close();
+        }
         active.close();
         source.close();
         const before = readFileSync(active.dbPath);

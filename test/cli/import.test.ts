@@ -1,11 +1,16 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { exportAll, exportProject } from '../../src/cli/commands/backup.js';
-import { IMPORTED_TABLES, reportImportError, runImportOperation } from '../../src/cli/commands/import.js';
+import { exportProject } from '../../src/cli/commands/backup.js';
+import {
+    IMPORTED_TABLES,
+    PORTABLE_ENCRYPTED_IMPORT_UNSUPPORTED_MESSAGE,
+    reportImportError,
+    runImportOperation,
+} from '../../src/cli/commands/import.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
 import { detectShellSyntax, stripShellSyntax } from '../../src/security/sanitize.js';
 import { writeBackup } from '../../src/storage/backup.js';
@@ -18,6 +23,7 @@ import { createTestDb, seedMemory, seedProject, seedRollup, seedSession, type Te
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 const elephaCli = path.join(repositoryRoot, 'src', 'cli', 'index.ts');
+const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
 const previousCodexHome = process.env.CODEX_HOME;
 let testCodexHome = '';
 
@@ -136,8 +142,13 @@ function addSession(fixture: TestDatabase, project: ProjectRow, nativeId: string
 function fullBackup(fixture: TestDatabase, active: TestDatabase): string {
     active.store.consent.grant(fixture.directory);
     const destination = path.join(fixture.directory, 'backup.db');
-    exportAll(fixture.db, destination);
+    plaintextExport(fixture.db, destination);
     return destination;
+}
+
+function plaintextExport(db: Database.Database, destination: string): void {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    copyFileSync(db.name, destination);
 }
 
 function rows(dbPath: string, table: (typeof IMPORTED_TABLES)[number]): unknown[] {
@@ -478,7 +489,7 @@ describe('elepha import', () => {
         addSession(backupSource, seedProject(backupSource, { path: cwd }), nativeId, 'new-revoked', cwd);
         active.store.consent.grant(cwd);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -532,7 +543,7 @@ describe('elepha import', () => {
         addSession(backupSource, seedProject(backupSource, { path: cwd }), nativeId, 'backup-existing', cwd);
         active.store.consent.grant(cwd);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         const portableBefore = portableRows(active.dbPath);
         active.close();
         backupSource.close();
@@ -571,7 +582,7 @@ describe('elepha import', () => {
         addSession(backupSource, seedProject(backupSource, { path: cwd }), nativeId, veto, cwd);
         active.store.consent.grant(cwd);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -609,7 +620,7 @@ describe('elepha import', () => {
         addSession(backupSource, seedProject(backupSource, { path: cwd }), 'unchanged-session', 'unchanged', cwd);
         active.store.consent.grant(cwd);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
         const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
@@ -665,7 +676,7 @@ describe('elepha import', () => {
         );
         addSession(unconsentedSource, forgedUnconsentedProject, 'forged-unconsented', 'forged-unconsented', unconsentedCwd);
         const unconsentedBackup = path.join(unconsentedSource.directory, 'backup.db');
-        exportAll(unconsentedSource.db, unconsentedBackup);
+        plaintextExport(unconsentedSource.db, unconsentedBackup);
 
         const approvedSource = createTestDb('elepha-import-consent-approved-source-');
         const forgedApprovedProject = setProjectIdentity(
@@ -676,7 +687,7 @@ describe('elepha import', () => {
         );
         addSession(approvedSource, forgedApprovedProject, 'approved-control', 'approved-control', approvedRoot);
         const approvedBackup = path.join(approvedSource.directory, 'backup.db');
-        exportAll(approvedSource.db, approvedBackup);
+        plaintextExport(approvedSource.db, approvedBackup);
 
         active.close();
         unconsentedSource.close();
@@ -739,7 +750,7 @@ describe('elepha import', () => {
         );
         addSession(backupSource, backupProject, 'unbound-project-session', 'unbound-project-session', unconsentedCwd);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -777,7 +788,7 @@ describe('elepha import', () => {
         addSession(backupSource, backupProjectA, 'legitimate-a', 'legitimate-a', projectAPath);
         addSession(backupSource, backupProjectB, 'legitimate-b', 'legitimate-b', projectBPath);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -839,7 +850,7 @@ describe('elepha import', () => {
         backupSource.db.prepare('UPDATE memories SET project_id = ? WHERE session_id = ?').run(backupProjectC.id, forged.id);
         backupSource.db.prepare('UPDATE session_rollups SET parent_session_id = ? WHERE session_id = ?').run(vetoedParent.id, forged.id);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -877,7 +888,7 @@ describe('elepha import', () => {
         const backupProjectB = seedProject(backupSource, { path: projectBPath });
         addSession(backupSource, backupProjectB, 'overwrite-rebind', 'backup-overwrite', projectAPath);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -931,7 +942,7 @@ describe('elepha import', () => {
             );
         addSession(backupSource, backupProject, 'untrusted-project-fields', 'untrusted-project-fields', projectPath);
         const backup = path.join(backupSource.directory, 'backup.db');
-        exportAll(backupSource.db, backup);
+        plaintextExport(backupSource.db, backup);
         active.close();
         backupSource.close();
 
@@ -1258,17 +1269,13 @@ describe('elepha import', () => {
         expect(Object.fromEntries(IMPORTED_TABLES.map((table) => [table, rows(active.dbPath, table)]))).toEqual(portableBefore);
     });
 
-    it('registers the command, imports a project export, prints the safe preview, and requires a file off-TTY', () => {
+    it('registers the command, imports a plaintext export, prints the safe preview, and requires a file off-TTY', () => {
         const active = createTestDb('elepha-import-cli-active-');
         const backupSource = createTestDb('elepha-import-cli-source-');
         const project = seedProject(backupSource);
         addSession(backupSource, project, 'new-session', 'new');
-        const resolution = new ProjectResolver(backupSource.db, { resolveGitRoot: () => null }).resolve(project.path);
-        if (!('project' in resolution) || resolution.project === null) {
-            throw new Error('project did not resolve');
-        }
         const backup = path.join(backupSource.directory, 'project.db');
-        exportProject(backupSource.db, resolution.project, backup);
+        plaintextExport(backupSource.db, backup);
         active.store.consent.grant(backupSource.directory);
         active.close();
         backupSource.close();
@@ -1292,5 +1299,24 @@ describe('elepha import', () => {
         const missing = runImportCli(active.dbPath);
         expect(missing.status).toBe(1);
         expect(missing.stderr).toContain('Specify a backup file when not running interactively.');
+    }, 15000);
+
+    it('rejects an encrypted project export with the exact portability message', () => {
+        const active = createTestDb('elepha-import-encrypted-active-');
+        const backupSource = createTestDb('elepha-import-encrypted-source-');
+        const project = seedProject(backupSource);
+        addSession(backupSource, project, 'encrypted-session', 'new');
+        const resolution = new ProjectResolver(backupSource.db, { resolveGitRoot: () => null }).resolve(project.path);
+        if (!('project' in resolution) || resolution.project === null) {
+            throw new Error('project did not resolve');
+        }
+        const backup = path.join(backupSource.directory, 'project.db');
+        exportProject(backupSource.db, resolution.project, backup, FIXED_KEY);
+        active.close();
+        backupSource.close();
+
+        const result = runImportCli(active.dbPath, backup, '--skip-confirmation');
+        expect(result.status).toBe(1);
+        expect(result.stderr.trim()).toBe(PORTABLE_ENCRYPTED_IMPORT_UNSUPPORTED_MESSAGE);
     }, 15000);
 });
