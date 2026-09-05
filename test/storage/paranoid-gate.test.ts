@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -17,6 +18,7 @@ import { openDb } from '../../src/storage/db.js';
 import { DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import {
+    type AuthenticatedReadGeneration,
     disableParanoidMode,
     enableParanoidMode,
     isMemoryLocked,
@@ -26,6 +28,7 @@ import {
     lockMemory,
     paranoidStatePath,
     unlockMemory,
+    withMemoryReadGenerationAsync,
 } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
@@ -35,6 +38,40 @@ import { withGrantableTestDir } from '../helpers/tmp.js';
 const PASSPHRASE = 'correct horse battery staple';
 const FIXED_KEY = Buffer.alloc(32, 7);
 const NOW = '2026-09-04T00:00:00.000Z';
+
+function transitionParanoidStateInChild(dbPath: string, transition: 'lock' | 'lock_unlock'): void {
+    const source = `
+        import path from 'node:path';
+        import { openDb } from ${JSON.stringify(new URL('../../src/storage/db.ts', import.meta.url).href)};
+        import { lockMemory, unlockMemory } from ${JSON.stringify(new URL('../../src/storage/paranoid-gate.ts', import.meta.url).href)};
+
+        const [dbPath, transition] = process.argv.slice(1);
+        const directory = path.dirname(dbPath);
+        const db = await openDb(dbPath, {
+            encryption: {
+                platform: 'linux',
+                env: { CI: '1' },
+                randomBytes: () => Buffer.alloc(32, 7),
+                randomUUID: () => '11111111-1111-4111-8111-111111111111',
+                keyFilePath: () => path.join(directory, 'elepha.keydata'),
+            },
+        });
+        try {
+            if (lockMemory(db) !== 'locked') throw new Error('child failed to lock memory');
+            if (transition === 'lock_unlock' && unlockMemory(db, ${JSON.stringify(PASSPHRASE)}) !== 'unlocked') {
+                throw new Error('child failed to unlock memory');
+            }
+        } finally {
+            db.close();
+        }
+        process.stdout.write(String(process.pid));
+    `;
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', source, dbPath, transition], {
+        encoding: 'utf8',
+    });
+    expect(child.status, child.stderr || child.stdout).toBe(0);
+    expect(Number(child.stdout)).not.toBe(process.pid);
+}
 
 interface TestGatePayload {
     mode: 'default' | 'paranoid';
@@ -248,6 +285,83 @@ async function expectRepresentativeReadsLocked(seeded: Awaited<ReturnType<typeof
 }
 
 describe('paranoid read gate', () => {
+    it.each([
+        { generationAdvance: 1, lockedAfterward: true, transition: 'lock' as const },
+        { generationAdvance: 2, lockedAfterward: false, transition: 'lock_unlock' as const },
+    ])(
+        'invalidates SQL-backed public response after a separate-process $transition transition',
+        async ({ generationAdvance, lockedAfterward, transition }) => {
+            const seeded = await fixture();
+            enableParanoidMode(seeded.db, PASSPHRASE);
+            expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+            const before = authorityState(seeded.db);
+            let pausedAfterProtectedRead = false;
+            const mcp = new ElephaMcpService(seeded.db, {
+                result: (text, structuredContent) => {
+                    if (!pausedAfterProtectedRead && Array.isArray(structuredContent?.sessions)) {
+                        expect(structuredContent.sessions).toEqual([expect.objectContaining({ title: 'prompt before lock' })]);
+                        pausedAfterProtectedRead = true;
+                        transitionParanoidStateInChild(seeded.dbPath, transition);
+                    }
+                    return { content: [{ type: 'text', text }], structuredContent };
+                },
+                textResult: (text) => ({ content: [{ type: 'text', text }] }),
+            });
+
+            const response = mcp.listSessions({ project: seeded.projectPath, include_all: true });
+
+            expect(pausedAfterProtectedRead).toBe(true);
+            expect(authorityState(seeded.db)).toEqual({
+                enrolled: 1,
+                state: lockedAfterward ? 'locked' : 'unlocked',
+                generation: before.generation + generationAdvance,
+            });
+            expect(isMemoryLocked(seeded.db)).toBe(lockedAfterward);
+            expect(response.content).toEqual([{ type: 'text', text: LOCKED_MEMORY_MESSAGE }]);
+            expect(response.structuredContent).toEqual(LOCKED_MCP_RESULT);
+            seeded.db.close();
+        },
+    );
+
+    it('rejects the original CLI generation after ABA before rollup service entry', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+        const before = authorityState(seeded.db);
+        const originalGeneration = await withMemoryReadGenerationAsync(
+            seeded.db,
+            () => {
+                throw new Error('expected an unlocked read generation');
+            },
+            async (generation) => generation,
+        );
+        transitionParanoidStateInChild(seeded.dbPath, 'lock_unlock');
+        expect(authorityState(seeded.db)).toEqual({ enrolled: 1, state: 'unlocked', generation: before.generation + 2 });
+
+        const providerResult = {
+            status: 'ok' as const,
+            output: { title: 'T', summary: 'S', decisions: [], pending_items: [], droppedDecisions: 0 },
+        };
+        const provider = { rollup: vi.fn().mockResolvedValue(providerResult), merge: vi.fn().mockResolvedValue(providerResult) };
+        const service = new RollupService({ store: seeded.store, rollups: new RollupStore(seeded.db), provider });
+        const rollupWithGeneration = service.rollupSession.bind(service) as (
+            session: typeof seeded.session,
+            kind: 'primary',
+            parentSessionId: null,
+            state: 'final',
+            generation: AuthenticatedReadGeneration,
+        ) => ReturnType<RollupService['rollupSession']>;
+
+        await expect(rollupWithGeneration(seeded.session, 'primary', null, 'final', originalGeneration)).resolves.toEqual({
+            wrote: false,
+            complete: false,
+            deferred: 'locked',
+        });
+        expect(provider.rollup).not.toHaveBeenCalled();
+        expect(provider.merge).not.toHaveBeenCalled();
+        seeded.db.close();
+    });
+
     it('C11 sentinel-wraps locked hook output while the gate blocks every protected serving surface', async () => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);

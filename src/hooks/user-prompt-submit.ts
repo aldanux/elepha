@@ -19,7 +19,7 @@ import { endedAt, type ServedSession, SessionReader, surfaceLabel, titleOf } fro
 import { ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
-import { isMemoryLocked, LOCKED_MEMORY_MESSAGE } from '../storage/paranoid-gate.js';
+import { LOCKED_MEMORY_MESSAGE, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
@@ -217,96 +217,91 @@ export async function runUserPromptSubmit(
             }
             return { output: envelope(output) };
         };
-        if (isMemoryLocked(db)) {
+        const locked = (): UserPromptSubmitResult => {
             const result = emit(LOCKED_MEMORY_MESSAGE);
             if ('output' in result) {
                 log(promptLogLine(tool, payload, 'served locked'));
             }
             return result;
-        }
-        const reader = new SessionReader(db);
-        const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-        let commandOutput: string;
-        let shownSessionIds: number[] | undefined;
-        let storeShownSessionIds = false;
-        let successNotice: string | undefined;
-        if (command?.kind === 'query') {
-            const query = tokenizeRecallQuery(command.query);
-            if (!query) {
-                commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_QUERY_REQUIRED}`;
-            } else {
-                const consent = new ConsentStore(db);
-                const projects =
-                    command.scope === 'global'
-                        ? projectResolver(db).listConsentedStored(consent)
-                        : [consentedProject(db, payload.cwd)].filter((project): project is ProjectSet => project !== undefined);
-                if (command.scope === 'here' && projects.length === 0 && consent.consentState(payload.cwd) !== 'approved') {
-                    successNotice = 'served notice=project_unavailable_or_unconsented';
-                    commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`;
+        };
+        return await withMemoryReadGenerationAsync(db, locked, async () => {
+            const reader = new SessionReader(db);
+            const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
+            let commandOutput: string;
+            let shownSessionIds: number[] | undefined;
+            let storeShownSessionIds = false;
+            let successNotice: string | undefined;
+            if (command?.kind === 'query') {
+                const query = tokenizeRecallQuery(command.query);
+                if (!query) {
+                    commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_QUERY_REQUIRED}`;
                 } else {
-                    const matchingMode = getSetting('query-matching', process.env, dependencies.configPath).value;
-                    const recall = await lexicalRecall(reader, projects, query, command.scope, Date.now, clock(), matchingMode);
-                    if (!contributingSessionsStillConsented(db, reader, recall.sessionIds)) {
-                        log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
-                        if (command.scope !== 'here') {
-                            return { reason: 'project_unavailable_or_unconsented' };
-                        }
+                    const consent = new ConsentStore(db);
+                    const projects =
+                        command.scope === 'global'
+                            ? projectResolver(db).listConsentedStored(consent)
+                            : [consentedProject(db, payload.cwd)].filter((project): project is ProjectSet => project !== undefined);
+                    if (command.scope === 'here' && projects.length === 0 && consent.consentState(payload.cwd) !== 'approved') {
+                        successNotice = 'served notice=project_unavailable_or_unconsented';
                         commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`;
                     } else {
-                        commandOutput = recall.body;
-                        shownSessionIds = recall.sessionIds;
-                        storeShownSessionIds = true;
-                    }
-                }
-            }
-        } else {
-            const project = consentedProject(db, payload.cwd);
-            let storedSelectTarget: StoredSelectTarget = { hasStoredList: false };
-            if (command?.kind === 'select') {
-                const storedSessionIds = store.shownSessionLists.forChat(tool, payload.session_id);
-                if (storedSessionIds !== undefined) {
-                    const sessionId = storedSessionIds[command.index - 1];
-                    const session = sessionId === undefined ? undefined : reader.sessionById(sessionId);
-                    if (session !== undefined) {
-                        const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
-                        if (!consentedProjects.some((candidate) => candidate.projectIds.includes(session.project_id))) {
-                            log(promptLogLine(tool, payload, 'failed reason=project_unavailable_or_unconsented'));
-                            return { reason: 'project_unavailable_or_unconsented' };
+                        const matchingMode = getSetting('query-matching', process.env, dependencies.configPath).value;
+                        const recall = await lexicalRecall(reader, projects, query, command.scope, Date.now, clock(), matchingMode);
+                        if (!contributingSessionsStillConsented(db, reader, recall.sessionIds)) {
+                            log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+                            if (command.scope !== 'here') {
+                                return { reason: 'project_unavailable_or_unconsented' };
+                            }
+                            commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`;
+                        } else {
+                            commandOutput = recall.body;
+                            shownSessionIds = recall.sessionIds;
+                            storeShownSessionIds = true;
                         }
                     }
-                    storedSelectTarget = { hasStoredList: true, session };
                 }
+            } else {
+                const project = consentedProject(db, payload.cwd);
+                let storedSelectTarget: StoredSelectTarget = { hasStoredList: false };
+                if (command?.kind === 'select') {
+                    const storedSessionIds = store.shownSessionLists.forChat(tool, payload.session_id);
+                    if (storedSessionIds !== undefined) {
+                        const sessionId = storedSessionIds[command.index - 1];
+                        const session = sessionId === undefined ? undefined : reader.sessionById(sessionId);
+                        if (session !== undefined) {
+                            const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
+                            if (!consentedProjects.some((candidate) => candidate.projectIds.includes(session.project_id))) {
+                                log(promptLogLine(tool, payload, 'failed reason=project_unavailable_or_unconsented'));
+                                return { reason: 'project_unavailable_or_unconsented' };
+                            }
+                        }
+                        storedSelectTarget = { hasStoredList: true, session };
+                    }
+                }
+                const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
+                const commandNow = command?.kind === 'list' ? clock() : undefined;
+                const result = await commandBody(command, reader, project, consentedProjects, storedSelectTarget, commandNow);
+                if (result.shownSessionIds !== undefined && !contributingSessionsStillConsented(db, reader, result.shownSessionIds)) {
+                    log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+                    return { reason: 'project_unavailable_or_unconsented' };
+                }
+                commandOutput = result.body;
+                shownSessionIds = result.shownSessionIds;
+                storeShownSessionIds = command?.kind === 'list';
             }
-            const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
-            const commandNow = command?.kind === 'list' ? clock() : undefined;
-            const result = await commandBody(command, reader, project, consentedProjects, storedSelectTarget, commandNow);
-            if (result.shownSessionIds !== undefined && !contributingSessionsStillConsented(db, reader, result.shownSessionIds)) {
-                log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
-                return { reason: 'project_unavailable_or_unconsented' };
+            const result = emit(commandOutput);
+            if (!('output' in result)) {
+                return result;
             }
-            commandOutput = result.body;
-            shownSessionIds = result.shownSessionIds;
-            storeShownSessionIds = command?.kind === 'list';
-        }
-        if (isMemoryLocked(db)) {
-            const result = emit(LOCKED_MEMORY_MESSAGE);
-            if ('output' in result) {
-                log(promptLogLine(tool, payload, 'served locked'));
+            if (successNotice !== undefined) {
+                log(promptLogLine(tool, payload, successNotice));
             }
+            if (storeShownSessionIds && shownSessionIds !== undefined) {
+                store.shownSessionLists.replace(tool, payload.session_id, shownSessionIds);
+            }
+            log(promptLogLine(tool, payload, command?.kind ?? 'help'));
             return result;
-        }
-        const result = emit(commandOutput);
-        if (!('output' in result)) {
-            return result;
-        }
-        if (successNotice !== undefined) {
-            log(promptLogLine(tool, payload, successNotice));
-        }
-        if (storeShownSessionIds && shownSessionIds !== undefined) {
-            store.shownSessionLists.replace(tool, payload.session_id, shownSessionIds);
-        }
-        log(promptLogLine(tool, payload, command?.kind ?? 'help'));
-        return result;
+        });
     } catch {
         log(promptLogLine(tool, payload, 'failed reason=hook_error'));
         return { reason: 'hook_error' };

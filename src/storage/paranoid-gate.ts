@@ -65,6 +65,20 @@ interface ParanoidAuthority {
     credentialTag: string | null;
 }
 
+const READ_GENERATION = Symbol('read-generation');
+
+// Generation rejects lock/unlock ABA; enrollment and credential identity reject
+// a different authority installed at the same generation.
+export interface AuthenticatedReadGeneration {
+    readonly [READ_GENERATION]: {
+        db: Database.Database;
+        enrolled: 0 | 1;
+        generation: number;
+        credentialTag: string | null;
+        registered: boolean;
+    };
+}
+
 const DATABASE_REGISTRY_SYMBOL = Symbol.for('dev.elepha.paranoid.database-registry');
 
 // Test runners and bundled consumers can load this module through more than
@@ -314,6 +328,74 @@ export function memoryServeState(db: Database.Database): GateServeState {
 
 export function isMemoryLocked(db: Database.Database): boolean {
     return memoryServeState(db) === 'locked';
+}
+
+function authenticatedReadGeneration(db: Database.Database): AuthenticatedReadGeneration | undefined {
+    const registered = registeredDatabases.get(db);
+    if (registered === undefined) {
+        return { [READ_GENERATION]: { db, enrolled: 0, generation: 0, credentialTag: null, registered: false } };
+    }
+    const authority = readAuthority(db);
+    if (authority === undefined) {
+        return undefined;
+    }
+    const stored = readRegisteredState(db);
+    const unlocked =
+        (pristineAuthority(authority) && stored === undefined) ||
+        (stored !== undefined && authorityMatches(authority, stored) && authority.state === 'unlocked');
+    if (!unlocked) {
+        return undefined;
+    }
+    return {
+        [READ_GENERATION]: {
+            db,
+            enrolled: authority.enrolled,
+            generation: authority.generation,
+            credentialTag: authority.credentialTag,
+            registered: true,
+        },
+    };
+}
+
+function readGenerationIsCurrent(db: Database.Database, token: AuthenticatedReadGeneration): boolean {
+    const expected = token[READ_GENERATION];
+    const current = authenticatedReadGeneration(db)?.[READ_GENERATION];
+    return (
+        expected.db === db &&
+        current !== undefined &&
+        current.registered === expected.registered &&
+        current.enrolled === expected.enrolled &&
+        current.generation === expected.generation &&
+        current.credentialTag === expected.credentialTag
+    );
+}
+
+export function withMemoryReadGeneration<T>(
+    db: Database.Database,
+    locked: () => T,
+    read: (token: AuthenticatedReadGeneration) => T,
+    existing?: AuthenticatedReadGeneration,
+): T {
+    const token = existing === undefined ? authenticatedReadGeneration(db) : readGenerationIsCurrent(db, existing) ? existing : undefined;
+    if (token === undefined) {
+        return locked();
+    }
+    const result = read(token);
+    return readGenerationIsCurrent(db, token) ? result : locked();
+}
+
+export async function withMemoryReadGenerationAsync<T>(
+    db: Database.Database,
+    locked: () => T,
+    read: (token: AuthenticatedReadGeneration) => Promise<T>,
+    existing?: AuthenticatedReadGeneration,
+): Promise<T> {
+    const token = existing === undefined ? authenticatedReadGeneration(db) : readGenerationIsCurrent(db, existing) ? existing : undefined;
+    if (token === undefined) {
+        return locked();
+    }
+    const result = await read(token);
+    return readGenerationIsCurrent(db, token) ? result : locked();
 }
 
 function registeredStateForMutation(

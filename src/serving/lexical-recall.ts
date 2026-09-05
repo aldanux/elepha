@@ -415,8 +415,7 @@ function renderBody(
     return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId) };
 }
 
-// Scans recent metadata plus indexed durable content and returns a fully budgeted injection body.
-export async function lexicalRecall(
+async function lexicalRecallUnlocked(
     reader: SessionReader,
     projects: ProjectSet[],
     query: RecallQuery,
@@ -425,14 +424,6 @@ export async function lexicalRecall(
     relativeNow: number | undefined,
     matchingMode: QueryMatchingMode,
 ): Promise<LexicalRecallResult> {
-    if (typeof reader.serveState === 'function' && reader.serveState() === 'locked') {
-        return {
-            body: LOCKED_MEMORY_MESSAGE,
-            sessionIds: [],
-            state: 'locked',
-            content_coverage: LOCKED_CONTENT_COVERAGE,
-        };
-    }
     const scanClock = now ?? Date.now;
     const allCandidates = projects
         .flatMap((project) => reader.sessionsFor(project).map((session) => ({ project, session })))
@@ -534,4 +525,30 @@ export async function lexicalRecall(
         hits.length === 0,
     );
     return renderBody(query, hits, coverage, renderedAt, scope, projects[0], usedLaxFallback);
+}
+
+// Scans recent metadata plus indexed durable content and returns a fully budgeted injection body.
+export async function lexicalRecall(
+    reader: SessionReader,
+    projects: ProjectSet[],
+    query: RecallQuery,
+    scope: RecallScope,
+    now: (() => number) | undefined,
+    relativeNow: number | undefined,
+    matchingMode: QueryMatchingMode,
+): Promise<LexicalRecallResult> {
+    const locked = (): LexicalRecallResult => ({
+        body: LOCKED_MEMORY_MESSAGE,
+        sessionIds: [],
+        state: 'locked',
+        content_coverage: LOCKED_CONTENT_COVERAGE,
+    });
+    if (typeof reader.withReadGenerationAsync !== 'function') {
+        return typeof reader.serveState === 'function' && reader.serveState() === 'locked'
+            ? locked()
+            : lexicalRecallUnlocked(reader, projects, query, scope, now, relativeNow, matchingMode);
+    }
+    return reader.withReadGenerationAsync(locked, () =>
+        lexicalRecallUnlocked(reader, projects, query, scope, now, relativeNow, matchingMode),
+    );
 }

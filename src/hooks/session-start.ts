@@ -22,7 +22,7 @@ import { endedAt, newestActivity, SessionReader, surfaceLabel, titleOf } from '.
 import { ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
-import { isMemoryLocked, LOCKED_MEMORY_MESSAGE } from '../storage/paranoid-gate.js';
+import { LOCKED_MEMORY_MESSAGE, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookSource, type HookTool, parsePayload, readStdin, type SessionStartPayload } from './common.js';
@@ -258,117 +258,112 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
             }
             return { output: envelope(tool, output, channel) };
         };
-        if (isMemoryLocked(db)) {
+        const locked = (): HookResult => {
             const result = emit(LOCKED_MEMORY_MESSAGE, 'notify', notifyChannel(tool));
             if ('output' in result) {
                 log(sessionLogLine(tool, payload, 'served locked'));
             }
             return result;
-        }
-        let canonicalCwd: string;
-        try {
-            canonicalCwd = realpathSync(payload.cwd);
-        } catch {
-            return { reason: 'project_unavailable_or_unconsented' };
-        }
-        const captureOffRoot = store.consent.captureOffNudge(canonicalCwd);
-        if (captureOffRoot) {
-            const grantHint =
-                captureOffRoot !== 'refused' && captureOffRoot.state === 'pending'
-                    ? ` · run 'elepha consent grant ${captureOffRoot.path}' to capture here`
-                    : '';
-            const body = `🐘 elepha · capture off · type elepha:list to recall${grantHint}`;
-            const result = emit(body, 'notify', notifyChannel(tool));
-            if ('output' in result) {
-                log(sessionLogLine(tool, payload, 'emitted capture-off nudge'));
-            }
-            return result;
-        }
-        const project = consentedProject(db, canonicalCwd);
-        if (!project) {
-            return { reason: 'project_unavailable_or_unconsented' };
-        }
-        const reader = new SessionReader(db);
-        const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-        const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
-        if (reader.consentedTotal(consentedProjects) === 0) {
-            return { reason: 'no_consented_sessions' };
-        }
-        const session = reader.newestSubstantive(project);
-        const now = clock();
-        const age = session === undefined ? undefined : now - Date.parse(endedAt(session));
-        let effective = mode;
-        if (
-            session === undefined ||
-            age === undefined ||
-            !Number.isFinite(age) ||
-            age > AUTO_BRIEF_MAX_AGE_MS ||
-            (effective === 'auto' && age > AUTO_BRIEF_NOTIFY_AGE_MS)
-        ) {
-            effective = 'notify';
-        }
-        if (effective === 'auto' && session !== undefined && session.has_external_content === 1) {
-            effective = 'notify';
-            log(sessionLogLine(tool, payload, 'auto degraded: session has external content'));
-        }
-        if (effective === 'auto' && session !== undefined) {
-            const cwd = project.gitRoot ?? project.paths[0];
-            if (cwd) {
-                const { branch, count } = await probeGitState(
-                    cwd,
-                    dependencies.gitBranch ?? gitRevParseAbbrevRefHeadAsync,
-                    dependencies.gitCommitCount ?? gitRevListCountHeadAsync,
-                );
-                if (branch !== null && session.git_branch !== null && branch !== session.git_branch) {
-                    effective = 'notify';
-                    // Historical and manually resegmented rows do not have a trustworthy
-                    // baseline. Auto must fail closed to the smaller notify injection.
-                } else if (session.git_commit_count === null) {
-                    effective = 'notify';
-                    log(sessionLogLine(tool, payload, 'auto degraded: stored git commit count unavailable'));
-                } else if (count !== null && count - session.git_commit_count > AUTO_BRIEF_MAX_COMMITS_BEHIND) {
-                    effective = 'notify';
-                } else if (count === null) {
-                    log(sessionLogLine(tool, payload, 'git commit count unavailable; retaining auto'));
-                }
-            }
-        }
-        let body: string;
-        if (effective === 'auto' && session !== undefined) {
-            const rendered = await reader.render(session, undefined, undefined, AUTO_BRIEF_CHAR_BUDGET);
-            if (!projectStillConsented(db, session.project_id)) {
-                log(sessionLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+        };
+        return await withMemoryReadGenerationAsync(db, locked, async () => {
+            let canonicalCwd: string;
+            try {
+                canonicalCwd = realpathSync(payload.cwd);
+            } catch {
                 return { reason: 'project_unavailable_or_unconsented' };
             }
-            if (!rendered.episode) {
-                log(sessionLogLine(tool, payload, `auto degraded: ${rendered.reason}`));
-                effective = 'notify';
-                body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
-            } else {
-                body = autoBody(project, session, rendered.episode.text, rendered.episode.nonce, reader, now);
+            const captureOffRoot = store.consent.captureOffNudge(canonicalCwd);
+            if (captureOffRoot) {
+                const grantHint =
+                    captureOffRoot !== 'refused' && captureOffRoot.state === 'pending'
+                        ? ` · run 'elepha consent grant ${captureOffRoot.path}' to capture here`
+                        : '';
+                const body = `🐘 elepha · capture off · type elepha:list to recall${grantHint}`;
+                const result = emit(body, 'notify', notifyChannel(tool));
+                if ('output' in result) {
+                    log(sessionLogLine(tool, payload, 'emitted capture-off nudge'));
+                }
+                return result;
             }
-        } else {
-            body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
-        }
-        body = withDaemonHealthWarning(body, now, dependencies.daemonHealth ?? classifyDaemonHealth);
-        body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
-        if (isMemoryLocked(db)) {
-            const result = emit(LOCKED_MEMORY_MESSAGE, 'notify', notifyChannel(tool));
+            const project = consentedProject(db, canonicalCwd);
+            if (!project) {
+                return { reason: 'project_unavailable_or_unconsented' };
+            }
+            const reader = new SessionReader(db);
+            const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
+            const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
+            if (reader.consentedTotal(consentedProjects) === 0) {
+                return { reason: 'no_consented_sessions' };
+            }
+            const session = reader.newestSubstantive(project);
+            const now = clock();
+            const age = session === undefined ? undefined : now - Date.parse(endedAt(session));
+            let effective = mode;
+            if (
+                session === undefined ||
+                age === undefined ||
+                !Number.isFinite(age) ||
+                age > AUTO_BRIEF_MAX_AGE_MS ||
+                (effective === 'auto' && age > AUTO_BRIEF_NOTIFY_AGE_MS)
+            ) {
+                effective = 'notify';
+            }
+            if (effective === 'auto' && session !== undefined && session.has_external_content === 1) {
+                effective = 'notify';
+                log(sessionLogLine(tool, payload, 'auto degraded: session has external content'));
+            }
+            if (effective === 'auto' && session !== undefined) {
+                const cwd = project.gitRoot ?? project.paths[0];
+                if (cwd) {
+                    const { branch, count } = await probeGitState(
+                        cwd,
+                        dependencies.gitBranch ?? gitRevParseAbbrevRefHeadAsync,
+                        dependencies.gitCommitCount ?? gitRevListCountHeadAsync,
+                    );
+                    if (branch !== null && session.git_branch !== null && branch !== session.git_branch) {
+                        effective = 'notify';
+                        // Historical and manually resegmented rows do not have a trustworthy
+                        // baseline. Auto must fail closed to the smaller notify injection.
+                    } else if (session.git_commit_count === null) {
+                        effective = 'notify';
+                        log(sessionLogLine(tool, payload, 'auto degraded: stored git commit count unavailable'));
+                    } else if (count !== null && count - session.git_commit_count > AUTO_BRIEF_MAX_COMMITS_BEHIND) {
+                        effective = 'notify';
+                    } else if (count === null) {
+                        log(sessionLogLine(tool, payload, 'git commit count unavailable; retaining auto'));
+                    }
+                }
+            }
+            let body: string;
+            if (effective === 'auto' && session !== undefined) {
+                const rendered = await reader.render(session, undefined, undefined, AUTO_BRIEF_CHAR_BUDGET);
+                if (!projectStillConsented(db, session.project_id)) {
+                    log(sessionLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+                    return { reason: 'project_unavailable_or_unconsented' };
+                }
+                if (!rendered.episode) {
+                    log(sessionLogLine(tool, payload, `auto degraded: ${rendered.reason}`));
+                    effective = 'notify';
+                    body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
+                } else {
+                    body = autoBody(project, session, rendered.episode.text, rendered.episode.nonce, reader, now);
+                }
+            } else {
+                body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
+            }
+            body = withDaemonHealthWarning(body, now, dependencies.daemonHealth ?? classifyDaemonHealth);
+            body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
+            const result = emit(
+                body,
+                effective === 'auto' ? 'brief' : 'notify',
+                effective === 'auto' ? 'additionalContext' : notifyChannel(tool),
+                now,
+            );
             if ('output' in result) {
-                log(sessionLogLine(tool, payload, 'served locked'));
+                log(sessionLogLine(tool, payload, `emitted ${effective}`));
             }
             return result;
-        }
-        const result = emit(
-            body,
-            effective === 'auto' ? 'brief' : 'notify',
-            effective === 'auto' ? 'additionalContext' : notifyChannel(tool),
-            now,
-        );
-        if ('output' in result) {
-            log(sessionLogLine(tool, payload, `emitted ${effective}`));
-        }
-        return result;
+        });
     } catch (error) {
         log(sessionLogLine(tool, payload, (error as Error).message));
         return { reason: 'hook_error' };

@@ -10,7 +10,7 @@
 import { IDLE_CLOSE_MS } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
 import type { MemoryRow, MemoryStore, SessionRow } from '../storage/memory-store.js';
-import { isMemoryLocked } from '../storage/paranoid-gate.js';
+import { type AuthenticatedReadGeneration, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { mergeRollupContent, ROLLUP_VERSION, type RollupDecision, type RollupStore } from '../storage/rollup-store.js';
 import { chunkTurns, type RollupTurnInput } from '../summarizer/rollup-prompt.js';
 import { attributeDecisions, type RollupProvider } from '../summarizer/rollup-provider.js';
@@ -100,10 +100,25 @@ export class RollupService {
         kind: SessionKind,
         parentSessionId: number | null,
         state: 'live' | 'final',
+        existingGeneration?: AuthenticatedReadGeneration,
     ): Promise<RollupOutcome> {
-        if (isMemoryLocked(this.store.database)) {
-            return { wrote: false, complete: false, deferred: 'locked' };
-        }
+        const progress = { wrote: false };
+        return withMemoryReadGenerationAsync(
+            this.store.database,
+            () => ({ wrote: progress.wrote, complete: false, deferred: 'locked' }),
+            (generation) => this.rollupSessionGuarded(session, kind, parentSessionId, state, generation, progress),
+            existingGeneration,
+        );
+    }
+
+    private async rollupSessionGuarded(
+        session: SessionRow,
+        kind: SessionKind,
+        parentSessionId: number | null,
+        state: 'live' | 'final',
+        generation: AuthenticatedReadGeneration,
+        progress: { wrote: boolean },
+    ): Promise<RollupOutcome> {
         const all = this.store.listMemoriesForSession(session.id);
         if (all.length === 0) {
             return { wrote: false, complete: true };
@@ -157,9 +172,6 @@ export class RollupService {
         let wroteAny = false;
 
         for (const [index, batch] of batches.entries()) {
-            if (isMemoryLocked(this.store.database)) {
-                return { wrote: wroteAny, complete: false, deferred: 'locked' };
-            }
             if (batch.omitted > 0) {
                 // A single turn too large for one batch is the one irreducible
                 // ceiling. It binds from the oldest end and it is never silent.
@@ -181,14 +193,19 @@ export class RollupService {
                 return { wrote: wroteAny, complete: false };
             }
 
-            const result = carry
-                ? await this.provider.merge(
-                      { title: carry.title, summary: carry.summary, decisions: carry.decisions, pendingItems: carry.pendingItems },
-                      batch.turns,
-                  )
-                : await this.provider.rollup(batch.turns);
-
-            if (isMemoryLocked(this.store.database)) {
+            const result = await withMemoryReadGenerationAsync(
+                this.store.database,
+                () => undefined,
+                () =>
+                    carry
+                        ? this.provider.merge(
+                              { title: carry.title, summary: carry.summary, decisions: carry.decisions, pendingItems: carry.pendingItems },
+                              batch.turns,
+                          )
+                        : this.provider.rollup(batch.turns),
+                generation,
+            );
+            if (result === undefined) {
                 return { wrote: wroteAny, complete: false, deferred: 'locked' };
             }
 
@@ -269,6 +286,7 @@ export class RollupService {
             }
 
             wroteAny = true;
+            progress.wrote = true;
             expected = batchHighWater;
             carry = {
                 title: result.output.title,
