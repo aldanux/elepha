@@ -1,9 +1,11 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
+    closeSync,
     copyFileSync,
     existsSync,
     linkSync,
+    lstatSync,
     mkdirSync,
     readdirSync,
     readFileSync,
@@ -21,16 +23,41 @@ import {
     REQUIRED_RESTORE_TABLES,
     RESTORE_CONSENT_CHANGED_ERROR,
     RESTORE_CONSENT_TRIGGER_ERROR,
+    RESTORE_CONTROL_TRIGGER_ERROR,
+    RESTORE_ENCRYPTION_CHANGED_ERROR,
+    RESTORE_EVICTIONS_CHANGED_ERROR,
+    RESTORE_INJECTIONS_CHANGED_ERROR,
+    RESTORE_PARANOID_CHANGED_ERROR,
+    RESTORE_STAGE_CHANGED_ERROR,
     RESTORE_TOMBSTONES_CHANGED_ERROR,
     runRestoreOperation,
 } from '../../src/cli/commands/restore.js';
+import { DATABASE_SCHEMA_METADATA_MAX_CHARS, DATABASE_SCHEMA_METADATA_MAX_ROWS } from '../../src/config/constants.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
+import { recordHookOutput } from '../../src/hooks/output.js';
+import { filterTurn } from '../../src/rendering/filtered-turn.js';
+import { SessionReader } from '../../src/serving/session-reader.js';
 import { writeBackup } from '../../src/storage/backup.js';
-import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
+import {
+    type DatabaseEncryptionRuntime,
+    databaseKey,
+    encryptionMetadataPath,
+    readEncryptionMetadata,
+} from '../../src/storage/database-encryption.js';
 import { DATABASE_LIFECYCLE_AMBIGUOUS, DATABASE_LIFECYCLE_BUSY, databaseLifecyclePaths } from '../../src/storage/database-lifecycle.js';
-import { openKeyedDatabase, openManagedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
+import { type DatabaseMigrationRuntime, migratePrimaryDatabaseToEncrypted } from '../../src/storage/database-migration.js';
+import { openDb, openKeyedDatabase, openManagedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
+import { DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import { assertCanonicalDurableCaptureSchema, DURABLE_CAPTURE_SCHEMA_MISMATCH } from '../../src/storage/durable-capture-integrity.js';
+import {
+    BACKUP_SOURCE_COMPANION_ERROR,
+    createPrivateEmptyDatabaseDescriptor,
+    DATABASE_SCHEMA_METADATA_LIMIT_ERROR,
+    inspectPrivateEmptyDatabaseDescriptor,
+    writeEncryptedDatabaseImport,
+} from '../../src/storage/encrypted-database-export.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { enableParanoidMode, isMemoryLocked, unlockMemory } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
@@ -79,6 +106,69 @@ function encryptionRuntime(): DatabaseEncryptionRuntime {
         randomUUID: () => '11111111-1111-4111-8111-111111111111',
         keyFilePath: (dbPath) => path.join(path.dirname(dbPath), 'restore.keydata'),
     };
+}
+
+function migrationRuntime(directory: string): DatabaseMigrationRuntime {
+    return {
+        ...encryptionRuntime(),
+        arch: 'x64',
+        libc: 'glibc',
+        statePaths: {
+            lock: path.join(directory, 'database-migration.lock'),
+            manifest: path.join(directory, 'database-migration.json'),
+        },
+        availableBytes: () => BigInt(Number.MAX_SAFE_INTEGER),
+    };
+}
+
+function canReadDatabase(dbPath: string, key?: Buffer): boolean {
+    let db: Database.Database | undefined;
+    try {
+        db =
+            key === undefined
+                ? new Database(dbPath, { readonly: true, fileMustExist: true })
+                : openKeyedDatabase(dbPath, key, {
+                      readonly: true,
+                      fileMustExist: true,
+                  });
+        db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+        return true;
+    } catch {
+        return false;
+    } finally {
+        db?.close();
+    }
+}
+
+const C22_SOURCE_COMPANIONS = ['-wal', '-shm', '-journal'] as const;
+
+function removeC22SourceCompanions(dbPath: string): void {
+    for (const suffix of C22_SOURCE_COMPANIONS) {
+        if (existsSync(`${dbPath}${suffix}`)) unlinkSync(`${dbPath}${suffix}`);
+    }
+}
+
+function c22SourceStat(dbPath: string) {
+    const stat = lstatSync(dbPath, { bigint: true });
+    return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs, nlink: stat.nlink };
+}
+
+function c22Schema(db: Database.Database): unknown[] {
+    return db.prepare('SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type, name').all();
+}
+
+function c22ShadowRows(db: Database.Database): Record<string, unknown[]> {
+    const tables = db
+        .prepare("SELECT name, wr FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow' ORDER BY name")
+        .all() as Array<{ name: string; wr: number }>;
+    return Object.fromEntries(
+        tables.map(({ name, wr }) => {
+            const quoted = `"${name.replaceAll('"', '""')}"`;
+            const columns = db.prepare("SELECT name FROM pragma_table_xinfo(?, 'main') ORDER BY cid").all(name) as Array<{ name: string }>;
+            const order = wr === 0 ? 'rowid' : columns.map(({ name: column }) => `"${column.replaceAll('"', '""')}"`).join(', ');
+            return [name, db.prepare(`SELECT * FROM ${quoted} ORDER BY ${order}`).raw().safeIntegers().all() as unknown[]];
+        }),
+    );
 }
 
 async function encryptDatabase(dbPath: string, runtime: DatabaseEncryptionRuntime): Promise<void> {
@@ -243,9 +333,13 @@ function populate(dbPath: string, suffix: string): void {
         '2026-08-01T00:00:00.000Z',
         'cli',
     );
-    db.prepare(
-        'INSERT INTO injections (tool, native_session_id, injected_at, injection_id, body_hash, body) VALUES (?, ?, ?, ?, ?, ?)',
-    ).run('codex', `session-${suffix}`, '2026-08-01T00:00:00.000Z', `injection-${suffix}`, `hash-${suffix}`, 'body');
+    store.recordInjection({
+        tool: 'codex',
+        nativeSessionId: `session-${suffix}`,
+        injectedAt: '2026-08-01T00:00:00.000Z',
+        injectionId: `injection-${suffix}`,
+        body: 'body',
+    });
     db.prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)').run(
         'codex',
         `purged-${suffix}`,
@@ -321,12 +415,232 @@ function replaceWithLegacySessionsTable(db: Database.Database): void {
 }
 
 describe('elepha restore', () => {
+    it.each([
+        { encrypted: false, label: 'plaintext' },
+        { encrypted: true, label: 'same-key encrypted' },
+    ])('C22 imports a sealed readonly $label source into a pre-keyed stage with exact native fidelity', ({ encrypted }) => {
+        const fixture = createTestDb(`elepha-c22-native-${encrypted ? 'encrypted' : 'plaintext'}-`);
+        fixture.close();
+        const sourcePath = path.join(fixture.directory, 'clean-wal-source.db');
+        const destinationPath = path.join(fixture.directory, 'encrypted-stage.db');
+        if (encrypted) closeSync(createPrivateEmptyDatabaseDescriptor(sourcePath));
+        const source = encrypted ? openKeyedDatabase(sourcePath, FIXED_KEY, { fileMustExist: true }) : new Database(sourcePath);
+        source.exec(`
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE import_probe (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload BLOB NOT NULL,
+                touched INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX import_probe_payload ON import_probe(payload);
+            CREATE TRIGGER import_probe_au AFTER UPDATE OF payload ON import_probe
+            BEGIN
+                UPDATE import_probe SET touched = touched + 1 WHERE id = NEW.id;
+            END;
+            CREATE VIEW import_probe_view AS SELECT id, hex(payload) AS payload_hex FROM import_probe;
+            CREATE TABLE import_rowid_probe (payload BLOB NOT NULL);
+            CREATE VIRTUAL TABLE import_fts_probe USING fts5(content);
+        `);
+        source.prepare('INSERT INTO import_probe (id, payload) VALUES (?, ?)').run(73, Buffer.from([255, 0, 128, 7]));
+        source.prepare('INSERT INTO import_rowid_probe (rowid, payload) VALUES (?, ?)').run(9_007_199_254_740_993n, Buffer.from([9, 0, 7]));
+        source.prepare('INSERT INTO import_fts_probe (rowid, content) VALUES (?, ?)').run(91, 'c22 native import token');
+        source.prepare('INSERT INTO import_fts_probe (rowid, content) VALUES (?, ?)').run(107, 'deleted token');
+        source.prepare('DELETE FROM import_fts_probe WHERE rowid = ?').run(107);
+        source.pragma('wal_checkpoint(TRUNCATE)');
+        source.close();
+        removeC22SourceCompanions(sourcePath);
+
+        const expected = encrypted
+            ? openKeyedDatabase(sourcePath, FIXED_KEY, { readonly: true, fileMustExist: true })
+            : new Database(sourcePath, { readonly: true, fileMustExist: true });
+        const expectedSchema = c22Schema(expected);
+        const expectedShadows = c22ShadowRows(expected);
+        const expectedSequence = expected.prepare('SELECT name, seq FROM sqlite_sequence ORDER BY name').safeIntegers().all();
+        expect(() => expected.prepare("UPDATE import_probe SET payload = X'00'").run()).toThrow(
+            expect.objectContaining({ code: 'SQLITE_READONLY' }),
+        );
+        expected.close();
+        const admitted = C22_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`)).map((suffix) => ({
+            suffix,
+            size: statSync(`${sourcePath}${suffix}`).size,
+        }));
+        expect(admitted).toEqual([
+            { suffix: '-wal', size: 0 },
+            { suffix: '-shm', size: 32_768 },
+        ]);
+        removeC22SourceCompanions(sourcePath);
+        const sourceBytes = readFileSync(sourcePath);
+        const sourceStat = c22SourceStat(sourcePath);
+
+        const destinationDescriptor = createPrivateEmptyDatabaseDescriptor(destinationPath);
+        const destinationIdentity = inspectPrivateEmptyDatabaseDescriptor(destinationDescriptor);
+        closeSync(destinationDescriptor);
+        const importSource = () =>
+            writeEncryptedDatabaseImport(
+                sourcePath,
+                { ...sourceStat },
+                destinationPath,
+                destinationIdentity,
+                FIXED_KEY,
+                encrypted ? FIXED_KEY : undefined,
+            );
+        writeFileSync(`${sourcePath}-wal`, '');
+        expect(importSource).toThrow(BACKUP_SOURCE_COMPANION_ERROR);
+        expect(existsSync(`${sourcePath}-wal`)).toBe(true);
+        unlinkSync(`${sourcePath}-wal`);
+        importSource();
+
+        expect(readFileSync(sourcePath)).toEqual(sourceBytes);
+        expect(c22SourceStat(sourcePath)).toEqual(sourceStat);
+        expect(C22_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`))).toEqual([]);
+        expect(readFileSync(destinationPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        expect(canReadDatabase(destinationPath)).toBe(false);
+        const imported = openKeyedDatabase(destinationPath, FIXED_KEY, { fileMustExist: true });
+        expect(c22Schema(imported)).toEqual(expectedSchema);
+        expect(c22ShadowRows(imported)).toEqual(expectedShadows);
+        expect(imported.prepare('SELECT name, seq FROM sqlite_sequence ORDER BY name').safeIntegers().all()).toEqual(expectedSequence);
+        expect(imported.prepare('SELECT rowid, hex(payload) FROM import_rowid_probe').raw().safeIntegers().get()).toEqual([
+            9_007_199_254_740_993n,
+            '090007',
+        ]);
+        expect(imported.prepare("SELECT rowid, content FROM import_fts_probe WHERE import_fts_probe MATCH 'native'").all()).toEqual([
+            { rowid: 91, content: 'c22 native import token' },
+        ]);
+        expect(imported.prepare('SELECT * FROM import_probe_view').all()).toEqual([{ id: 73, payload_hex: 'FF008007' }]);
+        imported.prepare('UPDATE import_probe SET payload = ? WHERE id = ?').run(Buffer.from([1]), 73);
+        expect(imported.prepare('SELECT touched FROM import_probe WHERE id = 73').get()).toEqual({ touched: 1 });
+        imported.close();
+    });
+
+    it.each([
+        {
+            label: 'schema object rows',
+            expectedRows: { schema_rows: 257n, table_rows: 2n },
+            populate(db: Database.Database) {
+                db.exec('CREATE TABLE metadata_anchor (value INTEGER)');
+                db.exec(
+                    Array.from(
+                        { length: DATABASE_SCHEMA_METADATA_MAX_ROWS },
+                        (_, index) => `CREATE INDEX metadata_index_${index} ON metadata_anchor(value)`,
+                    ).join(';'),
+                );
+            },
+        },
+        {
+            label: 'main table-list rows',
+            expectedRows: { schema_rows: 256n, table_rows: 257n },
+            populate(db: Database.Database) {
+                db.exec(
+                    Array.from(
+                        { length: DATABASE_SCHEMA_METADATA_MAX_ROWS },
+                        (_, index) => `CREATE TABLE metadata_table_${index} (value INTEGER)`,
+                    ).join(';'),
+                );
+            },
+        },
+        {
+            label: 'aggregate schema text',
+            expectedRows: { schema_rows: 1n, table_rows: 2n },
+            populate(db: Database.Database) {
+                db.exec(`CREATE VIEW metadata_view AS SELECT '${'x'.repeat(DATABASE_SCHEMA_METADATA_MAX_CHARS)}' AS value`);
+            },
+        },
+    ])('C22 rejects $label before encrypted reconstruction materializes unbounded metadata', ({ expectedRows, populate }) => {
+        const directory = withGrantableTestDir('elepha-c22-schema-metadata-');
+        const sourcePath = path.join(directory, 'source.db');
+        const destinationPath = path.join(directory, 'encrypted-stage.db');
+        const source = new Database(sourcePath);
+        populate(source);
+        expect(
+            source
+                .prepare(
+                    `SELECT (SELECT COUNT(*) FROM sqlite_schema WHERE sql IS NOT NULL) AS schema_rows,
+                            (SELECT COUNT(*) FROM pragma_table_list WHERE schema = 'main') AS table_rows`,
+                )
+                .safeIntegers()
+                .get(),
+        ).toEqual(expectedRows);
+        source.close();
+        const descriptor = createPrivateEmptyDatabaseDescriptor(destinationPath);
+        const destinationIdentity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
+        closeSync(descriptor);
+
+        expect(() =>
+            writeEncryptedDatabaseImport(sourcePath, c22SourceStat(sourcePath), destinationPath, destinationIdentity, FIXED_KEY),
+        ).toThrow(DATABASE_SCHEMA_METADATA_LIMIT_ERROR);
+    });
+
+    it.each([
+        { encrypted: false, label: 'plaintext' },
+        { encrypted: true, label: 'encrypted' },
+    ])('C22 rejects excessive schema metadata before $label restore confirmation or active mutation', async ({ encrypted }) => {
+        const active = createTestDb('elepha-c22-schema-active-');
+        const candidate = createTestDb('elepha-c22-schema-candidate-');
+        candidate.db.exec(`CREATE VIEW metadata_view AS SELECT '${'x'.repeat(DATABASE_SCHEMA_METADATA_MAX_CHARS)}' AS value`);
+        candidate.close();
+        active.close();
+        const runtime = encryptionRuntime();
+        if (encrypted) {
+            await encryptDatabase(active.dbPath, runtime);
+        }
+        const activeBytes = readFileSync(active.dbPath);
+        const restoreTemp = isolateRestoreTemp();
+        const confirm = vi.fn(async () => false);
+        const snapshot = vi.fn(() => 'unused');
+
+        await expect(
+            runRestoreOperation(candidate.dbPath, {
+                dbPath: active.dbPath,
+                encryption: runtime,
+                daemonHealth: () => ({ healthy: false, state: 'STOPPED' }),
+                confirm,
+                writeBackup: snapshot,
+            }),
+        ).rejects.toThrow(DATABASE_SCHEMA_METADATA_LIMIT_ERROR);
+        expect(confirm).not.toHaveBeenCalled();
+        expect(snapshot).not.toHaveBeenCalled();
+        expect(readFileSync(active.dbPath)).toEqual(activeBytes);
+        expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
+    });
+
+    it('C22 leaves only ciphertext stage data when native import fails foreign-key verification', () => {
+        const fixture = createTestDb('elepha-c22-import-failure-');
+        fixture.close();
+        const sourcePath = path.join(fixture.directory, 'invalid-clean-wal-source.db');
+        const stagePath = path.join(fixture.directory, 'failed-encrypted-stage.db');
+        const source = new Database(sourcePath);
+        source.exec(`
+            PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE parent (id INTEGER PRIMARY KEY);
+            CREATE TABLE child (parent_id INTEGER NOT NULL REFERENCES parent(id));
+            INSERT INTO child VALUES (1);
+        `);
+        source.pragma('wal_checkpoint(TRUNCATE)');
+        source.close();
+        removeC22SourceCompanions(sourcePath);
+        const sourceBytes = readFileSync(sourcePath);
+        const sourceStat = c22SourceStat(sourcePath);
+        const descriptor = createPrivateEmptyDatabaseDescriptor(stagePath);
+        const stageIdentity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
+        closeSync(descriptor);
+        expect(() => writeEncryptedDatabaseImport(sourcePath, sourceStat, stagePath, stageIdentity, FIXED_KEY)).toThrow(
+            'Imported database failed foreign_key_check.',
+        );
+        expect(readFileSync(stagePath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        expect(canReadDatabase(stagePath)).toBe(false);
+        expect(canReadDatabase(stagePath, FIXED_KEY)).toBe(true);
+        expect(readFileSync(sourcePath)).toEqual(sourceBytes);
+        expect(c22SourceStat(sourcePath)).toEqual(sourceStat);
+        expect(C22_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`))).toEqual([]);
+    });
+
     it('restores an encrypted full export with identical schema and row counts using the installation key', async () => {
         const active = createTestDb('elepha-restore-encrypted-active-');
         const candidate = createTestDb('elepha-restore-encrypted-candidate-');
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
-        active.db.exec('DELETE FROM purged_transcripts');
+        active.db.exec('DELETE FROM purged_transcripts; DELETE FROM injections');
         active.close();
         candidate.close();
         const runtime = encryptionRuntime();
@@ -338,7 +652,9 @@ describe('elepha restore', () => {
         const expectedCounts = Object.fromEntries(
             REQUIRED_RESTORE_TABLES.map((table) => [
                 table,
-                Number((candidateDb.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
+                table === 'injections'
+                    ? 0
+                    : Number((candidateDb.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
             ]),
         );
         exportAll(candidateDb, backup, FIXED_KEY);
@@ -369,6 +685,536 @@ describe('elepha restore', () => {
         expect(result.snapshotPath).toBeDefined();
         expect(readFileSync(result.snapshotPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
     });
+
+    it('C22 imports a plaintext legacy backup into the active encrypted installation and preserves its locked authority', async () => {
+        const active = createTestDb('elepha-c22-plaintext-active-');
+        active.db.pragma('wal_checkpoint(TRUNCATE)');
+        const backup = path.join(active.directory, 'plaintext-legacy.db');
+        copyFileSync(active.dbPath, backup);
+        const legacy = new Database(backup);
+        replaceWithLegacySessionsTable(legacy);
+        legacy.exec(`
+            DROP TABLE filtered_turns_fts;
+            DROP TABLE filtered_turns;
+            DROP TABLE durable_capture_status;
+            DROP TABLE durable_capture_usage;
+        `);
+        legacy.close();
+        const sourceBytes = readFileSync(backup);
+        active.close();
+
+        const encryption = encryptionRuntime();
+        await encryptDatabase(active.dbPath, encryption);
+        const enrolled = await openDb(active.dbPath, { encryption });
+        enableParanoidMode(enrolled, 'c22 restore passphrase');
+        const authorityBefore = enrolled
+            .prepare('SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1')
+            .get();
+        enrolled.close();
+        const metadataBefore = readEncryptionMetadata(encryptionMetadataPath(active.dbPath));
+        const keyPath = encryption.keyFilePath!(active.dbPath);
+        const keyBefore = readFileSync(keyPath);
+        const restoreTemp = isolateRestoreTemp();
+        let stageWasPlaintext: boolean | undefined;
+
+        const result = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            encryption,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: async () => {
+                const staged = stagedRestoreDirectories(restoreTemp);
+                expect(staged).toHaveLength(1);
+                stageWasPlaintext =
+                    readFileSync(path.join(restoreTemp, staged[0]!, 'candidate.db'))
+                        .subarray(0, 16)
+                        .toString('binary') === 'SQLite format 3\0';
+                return true;
+            },
+        });
+
+        const activeHeaderAfterRestore = readFileSync(active.dbPath).subarray(0, 16).toString('binary');
+        const unkeyedReadable = canReadDatabase(active.dbPath);
+        const keyedReadable = canReadDatabase(active.dbPath, FIXED_KEY);
+        const restored = await openManagedDatabase(active.dbPath, { readonly: true, fileMustExist: true, encryption });
+        const authorityAfter = restored
+            .prepare('SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1')
+            .get();
+        const lockedAfter = isMemoryLocked(restored);
+        const readStateAfter = new SessionReader(restored).serveState();
+        restored.close();
+        let migration: unknown;
+        try {
+            migration = await migratePrimaryDatabaseToEncrypted(active.dbPath, migrationRuntime(active.directory));
+        } catch (error) {
+            migration = { error: error instanceof Error ? error.message : String(error) };
+        }
+
+        expect.soft(stageWasPlaintext).toBe(false);
+        expect.soft(activeHeaderAfterRestore).not.toBe('SQLite format 3\0');
+        expect.soft(unkeyedReadable).toBe(false);
+        expect.soft(keyedReadable).toBe(true);
+        expect.soft(authorityAfter).toEqual(authorityBefore);
+        expect.soft(lockedAfter).toBe(true);
+        expect.soft(readStateAfter).toBe('locked');
+        expect.soft(migration).toEqual({ status: 'already-encrypted' });
+        expect.soft(readEncryptionMetadata(encryptionMetadataPath(active.dbPath))).toEqual(metadataBefore);
+        expect.soft(readFileSync(keyPath)).toEqual(keyBefore);
+        expect.soft(readFileSync(backup)).toEqual(sourceBytes);
+        expect.soft(result.snapshotPath).toBeDefined();
+        expect.soft(readFileSync(result.snapshotPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+    });
+
+    it('C22 preserves a hook injection recorded after the backup so its quote-back remains suppressed', async () => {
+        const active = createTestDb('elepha-c22-injection-active-');
+        populate(active.dbPath, 'c22-injection');
+        active.close();
+        const encryption = encryptionRuntime();
+        await encryptDatabase(active.dbPath, encryption);
+        const current = await openDb(active.dbPath, { encryption });
+        const backup = path.join(active.directory, 'before-current-injection.db');
+        exportAll(current, backup, FIXED_KEY);
+        current.prepare('DELETE FROM injections').run();
+        const store = new MemoryStore(current);
+        const body = 'current hook output must remain attributable after restore';
+        const output = recordHookOutput({
+            store,
+            tool: 'codex',
+            nativeSessionId: 'c22-current-chat',
+            body,
+            kind: 'brief',
+            injectedAt: '2026-09-06T01:00:00.000Z',
+        });
+        expect(output).toContain(body);
+        current.close();
+
+        await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            encryption,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+        });
+
+        const restored = await openDb(active.dbPath, { encryption });
+        const restoredStore = new MemoryStore(restored);
+        const rows = restoredStore.injectionsForSession('codex', 'c22-current-chat', '2026-09-06T01:00:01.000Z');
+        expect.soft(restored.prepare('SELECT body FROM injections').all()).toEqual([{ body }]);
+        const quoteBack = restoredStore.isInjectionQuoteBack({
+            tool: 'codex',
+            sessionId: 'c22-current-chat',
+            sourcePath: path.join(active.directory, 'c22-current-chat.jsonl'),
+            projectPath: active.directory,
+            turnIndex: 1,
+            startedAt: '2026-09-06T01:00:00.000Z',
+            endedAt: '2026-09-06T01:00:01.000Z',
+            userMessage: 'quote follows',
+            assistantText: body,
+            toolCalls: [],
+            cursor: '1',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        });
+        restored.close();
+
+        expect.soft(rows).toEqual([expect.objectContaining({ body, tool: 'codex', native_session_id: 'c22-current-chat' })]);
+        expect.soft(quoteBack).toBe(true);
+    });
+
+    it('C22 preserves current terminal eviction through restore so backfill and search cannot resurrect it', async () => {
+        const active = createTestDb('elepha-c22-eviction-active-');
+        const project = seedProject(active, { path: path.join(active.directory, 'project') });
+        active.store.consent.grant(project.path);
+        const sourcePath = path.join(active.directory, 'terminal-session.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(active, { project, nativeId: 'c22-terminal-session', sourcePath });
+        seedMemory(active, { project, session, turnIndex: 0 });
+        const candidateOnly = seedSession(active, { project, nativeId: 'c22-candidate-terminal', sourcePath });
+        seedMemory(active, { project, session: candidateOnly, turnIndex: 0 });
+        active.close();
+        const encryption = encryptionRuntime();
+        await encryptDatabase(active.dbPath, encryption);
+        const current = await openDb(active.dbPath, { encryption });
+        const backup = path.join(active.directory, 'before-current-eviction.db');
+        const terminal = current.prepare(
+            `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+             VALUES (?, 'evicted', 1, ?)
+             ON CONFLICT (session_id) DO UPDATE SET state = 'evicted', updated_at = excluded.updated_at`,
+        );
+        terminal.run(candidateOnly.id, '2026-09-06T01:59:00.000Z');
+        exportAll(current, backup, FIXED_KEY);
+        current.prepare("UPDATE durable_capture_status SET state = 'complete' WHERE session_id = ?").run(candidateOnly.id);
+        terminal.run(session.id, '2026-09-06T02:00:00.000Z');
+        const currentOnlyProjectPath = path.join(project.path, 'current-only-project');
+        const currentStore = new MemoryStore(current, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        const currentOnlyProject = currentStore.upsertProject(currentOnlyProjectPath);
+        const currentOnlySourcePath = path.join(active.directory, 'current-only.jsonl');
+        writeFileSync(currentOnlySourcePath, '{}\n');
+        const currentOnly = currentStore.upsertSession('codex', 'c22-current-only-absent', currentOnlyProject.id, currentOnlySourcePath);
+        current
+            .prepare('UPDATE projects SET first_seen_at = ?, last_seen_at = ? WHERE id = ?')
+            .run('2026-09-06T01:57:00.000Z', '2026-09-06T01:58:00.000Z', currentOnlyProject.id);
+        current
+            .prepare('UPDATE sessions SET segment_index = 2, started_at = ?, last_ingested_at = ? WHERE id = ?')
+            .run('2026-09-06T01:58:00.000Z', '2026-09-06T01:59:00.000Z', currentOnly.id);
+        current.prepare("INSERT INTO durable_capture_status VALUES (?, 'evicted', 1, ?)").run(currentOnly.id, '2026-09-06T02:00:00.000Z');
+        current.close();
+
+        await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            encryption,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+        });
+
+        const restored = await openDb(active.dbPath, { encryption });
+        const restoredStore = new MemoryStore(restored);
+        const backfill = new DurableCaptureBackfillStore(restored, restoredStore.consent);
+        const anchor = restored
+            .prepare(
+                `SELECT s.id, s.project_id, s.tool, s.native_id, s.segment_index, s.source_path, s.started_at, s.last_ingested_at,
+                        p.path AS project_path, p.first_seen_at, p.last_seen_at, d.state
+                 FROM sessions s
+                 JOIN projects p ON p.id = s.project_id
+                 JOIN durable_capture_status d ON d.session_id = s.id
+                 WHERE s.tool = 'codex' AND s.native_id = 'c22-current-only-absent'`,
+            )
+            .get() as Record<string, unknown>;
+        expect.soft(anchor).toEqual({
+            id: expect.any(Number),
+            project_id: expect.any(Number),
+            tool: 'codex',
+            native_id: 'c22-current-only-absent',
+            segment_index: 2,
+            source_path: currentOnlySourcePath,
+            started_at: '2026-09-06T01:58:00.000Z',
+            last_ingested_at: '2026-09-06T01:59:00.000Z',
+            project_path: currentOnlyProjectPath,
+            first_seen_at: '2026-09-06T01:57:00.000Z',
+            last_seen_at: '2026-09-06T01:58:00.000Z',
+            state: 'evicted',
+        });
+        const ingested = restoredStore.recordIngestedTurn(
+            {
+                tool: 'codex',
+                sessionId: 'c22-current-only-absent',
+                sourcePath: currentOnlySourcePath,
+                projectPath: currentOnlyProjectPath,
+                turnIndex: 0,
+                startedAt: '2026-09-06T02:01:00.000Z',
+                endedAt: '2026-09-06T02:01:01.000Z',
+                userMessage: 'c22terminalresurrectionneedle',
+                assistantText: 'raw response',
+                toolCalls: [],
+                cursor: '1',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            },
+            {},
+            false,
+            { decisions: [], pending_items: [], status: 'ok' },
+            false,
+            undefined,
+            undefined,
+            { projectIdentity: { gitRoot: null, gitRemote: null, gitRootCommit: null }, gitCommitCount: null },
+        );
+        expect
+            .soft(ingested)
+            .toEqual(expect.objectContaining({ inserted: true, session: expect.objectContaining({ id: anchor.id, segment_index: 2 }) }));
+        const candidates = backfill.listCandidates([project.id, Number(anchor.project_id)], 10);
+        const results = [];
+        for (const candidate of candidates) {
+            const work = backfill.begin(candidate, '2026-09-06T02:01:00.000Z');
+            const touched = new Set<number>();
+            for (const turnIndex of work?.missingTurnIndexes ?? []) {
+                const result = backfill.record(
+                    candidate,
+                    turnIndex,
+                    filterTurn({
+                        userMessage: 'c22terminalresurrectionneedle',
+                        assistantText: 'backfilled response',
+                        toolCalls: [],
+                    }),
+                    '2026-09-06T02:01:00.000Z',
+                );
+                results.push(result);
+                if ('sessionId' in result) touched.add(result.sessionId);
+            }
+            backfill.finish(candidate, touched, 'success', '2026-09-06T02:01:01.000Z');
+        }
+
+        expect.soft(candidates).toEqual([]);
+        expect.soft(results).toEqual([]);
+        expect
+            .soft(
+                restored
+                    .prepare(
+                        "SELECT s.native_id, d.state FROM sessions s JOIN durable_capture_status d ON d.session_id = s.id WHERE d.state = 'evicted' ORDER BY s.native_id",
+                    )
+                    .all(),
+            )
+            .toEqual([
+                { native_id: 'c22-candidate-terminal', state: 'evicted' },
+                { native_id: 'c22-current-only-absent', state: 'evicted' },
+                { native_id: 'c22-terminal-session', state: 'evicted' },
+            ]);
+        expect.soft(restored.prepare('SELECT memory_id FROM filtered_turns').all()).toEqual([]);
+        expect
+            .soft(
+                restored
+                    .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c22terminalresurrectionneedle'")
+                    .all(),
+            )
+            .toEqual([]);
+        expect.soft(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
+        restored.close();
+    });
+
+    it('C22 preserves plaintext-active injection provenance and terminal eviction', async () => {
+        const active = createTestDb('elepha-c22-plaintext-controls-');
+        const project = seedProject(active, { path: path.join(active.directory, 'project') });
+        active.store.consent.grant(project.path);
+        const sourcePath = path.join(active.directory, 'plaintext-terminal.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(active, { project, nativeId: 'c22-plaintext-terminal', sourcePath });
+        seedMemory(active, { project, session, assistantText: 'c22plaintextresurrectionneedle' });
+        recordHookOutput({
+            store: active.store,
+            tool: 'codex',
+            nativeSessionId: 'c22-plaintext-chat',
+            body: 'candidate forged hook output',
+            kind: 'brief',
+            injectedAt: '2026-09-06T04:00:00.000Z',
+        });
+        const backup = path.join(active.directory, 'before-plaintext-controls.db');
+        fullBackup(active.dbPath, backup);
+        active.db.prepare('DELETE FROM injections').run();
+        const body = 'authentic plaintext-active hook output';
+        recordHookOutput({
+            store: active.store,
+            tool: 'codex',
+            nativeSessionId: 'c22-plaintext-chat',
+            body,
+            kind: 'brief',
+            injectedAt: '2026-09-06T04:01:00.000Z',
+        });
+        active.db
+            .prepare(
+                "INSERT INTO durable_capture_status VALUES (?, 'evicted', 1, ?) ON CONFLICT(session_id) DO UPDATE SET state = 'evicted', updated_at = excluded.updated_at",
+            )
+            .run(session.id, '2026-09-06T04:01:00.000Z');
+        active.close();
+        await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+        });
+
+        const restored = openUnmanagedDb(active.dbPath);
+        const store = new MemoryStore(restored);
+        const quoteBack = store.isInjectionQuoteBack({
+            tool: 'codex',
+            sessionId: 'c22-plaintext-chat',
+            sourcePath,
+            projectPath: project.path,
+            turnIndex: 1,
+            startedAt: '2026-09-06T04:01:00.000Z',
+            endedAt: '2026-09-06T04:02:00.000Z',
+            userMessage: 'quote follows',
+            assistantText: body,
+            toolCalls: [],
+            cursor: '1',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        });
+        const candidates = new DurableCaptureBackfillStore(restored, store.consent).listCandidates([project.id], 10);
+
+        expect.soft(restored.prepare('SELECT body FROM injections').all()).toEqual([{ body }]);
+        expect.soft(quoteBack).toBe(true);
+        expect.soft(candidates).toEqual([]);
+        expect.soft(restored.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+            state: 'evicted',
+        });
+        expect.soft(restored.prepare('SELECT memory_id FROM filtered_turns').all()).toEqual([]);
+        expect
+            .soft(
+                restored
+                    .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c22plaintextresurrectionneedle'")
+                    .all(),
+            )
+            .toEqual([]);
+        expect.soft(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
+        restored.close();
+    });
+
+    it.each([
+        ['paranoid', RESTORE_PARANOID_CHANGED_ERROR],
+        ['injection', RESTORE_INJECTIONS_CHANGED_ERROR],
+        ['eviction', RESTORE_EVICTIONS_CHANGED_ERROR],
+    ] as const)('C22 aborts before snapshot when active %s control changes during confirmation', async (control, expectedError) => {
+        const active = createTestDb(`elepha-c22-${control}-stale-`);
+        populate(active.dbPath, control);
+        active.close();
+        const encryption = encryptionRuntime();
+        await encryptDatabase(active.dbPath, encryption);
+        const current = await openDb(active.dbPath, { encryption });
+        current.prepare('DELETE FROM injections').run();
+        if (control === 'paranoid') enableParanoidMode(current, 'c22 stale passphrase');
+        const backup = path.join(active.directory, 'control-backup.db');
+        exportAll(current, backup, FIXED_KEY);
+        current.close();
+        let activeBytes!: Buffer;
+        const snapshot = vi.fn((_db: Database.Database, _dbPath: string) => 'unreachable');
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                encryption,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                writeBackup: snapshot,
+                confirm: async () => {
+                    const changed = await openDb(active.dbPath, { encryption });
+                    if (control === 'paranoid') unlockMemory(changed, 'c22 stale passphrase');
+                    else if (control === 'injection')
+                        new MemoryStore(changed).recordInjection({
+                            tool: 'codex',
+                            nativeSessionId: 'stale',
+                            injectedAt: '2026-09-06T03:00:00.000Z',
+                            injectionId: 'stale',
+                            body: 'stale',
+                        });
+                    else
+                        expect(
+                            changed
+                                .prepare(
+                                    "INSERT INTO durable_capture_status SELECT id, 'evicted', 1, '2026-09-06T03:00:00.000Z' FROM sessions ORDER BY id LIMIT 1 ON CONFLICT(session_id) DO UPDATE SET state = 'evicted'",
+                                )
+                                .run().changes,
+                        ).toBe(1);
+                    changed.pragma('wal_checkpoint(TRUNCATE)');
+                    changed.close();
+                    activeBytes = readFileSync(active.dbPath);
+                    return true;
+                },
+            }),
+        ).rejects.toThrow(expectedError);
+        expect(snapshot).not.toHaveBeenCalled();
+        expect(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
+    it('C22 aborts before snapshot when plaintext active storage is encrypted during confirmation', async () => {
+        const active = createTestDb('elepha-c22-plaintext-encryption-stale-');
+        const candidate = createTestDb('elepha-c22-plaintext-encryption-candidate-');
+        populate(active.dbPath, 'concurrent-current');
+        populate(candidate.dbPath, 'staged-candidate');
+        const backup = path.join(candidate.directory, 'plaintext.db');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const runtime = migrationRuntime(active.directory);
+        const snapshot = vi.fn(writeBackup);
+        let concurrentBytes!: Buffer;
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            encryption: runtime,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            writeBackup: snapshot,
+            confirm: async () => {
+                await expect(migratePrimaryDatabaseToEncrypted(active.dbPath, runtime)).resolves.toEqual({ status: 'migrated' });
+                concurrentBytes = readFileSync(active.dbPath);
+                return true;
+            },
+        }).then(
+            () => ({ status: 'resolved' as const, message: undefined }),
+            (error: unknown) => ({
+                status: 'rejected' as const,
+                message: error instanceof Error ? error.message : String(error),
+            }),
+        );
+
+        expect.soft(outcome).toEqual({ status: 'rejected', message: RESTORE_ENCRYPTION_CHANGED_ERROR });
+        expect.soft(snapshot).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath).equals(concurrentBytes)).toBe(true);
+        expect.soft(readFileSync(active.dbPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        expect.soft(readEncryptionMetadata(encryptionMetadataPath(active.dbPath))).toBeDefined();
+        const concurrent = await openManagedDatabase(active.dbPath, { readonly: true, fileMustExist: true, encryption: runtime });
+        expect
+            .soft((concurrent.prepare('SELECT native_id FROM sessions').pluck().all() as string[]).sort())
+            .toEqual(['session-concurrent-current']);
+        concurrent.close();
+    });
+
+    it.each(['main file', 'companion WAL'] as const)(
+        'C22 rejects a substituted validated stage %s before overlay or snapshot',
+        async (kind) => {
+            const active = createTestDb('elepha-c22-stage-substitution-active-');
+            const candidate = createTestDb('elepha-c22-stage-substitution-candidate-');
+            const substitution = createTestDb('elepha-c22-stage-substitution-malicious-');
+            populate(active.dbPath, 'stage-current');
+            populate(candidate.dbPath, 'stage-candidate');
+            populate(substitution.dbPath, 'stage-malicious');
+            const triggerSql = `
+            CREATE TRIGGER candidate_consent_expand
+            AFTER INSERT ON consent_roots
+            BEGIN
+              INSERT OR IGNORE INTO consent_roots
+              VALUES (NULL, 'evil-ulid', '/tmp/expanded', 'approved', '2026-09-06T00:00:00.000Z', 'cli', NULL);
+            END;
+        `;
+            if (kind === 'main file') substitution.db.exec(triggerSql);
+            substitution.db.pragma('wal_checkpoint(TRUNCATE)');
+            const backup = path.join(candidate.directory, 'plaintext.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            substitution.close();
+            const activeBytes = readFileSync(active.dbPath);
+            const restoreTemp = isolateRestoreTemp();
+            const snapshot = vi.fn(writeBackup);
+            let stagedWriter: Database.Database | undefined;
+            let unchangedStageMain: boolean | undefined;
+            let stagedWalBytes = 0;
+
+            const outcome = await runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                writeBackup: snapshot,
+                confirm: async () => {
+                    const staged = stagedRestoreDirectories(restoreTemp);
+                    expect(staged).toHaveLength(1);
+                    const stagedPath = path.join(restoreTemp, staged[0]!, 'candidate.db');
+                    expect(readdirSync(path.dirname(stagedPath))).toEqual(['candidate.db']);
+                    if (kind === 'main file') {
+                        unlinkSync(stagedPath);
+                        copyFileSync(substitution.dbPath, stagedPath);
+                    } else {
+                        const validatedMain = readFileSync(stagedPath);
+                        stagedWriter = new Database(stagedPath);
+                        expect(stagedWriter.pragma('journal_mode = WAL', { simple: true })).toBe('wal');
+                        stagedWriter.pragma('wal_autocheckpoint = 0');
+                        stagedWriter.exec(triggerSql);
+                        unchangedStageMain = readFileSync(stagedPath).equals(validatedMain);
+                        stagedWalBytes = statSync(`${stagedPath}-wal`).size;
+                    }
+                    return true;
+                },
+            }).then(
+                () => ({ status: 'resolved' as const, message: undefined }),
+                (error: unknown) => ({
+                    status: 'rejected' as const,
+                    message: error instanceof Error ? error.message : String(error),
+                }),
+            );
+            stagedWriter?.close();
+
+            if (kind === 'companion WAL') {
+                expect.soft(unchangedStageMain).toBe(true);
+                expect.soft(stagedWalBytes).toBeGreaterThan(0);
+            }
+            expect.soft(outcome).toEqual({ status: 'rejected', message: RESTORE_STAGE_CHANGED_ERROR });
+            expect.soft(snapshot).not.toHaveBeenCalled();
+            expect.soft(readFileSync(active.dbPath).equals(activeBytes)).toBe(true);
+            expect.soft(sessionNativeIds(active.dbPath)).toEqual(['session-stage-current']);
+            expect
+                .soft(consentRows(active.dbPath))
+                .not.toContainEqual(expect.objectContaining({ path: '/tmp/expanded', state: 'approved' }));
+        },
+    );
     afterEach(() => vi.unstubAllEnvs());
 
     it('restores candidate rows, preserves active purge tombstones, snapshots the current database, and removes stale sidecars', () => {
@@ -617,7 +1463,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                 const count = installedDb
                     .prepare("SELECT COUNT(*) AS count FROM purged_transcripts WHERE tool = 'codex' AND native_id = 'must-stay-purged'")
                     .get() as { count: number };
-                expect(count.count).toBe(0);
+                expect(count.count).toBe(1);
             } finally {
                 installedDb.close();
             }
@@ -690,6 +1536,222 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         } finally {
             store.database.close();
         }
+    });
+
+    it('rejects a hostile UNIQUE index before it can drop a current purge tombstone', async () => {
+        const active = createTestDb('elepha-restore-hostile-index-active-');
+        const backup = path.join(active.directory, 'hostile-index.db');
+        populate(active.dbPath, 'shared');
+        fullBackup(active.dbPath, backup);
+        const candidate = new Database(backup);
+        try {
+            candidate.exec('CREATE UNIQUE INDEX candidate_one_purge_per_tool ON purged_transcripts(tool)');
+        } finally {
+            candidate.close();
+        }
+        active.db
+            .prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)')
+            .run('codex', 'purged-post-backup', '2026-09-06T03:00:00.000Z');
+        active.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).then(
+            () => ({ status: 'resolved' as const, message: undefined }),
+            (error: unknown) => ({
+                status: 'rejected' as const,
+                message: error instanceof Error ? error.message : String(error),
+            }),
+        );
+        log.mockRestore();
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            const tombstones = restored
+                .prepare("SELECT native_id FROM purged_transcripts WHERE tool = 'codex' ORDER BY native_id")
+                .pluck()
+                .all();
+            expect.soft(outcome.status).toBe('rejected');
+            expect.soft(outcome.message).toContain('Backup schema does not match the current elepha schema after migration');
+            expect.soft(confirmation).not.toHaveBeenCalled();
+            expect.soft(output).not.toContain(`Restore preview: ${backup}`);
+            expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+            expect.soft(tombstones).toEqual(['purged-post-backup', 'purged-shared']);
+        } finally {
+            restored.close();
+        }
+    });
+
+    it('rejects a noncanonical consent foreign key before preview or active mutation', async () => {
+        const active = createTestDb('elepha-restore-hostile-fk-active-');
+        const candidate = createTestDb('elepha-restore-hostile-fk-candidate-');
+        const backup = path.join(candidate.directory, 'hostile-fk.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db
+            .prepare('INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES (?, ?, ?)')
+            .run(path.join(candidate.directory, 'consent-after'), '2026-09-06T03:00:00.000Z', '2026-09-06T03:00:00.000Z');
+        candidate.db.exec(`
+            ALTER TABLE consent_roots RENAME TO consent_roots_old;
+            CREATE TABLE consent_roots (
+                id INTEGER PRIMARY KEY, ulid TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL, decided_at TEXT NOT NULL, source TEXT NOT NULL, nudged_at TEXT,
+                FOREIGN KEY (path) REFERENCES projects(path) ON UPDATE CASCADE
+            );
+            INSERT INTO consent_roots SELECT * FROM consent_roots_old;
+            DROP TABLE consent_roots_old;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        log.mockRestore();
+
+        expect.soft(outcome).toContain('Backup schema does not match the current elepha schema after migration');
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(output).not.toContain(`Restore preview: ${backup}`);
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
+    it.each([
+        ['future-only CHECK', "purged_at TEXT NOT NULL, CHECK (native_id <> 'future-purge')"],
+        ['column ON CONFLICT', 'purged_at TEXT NOT NULL ON CONFLICT IGNORE'],
+        ['non-key COLLATE', 'purged_at TEXT COLLATE NOCASE NOT NULL'],
+    ])('rejects a noncanonical %s declaration before preview or active mutation', async (_label, finalColumn) => {
+        const active = createTestDb('elepha-restore-hostile-clause-active-');
+        const candidate = createTestDb('elepha-restore-hostile-clause-candidate-');
+        const backup = path.join(candidate.directory, 'hostile-clause.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.exec(`
+            ALTER TABLE purged_transcripts RENAME TO purged_transcripts_old;
+            CREATE TABLE purged_transcripts (
+                tool TEXT NOT NULL, native_id TEXT NOT NULL, ${finalColumn}, PRIMARY KEY (tool, native_id)
+            );
+            INSERT INTO purged_transcripts SELECT * FROM purged_transcripts_old;
+            DROP TABLE purged_transcripts_old;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        log.mockRestore();
+
+        expect.soft(outcome).toContain('Backup schema does not match the current elepha schema after migration');
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(output).not.toContain(`Restore preview: ${backup}`);
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
+    it('rejects an extra-table cascade trigger before preview or active mutation', async () => {
+        const active = createTestDb('elepha-restore-extra-trigger-active-');
+        const candidate = createTestDb('elepha-restore-extra-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'extra-trigger.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.exec(`
+            CREATE TABLE candidate_project_paths (
+                path TEXT PRIMARY KEY REFERENCES projects(path) ON UPDATE CASCADE
+            );
+            INSERT INTO candidate_project_paths SELECT path FROM projects ORDER BY id LIMIT 1;
+            CREATE TRIGGER candidate_cascade_control AFTER UPDATE ON candidate_project_paths
+            BEGIN DELETE FROM purged_transcripts; END;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+        log.mockRestore();
+
+        expect.soft(outcome).toBe(RESTORE_CONTROL_TRIGGER_ERROR);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(output).not.toContain(`Restore preview: ${backup}`);
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
+    it('accepts ALTER-derived clause order and identifier quoting', async () => {
+        const active = createTestDb('elepha-restore-clause-order-active-');
+        const candidate = createTestDb('elepha-restore-clause-order-candidate-');
+        const backup = path.join(candidate.directory, 'clause-order.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.exec(`
+            ALTER TABLE purged_transcripts RENAME TO purged_transcripts_old;
+            CREATE TABLE /* harmless legacy block comment: ), */ "purged_transcripts" (
+                -- harmless legacy line comment: (,
+                "native_id" TEXT NOT NULL, "purged_at" TEXT NOT NULL /* inline comment */, "tool" TEXT NOT NULL,
+                PRIMARY KEY ("tool", "native_id")
+            );
+            INSERT INTO purged_transcripts (tool, native_id, purged_at)
+            SELECT tool, native_id, purged_at FROM purged_transcripts_old;
+            DROP TABLE purged_transcripts_old;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+    });
+
+    it('rejects the legacy sessions_old FK shape when the parent object still exists', async () => {
+        const active = createTestDb('elepha-restore-legacy-fk-active-');
+        const candidate = createTestDb('elepha-restore-legacy-fk-candidate-');
+        const backup = path.join(candidate.directory, 'legacy-fk.db');
+        populate(active.dbPath, 'before');
+        replaceWithLegacySessionsTable(candidate.db);
+        candidate.db.exec('CREATE TABLE sessions_old (id INTEGER PRIMARY KEY)');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toContain('Backup schema does not match the current elepha schema after migration');
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
     });
 
     it('scrubs restored durable copies and FTS terms for active purge and incognito tombstones', async () => {
@@ -1260,7 +2322,61 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         }
     });
 
-    it('rejects a candidate consent trigger before preview or active mutation', async () => {
+    it('rejects an indirect control trigger before a later first-prompt skip write can fire it', async () => {
+        const active = createTestDb('elepha-restore-indirect-trigger-active-');
+        const candidate = createTestDb('elepha-restore-indirect-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        active.db.exec("INSERT INTO incognito_transcripts VALUES ('codex', 'incognito-before', '2026-09-06T00:00:00.000Z')");
+        candidate.db.exec(`
+            CREATE TRIGGER candidate_indirect_control_mutation
+            AFTER INSERT ON first_prompt_search_backfill_skips
+            BEGIN
+              DELETE FROM purged_transcripts;
+              DELETE FROM incognito_transcripts;
+              DELETE FROM consent_roots;
+              INSERT INTO consent_roots VALUES
+                (NULL, 'evil-ulid', '/tmp/expanded', 'approved', '2026-09-06T00:00:00.000Z', 'cli', NULL);
+            END;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        const expectedConsent = consentRows(active.dbPath);
+        active.close();
+        candidate.close();
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+        }).catch((caught: unknown) => (caught instanceof Error ? caught.message : String(caught)));
+        const restored = openUnmanagedDb(active.dbPath);
+        try {
+            restored
+                .prepare(
+                    "INSERT INTO first_prompt_search_backfill_skips SELECT id, '2026-09-06T00:01:00.000Z' FROM sessions ORDER BY id LIMIT 1",
+                )
+                .run();
+            expect.soft(outcome).toBe(RESTORE_CONTROL_TRIGGER_ERROR);
+            expect.soft(consentRows(active.dbPath)).toEqual(expectedConsent);
+            expect.soft(restored.prepare('SELECT COUNT(*) FROM purged_transcripts').pluck().get()).toBe(1);
+            expect.soft(restored.prepare('SELECT COUNT(*) FROM incognito_transcripts').pluck().get()).toBe(1);
+        } finally {
+            restored.close();
+        }
+    });
+
+    it.each([
+        ['consent_roots', RESTORE_CONSENT_TRIGGER_ERROR],
+        ['purged_transcripts', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['incognito_transcripts', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['paranoid_authority', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['injections', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['durable_capture_status', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['projects', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['sessions', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['first_prompt_search_backfill_skips', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['meta', RESTORE_CONTROL_TRIGGER_ERROR],
+        ['shown_session_lists', RESTORE_CONTROL_TRIGGER_ERROR],
+    ])('rejects a candidate trigger targeting %s before preview or active mutation', async (triggerTable, expectedError) => {
         const active = createTestDb('elepha-restore-consent-trigger-active-');
         const candidate = createTestDb('elepha-restore-consent-trigger-candidate-');
         const backup = path.join(candidate.directory, 'full.db');
@@ -1271,7 +2387,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         candidate.store.consent.grant(consentPath);
         candidate.db.exec(`
             CREATE TRIGGER candidate_consent_expand
-            AFTER INSERT ON consent_roots
+            AFTER INSERT ON "${triggerTable}"
             BEGIN
               INSERT OR IGNORE INTO consent_roots
               VALUES (NULL, 'evil-ulid', '/tmp/expanded', 'approved', '2026-09-06T00:00:00.000Z', 'cli', NULL);
@@ -1301,7 +2417,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
 
         expect.soft(outcome).toEqual({
             status: 'rejected',
-            message: RESTORE_CONSENT_TRIGGER_ERROR,
+            message: expectedError,
         });
         expect.soft(confirmation).not.toHaveBeenCalled();
         expect.soft(output).not.toContain(`Restore preview: ${backup}`);

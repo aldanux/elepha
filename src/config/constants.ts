@@ -83,6 +83,9 @@ export const DATABASE_MIGRATION_COPY_SPACE_NUMERATOR = 21;
 export const DATABASE_MIGRATION_COPY_SPACE_DENOMINATOR = 10;
 export const DATABASE_MIGRATION_HASH_CHUNK_BYTES = 1024 * 1024;
 export const DATABASE_EXPORT_VERIFY_CHUNK_BYTES = 1024 * 1024;
+// Restore/import metadata caps leave at least 8x row and 100x text headroom over the canonical schema.
+export const DATABASE_SCHEMA_METADATA_MAX_ROWS = 256;
+export const DATABASE_SCHEMA_METADATA_MAX_CHARS = 1024 * 1024;
 export const MAX_TITLE_CHARS = 72;
 export const TRAILING_FILES_CAP = 50;
 export const SEGMENT_UNCONDITIONAL_GAP_HOURS = 7 * 24;

@@ -36,19 +36,77 @@ function normalizeIdentifier(token: string): string {
 // identifier quoting differences from supported ALTER migrations do not make
 // an otherwise canonical object fail raw byte equality. String literals stay
 // case-sensitive because they carry CHECK and FTS command semantics.
-function normalizeSchemaSql(sql: string | null): string {
+function schemaTokens(sql: string | null): string[] {
     if (sql === null) {
-        return '';
+        return [];
     }
     const tokens =
-        sql.match(/'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[(?:\]\]|[^\]])*\]|[a-z_][a-z0-9_]*|\d+(?:\.\d+)?|<=|>=|<>|!=|==|\S/gi) ??
-        [];
-    return tokens.map((token) => (token.startsWith("'") ? token : normalizeIdentifier(token))).join(' ');
+        sql.match(
+            /'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[(?:\]\]|[^\]])*\]|--[^\r\n]*|\/\*[\s\S]*?\*\/|[a-z_][a-z0-9_]*|\d+(?:\.\d+)?|<=|>=|<>|!=|==|\S/gi,
+        ) ?? [];
+    return tokens
+        .filter((token) => !token.startsWith('--') && !token.startsWith('/*'))
+        .map((token) => (token.startsWith("'") ? token : normalizeIdentifier(token)));
+}
+
+const LEGACY_SESSION_FK_CHILDREN = new Set(['memories', 'session_rollups', 'first_prompt_search_backfill_skips']);
+
+export function tableClauseSignature(sql: string | null, table: string, allowLegacySessionForeignKeys = false): string {
+    const tokens = schemaTokens(sql);
+    const tableName = table.toLowerCase();
+    const reject = (): never => {
+        throw new Error('Unsupported CREATE TABLE declaration.');
+    };
+    if (tokens[0] !== 'create' || tokens[1] !== 'table' || tokens[2] !== tableName || tokens[3] !== '(' || tokens.at(-1) !== ')') {
+        reject();
+    }
+    const clauses: string[][] = [];
+    let clause: string[] = [];
+    let depth = 0;
+    for (const token of tokens.slice(4, -1)) {
+        depth += Number(token === '(') - Number(token === ')');
+        if (depth < 0) {
+            reject();
+        }
+        if (token === ',' && depth === 0) {
+            if (clause.length === 0) {
+                reject();
+            }
+            clauses.push(clause);
+            clause = [];
+        } else {
+            clause.push(token);
+        }
+    }
+    if (depth !== 0 || clause.length === 0) {
+        reject();
+    }
+    clauses.push(clause);
+    const normalized = clauses.map((tokens) => {
+        if (
+            tableName === 'sessions' &&
+            (tokens[0] === 'rendered_chars' || tokens[0] === 'rendered_turns') &&
+            tokens.length === 2 &&
+            tokens[1] === 'integer'
+        ) {
+            return `${tokens.join(' ')} default 0`;
+        }
+        if (allowLegacySessionForeignKeys && LEGACY_SESSION_FK_CHILDREN.has(tableName)) {
+            const reference = tokens.findIndex(
+                (token, index) => index > 0 && tokens[index - 1] === 'references' && token === 'sessions_old',
+            );
+            if (reference >= 0) {
+                tokens[reference] = 'sessions';
+            }
+        }
+        return tokens.join(' ');
+    });
+    return JSON.stringify(normalized.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)));
 }
 
 function objectSignature(rows: readonly SchemaObjectRow[]): string {
     return JSON.stringify(
-        rows.map((row) => [row.type.toLowerCase(), row.name.toLowerCase(), row.tbl_name.toLowerCase(), normalizeSchemaSql(row.sql)]),
+        rows.map((row) => [row.type.toLowerCase(), row.name.toLowerCase(), row.tbl_name.toLowerCase(), schemaTokens(row.sql).join(' ')]),
     );
 }
 

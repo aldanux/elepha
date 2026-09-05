@@ -652,6 +652,16 @@ function initializeDatabase(db: Database.Database, dbPath: string): Database.Dat
     return db;
 }
 
+// Only caller-owned private encrypted stages may bypass managed-primary discovery and lifecycle ownership.
+export function openInitializedKeyedDatabase(dbPath: string, key: Buffer): Database.Database {
+    const db = openKeyedDatabase(dbPath, key, { fileMustExist: true });
+    try {
+        return initializeDatabase(db, dbPath);
+    } catch (error) {
+        return closeDatabaseAfterFailure(db, error);
+    }
+}
+
 // Foreign/transient databases are deliberately unkeyed. Primary database
 // callers must use openDb() or openManagedDatabase() instead.
 export function openUnmanagedDb(dbPath: string = ':memory:'): Database.Database {

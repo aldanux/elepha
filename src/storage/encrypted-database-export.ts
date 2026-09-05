@@ -1,14 +1,33 @@
-import { fchmodSync, constants as fsConstants, fstatSync, lstatSync, openSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+    closeSync,
+    fchmodSync,
+    constants as fsConstants,
+    fstatSync,
+    lstatSync,
+    openSync,
+    readSync,
+    realpathSync,
+    unlinkSync,
+} from 'node:fs';
 import Database from 'better-sqlite3-multiple-ciphers';
-import { PRIVATE_FILE_MODE } from '../config/constants.js';
+import {
+    DATABASE_EXPORT_VERIFY_CHUNK_BYTES,
+    DATABASE_HEADER_BYTES,
+    DATABASE_SCHEMA_METADATA_MAX_CHARS,
+    DATABASE_SCHEMA_METADATA_MAX_ROWS,
+    PRIVATE_FILE_MODE,
+} from '../config/constants.js';
 import { pinSQLitePathForOpen, type SQLiteFileIdentitySeal } from './database-lifecycle.js';
-import { hasPlaintextDatabaseHeader, openKeyedDatabase } from './db.js';
+import { hasPlaintextDatabaseHeader, isPlaintextDatabaseHeader, keyDatabaseConnection, openKeyedDatabase } from './db.js';
 
 const ATTACHED_EXPORT_SCHEMA = 'elepha_export';
 const ROWID_ALIASES = ['rowid', '_rowid_', 'oid'] as const;
 const SQLITE_COMPANION_SUFFIXES = ['-journal', '-shm', '-wal'] as const;
 
 export const BACKUP_DESTINATION_COMPANION_ERROR = 'Backup destination has an existing SQLite companion; refusing to export.';
+export const BACKUP_SOURCE_COMPANION_ERROR = 'Backup source has a SQLite companion; refusing to import.';
+export const DATABASE_SCHEMA_METADATA_LIMIT_ERROR = 'Backup schema metadata exceeds the supported limit.';
 
 export interface DatabaseFileIdentity {
     dev: bigint;
@@ -45,6 +64,14 @@ interface AttachedExportState {
 
 type AttachedEncryption = { kind: 'inherited'; cipherSalt: string } | { kind: 'explicit'; key: Buffer };
 
+function attemptCleanup(failures: unknown[], cleanup: () => void): void {
+    try {
+        cleanup();
+    } catch (error) {
+        failures.push(error);
+    }
+}
+
 function privateEmptyDatabaseIdentity(descriptor: number): DatabaseFileSeal {
     fchmodSync(descriptor, PRIVATE_FILE_MODE);
     const stats = fstatSync(descriptor, { bigint: true });
@@ -70,6 +97,24 @@ export function createPrivateEmptyDatabaseDescriptor(databasePath: string): numb
 
 export function inspectPrivateEmptyDatabaseDescriptor(descriptor: number): DatabaseFileSeal {
     return privateEmptyDatabaseIdentity(descriptor);
+}
+
+export function inspectDatabaseImportSource(databasePath: string): { identity: DatabaseFileSeal; plaintext: boolean } {
+    const descriptor = openSync(databasePath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0));
+    try {
+        const stats = fstatSync(descriptor, { bigint: true });
+        if (!stats.isFile()) {
+            throw new Error(`Backup source is not a regular file: ${databasePath}`);
+        }
+        const header = Buffer.alloc(DATABASE_HEADER_BYTES);
+        const bytes = readSync(descriptor, header, 0, header.length, 0);
+        return {
+            identity: { dev: stats.dev, ino: stats.ino, size: stats.size, ctimeNs: stats.ctimeNs, nlink: stats.nlink },
+            plaintext: isPlaintextDatabaseHeader(header.subarray(0, bytes)),
+        };
+    } finally {
+        closeSync(descriptor);
+    }
 }
 
 export function assertDatabaseFileIdentity(databasePath: string, expected: DatabaseFileIdentity, label = 'Backup temporary'): void {
@@ -116,23 +161,13 @@ export function writeEncryptedAttachedDatabase(
         primaryError = error;
     }
     if (state.attached) {
-        try {
-            source.exec(`DETACH DATABASE ${quoteIdentifier(ATTACHED_EXPORT_SCHEMA)}`);
-        } catch (error) {
-            cleanupFailures.push(error);
-        }
+        attemptCleanup(cleanupFailures, () => source.exec(`DETACH DATABASE ${quoteIdentifier(ATTACHED_EXPORT_SCHEMA)}`));
     }
-    try {
+    attemptCleanup(cleanupFailures, () => {
         const state = seal.captureMutationState();
         seal.assertCurrent(state);
-    } catch (error) {
-        cleanupFailures.push(error);
-    }
-    try {
-        seal.release();
-    } catch (error) {
-        cleanupFailures.push(error);
-    }
+    });
+    attemptCleanup(cleanupFailures, () => seal.release());
     if (primaryError !== undefined && cleanupFailures.length === 0) {
         throw primaryError;
     }
@@ -186,7 +221,7 @@ function runAttachedEncryptedExport(
         throw new Error(`Backup could not keep target journaling in memory (observed ${String(journalMode)}).`);
     }
     writer(ATTACHED_EXPORT_SCHEMA);
-    const integrity = source.pragma(`${ATTACHED_EXPORT_SCHEMA}.integrity_check`) as Array<{ integrity_check: string }>;
+    const integrity = source.pragma(`${ATTACHED_EXPORT_SCHEMA}.integrity_check(1)`) as Array<{ integrity_check: string }>;
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
         throw new Error(`Backup failed integrity_check: ${integrity.map((row) => row.integrity_check).join('; ')}`);
     }
@@ -227,23 +262,48 @@ function rowidAlias(columns: readonly TableColumnRow[], table: TableListRow): st
     return alias;
 }
 
-function copyWholeTable(source: Database.Database, targetSchema: string, table: TableListRow, clearTarget = false): void {
+function copyProjection(source: Database.Database, table: TableListRow): { columnSql: string; tableSql: string; valuesSql: string } {
     const columns = tableColumns(source, table.name);
-    const writableColumns = columns.filter((column) => column.hidden === 0).map((column) => column.name);
+    const writableColumns = columns.filter(({ hidden }) => hidden === 0).map(({ name }) => name);
     const hiddenRowid = rowidAlias(columns, table);
     const selectedColumns = hiddenRowid === undefined ? writableColumns : [hiddenRowid, ...writableColumns];
     if (selectedColumns.length === 0) {
         throw new Error(`Backup cannot copy table ${table.name} without writable columns.`);
     }
-    const target = `${quoteIdentifier(targetSchema)}.${quoteIdentifier(table.name)}`;
-    if (clearTarget) {
+    const columnSql = selectedColumns.map(quoteIdentifier).join(', ');
+    return { columnSql, tableSql: quoteIdentifier(table.name), valuesSql: selectedColumns.map(() => '?').join(', ') };
+}
+
+function copyWholeTable(source: Database.Database, targetSchema: string, table: TableListRow, clear = false): void {
+    const { columnSql, tableSql } = copyProjection(source, table);
+    const target = `${quoteIdentifier(targetSchema)}.${tableSql}`;
+    if (clear) {
         source.exec(`DELETE FROM ${target}`);
     }
-    const columnSql = selectedColumns.map(quoteIdentifier).join(', ');
-    source.exec(`INSERT INTO ${target} (${columnSql}) SELECT ${columnSql} FROM main.${quoteIdentifier(table.name)}`);
+    source.exec(`INSERT INTO ${target} (${columnSql}) SELECT ${columnSql} FROM main.${tableSql}`);
+}
+
+export function assertBoundedDatabaseSchemaMetadata(source: Database.Database): void {
+    const totals = source
+        .prepare(
+            `SELECT (SELECT COUNT(*) FROM main.sqlite_schema WHERE sql IS NOT NULL) AS schema_rows,
+                    (SELECT COUNT(*) FROM pragma_table_list WHERE schema = 'main') AS table_rows,
+                    (SELECT COALESCE(SUM(length(sql) + length(name) + length(tbl_name)), 0)
+                     FROM main.sqlite_schema WHERE sql IS NOT NULL) AS text_chars`,
+        )
+        .safeIntegers()
+        .get() as { schema_rows: bigint; table_rows: bigint; text_chars: bigint };
+    if (
+        totals.schema_rows > BigInt(DATABASE_SCHEMA_METADATA_MAX_ROWS) ||
+        totals.table_rows > BigInt(DATABASE_SCHEMA_METADATA_MAX_ROWS) ||
+        totals.text_chars > BigInt(DATABASE_SCHEMA_METADATA_MAX_CHARS)
+    ) {
+        throw new Error(DATABASE_SCHEMA_METADATA_LIMIT_ERROR);
+    }
 }
 
 function readFullSchema(source: Database.Database): { schema: FullSchemaRow[]; tables: Map<string, TableListRow> } {
+    assertBoundedDatabaseSchemaMetadata(source);
     const schema = source
         .prepare(
             `SELECT rowid, type, name, tbl_name, sql
@@ -266,56 +326,226 @@ function readFullSchema(source: Database.Database): { schema: FullSchemaRow[]; t
     return { schema, tables };
 }
 
-function cloneFullDatabase(source: Database.Database, targetSchema: string): void {
-    const snapshot = source.transaction(() => {
-        const { schema, tables } = readFullSchema(source);
-        const tableEntries = schema.filter((entry) => entry.type === 'table' && entry.name !== 'sqlite_sequence');
-        for (const entry of tableEntries) {
-            const table = tables.get(entry.name);
-            if (table?.type === 'table') {
-                source.exec(qualifyCreateSql(entry, targetSchema));
-            }
-        }
-        for (const entry of tableEntries) {
-            const table = tables.get(entry.name);
-            if (table?.type === 'table') {
-                copyWholeTable(source, targetSchema, table);
-            }
-        }
-        for (const entry of tableEntries) {
-            const table = tables.get(entry.name);
-            if (table?.type === 'virtual') {
-                source.exec(qualifyCreateSql(entry, targetSchema));
-            }
-        }
-
-        // CREATE VIRTUAL TABLE materializes FTS5's shadow schema but not its
-        // exact segment state. Direct shadow writes are the only public SQL
-        // route that preserves the selected snapshot byte-for-byte; keep the
-        // defensive-mode exception scoped to fixed, target-qualified DML and
-        // restore it before executing any source schema text.
-        source.unsafeMode(true);
-        try {
-            for (const entry of tableEntries) {
-                const table = tables.get(entry.name);
-                if (table?.type === 'shadow') {
-                    copyWholeTable(source, targetSchema, table, true);
-                }
-            }
-        } finally {
-            source.unsafeMode(false);
-        }
-        const sequence = tables.get('sqlite_sequence');
-        if (sequence !== undefined) {
-            copyWholeTable(source, targetSchema, sequence, true);
-        }
-        for (const entry of schema) {
-            if (entry.type !== 'table') {
-                source.exec(qualifyCreateSql(entry, targetSchema));
-            }
-        }
+function reconstructFullDatabase(
+    source: Database.Database,
+    create: (entry: FullSchemaRow) => void,
+    copy: (table: TableListRow, clear?: boolean) => void,
+    unsafe: (enabled: boolean) => void,
+): void {
+    const { schema, tables } = readFullSchema(source);
+    const entries = schema.filter(({ type, name }) => type === 'table' && name !== 'sqlite_sequence');
+    const withType = (type: TableListRow['type']) => entries.filter(({ name }) => tables.get(name)?.type === type);
+    withType('table').forEach(create);
+    withType('table').forEach(({ name }) => {
+        copy(tables.get(name) as TableListRow);
     });
-    snapshot();
+    withType('virtual').forEach(create);
+    // CREATE VIRTUAL TABLE materializes FTS5's shadow schema but not its
+    // exact segment state. Direct shadow writes are the only public SQL
+    // route that preserves the selected snapshot byte-for-byte; keep the
+    // exception scoped to fixed destination shadow DML and restore it before
+    // executing any source-provided schema SQL.
+    unsafe(true);
+    try {
+        withType('shadow').forEach(({ name }) => {
+            copy(tables.get(name) as TableListRow, true);
+        });
+    } finally {
+        unsafe(false);
+    }
+    const sequence = tables.get('sqlite_sequence');
+    if (sequence !== undefined) {
+        copy(sequence, true);
+    }
+    schema.filter(({ type }) => type !== 'table').forEach(create);
+}
+
+function cloneFullDatabase(source: Database.Database, targetSchema: string): void {
+    source.transaction(() =>
+        reconstructFullDatabase(
+            source,
+            (entry) => source.exec(qualifyCreateSql(entry, targetSchema)),
+            (table, clear) => copyWholeTable(source, targetSchema, table, clear),
+            (enabled) => source.unsafeMode(enabled),
+        ),
+    )();
+}
+
+function copyWholeTableBetween(source: Database.Database, target: Database.Database, table: TableListRow, clear = false): void {
+    const { columnSql, tableSql, valuesSql } = copyProjection(source, table);
+    if (clear) {
+        target.exec(`DELETE FROM ${tableSql}`);
+    }
+    const insert = target.prepare(`INSERT INTO ${tableSql} (${columnSql}) VALUES (${valuesSql})`);
+    let copied = 0n;
+    for (const row of source.prepare(`SELECT ${columnSql} FROM ${tableSql}`).raw().safeIntegers().iterate() as Iterable<unknown[]>) {
+        insert.run(...row);
+        copied += 1n;
+    }
+    if ((target.prepare(`SELECT COUNT(*) FROM ${tableSql}`).pluck().safeIntegers().get() as bigint) !== copied) {
+        throw new Error(`Backup row count changed while copying table ${table.name}.`);
+    }
+}
+
+function descriptorHash(descriptor: number): string {
+    const hash = createHash('sha256');
+    const chunk = Buffer.alloc(DATABASE_EXPORT_VERIFY_CHUNK_BYTES);
+    let offset = 0;
+    while (true) {
+        const bytes = readSync(descriptor, chunk, 0, chunk.length, offset);
+        if (bytes === 0) {
+            return hash.digest('hex');
+        }
+        hash.update(chunk.subarray(0, bytes));
+        offset += bytes;
+    }
+}
+
+type SQLitePathSeal = ReturnType<typeof pinSQLitePathForOpen>;
+
+interface EncryptedDatabaseImportState {
+    preflightPassed: boolean;
+    physicalSource?: string;
+    sourceState?: ReturnType<SQLitePathSeal['captureMutationState']>;
+    sourceHash?: string;
+    destinationSeal?: SQLitePathSeal;
+    source?: Database.Database;
+    destination?: Database.Database;
+}
+
+function runEncryptedDatabaseImport(
+    sourceSeal: SQLitePathSeal,
+    destinationPath: string,
+    destinationIdentity: DatabaseFileSeal,
+    destinationKey: Buffer,
+    sourceKey: Buffer | undefined,
+    validateSource: ((source: Database.Database) => void) | undefined,
+    state: EncryptedDatabaseImportState,
+): void {
+    state.physicalSource = realpathSync(sourceSeal.sqlitePath);
+    state.sourceState = sourceSeal.captureMutationState();
+    state.sourceHash = descriptorHash(sourceSeal.descriptor);
+    for (const suffix of SQLITE_COMPANION_SUFFIXES) {
+        if (lstatSync(`${state.physicalSource}${suffix}`, { throwIfNoEntry: false }) !== undefined) {
+            throw new Error(BACKUP_SOURCE_COMPANION_ERROR);
+        }
+    }
+    state.preflightPassed = true;
+    state.destinationSeal = pinSQLitePathForOpen(destinationPath, destinationIdentity);
+    state.source = new Database(sourceSeal.sqlitePath, { readonly: true, fileMustExist: true });
+    sourceSeal.confirmOpen(state.source);
+    if (sourceKey !== undefined) {
+        keyDatabaseConnection(state.source, sourceKey);
+    }
+    state.source.pragma('temp_store = MEMORY');
+    validateSource?.(state.source);
+    state.destination = new Database(state.destinationSeal.sqlitePath, { fileMustExist: true });
+    state.destinationSeal.confirmOpen(state.destination);
+    keyDatabaseConnection(state.destination, destinationKey);
+    state.destination.pragma('temp_store = MEMORY');
+    state.destination.pragma('journal_mode = MEMORY');
+    state.destination.exec('VACUUM');
+    state.destination.pragma('foreign_keys = OFF');
+    const openedSource = state.source;
+    const openedDestination = state.destination;
+    openedSource.transaction(() =>
+        openedDestination.transaction(() => {
+            reconstructFullDatabase(
+                openedSource,
+                ({ sql }) => openedDestination.exec(sql),
+                (table, clear) => copyWholeTableBetween(openedSource, openedDestination, table, clear),
+                (enabled) => openedDestination.unsafeMode(enabled),
+            );
+            if ((openedDestination.pragma('integrity_check(1)') as Array<{ integrity_check: string }>)[0]?.integrity_check !== 'ok') {
+                throw new Error('Imported database failed integrity_check.');
+            }
+            if ((openedDestination.prepare('SELECT COUNT(*) FROM pragma_foreign_key_check').pluck().safeIntegers().get() as bigint) > 0n) {
+                throw new Error('Imported database failed foreign_key_check.');
+            }
+        })(),
+    )();
+}
+
+export function writeEncryptedDatabaseImport(
+    sourcePath: string,
+    sourceIdentity: DatabaseFileSeal,
+    destinationPath: string,
+    destinationIdentity: DatabaseFileSeal,
+    destinationKey: Buffer,
+    sourceKey?: Buffer,
+    validateSource?: (source: Database.Database) => void,
+): void {
+    const sourceSeal = pinSQLitePathForOpen(sourcePath, sourceIdentity);
+    const cleanupFailures: unknown[] = [];
+    let primaryError: unknown;
+    let primaryFailed = false;
+    const state: EncryptedDatabaseImportState = { preflightPassed: false };
+    try {
+        runEncryptedDatabaseImport(sourceSeal, destinationPath, destinationIdentity, destinationKey, sourceKey, validateSource, state);
+    } catch (error) {
+        primaryFailed = true;
+        primaryError = error;
+    }
+    if (state.destination !== undefined) {
+        const closing = state.destination;
+        attemptCleanup(cleanupFailures, () => closing.close());
+    }
+    if (state.source !== undefined) {
+        const closing = state.source;
+        attemptCleanup(cleanupFailures, () => closing.close());
+    }
+    for (const suffix of state.preflightPassed && state.physicalSource !== undefined ? SQLITE_COMPANION_SUFFIXES : []) {
+        const companion = `${state.physicalSource}${suffix}`;
+        attemptCleanup(cleanupFailures, () => {
+            const observed = lstatSync(companion, { bigint: true, throwIfNoEntry: false });
+            const confirmed = observed === undefined ? undefined : lstatSync(companion, { bigint: true });
+            const same =
+                observed !== undefined &&
+                confirmed !== undefined &&
+                observed.dev === confirmed.dev &&
+                observed.ino === confirmed.ino &&
+                observed.ctimeNs === confirmed.ctimeNs;
+            const admitted =
+                same &&
+                confirmed.isFile() &&
+                !confirmed.isSymbolicLink() &&
+                ((suffix === '-wal' && confirmed.size === 0n) || (suffix === '-shm' && confirmed.size === 32_768n));
+            if (admitted) {
+                unlinkSync(companion);
+            } else if (observed !== undefined) {
+                throw new Error('Backup source created an unsupported SQLite companion.');
+            }
+            if (admitted && lstatSync(companion, { throwIfNoEntry: false }) !== undefined) {
+                throw new Error('Backup source SQLite companion cleanup failed.');
+            }
+        });
+    }
+    const { sourceState, sourceHash } = state;
+    if (sourceState !== undefined && sourceHash !== undefined) {
+        attemptCleanup(cleanupFailures, () => {
+            sourceSeal.assertCurrent(sourceState);
+            if (descriptorHash(sourceSeal.descriptor) !== sourceHash) {
+                throw new Error('Backup source changed while importing.');
+            }
+        });
+    }
+    if (state.destinationSeal !== undefined) {
+        const closingSeal = state.destinationSeal;
+        attemptCleanup(cleanupFailures, () => closingSeal.assertCurrent(closingSeal.captureMutationState()));
+        attemptCleanup(cleanupFailures, () => closingSeal.release());
+    }
+    attemptCleanup(cleanupFailures, () => sourceSeal.release());
+    if (primaryFailed && cleanupFailures.length === 0) {
+        throw primaryError;
+    }
+    if (primaryFailed || cleanupFailures.length > 0) {
+        throw new AggregateError(
+            primaryFailed ? [primaryError, ...cleanupFailures] : cleanupFailures,
+            `Encrypted database import failed for ${destinationPath}.`,
+            { ...(primaryFailed ? { cause: primaryError } : {}) },
+        );
+    }
+    assertEncryptedDatabaseFile(destinationPath, destinationKey, 'Imported database stage');
 }
 
 // The selected SQLite connection owns the authoritative snapshot and the

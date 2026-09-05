@@ -65,6 +65,13 @@ interface ParanoidAuthority {
     credentialTag: string | null;
 }
 
+export interface ParanoidControlState {
+    enrolled: 0 | 1;
+    state: 'locked' | 'unlocked';
+    generation: number;
+    credential_tag: string | null;
+}
+
 const READ_GENERATION = Symbol('read-generation');
 
 // Generation rejects lock/unlock ABA; enrollment and credential identity reject
@@ -264,6 +271,27 @@ function authorityFieldsMatch(authority: ParanoidAuthority, stored: ParsedGateSt
 
 function authorityMatches(authority: ParanoidAuthority, stored: ParsedGateState): boolean {
     return authorityFieldsMatch(authority, stored) && authority.credentialTag === stored.credentialTag;
+}
+
+// Call outside a SQLite transaction because authentication reads the external gate file.
+export function readParanoidControlState(db: Database.Database): ParanoidControlState {
+    if (registeredDatabases.get(db) === undefined) {
+        throw new Error('Paranoid control state requires a registered encrypted database.');
+    }
+    const authority = readAuthority(db);
+    const stored = readRegisteredState(db);
+    if (
+        authority === undefined ||
+        (pristineAuthority(authority) ? stored !== undefined : stored === undefined || !authorityMatches(authority, stored))
+    ) {
+        throw new Error('Paranoid control state is invalid or does not match its authenticated gate.');
+    }
+    return {
+        enrolled: authority.enrolled,
+        state: authority.state,
+        generation: authority.generation,
+        credential_tag: authority.credentialTag,
+    };
 }
 
 export function initializeParanoidAuthority(db: Database.Database): void {
