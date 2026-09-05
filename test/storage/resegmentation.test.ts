@@ -4,8 +4,12 @@ import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
+import { DURABLE_CAPTURE_FILTER_VERSION } from '../../src/config/constants.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
+import { filterTurn } from '../../src/rendering/filtered-turn.js';
+import { ConsentStore } from '../../src/storage/consent-store.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
+import { type DurableCaptureBackfillRecordResult, DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import {
     applyManualMerge,
@@ -19,11 +23,14 @@ import {
 import { titleForSegment } from '../../src/storage/session-title.js';
 import { planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
 import type { SessionAdapter, ToolName } from '../../src/types/index.js';
+import { withGrantableTestDir } from '../helpers/tmp.js';
 
 const adapters: Record<ToolName, SessionAdapter> = {
     'claude-code': new ClaudeCodeAdapter(),
     codex: new CodexAdapter(),
 };
+
+const CAPTURED_AT = '2026-09-05T00:00:00.000Z';
 
 let previousCodexHome: string | undefined;
 
@@ -89,6 +96,7 @@ function codexFixture(options: { markerBeforeSecond?: boolean } = {}): string {
 
 function seed(options: { markerBeforeSecond?: boolean; missingSource?: boolean; outsideStore?: boolean } = {}) {
     const db = openUnmanagedDb(':memory:');
+    const projectPath = withGrantableTestDir('elepha-resegment-project-');
     const dir = realpathSync(
         options.outsideStore
             ? mkdtempSync(path.join(tmpdir(), 'elepha-resegment-outside-'))
@@ -100,8 +108,8 @@ function seed(options: { markerBeforeSecond?: boolean; missingSource?: boolean; 
     }
     db.prepare(
         `INSERT INTO projects (id, path, display_name, git_root, git_remote, first_seen_at, last_seen_at)
-         VALUES (1, '/tmp/project', 'project', NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T07:02:00.000Z')`,
-    ).run();
+         VALUES (1, ?, 'project', NULL, NULL, '2026-01-01T00:00:00.000Z', '2026-01-01T07:02:00.000Z')`,
+    ).run(projectPath);
     db.prepare(
         `INSERT INTO sessions
          (id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
@@ -119,7 +127,7 @@ function seed(options: { markerBeforeSecond?: boolean; missingSource?: boolean; 
     insertMemory.run(11, 1, '2026-01-01T06:01:00.000Z', '2026-08-15T00:00:02.000Z');
     insertMemory.run(12, 2, '2026-01-01T07:01:00.000Z', '2026-08-15T00:00:03.000Z');
     insertRollup(db, 1);
-    return { db, sourcePath };
+    return { db, projectPath, sourcePath };
 }
 
 function insertRollup(db: ReturnType<typeof openUnmanagedDb>, sessionId: number, parentSessionId: number | null = null): void {
@@ -164,6 +172,88 @@ function failMemoryUpdate(db: ReturnType<typeof openUnmanagedDb>, message: strin
         SELECT RAISE(ABORT, '${message}');
       END;
     `);
+}
+
+function setDurableStatus(db: ReturnType<typeof openUnmanagedDb>, sessionId: number, state: 'complete' | 'evicted'): void {
+    db.prepare(
+        `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT (session_id) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at`,
+    ).run(sessionId, state, DURABLE_CAPTURE_FILTER_VERSION, CAPTURED_AT);
+}
+
+function captureMemory(db: ReturnType<typeof openUnmanagedDb>, memoryId: number, needle: string): void {
+    db.prepare(
+        `INSERT INTO filtered_turns
+         (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
+          dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+         VALUES (?, 1, ?, '', '[]', 0, 0, 0, ?, ?)`,
+    ).run(memoryId, needle, DURABLE_CAPTURE_FILTER_VERSION, CAPTURED_AT);
+}
+
+function evictSession(db: ReturnType<typeof openUnmanagedDb>, sessionId: number): void {
+    db.prepare('DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)').run(sessionId);
+    setDurableStatus(db, sessionId, 'evicted');
+}
+
+function runBackfill(
+    db: ReturnType<typeof openUnmanagedDb>,
+    projectPath: string,
+    needle: string,
+): {
+    candidateIds: number[];
+    results: DurableCaptureBackfillRecordResult[];
+} {
+    const consent = new ConsentStore(db);
+    consent.grant(projectPath);
+    const store = new DurableCaptureBackfillStore(db, consent);
+    const candidates = store.listCandidates([1], 10);
+    const results: DurableCaptureBackfillRecordResult[] = [];
+    for (const candidate of candidates) {
+        const work = store.begin(candidate, CAPTURED_AT);
+        const touched = new Set<number>();
+        for (const turnIndex of work?.missingTurnIndexes ?? []) {
+            const result = store.record(
+                candidate,
+                turnIndex,
+                filterTurn({
+                    userMessage: `${needle} ${turnIndex}`,
+                    assistantText: 'backfilled response',
+                    toolCalls: [],
+                }),
+                CAPTURED_AT,
+            );
+            results.push(result);
+            if ('sessionId' in result) touched.add(result.sessionId);
+        }
+        store.finish(candidate, touched, 'success', CAPTURED_AT);
+    }
+    return { candidateIds: candidates.map((candidate) => candidate.id), results };
+}
+
+function expectTerminalIdentity(db: ReturnType<typeof openUnmanagedDb>, needle: string, expectedSegments: number): void {
+    expect
+        .soft(db.prepare('SELECT state FROM durable_capture_status ORDER BY session_id').all())
+        .toEqual(Array.from({ length: expectedSegments }, () => ({ state: 'evicted' })));
+    expect.soft(db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+    db.exec('CREATE VIRTUAL TABLE temp.resegmentation_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+    expect.soft(db.prepare('SELECT COUNT(*) AS count FROM temp.resegmentation_terms').get()).toEqual({ count: 0 });
+    expect.soft(db.prepare(`SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?`).all(needle)).toEqual([]);
+    expect.soft(db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
+    expect
+        .soft(
+            db
+                .prepare(
+                    `SELECT COALESCE(SUM(
+                   length(CAST(user_prompt AS BLOB)) +
+                   length(CAST(assistant_response AS BLOB)) +
+                   length(CAST(tool_calls AS BLOB))
+                 ), 0) AS total_bytes
+                 FROM filtered_turns`,
+                )
+                .get(),
+        )
+        .toEqual({ total_bytes: 0 });
 }
 
 describe('P2.2c re-segmentation', () => {
@@ -221,6 +311,10 @@ describe('P2.2c re-segmentation', () => {
         expect(db.prepare('SELECT custom_title FROM sessions WHERE id = 1').get()).toEqual({ custom_title: 'Keep mine' });
         expect((await planSessionTitleBackfill(db, adapters)).changes).toHaveLength(0);
         expect(db.prepare('SELECT COUNT(*) AS count FROM session_rollups').get()).toEqual({ count: 0 });
+        expect(db.prepare('SELECT state FROM durable_capture_status ORDER BY session_id').all()).toEqual([
+            { state: 'disabled_gap' },
+            { state: 'disabled_gap' },
+        ]);
         expect(verifyResegmentation(db, plan)).toEqual({ ok: true, errors: [] });
 
         const second = await planResegmentation(db, adapters);
@@ -252,6 +346,31 @@ describe('P2.2c re-segmentation', () => {
             ok: false,
             errors: ['codex:native-1:1 first_prompt_search differs'],
         });
+        db.close();
+    });
+
+    it('keeps both automatic split results evicted through backfill and search', async () => {
+        const { db, projectPath } = seed({ markerBeforeSecond: true });
+        evictSession(db, 1);
+        const plan = await planResegmentation(db, adapters);
+
+        applyResegmentation(db, plan);
+        const afterApply = db
+            .prepare(
+                `SELECT s.segment_index, dcs.state
+                 FROM sessions s
+                 LEFT JOIN durable_capture_status dcs ON dcs.session_id = s.id
+                 ORDER BY s.segment_index`,
+            )
+            .all();
+        const backfill = runBackfill(db, projectPath, 'automaticbackfillneedle');
+
+        expect.soft(afterApply).toEqual([
+            { segment_index: 0, state: 'evicted' },
+            { segment_index: 1, state: 'evicted' },
+        ]);
+        expect.soft(backfill).toEqual({ candidateIds: [], results: [] });
+        expectTerminalIdentity(db, 'automaticbackfillneedle', 2);
         db.close();
     });
 
@@ -355,6 +474,58 @@ describe('P2.2c re-segmentation', () => {
 });
 
 describe('manual segment corrections', () => {
+    it('keeps both manual split results evicted through backfill and search', async () => {
+        const { db, projectPath } = seed();
+        evictSession(db, 1);
+        const split = await planManualSplit(db, adapters, 1, 1);
+
+        applyManualSplit(db, split);
+        const afterApply = db
+            .prepare(
+                `SELECT s.segment_index, dcs.state
+                 FROM sessions s
+                 LEFT JOIN durable_capture_status dcs ON dcs.session_id = s.id
+                 ORDER BY s.segment_index`,
+            )
+            .all();
+        const backfill = runBackfill(db, projectPath, 'manualbackfillneedle');
+
+        expect.soft(afterApply).toEqual([
+            { segment_index: 0, state: 'evicted' },
+            { segment_index: 1, state: 'evicted' },
+        ]);
+        expect.soft(backfill).toEqual({ candidateIds: [], results: [] });
+        expectTerminalIdentity(db, 'manualbackfillneedle', 2);
+        db.close();
+    });
+
+    it('conservatively evicts a mixed merge and removes all durable rows before backfill and search', async () => {
+        const { db, projectPath } = seed();
+        const split = await planManualSplit(db, adapters, 1, 1);
+        const rightId = applyManualSplit(db, split);
+        captureMemory(db, 10, 'mixedretainedneedle');
+        setDurableStatus(db, 1, 'complete');
+        evictSession(db, rightId);
+        expect(db.prepare('SELECT state FROM durable_capture_status ORDER BY session_id').all()).toEqual([
+            { state: 'complete' },
+            { state: 'evicted' },
+        ]);
+        const merge = await planManualMerge(db, adapters, 1, rightId);
+
+        applyManualMerge(db, merge);
+        const afterApply = {
+            statuses: db.prepare('SELECT state FROM durable_capture_status ORDER BY session_id').all(),
+            filtered: db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
+            usage: db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get(),
+        };
+        const backfill = runBackfill(db, projectPath, 'mixedmergebackfillneedle');
+
+        expect.soft(afterApply).toEqual({ statuses: [{ state: 'evicted' }], filtered: { count: 0 }, usage: { total_bytes: 0 } });
+        expect.soft(backfill).toEqual({ candidateIds: [], results: [] });
+        expectTerminalIdentity(db, 'mixedmergebackfillneedle', 1);
+        db.close();
+    });
+
     it('rejects out-of-store manual split and merge without touching the parser or database', async () => {
         const operations = [
             {
@@ -483,6 +654,10 @@ describe('manual segment corrections', () => {
             { segment_index: 1, first_prompt_search: split.right.firstPromptSearch },
         ]);
         expect(db.prepare('SELECT custom_title FROM sessions WHERE id = 1').get()).toEqual({ custom_title: 'Keep mine' });
+        expect(db.prepare('SELECT state FROM durable_capture_status ORDER BY session_id').all()).toEqual([
+            { state: 'disabled_gap' },
+            { state: 'disabled_gap' },
+        ]);
 
         insertRollup(db, 1);
         insertRollup(db, newId);
@@ -502,6 +677,7 @@ describe('manual segment corrections', () => {
         });
         expect(db.prepare('SELECT git_commit_count FROM sessions WHERE id = 1').get()).toEqual({ git_commit_count: 42 });
         expect(db.prepare('SELECT custom_title FROM sessions WHERE id = 1').get()).toEqual({ custom_title: 'Keep mine' });
+        expect(db.prepare('SELECT state FROM durable_capture_status WHERE session_id = 1').get()).toEqual({ state: 'disabled_gap' });
         expect(db.prepare('SELECT GROUP_CONCAT(turn_index) AS turns FROM memories WHERE session_id = 1 ORDER BY turn_index').get()).toEqual(
             {
                 turns: '0,1,2',
