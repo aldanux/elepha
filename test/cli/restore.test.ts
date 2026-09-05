@@ -29,8 +29,10 @@ import { writeBackup } from '../../src/storage/backup.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
 import { DATABASE_LIFECYCLE_AMBIGUOUS, DATABASE_LIFECYCLE_BUSY, databaseLifecyclePaths } from '../../src/storage/database-lifecycle.js';
 import { openKeyedDatabase, openManagedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
+import { assertCanonicalDurableCaptureSchema, DURABLE_CAPTURE_SCHEMA_MISMATCH } from '../../src/storage/durable-capture-integrity.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
+import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
@@ -778,6 +780,222 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             ).toEqual({ count: 2 });
         } finally {
             restored.close();
+        }
+    });
+
+    it('rebuilds orphaned durable FTS postings and the forged usage singleton before installing a candidate', async () => {
+        const active = createTestDb('elepha-restore-derived-active-');
+        const candidate = createTestDb('elepha-restore-derived-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const needle = 'c21orphanpostingneedle';
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        const project = candidate.store.upsertProject(path.join(candidate.directory, 'durable-project'));
+        const session = candidate.store.upsertSession(
+            'codex',
+            'orphaned-index-session',
+            project.id,
+            path.join(candidate.directory, 'orphan.jsonl'),
+        );
+        const orphanTurn: ParsedTurn = {
+            tool: 'codex',
+            sessionId: session.native_id,
+            sourcePath: session.source_path,
+            projectPath: project.path,
+            turnIndex: 0,
+            startedAt: '2026-08-01T00:00:00.000Z',
+            endedAt: '2026-08-01T00:00:01.000Z',
+            userMessage: needle,
+            assistantText: 'orphaned response',
+            toolCalls: [],
+            cursor: '0',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+        candidate.store.recordTurn(orphanTurn, session.id, project.id, { decisions: [], pending_items: [], status: 'ok' }, true);
+        const memoryId = candidate.store.listMemoriesForSession(session.id)[0]?.id;
+        if (memoryId === undefined) throw new Error('durable memory was not recorded');
+        candidate.store.recordTurn(
+            { ...orphanTurn, turnIndex: 1, userMessage: 'retained durable prompt', assistantText: 'retained response', cursor: '1' },
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'ok' },
+            true,
+        );
+        candidate.db.exec(`
+            DROP TRIGGER filtered_turns_ad;
+            DROP TRIGGER filtered_turns_usage_ad;
+        `);
+        candidate.db.prepare('DELETE FROM filtered_turns WHERE memory_id = ?').run(memoryId);
+        candidate.db.prepare('UPDATE durable_capture_usage SET total_bytes = ? WHERE id = 1').run(424_242);
+        candidate.db.exec('CREATE VIRTUAL TABLE temp.c21_candidate_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+        expect(candidate.db.prepare('SELECT memory_id FROM filtered_turns WHERE memory_id = ?').all(memoryId)).toEqual([]);
+        expect(candidate.db.prepare('SELECT term, doc FROM temp.c21_candidate_terms WHERE term = ?').all(needle)).toEqual([
+            { term: needle, doc: memoryId },
+        ]);
+        expect(candidate.db.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle)).toEqual([
+            { rowid: memoryId },
+        ]);
+        expect(candidate.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 424_242 });
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            restored.exec('CREATE VIRTUAL TABLE temp.c21_restored_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+            const usage = restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get();
+            const measuredUsage = restored
+                .prepare(
+                    `SELECT COALESCE(SUM(
+                         length(CAST(user_prompt AS BLOB)) +
+                         length(CAST(assistant_response AS BLOB)) +
+                         length(CAST(tool_calls AS BLOB))
+                     ), 0) AS total_bytes
+                     FROM filtered_turns`,
+                )
+                .get() as { total_bytes: number };
+
+            expect.soft(restored.prepare('SELECT term, doc FROM temp.c21_restored_terms WHERE term = ?').all(needle)).toEqual([]);
+            expect.soft(restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle)).toEqual([]);
+            expect.soft(measuredUsage.total_bytes).toBeGreaterThan(0);
+            expect.soft(usage).toEqual(measuredUsage);
+        } finally {
+            restored.close();
+        }
+    });
+
+    it('normalizes every legacy summarizer and durable text field before installing a candidate', async () => {
+        const active = createTestDb('elepha-restore-sanitize-active-');
+        const candidate = createTestDb('elepha-restore-sanitize-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const tainted = (label: string) => `${label}\n\\|| active\u0085control`;
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        const project = candidate.store.upsertProject(path.join(candidate.directory, 'sanitize-project'));
+        const session = candidate.store.upsertSession(
+            'codex',
+            'legacy-sanitize-session',
+            project.id,
+            path.join(candidate.directory, 'sanitize.jsonl'),
+        );
+        candidate.store.recordTurn(
+            {
+                tool: 'codex',
+                sessionId: session.native_id,
+                sourcePath: session.source_path,
+                projectPath: project.path,
+                turnIndex: 0,
+                startedAt: '2026-08-01T00:00:00.000Z',
+                endedAt: '2026-08-01T00:00:01.000Z',
+                userMessage: 'safe prompt',
+                assistantText: 'safe response',
+                toolCalls: [],
+                cursor: '0',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            },
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'ok' },
+            true,
+        );
+        const memoryId = candidate.store.listMemoriesForSession(session.id)[0]?.id;
+        if (memoryId === undefined) throw new Error('durable memory was not recorded');
+        candidate.db
+            .prepare('UPDATE memories SET decisions = ?, pending_items = ? WHERE id = ?')
+            .run(
+                JSON.stringify([{ what: tainted('memory what'), why: tainted('memory why') }]),
+                JSON.stringify([tainted('memory pending')]),
+                memoryId,
+            );
+        candidate.db
+            .prepare(
+                `INSERT INTO session_rollups
+                 (session_id, project_id, tool, title, summary, decisions, pending_items, files_touched, turn_count,
+                  started_at, ended_at, kind, parent_session_id, summarizer_status, rollup_state,
+                  rolled_up_through_turn_index, computed_at, rollup_version)
+                 VALUES (?, ?, 'codex', ?, ?, ?, ?, '[]', 1, '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:01.000Z',
+                         'primary', NULL, 'ok', 'final', 0, '2026-08-01T00:00:01.000Z', 1)`,
+            )
+            .run(
+                session.id,
+                project.id,
+                tainted('rollup title'),
+                tainted('rollup summary'),
+                JSON.stringify([{ what: tainted('rollup what'), why: tainted('rollup why') }]),
+                JSON.stringify([tainted('rollup pending')]),
+            );
+        candidate.db.prepare('UPDATE filtered_turns SET user_prompt = ?, assistant_response = ?, tool_calls = ? WHERE memory_id = ?').run(
+            tainted('filtered prompt'),
+            tainted('filtered response'),
+            JSON.stringify([
+                {
+                    name: tainted('tool name'),
+                    filePaths: [tainted('tool path')],
+                    legacy: { nested: tainted('nested tool value') },
+                },
+            ]),
+            memoryId,
+        );
+        expect([...new Set(verifySanitize(candidate.db).map(({ table, field }) => `${table}.${field}`))].sort()).toEqual([
+            'filtered_turns.assistant_response',
+            'filtered_turns.tool_calls',
+            'filtered_turns.user_prompt',
+            'memories.decisions',
+            'memories.pending_items',
+            'session_rollups.decisions',
+            'session_rollups.pending_items',
+            'session_rollups.summary',
+            'session_rollups.title',
+        ]);
+        fullBackup(candidate.dbPath, backup);
+        const candidateBytes = readFileSync(backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            expect.soft(verifySanitize(restored)).toEqual([]);
+            expect.soft(planSanitize(restored).changes).toEqual([]);
+        } finally {
+            restored.close();
+        }
+        expect(readFileSync(backup)).toEqual(candidateBytes);
+    });
+
+    it('rejects missing, extra, and substituted durable maintenance objects with a source-owned error', () => {
+        const canonical = openUnmanagedDb(':memory:');
+        const mutations = [
+            'DROP TRIGGER filtered_turns_usage_ai',
+            'CREATE TRIGGER c21_extra_memory_trigger AFTER UPDATE ON memories BEGIN SELECT 1; END',
+            'CREATE INDEX c21_extra_memory_index ON memories(turn_index)',
+            `DROP TRIGGER filtered_turns_ai;
+             CREATE TRIGGER filtered_turns_ai AFTER INSERT ON filtered_turns BEGIN SELECT 1; END`,
+        ];
+        try {
+            for (const mutation of mutations) {
+                const candidate = createTestDb('elepha-restore-durable-schema-');
+                candidate.db.exec(mutation);
+
+                expect(() => assertCanonicalDurableCaptureSchema(candidate.db, canonical)).toThrow(DURABLE_CAPTURE_SCHEMA_MISMATCH);
+            }
+        } finally {
+            canonical.close();
         }
     });
 
@@ -1667,9 +1885,10 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         removeLifecycleIntents(active.dbPath);
     });
 
-    it('accepts an older sessions schema when the current migration can bring it forward', async () => {
+    it('accepts a legacy-minimum backup and migrates its durable schema without changing the source', async () => {
         const active = createTestDb('elepha-restore-active-');
         const candidate = createTestDb('elepha-restore-candidate-');
+        const backup = path.join(candidate.directory, 'legacy-minimum.db');
         populate(active.dbPath, 'before');
         candidate.db
             .prepare('INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES (?, ?, ?)')
@@ -1687,24 +1906,48 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                 '2026-08-01T00:00:00.000Z',
             );
         replaceWithLegacySessionsTable(candidate.db);
+        candidate.db.exec(`
+            DROP TABLE filtered_turns_fts;
+            DROP TABLE filtered_turns;
+            DROP TABLE durable_capture_status;
+            DROP TABLE durable_capture_usage;
+        `);
+        expect(
+            candidate.db
+                .prepare(
+                    `SELECT name FROM sqlite_master
+                     WHERE lower(name) GLOB 'filtered_turns*'
+                        OR lower(name) GLOB 'durable_capture*'
+                        OR lower(tbl_name) = 'filtered_turns'`,
+                )
+                .all(),
+        ).toEqual([]);
         active.close();
+        candidate.db.pragma('wal_checkpoint(TRUNCATE)');
         candidate.close();
+        copyFileSync(candidate.dbPath, backup);
+        const legacyBytes = readFileSync(backup);
 
         await expect(
-            runRestoreOperation(candidate.dbPath, {
+            runRestoreOperation(backup, {
                 dbPath: active.dbPath,
                 daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
             }),
         ).resolves.toMatchObject({ cancelled: false });
         expect(sessionNativeIds(active.dbPath)).toEqual(['legacy-session']);
-        const restored = openUnmanagedDb(active.dbPath);
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        const canonical = openUnmanagedDb(':memory:');
         try {
             expect((restored.pragma('table_info(sessions)') as Array<{ name: string }>).map((column) => column.name)).toContain(
                 'segment_index',
             );
+            expect(() => assertCanonicalDurableCaptureSchema(restored, canonical)).not.toThrow();
+            expect(restored.prepare('SELECT id, total_bytes FROM durable_capture_usage').all()).toEqual([{ id: 1, total_bytes: 0 }]);
         } finally {
+            canonical.close();
             restored.close();
         }
+        expect(readFileSync(backup)).toEqual(legacyBytes);
     });
 
     it('leaves the database untouched when a TTY declines confirmation', () => {

@@ -22,6 +22,7 @@ import {
     openManagedDatabase,
     openUnmanagedDb,
 } from '../../storage/db.js';
+import { assertCanonicalDurableCaptureSchema, normalizeAndVerifyDurableCapture } from '../../storage/durable-capture-integrity.js';
 import { errorMessage } from '../../util/error.js';
 import { atomicCopyPrivateFile } from '../../util/fs.js';
 import { runRestoreWizard } from '../restore-wizard.js';
@@ -176,10 +177,12 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
         if (errors.length > 0) {
             throw new Error(`Backup schema does not match the current elepha schema after migration: ${errors.join('; ')}`);
         }
+        assertCanonicalDurableCaptureSchema(staged, canonical);
         const semanticViolations = validateCandidateSemantics(staged, ['sessions', 'memories', 'session_rollups', 'consent_roots']);
         if (semanticViolations.length > 0) {
             throw new Error(`Backup is semantically invalid: ${semanticViolations.join('; ')}`);
         }
+        normalizeAndVerifyDurableCapture(staged);
     } finally {
         canonical?.close();
         staged?.close();
@@ -423,6 +426,7 @@ async function unionTranscriptTombstones(
                 )
                 .run();
         })();
+        normalizeAndVerifyDurableCapture(restored);
         const checkpoint = restored.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
         if (checkpoint[0]?.busy !== 0) {
             throw new Error('Could not checkpoint preserved transcript tombstones.');
