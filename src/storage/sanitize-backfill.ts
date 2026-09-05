@@ -163,17 +163,32 @@ export function planSanitize(db: Database): SanitizePlan {
     };
 }
 
+export interface GuardedSanitizeApplyOptions {
+    beforeFirstMutation(): boolean;
+}
+
+export type GuardedSanitizeApplyResult = { status: 'applied'; plan: SanitizePlan } | { status: 'not_applied'; plan: SanitizePlan };
+
 // Applies planSanitize's plan in a single transaction. Returns the plan that was applied, for reporting.
-export function applySanitize(db: Database): SanitizePlan {
+export function applySanitize(db: Database): SanitizePlan;
+export function applySanitize(db: Database, options: GuardedSanitizeApplyOptions): GuardedSanitizeApplyResult;
+export function applySanitize(db: Database, options?: GuardedSanitizeApplyOptions): SanitizePlan | GuardedSanitizeApplyResult {
     const plan = planSanitize(db);
     const apply = db.transaction(() => {
+        if (options !== undefined && !options.beforeFirstMutation()) {
+            return false;
+        }
         for (const c of plan.changes) {
             const idColumn = c.table === 'session_rollups' ? 'session_id' : c.table === 'filtered_turns' ? 'memory_id' : 'id';
             db.prepare(`UPDATE ${c.table} SET ${c.field} = ? WHERE ${idColumn} = ?`).run(c.after, c.rowId);
         }
+        return true;
     });
-    apply();
-    return plan;
+    if (options === undefined) {
+        apply();
+        return plan;
+    }
+    return apply.immediate() ? { status: 'applied', plan } : { status: 'not_applied', plan };
 }
 
 export interface SanitizeResidue {

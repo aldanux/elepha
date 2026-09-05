@@ -10,6 +10,20 @@ import type { PurgePlan } from '../storage/memory-store.js';
 import { errorMessage } from '../util/error.js';
 import { pauseCaptureService, resolveCaptureService, resumeCaptureService } from './capture-service.js';
 
+export interface CliOutputSink {
+    error(message: string): void;
+    exitCode?(code: number): void;
+    log(message: string): void;
+}
+
+function setOutputExitCode(output: CliOutputSink, code: number): void {
+    if (output.exitCode) {
+        output.exitCode(code);
+    } else {
+        process.exitCode = code;
+    }
+}
+
 export async function confirmYesNo(question: string): Promise<boolean> {
     const prompt = readline.createInterface({ input: process.stdin, output: process.stdout });
     const answer = await new Promise<string>((resolve) => prompt.question(question, resolve));
@@ -85,11 +99,11 @@ async function waitForCaptureToStop(): Promise<boolean> {
 }
 
 // Runs a destructive operation only after confirming that the capture writer is stopped.
-export async function withCapturePaused(operation: string, fn: () => Promise<void>): Promise<boolean> {
+export async function withCapturePaused(operation: string, fn: () => Promise<void>, output: CliOutputSink = console): Promise<boolean> {
     const health = daemonHealth();
     if (!health.healthy) {
         if (health.state.startsWith('STUCK')) {
-            console.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
+            output.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
         }
         await fn();
         return true;
@@ -97,8 +111,8 @@ export async function withCapturePaused(operation: string, fn: () => Promise<voi
 
     const service = resolveCaptureService();
     if (!service) {
-        console.error(`Refusing ${operation}: a running daemon could not be paused automatically. Stop it and retry.`);
-        process.exitCode = 1;
+        output.error(`Refusing ${operation}: a running daemon could not be paused automatically. Stop it and retry.`);
+        setOutputExitCode(output, 1);
         return false;
     }
 
@@ -107,22 +121,22 @@ export async function withCapturePaused(operation: string, fn: () => Promise<voi
         pauseCaptureService(service);
         pausedByUs = await waitForCaptureToStop();
     } catch (error) {
-        console.error(errorMessage(error));
+        output.error(errorMessage(error));
     }
 
     if (!pausedByUs) {
-        console.error(`Refusing ${operation}: a running daemon could not be paused automatically. Stop it and retry.`);
-        process.exitCode = 1;
+        output.error(`Refusing ${operation}: a running daemon could not be paused automatically. Stop it and retry.`);
+        setOutputExitCode(output, 1);
         return false;
     }
 
-    console.log('Paused capture…');
+    output.log('Paused capture…');
     try {
         await fn();
         return true;
     } finally {
         resumeCaptureService(service);
-        console.log('Capture resumed.');
+        output.log('Capture resumed.');
     }
 }
 

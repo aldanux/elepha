@@ -2,14 +2,18 @@
 // the transforms; these prove the choke points are actually wired, which is the
 // difference between a stated rule and one enforced in code.
 
+import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { Command } from 'commander';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
-import { openUnmanagedDb } from '../../src/storage/db.js';
+import { openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { enableParanoidMode, LOCKED_MEMORY_MESSAGE, lockMemory, unlockMemory } from '../../src/storage/paranoid-gate.js';
 import { mergeRollupContent, RollupStore, type RollupWrite } from '../../src/storage/rollup-store.js';
 import { applySanitize, planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import type { ParsedTurn, SummarizationOutput } from '../../src/types/index.js';
+import { withGrantableTestDir } from '../helpers/tmp.js';
 
 const C1_CONTROLS = '\u0080\u0085\u0090\u009b\u009f';
 
@@ -341,4 +345,195 @@ describe('Rule 3 backfill', () => {
         expect(raw.decisions).toContain('\\\\`');
         expect(verifySanitize(db)).toEqual([]);
     });
+});
+
+const SANITIZE_SECRET = 'c18-secret-value $(exposed)';
+const PARANOID_PASSPHRASE = 'correct horse battery staple';
+
+interface ManagedSanitizeFixture {
+    db: Database;
+    dbPath: string;
+    directory: string;
+    memoryId: number;
+}
+
+async function createManagedSanitizeFixture(): Promise<ManagedSanitizeFixture> {
+    const directory = withGrantableTestDir('elepha-sanitize-paranoid-');
+    const dbPath = path.join(directory, 'elepha.db');
+    vi.stubEnv('ELEPHA_DB_PATH', dbPath);
+    vi.stubEnv('ELEPHA_ENV_FILE', path.join(directory, 'missing.env'));
+    vi.stubEnv('ELEPHA_HOME', path.join(directory, 'isolated-elepha-home'));
+    const db = await openDb(dbPath, {
+        encryption: {
+            platform: 'linux',
+            env: { CI: '1' },
+            keyFilePath: () => path.join(directory, 'elepha.keydata'),
+        },
+    });
+    const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+    const project = store.upsertProject(path.join(directory, 'project'));
+    const session = store.upsertSession('claude-code', 'sanitize-session', project.id, path.join(directory, 'session.jsonl'));
+    store.recordTurn(
+        {
+            tool: 'claude-code',
+            sessionId: 'sanitize-session',
+            sourcePath: path.join(directory, 'session.jsonl'),
+            projectPath: project.path,
+            turnIndex: 0,
+            startedAt: '2026-08-01T00:00:00.000Z',
+            endedAt: '2026-08-01T00:00:01.000Z',
+            userMessage: 'safe prompt',
+            assistantText: 'safe response',
+            toolCalls: [],
+            cursor: 'c0',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        },
+        session.id,
+        project.id,
+        { decisions: [], pending_items: [], status: 'ok' },
+        true,
+    );
+    const memory = store.listMemoriesForSession(session.id)[0];
+    db.prepare('UPDATE filtered_turns SET user_prompt = ? WHERE memory_id = ?').run(SANITIZE_SECRET, memory.id);
+    return { db, dbPath, directory, memoryId: memory.id };
+}
+
+function storedSanitizeSecret(fixture: ManagedSanitizeFixture): string {
+    return (
+        fixture.db.prepare('SELECT user_prompt FROM filtered_turns WHERE memory_id = ?').get(fixture.memoryId) as {
+            user_prompt: string;
+        }
+    ).user_prompt;
+}
+
+async function runRegisteredSanitize(db: Database, ...args: string[]): Promise<{ errors: string[]; logs: string[]; warnings: string[] }> {
+    vi.doMock('../../src/storage/db.js', async (importOriginal) => ({
+        ...(await importOriginal<typeof import('../../src/storage/db.js')>()),
+        openDb: vi.fn().mockResolvedValue(db),
+    }));
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((message) => logs.push(String(message)));
+    vi.spyOn(console, 'error').mockImplementation((message) => errors.push(String(message)));
+    vi.spyOn(console, 'warn').mockImplementation((message) => warnings.push(String(message)));
+    const { registerSanitize } = await import('../../src/cli/commands/sanitize.js');
+    const program = new Command();
+    registerSanitize(program);
+    await program.parseAsync(['node', 'elepha', 'sanitize', ...args]);
+    return { errors, logs, warnings };
+}
+
+describe('sanitize paranoid read gate', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.resetModules();
+        vi.doUnmock('../../src/storage/db.js');
+        vi.doUnmock('../../src/storage/sanitize-backfill.js');
+        vi.unstubAllEnvs();
+    });
+
+    it('prints only the standard locked response during a locked dry run', async () => {
+        const fixture = await createManagedSanitizeFixture();
+        enableParanoidMode(fixture.db, PARANOID_PASSPHRASE);
+
+        const output = await runRegisteredSanitize(fixture.db);
+
+        expect(output).toEqual({ errors: [], logs: [LOCKED_MEMORY_MESSAGE], warnings: [] });
+        expect(output.logs.join('\n')).not.toContain(SANITIZE_SECRET);
+        expect(storedSanitizeSecret(fixture)).toBe(SANITIZE_SECRET);
+        fixture.db.close();
+    });
+
+    it('prints only the standard locked response and changes nothing during locked apply', async () => {
+        const fixture = await createManagedSanitizeFixture();
+        enableParanoidMode(fixture.db, PARANOID_PASSPHRASE);
+
+        const output = await runRegisteredSanitize(fixture.db, '--apply');
+
+        expect(output).toEqual({ errors: [], logs: [LOCKED_MEMORY_MESSAGE], warnings: [] });
+        expect(output.logs.join('\n')).not.toContain(SANITIZE_SECRET);
+        expect(storedSanitizeSecret(fixture)).toBe(SANITIZE_SECRET);
+        fixture.db.close();
+    });
+
+    it('suppresses a plan when lock completes after its rows are read but before rendering', async () => {
+        const fixture = await createManagedSanitizeFixture();
+        enableParanoidMode(fixture.db, PARANOID_PASSPHRASE);
+        expect(unlockMemory(fixture.db, PARANOID_PASSPHRASE)).toBe('unlocked');
+        let planRead = false;
+        vi.doMock('../../src/storage/sanitize-backfill.js', async (importOriginal) => {
+            const actual = await importOriginal<typeof import('../../src/storage/sanitize-backfill.js')>();
+            return {
+                ...actual,
+                planSanitize: (db: Database) => {
+                    const plan = actual.planSanitize(db);
+                    planRead = true;
+                    expect(lockMemory(db)).toBe('locked');
+                    return plan;
+                },
+            };
+        });
+
+        const output = await runRegisteredSanitize(fixture.db);
+
+        expect(planRead).toBe(true);
+        expect(output).toEqual({ errors: [], logs: [LOCKED_MEMORY_MESSAGE], warnings: [] });
+        expect(output.logs.join('\n')).not.toContain(SANITIZE_SECRET);
+        expect(storedSanitizeSecret(fixture)).toBe(SANITIZE_SECRET);
+        fixture.db.close();
+    });
+
+    it('does not update after a competing lock completes before the first sanitize update', async () => {
+        const fixture = await createManagedSanitizeFixture();
+        enableParanoidMode(fixture.db, PARANOID_PASSPHRASE);
+        expect(unlockMemory(fixture.db, PARANOID_PASSPHRASE)).toBe('unlocked');
+        const contender = await openDb(fixture.dbPath, {
+            encryption: {
+                platform: 'linux',
+                env: { CI: '1' },
+                keyFilePath: () => path.join(fixture.directory, 'elepha.keydata'),
+            },
+        });
+        const prepare = fixture.db.prepare.bind(fixture.db);
+        let lockAttempted = false;
+        let lockCompletedBeforeUpdate = false;
+        let lockError: unknown;
+        vi.spyOn(fixture.db, 'prepare').mockImplementation(((source: string) => {
+            if (!lockAttempted && /^UPDATE filtered_turns SET user_prompt = \?/.test(source)) {
+                lockAttempted = true;
+                try {
+                    lockCompletedBeforeUpdate = lockMemory(contender) === 'locked';
+                } catch (error) {
+                    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'SQLITE_BUSY') {
+                        throw error;
+                    }
+                    lockError = error;
+                }
+            }
+            return prepare(source);
+        }) as typeof fixture.db.prepare);
+
+        const output = await runRegisteredSanitize(fixture.db, '--apply');
+        const stored = storedSanitizeSecret(fixture);
+
+        expect({ lockAttempted, output }).toMatchObject({ lockAttempted: true });
+        if (lockCompletedBeforeUpdate) {
+            expect(lockError).toBeUndefined();
+            expect(output).toEqual({ errors: [], logs: [LOCKED_MEMORY_MESSAGE], warnings: [] });
+            expect(stored).toBe(SANITIZE_SECRET);
+        } else {
+            expect(lockError).toMatchObject({ code: 'SQLITE_BUSY' });
+            expect(stored).not.toBe(SANITIZE_SECRET);
+            expect(output.errors).toEqual([]);
+            expect(output.warnings).toEqual([]);
+            expect(output.logs.join('\n')).toContain(SANITIZE_SECRET);
+            expect(output.logs).toContain('Rewrote 1 field(s).');
+            expect(output.logs).toContain('Verified: no stored field carries shell-active syntax.');
+            expect(lockMemory(contender)).toBe('locked');
+        }
+        contender.close();
+        fixture.db.close();
+    }, 15000);
 });

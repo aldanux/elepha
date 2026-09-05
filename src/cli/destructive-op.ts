@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { backupDatabaseAndReport } from '../storage/backup.js';
 import { defaultDbPath } from '../storage/db.js';
-import { withCapturePaused } from './shared.js';
+import { type CliOutputSink, withCapturePaused } from './shared.js';
 
 type MaybePromise<T> = T | Promise<T>;
 
@@ -19,6 +19,7 @@ export interface DestructiveOpOptions<Plan> {
     verify(plan: Plan): MaybePromise<void>;
     confirm?: (plan: Plan) => MaybePromise<boolean>;
     backupLog?: (message: string) => void;
+    output?: CliOutputSink;
     messages: {
         dryRun: string;
     };
@@ -26,6 +27,7 @@ export interface DestructiveOpOptions<Plan> {
 
 // Runs the shared preview -> optional confirm -> backup -> apply -> verify sequence.
 export async function runDestructiveOp<Plan>(opts: DestructiveOpOptions<Plan>): Promise<boolean> {
+    const output = opts.output ?? console;
     const plan = await opts.plan();
     opts.describe(plan);
     if (opts.isEmpty(plan)) {
@@ -33,7 +35,7 @@ export async function runDestructiveOp<Plan>(opts: DestructiveOpOptions<Plan>): 
         return true;
     }
     if (!opts.applyRequested) {
-        console.log(opts.messages.dryRun);
+        output.log(opts.messages.dryRun);
         return true;
     }
 
@@ -41,16 +43,20 @@ export async function runDestructiveOp<Plan>(opts: DestructiveOpOptions<Plan>): 
         return true;
     }
 
-    return withCapturePaused(opts.operationLabel ?? 'this operation', async () => {
-        // Each backup is a full snapshot of exactly the data being changed - an
-        // unbounded pile of them undercuts "revocation = deletion" as badly as
-        // skipping the delete would.
-        const dbPath = defaultDbPath();
-        if (existsSync(dbPath)) {
-            backupDatabaseAndReport(opts.db, dbPath, opts.backupLog);
-        }
+    return withCapturePaused(
+        opts.operationLabel ?? 'this operation',
+        async () => {
+            // Each backup is a full snapshot of exactly the data being changed - an
+            // unbounded pile of them undercuts "revocation = deletion" as badly as
+            // skipping the delete would.
+            const dbPath = defaultDbPath();
+            if (existsSync(dbPath)) {
+                backupDatabaseAndReport(opts.db, dbPath, opts.backupLog);
+            }
 
-        await opts.apply(plan);
-        await opts.verify(plan);
-    });
+            await opts.apply(plan);
+            await opts.verify(plan);
+        },
+        output,
+    );
 }

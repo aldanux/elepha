@@ -370,6 +370,24 @@ function readGenerationIsCurrent(db: Database.Database, token: AuthenticatedRead
     );
 }
 
+// This is the DB-only half of generation validation for a caller that already
+// authenticated the full DB/file state immediately before acquiring a SQLite
+// writer slot. Call it only as the first action inside that writer transaction.
+export function memoryReadAuthorityMatchesGenerationInTransaction(db: Database.Database, token: AuthenticatedReadGeneration): boolean {
+    const expected = token[READ_GENERATION];
+    if (expected.db !== db || (registeredDatabases.get(db) !== undefined) !== expected.registered) {
+        return false;
+    }
+    const authority = readAuthority(db);
+    return (
+        authority !== undefined &&
+        authority.enrolled === expected.enrolled &&
+        authority.state === 'unlocked' &&
+        authority.generation === expected.generation &&
+        authority.credentialTag === expected.credentialTag
+    );
+}
+
 export function withMemoryReadGeneration<T>(
     db: Database.Database,
     locked: () => T,
