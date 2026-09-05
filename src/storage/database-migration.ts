@@ -18,7 +18,6 @@ import {
     statSync,
     unlinkSync,
     writeFileSync,
-    writeSync,
 } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
@@ -97,10 +96,16 @@ export interface DatabaseMigrationManifest {
     sourcePath: string;
     originalSha256: string;
     rollbackPath: string;
+    rollbackSha256?: string | null;
     sidecarPath: string;
-    backups: ManagedBackupMigration[];
+    backups?: ManagedBackupMigration[];
     keySha256: string | null;
     stage: MigrationStage;
+}
+
+interface CompleteDatabaseMigrationManifest extends DatabaseMigrationManifest {
+    rollbackSha256: string | null;
+    backups: ManagedBackupMigration[];
 }
 
 export interface DatabaseMigrationStatePaths {
@@ -312,6 +317,9 @@ function readManifest(file: string, databasePath: string): DatabaseMigrationMani
         typeof manifest.originalSha256 !== 'string' ||
         !/^[0-9a-f]{64}$/.test(manifest.originalSha256) ||
         typeof manifest.rollbackPath !== 'string' ||
+        (manifest.rollbackSha256 !== undefined &&
+            manifest.rollbackSha256 !== null &&
+            (typeof manifest.rollbackSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(manifest.rollbackSha256))) ||
         typeof manifest.sidecarPath !== 'string' ||
         (manifest.keySha256 !== null && (typeof manifest.keySha256 !== 'string' || !/^[0-9a-f]{64}$/.test(manifest.keySha256))) ||
         typeof manifest.stage !== 'string' ||
@@ -323,12 +331,15 @@ function readManifest(file: string, databasePath: string): DatabaseMigrationMani
     if (path.resolve(manifest.rollbackPath) !== expected.rollback || path.resolve(manifest.sidecarPath) !== expected.sidecar) {
         return malformedManifest(file);
     }
-    if (!Array.isArray(manifest.backups)) {
+    if (manifest.backups === undefined && manifest.rollbackSha256 !== undefined) {
+        return malformedManifest(file);
+    }
+    if (manifest.backups !== undefined && !Array.isArray(manifest.backups)) {
         return malformedManifest(file);
     }
     const backupDirectory = path.dirname(manifest.sourcePath);
     const backupPrefix = `${path.basename(manifest.sourcePath)}.bak-`;
-    for (const [index, backup] of manifest.backups.entries()) {
+    for (const [index, backup] of (manifest.backups ?? []).entries()) {
         if (
             !backup ||
             typeof backup !== 'object' ||
@@ -346,7 +357,7 @@ function readManifest(file: string, databasePath: string): DatabaseMigrationMani
             return malformedManifest(file);
         }
     }
-    const backupPaths = manifest.backups.map((backup) => backup.sourcePath);
+    const backupPaths = (manifest.backups ?? []).map((backup) => backup.sourcePath);
     if (new Set(backupPaths).size !== backupPaths.length || JSON.stringify(backupPaths) !== JSON.stringify([...backupPaths].sort())) {
         return malformedManifest(file);
     }
@@ -367,18 +378,18 @@ function writeManifest(file: string, databasePath: string, manifest: DatabaseMig
 
 function transitionManifest(
     file: string,
-    manifest: DatabaseMigrationManifest,
+    manifest: CompleteDatabaseMigrationManifest,
     stage: MigrationStage,
     runtime: DatabaseMigrationRuntime,
-    fields: Partial<Pick<DatabaseMigrationManifest, 'backend' | 'installationId' | 'keySha256'>> = {},
-): DatabaseMigrationManifest {
+    fields: Partial<Pick<CompleteDatabaseMigrationManifest, 'backend' | 'installationId' | 'keySha256' | 'rollbackSha256'>> = {},
+): CompleteDatabaseMigrationManifest {
     const next = { ...manifest, ...fields, stage };
     writeManifest(file, manifest.sourcePath, next);
     hit(runtime, `after_manifest_${stage}`);
     return next;
 }
 
-function rebaseUnfrozenManifest(manifestPath: string, manifest: DatabaseMigrationManifest): DatabaseMigrationManifest {
+function rebaseUnfrozenManifest(manifestPath: string, manifest: CompleteDatabaseMigrationManifest): CompleteDatabaseMigrationManifest {
     if (manifest.stage !== 'quiesced' || existsSync(manifest.rollbackPath)) {
         return manifest;
     }
@@ -504,8 +515,8 @@ function assertMatchesSnapshot(db: Database.Database, expected: DatabaseSnapshot
     }
 }
 
-function managedBackupVerificationError(backupPath: string, cause: unknown): Error {
-    return new Error(`Managed backup is unrecognized or unverifiable: ${backupPath}: ${errorMessage(cause)}`, { cause });
+function plaintextDatabaseVerificationError(databasePath: string, errorPrefix: string, cause: unknown): Error {
+    return new Error(`${errorPrefix}: ${databasePath}: ${errorMessage(cause)}`, { cause });
 }
 
 function managedBackupOpenCleanupCause(primary: unknown, db?: Database.Database, seal?: ReturnType<typeof pinSQLitePathForOpen>): unknown {
@@ -529,68 +540,102 @@ function managedBackupOpenCleanupCause(primary: unknown, db?: Database.Database,
         : new AggregateError(failures, 'Managed backup validation and cleanup both failed.', { cause: primary });
 }
 
-function openVerifiedPlaintextManagedBackup(backupPath: string, expectedSha256?: string): Database.Database {
+function openVerifiedPlaintextDatabase(
+    databasePath: string,
+    expectedSha256?: string,
+    integrityLabel = 'Managed backup',
+    errorPrefix = 'Managed backup is unrecognized or unverifiable',
+): Database.Database {
     let stats: BigIntStats;
     let plaintext: boolean;
     try {
-        stats = lstatSync(backupPath, { bigint: true });
-        plaintext = hasPlaintextHeader(backupPath);
+        stats = lstatSync(databasePath, { bigint: true });
+        plaintext = hasPlaintextHeader(databasePath);
     } catch (error) {
-        throw managedBackupVerificationError(backupPath, error);
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, error);
     }
     if (!stats.isFile() || stats.isSymbolicLink() || !plaintext) {
         const cause = new Error('expected a regular plaintext SQLite database');
-        throw managedBackupVerificationError(backupPath, cause);
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, cause);
     }
     if (expectedSha256 !== undefined) {
         let actualSha256: string;
         try {
-            actualSha256 = hashFile(backupPath);
+            actualSha256 = hashFile(databasePath);
         } catch (error) {
-            throw managedBackupVerificationError(backupPath, error);
+            throw plaintextDatabaseVerificationError(databasePath, errorPrefix, error);
         }
         if (actualSha256 !== expectedSha256) {
             const cause = new Error('contents changed after migration preflight');
-            throw managedBackupVerificationError(backupPath, cause);
+            throw plaintextDatabaseVerificationError(databasePath, errorPrefix, cause);
         }
     }
     let seal: ReturnType<typeof pinSQLitePathForOpen>;
     try {
-        seal = pinSQLitePathForOpen(backupPath, {
+        seal = pinSQLitePathForOpen(databasePath, {
             dev: stats.dev,
             ino: stats.ino,
             ctimeNs: stats.ctimeNs,
             nlink: stats.nlink,
         });
     } catch (error) {
-        throw managedBackupVerificationError(backupPath, error);
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, error);
     }
     let db: Database.Database;
     try {
         db = new Database(seal.sqlitePath, { fileMustExist: true, timeout: 0 });
     } catch (error) {
-        throw managedBackupVerificationError(backupPath, managedBackupOpenCleanupCause(error, undefined, seal));
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, managedBackupOpenCleanupCause(error, undefined, seal));
     }
     try {
         seal.confirmOpen(db);
-        assertIntegrity(db, 'Managed backup');
+        assertIntegrity(db, integrityLabel);
     } catch (error) {
-        throw managedBackupVerificationError(backupPath, managedBackupOpenCleanupCause(error, db, seal));
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, managedBackupOpenCleanupCause(error, db, seal));
     }
     try {
         seal.release();
     } catch (error) {
-        throw managedBackupVerificationError(backupPath, managedBackupOpenCleanupCause(error, db));
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, managedBackupOpenCleanupCause(error, db));
     }
     return db;
 }
 
 function preflightManagedBackups(databasePath: string): Array<Pick<ManagedBackupMigration, 'sourcePath' | 'originalSha256'>> {
     return listManagedBackups(databasePath).map((backupPath) => {
-        const backup = openVerifiedPlaintextManagedBackup(backupPath);
+        const backup = openVerifiedPlaintextDatabase(backupPath);
         backup.close();
         return { sourcePath: backupPath, originalSha256: hashFile(backupPath) };
     });
+}
+
+function normalizeLegacyManifest(
+    manifestPath: string,
+    manifest: DatabaseMigrationManifest,
+    runtime: DatabaseMigrationRuntime,
+): CompleteDatabaseMigrationManifest {
+    if (manifest.backups !== undefined && manifest.rollbackSha256 !== undefined) {
+        return manifest as CompleteDatabaseMigrationManifest;
+    }
+    let backups: ManagedBackupMigration[];
+    if (manifest.backups !== undefined) {
+        backups = manifest.backups;
+    } else {
+        backups = preflightManagedBackups(manifest.sourcePath).map((backup, index) => ({
+            ...backup,
+            encryptedPath: managedBackupArtifactPath(manifest.sourcePath, manifest.migrationId, index),
+            encryptedSha256: null,
+            stage: 'pending',
+        }));
+    }
+    const normalized: CompleteDatabaseMigrationManifest = {
+        ...manifest,
+        rollbackSha256: manifest.rollbackSha256 ?? null,
+        backups,
+    };
+    writeManifest(manifestPath, manifest.sourcePath, normalized);
+    hit(runtime, 'after_manifest_legacy_normalized');
+    return normalized;
 }
 
 function preflightPlaintextDatabase(databasePath: string, runtime: DatabaseMigrationRuntime): void {
@@ -661,48 +706,6 @@ function closePlaintextDatabase(db: Database.Database, runtime: DatabaseMigratio
     hit(runtime, 'after_plaintext_closed');
 }
 
-function assertRegularMigrationCopySource(descriptor: number, source: string): void {
-    if (!fstatSync(descriptor).isFile()) {
-        throw new Error(`Database migration copy source is not a regular file: ${source}`);
-    }
-}
-
-function copyFileDurably(source: string, destination: string): void {
-    removeFile(destination);
-    const sourceDescriptor = openSync(source, fsConstants.O_RDONLY | noFollowFlag());
-    let destinationDescriptor: number | undefined;
-    try {
-        assertRegularMigrationCopySource(sourceDescriptor, source);
-        destinationDescriptor = openSync(
-            destination,
-            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollowFlag(),
-            PRIVATE_FILE_MODE,
-        );
-        fchmodSync(destinationDescriptor, PRIVATE_FILE_MODE);
-        const buffer = Buffer.alloc(DATABASE_MIGRATION_HASH_CHUNK_BYTES);
-        let bytesRead = readSync(sourceDescriptor, buffer, 0, buffer.length, null);
-        while (bytesRead > 0) {
-            let offset = 0;
-            while (offset < bytesRead) {
-                offset += writeSync(destinationDescriptor, buffer, offset, bytesRead - offset);
-            }
-            bytesRead = readSync(sourceDescriptor, buffer, 0, buffer.length, null);
-        }
-        fsyncSync(destinationDescriptor);
-        closeSync(destinationDescriptor);
-        destinationDescriptor = undefined;
-        fsyncDirectory(path.dirname(destination));
-    } catch (error) {
-        if (destinationDescriptor !== undefined) {
-            closeSync(destinationDescriptor);
-        }
-        removeFile(destination);
-        throw error;
-    } finally {
-        closeSync(sourceDescriptor);
-    }
-}
-
 function rawKeyBuffer(key: Buffer): Buffer {
     return Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
 }
@@ -734,11 +737,11 @@ function syncFile(file: string): void {
 
 function transitionManagedBackup(
     manifestPath: string,
-    manifest: DatabaseMigrationManifest,
+    manifest: CompleteDatabaseMigrationManifest,
     index: number,
     backup: ManagedBackupMigration,
     runtime: DatabaseMigrationRuntime,
-): DatabaseMigrationManifest {
+): CompleteDatabaseMigrationManifest {
     const backups = manifest.backups.map((current, currentIndex) => (currentIndex === index ? backup : current));
     const next = { ...manifest, backups };
     writeManifest(manifestPath, manifest.sourcePath, next);
@@ -746,7 +749,7 @@ function transitionManagedBackup(
     return next;
 }
 
-function assertManagedBackupSet(manifest: DatabaseMigrationManifest): void {
+function assertManagedBackupSet(manifest: CompleteDatabaseMigrationManifest): void {
     const expected = manifest.backups.map((backup) => backup.sourcePath);
     if (JSON.stringify(listManagedBackups(manifest.sourcePath)) !== JSON.stringify(expected)) {
         throw new Error('Managed backup set changed after migration preflight; refusing to continue.');
@@ -768,7 +771,7 @@ function verifyEncryptedManagedBackup(databasePath: string, encryptedSha256: str
 
 function buildEncryptedManagedBackup(backup: ManagedBackupMigration, key: Buffer): string {
     removeFile(backup.encryptedPath);
-    const source = openVerifiedPlaintextManagedBackup(backup.sourcePath, backup.originalSha256);
+    const source = openVerifiedPlaintextDatabase(backup.sourcePath, backup.originalSha256);
     let descriptor: number | undefined;
     try {
         descriptor = createPrivateEmptyDatabaseDescriptor(backup.encryptedPath);
@@ -789,17 +792,17 @@ function buildEncryptedManagedBackup(backup: ManagedBackupMigration, key: Buffer
     fsyncDirectory(path.dirname(backup.encryptedPath));
     const encryptedSha256 = hashFile(backup.encryptedPath);
     verifyEncryptedManagedBackup(backup.encryptedPath, encryptedSha256, key, 'Encrypted managed backup replacement');
-    const unchanged = openVerifiedPlaintextManagedBackup(backup.sourcePath, backup.originalSha256);
+    const unchanged = openVerifiedPlaintextDatabase(backup.sourcePath, backup.originalSha256);
     unchanged.close();
     return encryptedSha256;
 }
 
 function convertManagedBackups(
     manifestPath: string,
-    initialManifest: DatabaseMigrationManifest,
+    initialManifest: CompleteDatabaseMigrationManifest,
     key: Buffer,
     runtime: DatabaseMigrationRuntime,
-): DatabaseMigrationManifest {
+): CompleteDatabaseMigrationManifest {
     let manifest = initialManifest;
     assertManagedBackupSet(manifest);
     for (let index = 0; index < manifest.backups.length; index++) {
@@ -823,7 +826,7 @@ function convertManagedBackups(
         } else {
             verifyEncryptedManagedBackup(backup.encryptedPath, backup.encryptedSha256 ?? '', key, 'Encrypted managed backup replacement');
         }
-        const original = openVerifiedPlaintextManagedBackup(backup.sourcePath, backup.originalSha256);
+        const original = openVerifiedPlaintextDatabase(backup.sourcePath, backup.originalSha256);
         original.close();
         renameSync(backup.encryptedPath, backup.sourcePath);
         fsyncDirectory(path.dirname(backup.sourcePath));
@@ -835,7 +838,7 @@ function convertManagedBackups(
     return manifest;
 }
 
-function assertManagedBackupsEncrypted(manifest: DatabaseMigrationManifest, key: Buffer): void {
+function assertManagedBackupsEncrypted(manifest: CompleteDatabaseMigrationManifest, key: Buffer): void {
     assertManagedBackupSet(manifest);
     for (const backup of manifest.backups) {
         if (backup.stage !== 'replaced' || backup.encryptedSha256 === null) {
@@ -845,39 +848,53 @@ function assertManagedBackupsEncrypted(manifest: DatabaseMigrationManifest, key:
     }
 }
 
-function encryptAndVerifySidecar(
-    manifest: DatabaseMigrationManifest,
+function verifyEncryptedMigrationArtifact(
+    databasePath: string,
     key: Buffer,
     expected: DatabaseSnapshot,
-    runtime: DatabaseMigrationRuntime,
-): void {
-    const sidecar = new Database(manifest.sidecarPath, { fileMustExist: true, timeout: 0 });
-    const rawKey = rawKeyBuffer(key);
-    try {
-        const journalMode = sidecar.pragma('journal_mode = DELETE', { simple: true });
-        if (journalMode !== 'delete') {
-            throw new Error(`Encrypted sidecar could not enter DELETE journal mode (observed ${String(journalMode)}).`);
-        }
-        sidecar.pragma("cipher='chacha20'");
-        sidecar.rekey(rawKey);
-    } finally {
-        rawKey.fill(0);
-        sidecar.close();
+    label: string,
+    expectedSha256?: string,
+): string {
+    const sha256 = hashFile(databasePath);
+    if (expectedSha256 !== undefined && sha256 !== expectedSha256) {
+        throw new Error(`${label} changed after encryption verification.`);
     }
-    syncFile(manifest.sidecarPath);
-    fsyncDirectory(path.dirname(manifest.sidecarPath));
-    hit(runtime, 'after_sidecar_encrypted');
-    if (hasPlaintextHeader(manifest.sidecarPath)) {
-        throw new Error('Encrypted database sidecar retained a plaintext SQLite header.');
-    }
-    const verified = openKeyedDatabase(manifest.sidecarPath, key, true);
+    assertEncryptedDatabaseFile(databasePath, key, label);
+    const verified = openKeyedDatabase(databasePath, key, true);
     try {
-        assertIntegrity(verified, 'Encrypted database sidecar');
-        assertMatchesSnapshot(verified, expected, 'Encrypted database sidecar');
+        assertIntegrity(verified, label);
+        assertMatchesSnapshot(verified, expected, label);
     } finally {
         verified.close();
     }
-    hit(runtime, 'after_sidecar_verified');
+    return sha256;
+}
+
+function buildEncryptedMigrationArtifact(
+    source: Database.Database,
+    destinationPath: string,
+    key: Buffer,
+    expected: DatabaseSnapshot,
+    label: string,
+): string {
+    removeFile(destinationPath);
+    let descriptor: number | undefined;
+    try {
+        descriptor = createPrivateEmptyDatabaseDescriptor(destinationPath);
+        const identity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
+        closeSync(descriptor);
+        descriptor = undefined;
+        writeEncryptedDatabaseSnapshotWithKey(source, destinationPath, identity, key);
+        syncFile(destinationPath);
+        fsyncDirectory(path.dirname(destinationPath));
+        return verifyEncryptedMigrationArtifact(destinationPath, key, expected, label);
+    } catch (error) {
+        if (descriptor !== undefined) {
+            closeSync(descriptor);
+        }
+        removeFile(destinationPath);
+        throw error;
+    }
 }
 
 function encryptionMetadata(manifest: DatabaseMigrationManifest): EncryptionMetadata {
@@ -901,9 +918,65 @@ async function storedMigrationKey(
     return key;
 }
 
+function recordEncryptedRollback(
+    manifestPath: string,
+    manifest: CompleteDatabaseMigrationManifest,
+    rollbackSha256: string,
+    runtime: DatabaseMigrationRuntime,
+): CompleteDatabaseMigrationManifest {
+    const next = { ...manifest, rollbackSha256 };
+    writeManifest(manifestPath, manifest.sourcePath, next);
+    hit(runtime, 'after_manifest_rollback_encrypted');
+    return next;
+}
+
+function assertLegacyPlaintextRollback(manifest: CompleteDatabaseMigrationManifest, expected: DatabaseSnapshot): void {
+    const rollback = openVerifiedPlaintextDatabase(
+        manifest.rollbackPath,
+        manifest.originalSha256,
+        'Legacy plaintext rollback database',
+        'Legacy plaintext rollback is unrecognized or unverifiable',
+    );
+    try {
+        assertMatchesSnapshot(rollback, expected, 'Legacy plaintext rollback database');
+    } finally {
+        rollback.close();
+    }
+}
+
+function ensureEncryptedCandidatesFromPlaintext(
+    manifestPath: string,
+    initialManifest: CompleteDatabaseMigrationManifest,
+    source: Database.Database,
+    key: Buffer,
+    expected: DatabaseSnapshot,
+    runtime: DatabaseMigrationRuntime,
+): CompleteDatabaseMigrationManifest {
+    let manifest = initialManifest;
+    if (!existsSync(manifest.sidecarPath) || hasPlaintextHeader(manifest.sidecarPath)) {
+        buildEncryptedMigrationArtifact(source, manifest.sidecarPath, key, expected, 'Encrypted database sidecar');
+        hit(runtime, 'after_sidecar_encrypted');
+        hit(runtime, 'after_sidecar_verified');
+    } else {
+        verifyEncryptedMigrationArtifact(manifest.sidecarPath, key, expected, 'Encrypted database sidecar');
+    }
+    if (manifest.rollbackSha256 === null) {
+        if (existsSync(manifest.rollbackPath) && hasPlaintextHeader(manifest.rollbackPath)) {
+            assertLegacyPlaintextRollback(manifest, expected);
+        }
+        const rollbackSha256 = buildEncryptedMigrationArtifact(source, manifest.rollbackPath, key, expected, 'Encrypted rollback database');
+        hit(runtime, 'after_rollback_encrypted');
+        hit(runtime, 'after_rollback_verified');
+        manifest = recordEncryptedRollback(manifestPath, manifest, rollbackSha256, runtime);
+    } else {
+        verifyEncryptedMigrationArtifact(manifest.rollbackPath, key, expected, 'Encrypted rollback database', manifest.rollbackSha256);
+    }
+    return manifest;
+}
+
 function cleanupUncommittedMigration(
     manifestPath: string,
-    manifest: DatabaseMigrationManifest,
+    manifest: CompleteDatabaseMigrationManifest,
     runtime: DatabaseMigrationRuntime,
     completeReplacement: () => void,
 ): void {
@@ -912,6 +985,7 @@ function cleanupUncommittedMigration(
     }
     removeFile(manifest.sidecarPath);
     removeFile(manifest.rollbackPath);
+    removeFile(`${manifest.rollbackPath}.encrypted`);
     fsyncDirectory(path.dirname(manifest.sourcePath));
     hit(runtime, 'after_uncommitted_artifacts_removed');
     completeReplacement();
@@ -922,10 +996,10 @@ function cleanupUncommittedMigration(
 
 async function commitKey(
     manifestPath: string,
-    manifest: DatabaseMigrationManifest,
+    manifest: CompleteDatabaseMigrationManifest,
     key: Buffer,
     runtime: DatabaseMigrationRuntime,
-): Promise<DatabaseMigrationManifest> {
+): Promise<CompleteDatabaseMigrationManifest> {
     const committing = transitionManifest(manifestPath, manifest, 'key_commitment_started', runtime);
     const metadata = encryptionMetadata(manifest);
     let writeError: unknown;
@@ -969,7 +1043,7 @@ function removeInactiveWalFiles(databasePath: string, runtime: DatabaseMigration
     hit(runtime, 'after_inactive_wal_removed');
 }
 
-function restorePlaintextCanonical(manifest: DatabaseMigrationManifest, runtime: DatabaseMigrationRuntime): void {
+function restoreLegacyPlaintextCanonical(manifest: CompleteDatabaseMigrationManifest, runtime: DatabaseMigrationRuntime): void {
     if (!existsSync(manifest.rollbackPath) || hashFile(manifest.rollbackPath) !== manifest.originalSha256) {
         throw new Error('Cannot restore the plaintext database because its byte-exact rollback copy is unavailable.');
     }
@@ -988,24 +1062,51 @@ function restorePlaintextCanonical(manifest: DatabaseMigrationManifest, runtime:
     hit(runtime, 'after_plaintext_rollback_restored');
 }
 
+function verifyEncryptedRollback(manifest: CompleteDatabaseMigrationManifest, key: Buffer, expected: DatabaseSnapshot): void {
+    if (manifest.rollbackSha256 === null) {
+        throw new Error('Encrypted rollback database has no verified SHA-256 digest in the migration manifest.');
+    }
+    verifyEncryptedMigrationArtifact(manifest.rollbackPath, key, expected, 'Encrypted rollback database', manifest.rollbackSha256);
+}
+
+function restoreEncryptedCanonical(
+    manifest: CompleteDatabaseMigrationManifest,
+    key: Buffer,
+    expected: DatabaseSnapshot,
+    runtime: DatabaseMigrationRuntime,
+): void {
+    verifyEncryptedRollback(manifest, key, expected);
+    atomicCopyPrivateFile(manifest.rollbackPath, manifest.sourcePath, PRIVATE_FILE_MODE);
+    syncFile(manifest.sourcePath);
+    fsyncDirectory(path.dirname(manifest.sourcePath));
+    verifyEncryptedMigrationArtifact(
+        manifest.sourcePath,
+        key,
+        expected,
+        'Restored encrypted database',
+        manifest.rollbackSha256 ?? undefined,
+    );
+    hit(runtime, 'after_encrypted_rollback_restored');
+}
+
 function swapCanonical(
     manifestPath: string,
-    manifest: DatabaseMigrationManifest,
+    manifest: CompleteDatabaseMigrationManifest,
+    key: Buffer,
+    expected: DatabaseSnapshot,
     runtime: DatabaseMigrationRuntime,
     completeReplacement: () => void,
-): DatabaseMigrationManifest {
+): CompleteDatabaseMigrationManifest {
     try {
         (runtime.swapDatabase ?? renameSync)(manifest.sidecarPath, manifest.sourcePath);
         fsyncDirectory(path.dirname(manifest.sourcePath));
     } catch (error) {
-        restorePlaintextCanonical(manifest, runtime);
-        const rolledBack = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
+        restoreEncryptedCanonical(manifest, key, expected, runtime);
+        transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
         completeReplacement();
         throw new Error(
-            `Encrypted database swap failed; restored the plaintext database and retained its committed key: ${errorMessage(error)}`,
-            {
-                cause: rolledBack,
-            },
+            `Encrypted database swap failed; restored the encrypted database and retained its committed key: ${errorMessage(error)}`,
+            { cause: error },
         );
     }
     hit(runtime, 'after_canonical_swap');
@@ -1014,14 +1115,21 @@ function swapCanonical(
 
 function finalVerify(
     manifestPath: string,
-    manifest: DatabaseMigrationManifest,
+    manifest: CompleteDatabaseMigrationManifest,
     key: Buffer,
     runtime: DatabaseMigrationRuntime,
-): DatabaseMigrationManifest {
-    const baseline = new Database(manifest.rollbackPath, { readonly: true, fileMustExist: true, timeout: 0 });
+): CompleteDatabaseMigrationManifest {
+    if (manifest.rollbackSha256 === null) {
+        throw new Error('Encrypted rollback database has no verified SHA-256 digest in the migration manifest.');
+    }
+    if (hashFile(manifest.rollbackPath) !== manifest.rollbackSha256) {
+        throw new Error('Encrypted rollback database changed after encryption verification.');
+    }
+    assertEncryptedDatabaseFile(manifest.rollbackPath, key, 'Encrypted rollback database');
+    const baseline = openKeyedDatabase(manifest.rollbackPath, key, true);
     let expected: DatabaseSnapshot;
     try {
-        assertIntegrity(baseline, 'Plaintext rollback database');
+        assertIntegrity(baseline, 'Encrypted rollback database');
         expected = snapshotDatabase(baseline);
     } finally {
         baseline.close();
@@ -1058,11 +1166,12 @@ function finalVerify(
     return transitionManifest(manifestPath, manifest, 'committed_verified', runtime);
 }
 
-function finalizeMigration(manifestPath: string, manifest: DatabaseMigrationManifest, runtime: DatabaseMigrationRuntime): void {
+function finalizeMigration(manifestPath: string, manifest: CompleteDatabaseMigrationManifest, runtime: DatabaseMigrationRuntime): void {
     for (const backup of manifest.backups) {
         removeFile(backup.encryptedPath);
     }
     removeFile(manifest.rollbackPath);
+    removeFile(`${manifest.rollbackPath}.encrypted`);
     removeFile(manifest.sidecarPath);
     fsyncDirectory(path.dirname(manifest.sourcePath));
     hit(runtime, 'after_plaintext_rollback_removed');
@@ -1071,15 +1180,9 @@ function finalizeMigration(manifestPath: string, manifest: DatabaseMigrationMani
     hit(runtime, 'after_manifest_removed');
 }
 
-function assertRollback(manifest: DatabaseMigrationManifest): void {
-    if (!existsSync(manifest.rollbackPath) || hashFile(manifest.rollbackPath) !== manifest.originalSha256) {
-        throw new Error('Database migration plaintext rollback copy failed SHA-256 verification.');
-    }
-}
-
 async function resumeFromPlaintext(
     manifestPath: string,
-    initialManifest: DatabaseMigrationManifest,
+    initialManifest: CompleteDatabaseMigrationManifest,
     db: Database.Database,
     runtime: DatabaseMigrationRuntime,
     completeReplacement: () => void,
@@ -1087,15 +1190,9 @@ async function resumeFromPlaintext(
     let manifest = initialManifest;
     let key: Buffer | undefined;
     try {
-        if (!existsSync(manifest.rollbackPath) || hashFile(manifest.rollbackPath) !== manifest.originalSha256) {
-            copyFileDurably(manifest.sourcePath, manifest.rollbackPath);
-            hit(runtime, 'after_plaintext_rollback_copied');
-        }
-        assertRollback(manifest);
-        if (manifest.stage === 'quiesced') {
-            manifest = transitionManifest(manifestPath, manifest, 'rollback_copied', runtime);
-        }
         const expected = snapshotDatabase(db);
+        let adoptCommittedKey = false;
+        let commitGeneratedKey = false;
 
         if (manifest.stage === 'sidecar_encrypted') {
             key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
@@ -1104,17 +1201,13 @@ async function resumeFromPlaintext(
                 cleanupUncommittedMigration(manifestPath, manifest, runtime, completeReplacement);
                 return { status: 'recovered-plaintext' };
             }
-            writeEncryptionMetadata(manifest.sourcePath, encryptionMetadata(manifest));
-            hit(runtime, 'after_encryption_metadata_written');
-            manifest = transitionManifest(manifestPath, manifest, 'key_committed', runtime);
+            adoptCommittedKey = true;
         } else if (manifest.stage === 'key_commitment_started') {
             key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
             if (key === undefined) {
                 throw new Error(DATABASE_KEY_COMMITMENT_INDETERMINATE);
             }
-            writeEncryptionMetadata(manifest.sourcePath, encryptionMetadata(manifest));
-            hit(runtime, 'after_encryption_metadata_written');
-            manifest = transitionManifest(manifestPath, manifest, 'key_committed', runtime);
+            adoptCommittedKey = true;
         } else if (
             manifest.stage === 'key_committed' ||
             manifest.stage === 'backups_encrypted' ||
@@ -1129,11 +1222,8 @@ async function resumeFromPlaintext(
                 throw new Error('The database migration manifest records a committed key, but the key is absent.');
             }
         } else {
-            copyFileDurably(manifest.rollbackPath, manifest.sidecarPath);
-            hit(runtime, 'after_working_sidecar_copied');
-            if (manifest.stage === 'rollback_copied') {
-                manifest = transitionManifest(manifestPath, manifest, 'sidecar_copied', runtime);
-            }
+            removeFile(manifest.sidecarPath);
+            removeFile(manifest.rollbackPath);
             key = (runtime.randomBytes ?? randomBytes)(DATABASE_KEY_BYTES);
             if (key.length !== DATABASE_KEY_BYTES) {
                 key.fill(0);
@@ -1143,27 +1233,32 @@ async function resumeFromPlaintext(
             hit(runtime, 'after_key_generated');
             manifest = transitionManifest(manifestPath, manifest, 'key_prepared', runtime, {
                 keySha256,
+                rollbackSha256: null,
             });
-            encryptAndVerifySidecar(manifest, key, expected, runtime);
-            manifest = transitionManifest(manifestPath, manifest, 'sidecar_encrypted', runtime);
-            manifest = await commitKey(manifestPath, manifest, key, runtime);
+            commitGeneratedKey = true;
         }
 
         if (key === undefined) {
             throw new Error('Database migration reached the swap without a committed key.');
         }
-        if (!existsSync(manifest.sidecarPath) || hasPlaintextHeader(manifest.sidecarPath)) {
-            copyFileDurably(manifest.rollbackPath, manifest.sidecarPath);
-            hit(runtime, 'after_working_sidecar_copied');
-            encryptAndVerifySidecar(manifest, key, expected, runtime);
-        } else {
-            const sidecar = openKeyedDatabase(manifest.sidecarPath, key, true);
-            try {
-                assertIntegrity(sidecar, 'Encrypted database sidecar');
-                assertMatchesSnapshot(sidecar, expected, 'Encrypted database sidecar');
-            } finally {
-                sidecar.close();
-            }
+        if (db.inTransaction) {
+            db.exec('ROLLBACK');
+        }
+        manifest = ensureEncryptedCandidatesFromPlaintext(manifestPath, manifest, db, key, expected, runtime);
+        db.exec('BEGIN EXCLUSIVE');
+        if (hashFile(manifest.sourcePath) !== manifest.originalSha256) {
+            throw new Error('Plaintext canonical changed while encrypted migration artifacts were being built; recovery remains blocked.');
+        }
+        assertNoHotJournal(manifest.sourcePath);
+        assertIntegrity(db, 'Revalidated plaintext database');
+        assertMatchesSnapshot(db, expected, 'Revalidated plaintext database');
+        if (commitGeneratedKey) {
+            manifest = transitionManifest(manifestPath, manifest, 'sidecar_encrypted', runtime);
+            manifest = await commitKey(manifestPath, manifest, key, runtime);
+        } else if (adoptCommittedKey) {
+            writeEncryptionMetadata(manifest.sourcePath, encryptionMetadata(manifest));
+            hit(runtime, 'after_encryption_metadata_written');
+            manifest = transitionManifest(manifestPath, manifest, 'key_committed', runtime);
         }
         manifest = convertManagedBackups(manifestPath, manifest, key, runtime);
         if (manifest.stage === 'key_committed') {
@@ -1174,7 +1269,7 @@ async function resumeFromPlaintext(
         manifest = transitionManifest(manifestPath, manifest, 'plaintext_closed', runtime);
         removeInactiveWalFiles(manifest.sourcePath, runtime);
         manifest = transitionManifest(manifestPath, manifest, 'wal_cleaned', runtime);
-        manifest = swapCanonical(manifestPath, manifest, runtime, completeReplacement);
+        manifest = swapCanonical(manifestPath, manifest, key, expected, runtime, completeReplacement);
         manifest = finalVerify(manifestPath, manifest, key, runtime);
         manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
         completeReplacement();
@@ -1191,38 +1286,75 @@ async function resumeFromPlaintext(
     }
 }
 
+function ensureEncryptedRollbackAfterCanonicalSwap(
+    manifestPath: string,
+    initialManifest: CompleteDatabaseMigrationManifest,
+    source: Database.Database,
+    key: Buffer,
+    expected: DatabaseSnapshot,
+    runtime: DatabaseMigrationRuntime,
+): CompleteDatabaseMigrationManifest {
+    if (initialManifest.rollbackSha256 !== null) {
+        verifyEncryptedRollback(initialManifest, key, expected);
+        return initialManifest;
+    }
+    if (existsSync(initialManifest.rollbackPath) && !hasPlaintextHeader(initialManifest.rollbackPath)) {
+        const rollbackSha256 = verifyEncryptedMigrationArtifact(initialManifest.rollbackPath, key, expected, 'Encrypted rollback database');
+        return recordEncryptedRollback(manifestPath, initialManifest, rollbackSha256, runtime);
+    }
+    if (existsSync(initialManifest.rollbackPath)) {
+        assertLegacyPlaintextRollback(initialManifest, expected);
+    }
+    const replacementPath = `${initialManifest.rollbackPath}.encrypted`;
+    removeFile(replacementPath);
+    const rollbackSha256 = buildEncryptedMigrationArtifact(source, replacementPath, key, expected, 'Encrypted rollback replacement');
+    hit(runtime, 'after_rollback_encrypted');
+    hit(runtime, 'after_rollback_verified');
+    renameSync(replacementPath, initialManifest.rollbackPath);
+    fsyncDirectory(path.dirname(initialManifest.rollbackPath));
+    hit(runtime, 'after_encrypted_rollback_replaced');
+    verifyEncryptedMigrationArtifact(initialManifest.rollbackPath, key, expected, 'Encrypted rollback database', rollbackSha256);
+    return recordEncryptedRollback(manifestPath, initialManifest, rollbackSha256, runtime);
+}
+
 async function resumeManifest(
     manifestPath: string,
-    manifest: DatabaseMigrationManifest,
+    initialManifest: DatabaseMigrationManifest,
     runtime: DatabaseMigrationRuntime,
     completeReplacement: () => void,
 ): Promise<DatabaseMigrationResult> {
-    if (manifest.stage === 'verified' || manifest.stage === 'committed_verified') {
-        const key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
-        if (key === undefined) {
-            throw new Error('The database migration manifest records a committed key, but the key is absent.');
-        }
-        try {
-            assertManagedBackupsEncrypted(manifest, key);
-        } finally {
-            key.fill(0);
-        }
-        if (manifest.stage === 'committed_verified') {
-            manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
-        }
-        completeReplacement();
-        finalizeMigration(manifestPath, manifest, runtime);
-        return { status: 'migrated' };
-    }
+    let manifest = normalizeLegacyManifest(manifestPath, initialManifest, runtime);
     if (!existsSync(manifest.sourcePath)) {
-        restorePlaintextCanonical(manifest, runtime);
-        manifest = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
+        if (manifest.rollbackSha256 === null) {
+            restoreLegacyPlaintextCanonical(manifest, runtime);
+            if (manifest.keySha256 !== null) {
+                manifest = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
+            }
+        } else {
+            const key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
+            if (key === undefined) {
+                throw new Error('The database migration manifest records an encrypted rollback, but the key is absent.');
+            }
+            try {
+                const rollback = openKeyedDatabase(manifest.rollbackPath, key, true);
+                let expected: DatabaseSnapshot;
+                try {
+                    assertIntegrity(rollback, 'Encrypted rollback database');
+                    expected = snapshotDatabase(rollback);
+                } finally {
+                    rollback.close();
+                }
+                restoreEncryptedCanonical(manifest, key, expected, runtime);
+                manifest = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
+            } finally {
+                key.fill(0);
+            }
+        }
     }
     if (hasPlaintextHeader(manifest.sourcePath)) {
         manifest = rebaseUnfrozenManifest(manifestPath, manifest);
         if (hashFile(manifest.sourcePath) !== manifest.originalSha256) {
-            restorePlaintextCanonical(manifest, runtime);
-            manifest = transitionManifest(manifestPath, manifest, 'rolled_back_key_retained', runtime);
+            throw new Error('Plaintext canonical changed after the migration baseline was frozen; recovery remains blocked.');
         }
         const plaintext = quiescePlaintextDatabase(manifest.sourcePath, runtime);
         return resumeFromPlaintext(manifestPath, manifest, plaintext, runtime, completeReplacement);
@@ -1232,20 +1364,27 @@ async function resumeManifest(
         throw new Error('Canonical database appears encrypted, but the migration key is absent.');
     }
     try {
-        if (manifest.stage !== 'canonical_swapped') {
-            const committed = openKeyedDatabase(manifest.sourcePath, key, true);
-            try {
-                assertIntegrity(committed, 'Crash-recovered encrypted database');
-                assertRollback(manifest);
-                const baseline = new Database(manifest.rollbackPath, { readonly: true, fileMustExist: true, timeout: 0 });
-                try {
-                    assertMatchesSnapshot(committed, snapshotDatabase(baseline), 'Crash-recovered encrypted database');
-                } finally {
-                    baseline.close();
-                }
-            } finally {
-                committed.close();
+        const committed = openKeyedDatabase(manifest.sourcePath, key);
+        try {
+            assertIntegrity(committed, 'Crash-recovered encrypted database');
+            const expected = snapshotDatabase(committed);
+            if (existsSync(manifest.rollbackPath) || manifest.stage !== 'verified') {
+                manifest = ensureEncryptedRollbackAfterCanonicalSwap(manifestPath, manifest, committed, key, expected, runtime);
             }
+        } finally {
+            committed.close();
+        }
+        manifest = convertManagedBackups(manifestPath, manifest, key, runtime);
+        assertManagedBackupsEncrypted(manifest, key);
+        if (manifest.stage === 'verified' || manifest.stage === 'committed_verified') {
+            if (manifest.stage === 'committed_verified') {
+                manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
+            }
+            completeReplacement();
+            finalizeMigration(manifestPath, manifest, runtime);
+            return { status: 'migrated' };
+        }
+        if (manifest.stage !== 'canonical_swapped') {
             manifest = transitionManifest(manifestPath, manifest, 'canonical_swapped', runtime);
         }
         manifest = finalVerify(manifestPath, manifest, key, runtime);
@@ -1346,7 +1485,7 @@ export async function migratePrimaryDatabaseToEncrypted(
                     const artifacts = migrationArtifactPaths(pinnedDatabasePath, migrationId);
                     const backend = await selectBackend(runtime);
                     const installationId = (runtime.randomUUID ?? randomUUID)();
-                    const manifest: DatabaseMigrationManifest = {
+                    const manifest: CompleteDatabaseMigrationManifest = {
                         version: 1,
                         migrationId,
                         backend,
@@ -1354,6 +1493,7 @@ export async function migratePrimaryDatabaseToEncrypted(
                         sourcePath: pinnedDatabasePath,
                         originalSha256: hashFile(pinnedDatabasePath),
                         rollbackPath: artifacts.rollback,
+                        rollbackSha256: null,
                         sidecarPath: artifacts.sidecar,
                         backups: managedBackups.map((backup, index) => ({
                             ...backup,

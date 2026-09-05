@@ -256,14 +256,13 @@ describe('plaintext primary database encryption migration', () => {
         'after_lock_acquired',
         'after_plaintext_quiesced',
         'after_manifest_quiesced',
-        'after_plaintext_rollback_copied',
-        'after_manifest_rollback_copied',
-        'after_working_sidecar_copied',
-        'after_manifest_sidecar_copied',
         'after_key_generated',
         'after_manifest_key_prepared',
         'after_sidecar_encrypted',
         'after_sidecar_verified',
+        'after_rollback_encrypted',
+        'after_rollback_verified',
+        'after_manifest_rollback_encrypted',
         'after_manifest_sidecar_encrypted',
         'after_key_stored',
         'after_key_read_back',
@@ -315,6 +314,171 @@ describe('plaintext primary database encryption migration', () => {
         }
         expect(existsSync(recovered.statePaths?.manifest ?? '')).toBe(false);
         expect(existsSync(recovered.statePaths?.lock ?? '')).toBe(false);
+    });
+
+    it('never leaves a plaintext rollback after the encrypted canonical swap can occur', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-encrypted-rollback-');
+        const statePaths = {
+            lock: path.join(directory, 'database-migration.lock'),
+            manifest: path.join(directory, 'database-migration.json'),
+        };
+        const keyPath = path.join(directory, 'database.keydata');
+        const source = `
+const { migratePrimaryDatabaseToEncrypted } = await import(${JSON.stringify(migrationModule)});
+let uuidCalls = 0;
+await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
+    platform: 'linux',
+    arch: 'x64',
+    libc: 'glibc',
+    env: { CI: '1' },
+    randomBytes: () => Buffer.from(${JSON.stringify([...FIXED_KEY])}),
+    randomUUID: () => uuidCalls++ === 0 ? ${JSON.stringify(MIGRATION_ID)} : ${JSON.stringify(INSTALLATION_ID)},
+    keyFilePath: () => ${JSON.stringify(keyPath)},
+    statePaths: ${JSON.stringify(statePaths)},
+    availableBytes: () => BigInt(Number.MAX_SAFE_INTEGER),
+    failpoint: (point) => {
+        if (point === 'after_canonical_swap') {
+            process.send?.({ point });
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+        }
+    },
+});`;
+        const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', source], {
+            cwd: repositoryRoot,
+            env: { ...process.env, ELEPHA_HOME: directory },
+            stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+        });
+        let stderr = '';
+        child.stderr?.setEncoding('utf8');
+        child.stderr?.on('data', (chunk: string) => {
+            stderr += chunk;
+        });
+        try {
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error(`Timed out waiting for canonical swap: ${stderr}`)), 5_000);
+                child.once('message', (message) => {
+                    clearTimeout(timeout);
+                    if ((message as { point?: unknown }).point === 'after_canonical_swap') {
+                        resolve();
+                    } else {
+                        reject(new Error(`Unexpected migration child message: ${JSON.stringify(message)}`));
+                    }
+                });
+                child.once('exit', (code, signal) => {
+                    clearTimeout(timeout);
+                    reject(new Error(`Migration child exited before canonical swap (${String(code)}/${String(signal)}): ${stderr}`));
+                });
+                child.once('error', (error) => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+            });
+            await killChild(child);
+            expect(child.signalCode).toBe('SIGKILL');
+
+            const manifest = JSON.parse(readFileSync(statePaths.manifest, 'utf8')) as {
+                rollbackPath: string;
+                sidecarPath: string;
+                stage: string;
+            };
+            expect(manifest.stage).toBe('wal_cleaned');
+            expect(isPlaintext(dbPath)).toBe(false);
+            const canonical = openKeyedDatabase(dbPath, FIXED_KEY, { readonly: true, fileMustExist: true });
+            expect(canonical.prepare('SELECT native_id FROM sessions').get()).toEqual({ native_id: 'migration-session' });
+            canonical.close();
+
+            const rollbackArtifacts = [
+                manifest.rollbackPath,
+                `${manifest.rollbackPath}-wal`,
+                `${manifest.rollbackPath}-shm`,
+                `${manifest.rollbackPath}-journal`,
+            ].filter((artifact) => existsSync(artifact));
+            expect(rollbackArtifacts).toContain(manifest.rollbackPath);
+            expect(rollbackArtifacts.map((artifact) => isPlaintext(artifact))).toEqual(rollbackArtifacts.map(() => false));
+            expect(existsSync(manifest.sidecarPath)).toBe(false);
+
+            await expect(
+                migratePrimaryDatabaseToEncrypted(dbPath, {
+                    ...runtime(directory),
+                    keyFilePath: () => keyPath,
+                    statePaths,
+                }),
+            ).resolves.toEqual({ status: 'migrated' });
+        } finally {
+            await killChild(child);
+        }
+    });
+
+    it('recovers a pre-backup-encryption manifest after canonical swap without discarding plaintext recovery', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-legacy-post-swap-');
+        const backupPath = `${dbPath}.bak-2026-09-01`;
+        const savedRollbackPath = path.join(directory, 'saved-plaintext-rollback.db');
+        const savedBackupPath = path.join(directory, 'saved-plaintext-backup.db');
+        copyFileSync(dbPath, backupPath);
+        const backup = new Database(backupPath);
+        backup.prepare('UPDATE sessions SET native_id = ?').run('legacy-backup-session');
+        backup.close();
+        const interrupted = runtime(directory, {
+            failpoint: (point) => {
+                if (point === 'after_manifest_quiesced') {
+                    copyFileSync(dbPath, savedRollbackPath);
+                    copyFileSync(backupPath, savedBackupPath);
+                }
+                if (point === 'after_canonical_swap') {
+                    throw new Error('stop after legacy canonical swap');
+                }
+            },
+        });
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, interrupted)).rejects.toThrow('stop after legacy canonical swap');
+        const manifestPath = interrupted.statePaths?.manifest ?? '';
+        const legacyManifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown> & {
+            rollbackPath: string;
+        };
+        copyFileSync(savedRollbackPath, legacyManifest.rollbackPath);
+        copyFileSync(savedBackupPath, backupPath);
+        delete legacyManifest.rollbackSha256;
+        delete legacyManifest.backups;
+        writeFileSync(manifestPath, `${JSON.stringify(legacyManifest)}\n`);
+        expect(isPlaintext(dbPath)).toBe(false);
+        expect(isPlaintext(legacyManifest.rollbackPath)).toBe(true);
+        expect(isPlaintext(backupPath)).toBe(true);
+        expect(hasLifecycleIntent(dbPath)).toBe(true);
+
+        let inspected = false;
+        const inspecting = runtime(directory, {
+            failpoint: (point) => {
+                if (point === 'after_manifest_backup_replaced') {
+                    inspected = true;
+                    throw new Error('inspect upgraded recovery artifacts');
+                }
+            },
+        });
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, inspecting)).rejects.toThrow('inspect upgraded recovery artifacts');
+        expect(inspected).toBe(true);
+        const upgraded = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+            rollbackPath: string;
+            rollbackSha256: string;
+            backups: Array<{ sourcePath: string; stage: string }>;
+        };
+        expect(upgraded.rollbackSha256).toMatch(/^[0-9a-f]{64}$/);
+        expect(upgraded.backups).toEqual([expect.objectContaining({ sourcePath: backupPath, stage: 'replaced' })]);
+        for (const [databasePath, nativeId] of [
+            [upgraded.rollbackPath, 'migration-session'],
+            [backupPath, 'legacy-backup-session'],
+        ] as const) {
+            expect(isPlaintext(databasePath)).toBe(false);
+            const recovered = openKeyedDatabase(databasePath, FIXED_KEY, { readonly: true, fileMustExist: true });
+            expect(recovered.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+            expect(recovered.prepare('SELECT native_id FROM sessions').get()).toEqual({ native_id: nativeId });
+            recovered.close();
+        }
+        expect(hasLifecycleIntent(dbPath)).toBe(true);
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).resolves.toEqual({ status: 'migrated' });
+        await assertEncryptedOpenable(dbPath, runtime(directory));
+        expect(existsSync(manifestPath)).toBe(false);
+        expect(hasLifecycleIntent(dbPath)).toBe(false);
     });
 
     it('retains global ownership across interrupted migration recovery when process homes differ', async () => {
@@ -508,7 +672,7 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         }
     });
 
-    it('restores the byte-exact plaintext canonical and retains the committed key when rename fails', async () => {
+    it('restores the byte-exact encrypted canonical and retains the committed key when rename fails', async () => {
         const { directory, dbPath } = fixture('elepha-database-rename-rollback-');
         const failed = runtime(directory, {
             swapDatabase: () => {
@@ -517,23 +681,22 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
             },
         });
 
-        await expect(migratePrimaryDatabaseToEncrypted(dbPath, failed)).rejects.toThrow(/restored the plaintext database/);
-        assertPlaintextOpenable(dbPath);
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, failed)).rejects.toThrow(/restored the encrypted database/);
         expect(existsSync(failed.statePaths?.manifest ?? '')).toBe(true);
         expect(hasLifecycleIntent(dbPath)).toBe(false);
         expect(existsSync(failed.keyFilePath?.(dbPath) ?? '')).toBe(true);
         const manifest = JSON.parse(readFileSync(failed.statePaths?.manifest ?? '', 'utf8')) as {
-            originalSha256: string;
             rollbackPath: string;
         };
         expect(readFileSync(dbPath)).toEqual(readFileSync(manifest.rollbackPath));
+        await assertEncryptedOpenable(dbPath, failed);
 
         const recovered = runtime(directory);
         await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovered)).resolves.toEqual({ status: 'migrated' });
         await assertEncryptedOpenable(dbPath, recovered);
     });
 
-    it('cleans the exact plaintext rollback restore temporary when its rename fails', async () => {
+    it('cleans the exact encrypted rollback restore temporary when its rename fails', async () => {
         const { directory, dbPath } = fixture('elepha-database-rollback-restore-rename-failure-');
         const failed = runtime(directory, {
             swapDatabase: () => {
@@ -547,13 +710,19 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         const originalRenameSync = mutableFs.renameSync;
         let exactTemporary: string | undefined;
         let copiedHeader: string | undefined;
+        let copiedNativeId: string | undefined;
+        let canonicalBytesAtRestore: Buffer | undefined;
         let rollbackBytesBeforeFailure: Buffer | undefined;
         mutableFs.renameSync = ((oldPath, newPath) => {
             if (String(newPath) === dbPath) {
                 exactTemporary = String(oldPath);
                 copiedHeader = readFileSync(exactTemporary).subarray(0, 16).toString('binary');
+                const copied = openKeyedDatabase(exactTemporary, FIXED_KEY, { readonly: true, fileMustExist: true });
+                copiedNativeId = (copied.prepare('SELECT native_id FROM sessions').get() as { native_id: string }).native_id;
+                copied.close();
                 const manifest = JSON.parse(readFileSync(failed.statePaths?.manifest ?? '', 'utf8')) as { rollbackPath: string };
                 rollbackBytesBeforeFailure = readFileSync(manifest.rollbackPath);
+                canonicalBytesAtRestore = readFileSync(dbPath);
                 for (const suffix of ['-wal', '-shm', '-journal']) {
                     writeFileSync(`${exactTemporary}${suffix}`, `temporary ${suffix}`);
                 }
@@ -574,10 +743,17 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         }
 
         expect(caught).toBe(primaryError);
-        if (exactTemporary === undefined || copiedHeader === undefined || rollbackBytesBeforeFailure === undefined) {
+        if (
+            exactTemporary === undefined ||
+            copiedHeader === undefined ||
+            copiedNativeId === undefined ||
+            canonicalBytesAtRestore === undefined ||
+            rollbackBytesBeforeFailure === undefined
+        ) {
             throw new Error('Rollback restore rename failpoint was not reached.');
         }
-        expect(copiedHeader).toBe('SQLite format 3\0');
+        expect(copiedHeader).not.toBe('SQLite format 3\0');
+        expect(copiedNativeId).toBe('migration-session');
         const restoreTemporaries = [...new Set([legacyRestoreTemporary, exactTemporary])];
         expect(
             restoreTemporaries
@@ -587,7 +763,7 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         const manifest = JSON.parse(readFileSync(failed.statePaths?.manifest ?? '', 'utf8')) as { rollbackPath: string };
         expect(existsSync(manifest.rollbackPath)).toBe(true);
         expect(readFileSync(manifest.rollbackPath)).toEqual(rollbackBytesBeforeFailure);
-        expect(readFileSync(dbPath)).toEqual(rollbackBytesBeforeFailure);
+        expect(readFileSync(dbPath)).toEqual(canonicalBytesAtRestore);
         assertPlaintextOpenable(dbPath);
 
         const recovered = runtime(directory);
@@ -595,7 +771,7 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         await assertEncryptedOpenable(dbPath, recovered);
     });
 
-    it.each(['after_plaintext_rollback_restored', 'after_manifest_rolled_back_key_retained'])(
+    it.each(['after_encrypted_rollback_restored', 'after_manifest_rolled_back_key_retained'])(
         'recovers after a kill during rename rollback at %s',
         async (killPoint) => {
             const { directory, dbPath } = fixture(`elepha-database-rollback-kill-${killPoint}-`);
@@ -616,7 +792,10 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
 
             await expect(migratePrimaryDatabaseToEncrypted(dbPath, failed)).rejects.toThrow(`killed at ${killPoint}`);
             expect(killed).toBe(true);
-            assertPlaintextOpenable(dbPath);
+            expect(isPlaintext(dbPath)).toBe(false);
+            const restored = openKeyedDatabase(dbPath, FIXED_KEY, { readonly: true, fileMustExist: true });
+            expect(restored.prepare('SELECT native_id FROM sessions').get()).toEqual({ native_id: 'migration-session' });
+            restored.close();
 
             const recovered = runtime(directory);
             await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovered)).resolves.toEqual({ status: 'migrated' });
