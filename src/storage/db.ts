@@ -27,10 +27,11 @@ export function defaultDbPath(): string {
 
 const PARANOID_AUTHORITY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS paranoid_authority (
-  id         INTEGER PRIMARY KEY CHECK (id = 1),
-  enrolled   INTEGER NOT NULL CHECK (enrolled IN (0,1)),
-  state      TEXT NOT NULL CHECK (state IN ('locked','unlocked')),
-  generation INTEGER NOT NULL CHECK (generation >= 0),
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  enrolled       INTEGER NOT NULL CHECK (enrolled IN (0,1)),
+  state          TEXT NOT NULL CHECK (state IN ('locked','unlocked')),
+  generation     INTEGER NOT NULL CHECK (generation >= 0),
+  credential_tag TEXT,
   CHECK (enrolled = 1 OR state = 'unlocked')
 );
 `;
@@ -302,6 +303,10 @@ function initializeParanoidAuthoritySchema(db: Database.Database): void {
     const initialize = db.transaction(() => {
         const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'paranoid_authority'").get() !== undefined;
         if (exists) {
+            const columns = (db.pragma('table_info(paranoid_authority)') as Array<{ name: string }>).map((column) => column.name);
+            if (!columns.includes('credential_tag')) {
+                db.exec('ALTER TABLE paranoid_authority ADD COLUMN credential_tag TEXT');
+            }
             return;
         }
         db.exec(PARANOID_AUTHORITY_SCHEMA);

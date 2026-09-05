@@ -58,12 +58,14 @@ describe('sessions table migration', () => {
             'enrolled',
             'state',
             'generation',
+            'credential_tag',
         ]);
         expect(db.prepare('SELECT * FROM paranoid_authority WHERE id = 1').get()).toEqual({
             id: 1,
             enrolled: 0,
             state: 'unlocked',
             generation: 0,
+            credential_tag: null,
         });
         expect((db.pragma('table_info(filtered_turns)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
             'memory_id',

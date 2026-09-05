@@ -55,12 +55,14 @@ interface RegisteredDatabase {
 interface ParsedGateState {
     payload: GatePayload;
     authentic: boolean;
+    credentialTag: string;
 }
 
 interface ParanoidAuthority {
     enrolled: 0 | 1;
     state: GateServeState;
     generation: number;
+    credentialTag: string | null;
 }
 
 const DATABASE_REGISTRY_SYMBOL = Symbol.for('dev.elepha.paranoid.database-registry');
@@ -101,6 +103,17 @@ function signature(payload: GatePayload, key: Buffer): Buffer {
 
 function encodedSignature(payload: GatePayload, key: Buffer): string {
     return signature(payload, key).toString('base64');
+}
+
+// Commit the stable credential identity without storing salt, verifier, passphrase,
+// or key bytes in database authority.
+function credentialTag(payload: GatePayload, key: Buffer): string {
+    return createHmac('sha256', key)
+        .update('elepha-paranoid-credential\0')
+        .update(payload.salt)
+        .update('\0')
+        .update(payload.verifier)
+        .digest('base64');
 }
 
 function decodedBytes(value: string, expectedBytes: number): Buffer | undefined {
@@ -153,7 +166,11 @@ function parsedGateFile(contents: Buffer, key: Buffer): ParsedGateState | undefi
         state: value.state,
     };
     const expectedHmac = signature(payload, key);
-    return { payload, authentic: timingSafeEqual(storedHmac, expectedHmac) };
+    return {
+        payload,
+        authentic: timingSafeEqual(storedHmac, expectedHmac),
+        credentialTag: credentialTag(payload, key),
+    };
 }
 
 function readRegisteredState(db: Database.Database): ParsedGateState | undefined {
@@ -167,11 +184,11 @@ function readRegisteredState(db: Database.Database): ParsedGateState | undefined
         contents = readPrivateFile(file);
     } catch {
         // A present but unreadable or unsafe gate file must never open reads.
-        return { payload: invalidLockedPayload(), authentic: false };
+        return { payload: invalidLockedPayload(), authentic: false, credentialTag: '' };
     }
     return contents === undefined
         ? undefined
-        : (parsedGateFile(contents, registered.key) ?? { payload: invalidLockedPayload(), authentic: false });
+        : (parsedGateFile(contents, registered.key) ?? { payload: invalidLockedPayload(), authentic: false, credentialTag: '' });
 }
 
 function invalidLockedPayload(): GatePayload {
@@ -181,7 +198,7 @@ function invalidLockedPayload(): GatePayload {
 function readAuthority(db: Database.Database): ParanoidAuthority | undefined {
     let row: unknown;
     try {
-        row = db.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get();
+        row = db.prepare('SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1').get();
     } catch {
         return undefined;
     }
@@ -196,28 +213,33 @@ function readAuthority(db: Database.Database): ParanoidAuthority | undefined {
         typeof row.generation !== 'number' ||
         !Number.isSafeInteger(row.generation) ||
         row.generation < 0 ||
+        !('credential_tag' in row) ||
+        (row.credential_tag !== null &&
+            (typeof row.credential_tag !== 'string' || decodedBytes(row.credential_tag, PARANOID_HMAC_BYTES) === undefined)) ||
         (row.enrolled === 0 && row.state !== 'unlocked')
     ) {
         return undefined;
     }
-    return { enrolled: row.enrolled, state: row.state, generation: row.generation };
+    return { enrolled: row.enrolled, state: row.state, generation: row.generation, credentialTag: row.credential_tag };
 }
 
 function pristineAuthority(authority: ParanoidAuthority): boolean {
-    return authority.enrolled === 0 && authority.state === 'unlocked' && authority.generation === 0;
+    return authority.enrolled === 0 && authority.state === 'unlocked' && authority.generation === 0 && authority.credentialTag === null;
 }
 
-function authorityForPayload(payload: GatePayload): ParanoidAuthority {
+function authorityForStored(stored: ParsedGateState): ParanoidAuthority {
+    const { payload } = stored;
     const enrolled = payload.mode === 'paranoid' ? 1 : 0;
     return {
         enrolled,
         state: enrolled === 1 ? payload.state : 'unlocked',
         generation: payload.epoch,
+        credentialTag: stored.credentialTag,
     };
 }
 
-function authorityMatches(authority: ParanoidAuthority, stored: ParsedGateState): boolean {
-    const external = authorityForPayload(stored.payload);
+function authorityFieldsMatch(authority: ParanoidAuthority, stored: ParsedGateState): boolean {
+    const external = authorityForStored(stored);
     return (
         stored.authentic &&
         external.enrolled === authority.enrolled &&
@@ -226,15 +248,28 @@ function authorityMatches(authority: ParanoidAuthority, stored: ParsedGateState)
     );
 }
 
+function authorityMatches(authority: ParanoidAuthority, stored: ParsedGateState): boolean {
+    return authorityFieldsMatch(authority, stored) && authority.credentialTag === stored.credentialTag;
+}
+
 export function initializeParanoidAuthority(db: Database.Database): void {
     if (registeredDatabases.get(db) === undefined) {
         return;
     }
     const authority = readAuthority(db);
-    if (authority === undefined || !pristineAuthority(authority)) {
+    if (authority === undefined) {
         return;
     }
     const stored = readRegisteredState(db);
+    if (!pristineAuthority(authority)) {
+        if (authority.credentialTag === null && stored?.authentic === true && authorityFieldsMatch(authority, stored)) {
+            db.prepare(
+                `UPDATE paranoid_authority SET credential_tag = ?
+                 WHERE id = 1 AND enrolled = ? AND state = ? AND generation = ? AND credential_tag IS NULL`,
+            ).run(stored.credentialTag, authority.enrolled, authority.state, authority.generation);
+        }
+        return;
+    }
     if (stored === undefined) {
         return;
     }
@@ -242,17 +277,18 @@ export function initializeParanoidAuthority(db: Database.Database): void {
     // the installation enrolled and locked without copying any untrusted field
     // so deleting that anchor later cannot recreate a never-enabled default.
     const adopted: ParanoidAuthority = stored.authentic
-        ? authorityForPayload(stored.payload)
-        : { enrolled: 1, state: 'locked', generation: 0 };
+        ? authorityForStored(stored)
+        : { enrolled: 1, state: 'locked', generation: 0, credentialTag: null };
     const adoptOrQuarantine = db.transaction(() => {
         const current = readAuthority(db);
         if (current === undefined || !pristineAuthority(current)) {
             return;
         }
-        db.prepare('UPDATE paranoid_authority SET enrolled = ?, state = ?, generation = ? WHERE id = 1').run(
+        db.prepare('UPDATE paranoid_authority SET enrolled = ?, state = ?, generation = ?, credential_tag = ? WHERE id = 1').run(
             adopted.enrolled,
             adopted.state,
             adopted.generation,
+            adopted.credentialTag,
         );
     });
     adoptOrQuarantine();
@@ -280,10 +316,14 @@ export function isMemoryLocked(db: Database.Database): boolean {
     return memoryServeState(db) === 'locked';
 }
 
-function registeredStateForMutation(db: Database.Database): {
+function registeredStateForMutation(
+    db: Database.Database,
+    recover?: 'restrictive_lock' | 'permissive_unlock' | 'permissive_disable',
+): {
     registered: RegisteredDatabase;
     authority: ParanoidAuthority;
     stored?: ParsedGateState;
+    agreement: 'exact' | 'restrictive_lock_pending' | 'permissive_pending';
 } {
     const registered = registeredDatabases.get(db);
     if (registered === undefined) {
@@ -292,10 +332,36 @@ function registeredStateForMutation(db: Database.Database): {
     const authority = readAuthority(db);
     const stored = readRegisteredState(db);
     const validPristineState = authority !== undefined && pristineAuthority(authority) && stored === undefined;
-    if (authority === undefined || (!validPristineState && (stored === undefined || !authorityMatches(authority, stored)))) {
-        throw new Error('Paranoid gate state failed authentication. Memory remains locked.');
+    if (authority !== undefined && (validPristineState || (stored !== undefined && authorityMatches(authority, stored)))) {
+        return { registered, authority, stored, agreement: 'exact' };
     }
-    return { registered, authority, stored };
+    const matchingCredential =
+        authority !== undefined &&
+        authority.credentialTag !== null &&
+        stored?.authentic === true &&
+        stored.credentialTag === authority.credentialTag;
+    if (
+        matchingCredential &&
+        recover === 'restrictive_lock' &&
+        authority.enrolled === 1 &&
+        authority.state === 'locked' &&
+        stored.payload.mode === 'paranoid' &&
+        authority.generation === stored.payload.epoch + 1
+    ) {
+        return { registered, authority, stored, agreement: 'restrictive_lock_pending' };
+    }
+    const permissiveMode = recover === 'permissive_unlock' ? 'paranoid' : recover === 'permissive_disable' ? 'default' : undefined;
+    if (
+        matchingCredential &&
+        permissiveMode !== undefined &&
+        authority.enrolled === 1 &&
+        stored.payload.mode === permissiveMode &&
+        stored.payload.state === 'unlocked' &&
+        stored.payload.epoch === authority.generation + 1
+    ) {
+        return { registered, authority, stored, agreement: 'permissive_pending' };
+    }
+    throw new Error('Paranoid gate state failed authentication. Memory remains locked.');
 }
 
 function verifier(passphrase: string, salt: Buffer): Buffer {
@@ -307,23 +373,60 @@ function verifier(passphrase: string, salt: Buffer): Buffer {
     });
 }
 
-function writeState(db: Database.Database, registered: RegisteredDatabase, previous: ParanoidAuthority, payload: GatePayload): void {
+function writeExternalState(registered: RegisteredDatabase, payload: GatePayload): void {
     const file: GateFile = { ...payload, hmac: encodedSignature(payload, registered.key) };
     writePrivateFileAtomic(paranoidStatePath(registered.databasePath), Buffer.from(`${JSON.stringify(file)}\n`, 'utf8'), true);
-    const next = authorityForPayload(payload);
+}
+
+function updateAuthority(db: Database.Database, registered: RegisteredDatabase, previous: ParanoidAuthority, payload: GatePayload): void {
+    const next: ParanoidAuthority = {
+        enrolled: payload.mode === 'paranoid' ? 1 : 0,
+        state: payload.mode === 'paranoid' ? payload.state : 'unlocked',
+        generation: payload.epoch,
+        credentialTag: credentialTag(payload, registered.key),
+    };
     const update = db.transaction(() => {
         const result = db
             .prepare(
                 `UPDATE paranoid_authority
-                 SET enrolled = ?, state = ?, generation = ?
-                 WHERE id = 1 AND enrolled = ? AND state = ? AND generation = ?`,
+                 SET enrolled = ?, state = ?, generation = ?, credential_tag = ?
+                 WHERE id = 1 AND enrolled = ? AND state = ? AND generation = ? AND credential_tag IS ?`,
             )
-            .run(next.enrolled, next.state, next.generation, previous.enrolled, previous.state, previous.generation);
+            .run(
+                next.enrolled,
+                next.state,
+                next.generation,
+                next.credentialTag,
+                previous.enrolled,
+                previous.state,
+                previous.generation,
+                previous.credentialTag,
+            );
         if (result.changes !== 1) {
             throw new Error('Paranoid database authority changed during update. Memory remains locked.');
         }
     });
     update();
+}
+
+function writeRestrictiveState(
+    db: Database.Database,
+    registered: RegisteredDatabase,
+    previous: ParanoidAuthority,
+    payload: GatePayload,
+): void {
+    updateAuthority(db, registered, previous, payload);
+    writeExternalState(registered, payload);
+}
+
+function writePermissiveState(
+    db: Database.Database,
+    registered: RegisteredDatabase,
+    previous: ParanoidAuthority,
+    payload: GatePayload,
+): void {
+    writeExternalState(registered, payload);
+    updateAuthority(db, registered, previous, payload);
 }
 
 function nextGeneration(authority: ParanoidAuthority): number {
@@ -342,7 +445,7 @@ export function enableParanoidMode(db: Database.Database, passphrase: string): v
     const salt = randomBytes(PARANOID_SCRYPT_SALT_BYTES);
     const derived = verifier(passphrase, salt);
     try {
-        writeState(db, registered, authority, {
+        writeRestrictiveState(db, registered, authority, {
             mode: 'paranoid',
             salt: salt.toString('base64'),
             verifier: derived.toString('base64'),
@@ -369,35 +472,47 @@ function verifyPassphrase(stored: ParsedGateState, passphrase: string): boolean 
 }
 
 export function unlockMemory(db: Database.Database, passphrase: string): 'unlocked' | 'incorrect' | 'not_enabled' {
-    const { registered, authority, stored } = registeredStateForMutation(db);
+    const { registered, authority, stored, agreement } = registeredStateForMutation(db, 'permissive_unlock');
     if (authority.enrolled === 0 || stored === undefined || stored.payload.mode !== 'paranoid') {
         return 'not_enabled';
     }
     if (!verifyPassphrase(stored, passphrase)) {
         return 'incorrect';
     }
-    writeState(db, registered, authority, { ...stored.payload, epoch: nextGeneration(authority), state: 'unlocked' });
+    if (agreement === 'permissive_pending') {
+        updateAuthority(db, registered, authority, stored.payload);
+        return 'unlocked';
+    }
+    writePermissiveState(db, registered, authority, { ...stored.payload, epoch: nextGeneration(authority), state: 'unlocked' });
     return 'unlocked';
 }
 
 export function lockMemory(db: Database.Database): 'locked' | 'not_enabled' {
-    const { registered, authority, stored } = registeredStateForMutation(db);
+    const { registered, authority, stored, agreement } = registeredStateForMutation(db, 'restrictive_lock');
     if (authority.enrolled === 0 || stored === undefined || stored.payload.mode !== 'paranoid') {
         return 'not_enabled';
     }
-    writeState(db, registered, authority, { ...stored.payload, epoch: nextGeneration(authority), state: 'locked' });
+    if (agreement === 'restrictive_lock_pending') {
+        writeExternalState(registered, { ...stored.payload, epoch: authority.generation, state: 'locked' });
+        return 'locked';
+    }
+    writeRestrictiveState(db, registered, authority, { ...stored.payload, epoch: nextGeneration(authority), state: 'locked' });
     return 'locked';
 }
 
 export function disableParanoidMode(db: Database.Database, passphrase: string): 'disabled' | 'incorrect' | 'not_enabled' {
-    const { registered, authority, stored } = registeredStateForMutation(db);
-    if (authority.enrolled === 0 || stored === undefined || stored.payload.mode !== 'paranoid') {
+    const { registered, authority, stored, agreement } = registeredStateForMutation(db, 'permissive_disable');
+    if (authority.enrolled === 0 || stored === undefined || (stored.payload.mode !== 'paranoid' && agreement !== 'permissive_pending')) {
         return 'not_enabled';
     }
     if (!verifyPassphrase(stored, passphrase)) {
         return 'incorrect';
     }
-    writeState(db, registered, authority, {
+    if (agreement === 'permissive_pending') {
+        updateAuthority(db, registered, authority, stored.payload);
+        return 'disabled';
+    }
+    writePermissiveState(db, registered, authority, {
         ...stored.payload,
         mode: 'default',
         epoch: nextGeneration(authority),

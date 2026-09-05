@@ -1,3 +1,4 @@
+import { createHmac } from 'node:crypto';
 import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
@@ -34,6 +35,37 @@ import { withGrantableTestDir } from '../helpers/tmp.js';
 const PASSPHRASE = 'correct horse battery staple';
 const FIXED_KEY = Buffer.alloc(32, 7);
 const NOW = '2026-09-04T00:00:00.000Z';
+
+interface TestGatePayload {
+    mode: 'default' | 'paranoid';
+    salt: string;
+    verifier: string;
+    epoch: number;
+    state: 'locked' | 'unlocked';
+}
+
+interface TestGateFile extends TestGatePayload {
+    hmac: string;
+}
+
+function readGateFile(dbPath: string): TestGateFile {
+    return JSON.parse(readFileSync(paranoidStatePath(dbPath), 'utf8')) as TestGateFile;
+}
+
+function writeAuthenticGateFile(dbPath: string, payload: TestGatePayload): void {
+    const hmac = createHmac('sha256', FIXED_KEY)
+        .update(Buffer.from(JSON.stringify(payload), 'utf8'))
+        .digest('base64');
+    writeFileSync(paranoidStatePath(dbPath), `${JSON.stringify({ ...payload, hmac })}\n`);
+}
+
+function authorityState(db: Awaited<ReturnType<typeof openDb>>): { enrolled: number; state: string; generation: number } {
+    return db.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get() as {
+        enrolled: number;
+        state: string;
+        generation: number;
+    };
+}
 
 function encryptionRuntime(directory: string): DatabaseEncryptionRuntime {
     return {
@@ -123,7 +155,9 @@ async function expectRepresentativeReadsLocked(seeded: Awaited<ReturnType<typeof
     });
     // The authoritative singleton is the gate check; no session, memory, FTS,
     // or transcript read may occur before it returns locked.
-    expect(prepare.mock.calls.map(([sql]) => sql)).toEqual(['SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1']);
+    expect(prepare.mock.calls.map(([sql]) => sql)).toEqual([
+        'SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1',
+    ]);
     prepare.mockRestore();
 
     const query = tokenizeRecallQuery('before lock');
@@ -361,6 +395,12 @@ describe('paranoid read gate', () => {
                 seeded.db.prepare("UPDATE paranoid_authority SET state = 'unlocked' WHERE id = 1").run();
             },
         },
+        {
+            name: 'invalid database credential tag',
+            mutate: (seeded: Awaited<ReturnType<typeof fixture>>) => {
+                seeded.db.prepare("UPDATE paranoid_authority SET credential_tag = 'not-base64' WHERE id = 1").run();
+            },
+        },
     ])('treats $name external gate state as locked', async ({ mutate }) => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);
@@ -400,8 +440,22 @@ describe('paranoid read gate', () => {
     it('adopts an authentic legacy gate once and preserves that authority on reopen', async () => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);
-        seeded.db.exec('DROP TABLE IF EXISTS paranoid_authority');
+        seeded.db.exec('ALTER TABLE paranoid_authority DROP COLUMN credential_tag');
         seeded.db.close();
+
+        const upgraded = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        const upgradedTag = upgraded.prepare('SELECT credential_tag FROM paranoid_authority WHERE id = 1').get() as {
+            credential_tag: string;
+        };
+        expect(Buffer.from(upgradedTag.credential_tag, 'base64')).toHaveLength(32);
+        expect(isMemoryLocked(upgraded)).toBe(true);
+        upgraded.close();
+
+        const upgradedReopen = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(upgradedReopen.prepare('SELECT credential_tag FROM paranoid_authority WHERE id = 1').get()).toEqual(upgradedTag);
+        expect(isMemoryLocked(upgradedReopen)).toBe(true);
+        upgradedReopen.exec('DROP TABLE IF EXISTS paranoid_authority');
+        upgradedReopen.close();
 
         const adopted = await openDb(seeded.dbPath, { encryption: seeded.runtime });
         expect(adopted.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get()).toEqual({
@@ -456,5 +510,121 @@ describe('paranoid read gate', () => {
             generation: 0,
         });
         missingGate.close();
+    });
+
+    it('does not adopt an upgrade credential tag from an authentic mismatched gate', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        seeded.db.exec(`
+          ALTER TABLE paranoid_authority DROP COLUMN credential_tag;
+          UPDATE paranoid_authority SET state = 'unlocked';
+        `);
+        seeded.db.close();
+
+        const reopened = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(reopened.prepare('SELECT credential_tag FROM paranoid_authority WHERE id = 1').get()).toEqual({
+            credential_tag: null,
+        });
+        expect(isMemoryLocked(reopened)).toBe(true);
+        reopened.close();
+    });
+
+    it('rejects an authentic replayed lower generation after later lock generations complete', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+        const replayed = readFileSync(paranoidStatePath(seeded.dbPath));
+        const replayedEpoch = readGateFile(seeded.dbPath).epoch;
+        expect(replayedEpoch).toBe(2);
+
+        expect(lockMemory(seeded.db)).toBe('locked');
+        expect(lockMemory(seeded.db)).toBe('locked');
+        expect(authorityState(seeded.db)).toEqual({ enrolled: 1, state: 'locked', generation: replayedEpoch + 2 });
+        writeFileSync(paranoidStatePath(seeded.dbPath), replayed);
+
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(authorityState(seeded.db)).toEqual({ enrolled: 1, state: 'locked', generation: replayedEpoch + 2 });
+        seeded.db.close();
+    });
+
+    it.each([
+        {
+            name: 'unexpected higher generation',
+            mutate: (payload: TestGatePayload): TestGatePayload => ({ ...payload, epoch: payload.epoch + 1 }),
+        },
+        {
+            name: 'same-generation verifier payload mismatch',
+            mutate: (payload: TestGatePayload): TestGatePayload => ({
+                ...payload,
+                verifier: Buffer.alloc(32, 19).toString('base64'),
+            }),
+        },
+    ])('locks an authentic $name', async ({ mutate }) => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+        const { hmac: _hmac, ...payload } = readGateFile(seeded.dbPath);
+        writeAuthenticGateFile(seeded.dbPath, mutate(payload));
+
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        seeded.db.close();
+    });
+
+    it('makes database authority restrictive before installing the external lock state', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+        const gatePath = paranoidStatePath(seeded.dbPath);
+        const before = readGateFile(seeded.dbPath);
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalRenameSync = mutableFs.renameSync;
+        mutableFs.renameSync = ((oldPath, newPath) => {
+            if (path.resolve(newPath.toString()) === gatePath) {
+                const error = new Error('injected external lock installation failure') as NodeJS.ErrnoException;
+                error.code = 'EIO';
+                throw error;
+            }
+            return originalRenameSync(oldPath, newPath);
+        }) as typeof import('node:fs').renameSync;
+        syncBuiltinESMExports();
+
+        try {
+            expect(() => lockMemory(seeded.db)).toThrow('injected external lock installation failure');
+        } finally {
+            mutableFs.renameSync = originalRenameSync;
+            syncBuiltinESMExports();
+        }
+
+        expect(readGateFile(seeded.dbPath)).toEqual(before);
+        expect(authorityState(seeded.db)).toEqual({ enrolled: 1, state: 'locked', generation: before.epoch + 1 });
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(lockMemory(seeded.db)).toBe('locked');
+        expect(readGateFile(seeded.dbPath)).toMatchObject({ epoch: before.epoch + 1, state: 'locked' });
+        seeded.db.close();
+    });
+
+    it('installs a permissive external unlock before database authority and verifies recovery passphrases', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        seeded.db.exec(`
+          CREATE TEMP TRIGGER fail_paranoid_authority_update
+          BEFORE UPDATE ON paranoid_authority
+          BEGIN
+            SELECT RAISE(ABORT, 'injected authority failure');
+          END
+        `);
+
+        expect(() => unlockMemory(seeded.db, PASSPHRASE)).toThrow('injected authority failure');
+        seeded.db.exec('DROP TRIGGER fail_paranoid_authority_update');
+
+        expect(readGateFile(seeded.dbPath)).toMatchObject({ epoch: 2, state: 'unlocked' });
+        expect(authorityState(seeded.db)).toEqual({ enrolled: 1, state: 'locked', generation: 1 });
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(unlockMemory(seeded.db, 'wrong passphrase')).toBe('incorrect');
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
+        expect(authorityState(seeded.db)).toEqual({ enrolled: 1, state: 'unlocked', generation: 2 });
+        expect(isMemoryLocked(seeded.db)).toBe(false);
+        seeded.db.close();
     });
 });
