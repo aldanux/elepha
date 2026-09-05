@@ -7,6 +7,7 @@ import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
+import type { DurableEvictionPlan } from './durable-capture-store.js';
 import { type InjectionRow, InjectionStore, type RecordInjectionInput } from './injection-store.js';
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
@@ -37,6 +38,11 @@ export interface MemoryStoreOptions {
     resolveGitRootCommit?: (gitRoot: string) => string | null;
     // Test seam for the session/segment baseline captured from the same resolved project identity.
     resolveGitCommitCount?: (projectPath: string) => number | null;
+}
+
+export interface IngestedTurnWritePreparation {
+    projectIdentity: ResolvedProjectIdentity;
+    gitCommitCount: number | null;
 }
 
 // What to purge: at most one project scope, optionally narrowed by time.
@@ -234,8 +240,9 @@ export class MemoryStore {
         summary: SummarizationOutput,
         durableCapture = false,
         durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        evictionPlan?: DurableEvictionPlan,
     ): boolean {
-        return this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes);
+        return this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes, evictionPlan);
     }
 
     // Creates the project/session and records one live turn as one SQLite
@@ -249,8 +256,10 @@ export class MemoryStore {
         summary: SummarizationOutput,
         durableCapture = false,
         durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        evictionPlan?: DurableEvictionPlan,
+        preparation?: IngestedTurnWritePreparation,
     ): { project: ProjectRow; session: SessionRow; inserted: boolean } | undefined {
-        const resolved = this.resolveTurnGitValues(turn, startNextSegment);
+        const resolved = preparation ?? this.resolveTurnGitValues(turn, startNextSegment);
         const write = this.db.transaction(() => {
             if (this.recordIncognitoIfWriteBlocked(turn)) {
                 return undefined;
@@ -273,10 +282,22 @@ export class MemoryStore {
             return {
                 project,
                 session,
-                inserted: this.turns.recordTurnInTransaction(turn, session.id, project.id, summary, durableCapture, durableCaptureMaxBytes),
+                inserted: this.turns.recordTurnInTransaction(
+                    turn,
+                    session.id,
+                    project.id,
+                    summary,
+                    durableCapture,
+                    durableCaptureMaxBytes,
+                    evictionPlan,
+                ),
             };
         });
         return write();
+    }
+
+    prepareIngestedTurnWrite(turn: ParsedTurn, startNextSegment: boolean): IngestedTurnWritePreparation {
+        return this.resolveTurnGitValues(turn, startNextSegment);
     }
 
     recordDroppedTurn(
@@ -304,10 +325,7 @@ export class MemoryStore {
         return write();
     }
 
-    private resolveTurnGitValues(
-        turn: ParsedTurn,
-        startNextSegment: boolean,
-    ): { projectIdentity: ResolvedProjectIdentity; gitCommitCount: number | null } {
+    private resolveTurnGitValues(turn: ParsedTurn, startNextSegment: boolean): IngestedTurnWritePreparation {
         const projectIdentity = this.projects.resolveProjectIdentity(turn.projectPath);
         const existingSession = this.sessions.findSession(turn.tool, turn.sessionId);
         const needsGitCommitCount = existingSession === undefined || startNextSegment;

@@ -9,6 +9,7 @@ import { filterTurn } from '../../src/rendering/filtered-turn.js';
 import { openProviderTranscript } from '../../src/security/provider-transcript.js';
 import { type openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { type DurableCaptureBackfillSession, DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
+import { withValidatedDurableEvictionSources } from '../../src/storage/durable-capture-store.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
@@ -205,12 +206,16 @@ describe('daemon durable capture backfill', () => {
         backfillDb.close();
     });
 
-    it('enforces the configured byte cap while backfilling sessions', () => {
+    it('enforces the configured byte cap while backfilling sessions', async () => {
         const fixture = createTestDb('elepha-durable-backfill-cap-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
         const project = seedProject(fixture);
         fixture.store.consent.grant(project.path);
-        const firstPath = path.join(fixture.directory, 'first.jsonl');
-        const secondPath = path.join(fixture.directory, 'second.jsonl');
+        const firstPath = path.join(providerRoot, 'first.jsonl');
+        const secondPath = path.join(providerRoot, 'second.jsonl');
         writeFileSync(firstPath, '{}\n');
         writeFileSync(secondPath, '{}\n');
         const first = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'first', sourcePath: firstPath });
@@ -234,7 +239,16 @@ describe('daemon durable capture backfill', () => {
             const parsed = parsedTurn(session.source_path, session.native_id, 0);
             parsed.userMessage = `${session.native_id}-${'x'.repeat(200)}`;
             parsed.toolCalls = [];
-            expect(store.record(candidate, 0, filterTurn(parsed), NOW)).toEqual({ state: 'recorded', sessionId: session.id });
+            const projection = filterTurn(parsed);
+            await expect(
+                withValidatedDurableEvictionSources(
+                    fixture.db,
+                    projection,
+                    300,
+                    { sessionId: candidate.id, tool: candidate.tool, sourcePath: candidate.sourcePath },
+                    (evictionPlan) => store.record(candidate, 0, projection, NOW, evictionPlan),
+                ),
+            ).resolves.toEqual({ state: 'recorded', sessionId: session.id });
             store.finish(candidate, new Set([session.id]), 'success', NOW);
         }
 
@@ -639,6 +653,60 @@ describe('daemon durable capture backfill', () => {
         expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(moved.id)).toEqual({
             state: 'complete',
         });
+    });
+
+    it('keeps the resolved segment terminal when it differs from the preflight segment', async () => {
+        const fixture = createTestDb('elepha-durable-backfill-evicted-move-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const sourcePath = path.join(providerRoot, 'evicted-move.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const original = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'evicted-move', sourcePath });
+        const memory = seedMemory(fixture, { project, session: original, turnIndex: 0 });
+        const moved = fixture.store.startNextSegment(original, project.id, sourcePath);
+        expect(
+            fixture.store.recordTurn(
+                parsedTurn(sourcePath, original.native_id, 1),
+                moved.id,
+                project.id,
+                { decisions: [], pending_items: [], status: 'not_configured' },
+                true,
+            ),
+        ).toBe(true);
+        const maxBytes = (fixture.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number })
+            .total_bytes;
+        const store = new DurableCaptureBackfillStore(fixture.db, fixture.store.consent, maxBytes);
+        const candidate: DurableCaptureBackfillSession = {
+            id: original.id,
+            projectId: original.project_id,
+            tool: original.tool,
+            nativeId: original.native_id,
+            sourcePath: original.source_path,
+        };
+        expect(store.begin(candidate, NOW)?.missingTurnIndexes).toEqual(new Set([0]));
+        const projection = filterTurn(parsedTurn(sourcePath, original.native_id, 0));
+
+        const result = await withValidatedDurableEvictionSources(
+            fixture.db,
+            projection,
+            maxBytes,
+            { sessionId: candidate.id, tool: candidate.tool, sourcePath: candidate.sourcePath },
+            (evictionPlan) => store.record(candidate, 0, projection, NOW, evictionPlan),
+            {
+                afterFinalIdentityCheck: () =>
+                    fixture.db.prepare('UPDATE memories SET session_id = ? WHERE id = ?').run(moved.id, memory.id),
+            },
+        );
+        store.finish(candidate, new Set([moved.id]), 'parse_error', NOW);
+
+        expect({
+            result,
+            movedStatus: fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(moved.id),
+        }).toEqual({ result: { state: 'evicted' }, movedStatus: { state: 'evicted' } });
     });
 
     it('reruns sentinel and quote-back suppression before durable persistence', async () => {

@@ -3,7 +3,7 @@ import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import type { FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import type { ToolName } from '../types/index.js';
 import type { ConsentStore } from './consent-store.js';
-import { DurableCaptureStore } from './durable-capture-store.js';
+import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
 
 export interface DurableCaptureBackfillSession {
     id: number;
@@ -118,6 +118,7 @@ export class DurableCaptureBackfillStore {
         turnIndex: number,
         projection: FilteredTurnProjection,
         capturedAt: string,
+        evictionPlan?: DurableEvictionPlan,
     ): DurableCaptureBackfillRecordResult {
         const record = this.db.transaction((): DurableCaptureBackfillRecordResult => {
             const memory = this.db
@@ -140,7 +141,10 @@ export class DurableCaptureBackfillStore {
             if (existing !== undefined) {
                 return { state: 'already_recorded', sessionId: memory.session_id };
             }
-            if (this.durableCapture.record(memory.memory_id, memory.session_id, projection, capturedAt, this.maxBytes) === 'not_retained') {
+            if (
+                this.durableCapture.record(memory.memory_id, memory.session_id, projection, capturedAt, this.maxBytes, evictionPlan) ===
+                'not_retained'
+            ) {
                 return { state: 'evicted' };
             }
             // DurableCaptureStore computes live coverage after every insert;

@@ -5,7 +5,7 @@ import { filterTurn } from '../rendering/filtered-turn.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 import type { ParsedTurn, SummarizationOutput, ToolName, TurnDecision } from '../types/index.js';
-import { DurableCaptureStore } from './durable-capture-store.js';
+import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 import type { SessionStore } from './session-store.js';
 
@@ -163,9 +163,10 @@ export class TurnStore {
         summary: SummarizationOutput,
         durableCapture = false,
         durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        evictionPlan?: DurableEvictionPlan,
     ): boolean {
         const run = this.db.transaction(() =>
-            this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes),
+            this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes, evictionPlan),
         );
         return run();
     }
@@ -178,6 +179,7 @@ export class TurnStore {
         summary: SummarizationOutput,
         durableCapture = false,
         durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        evictionPlan?: DurableEvictionPlan,
     ): boolean {
         if (this.stmts.isTranscriptPurged.get(turn.tool, turn.sessionId) !== undefined) {
             return false;
@@ -197,7 +199,7 @@ export class TurnStore {
             has_external_content: turn.hasExternalContent ? 1 : 0,
         });
         if (info.changes > 0 && durableCapture) {
-            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now, durableCaptureMaxBytes);
+            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now, durableCaptureMaxBytes, evictionPlan);
         }
         this.sessions.advanceSessionCursorAt(sessionDbId, turn.cursor, now);
         this.sessions.updateTrailingState(sessionDbId, turn);

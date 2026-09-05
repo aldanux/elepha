@@ -50,8 +50,9 @@ import { filterTurn } from '../rendering/filtered-turn.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
 import type { ConsentState } from '../storage/consent-store.js';
 import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
+import { type DurableEvictionPlan, withValidatedDurableEvictionSources } from '../storage/durable-capture-store.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
-import type { MemoryStore } from '../storage/memory-store.js';
+import type { IngestedTurnWritePreparation, MemoryStore } from '../storage/memory-store.js';
 import { isMemoryLocked } from '../storage/paranoid-gate.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
@@ -513,7 +514,15 @@ export class IngestionDaemon {
                             );
                             continue;
                         }
-                        const result = backfill.record(session, turn.turnIndex, filterTurn(turn), new Date().toISOString());
+                        const projection = filterTurn(turn);
+                        const result = await withValidatedDurableEvictionSources(
+                            this.store.database,
+                            projection,
+                            this.durableCaptureMaxBytes,
+                            { sessionId: session.id, tool: session.tool, sourcePath: session.sourcePath },
+                            (evictionPlan) => backfill.record(session, turn.turnIndex, projection, new Date().toISOString(), evictionPlan),
+                            { openTranscript: this.openTranscript },
+                        );
                         if (result.state === 'unauthorized') {
                             writeUnauthorized = true;
                             break;
@@ -1214,7 +1223,33 @@ export class IngestionDaemon {
         if (this.summarizer) {
             this.trackOutcome(summary.status);
         }
-        const persisted = this.store.recordIngestedTurn(turn, meta, cut, summary, this.durableCapture, this.durableCaptureMaxBytes);
+        let preparation: IngestedTurnWritePreparation | undefined;
+        const record = (evictionPlan?: DurableEvictionPlan) =>
+            this.store.recordIngestedTurn(
+                turn,
+                meta,
+                cut,
+                summary,
+                this.durableCapture,
+                this.durableCaptureMaxBytes,
+                evictionPlan,
+                preparation,
+            );
+        const persisted = this.durableCapture
+            ? await withValidatedDurableEvictionSources(
+                  this.store.database,
+                  filterTurn(turn),
+                  this.durableCaptureMaxBytes,
+                  { sessionId: cut ? undefined : session?.id, tool: turn.tool, sourcePath: turn.sourcePath },
+                  record,
+                  {
+                      openTranscript: this.openTranscript,
+                      beforeFinalIdentityCheck: () => {
+                          preparation = this.store.prepareIngestedTurnWrite(turn, cut);
+                      },
+                  },
+              )
+            : record(undefined);
         if (!persisted) {
             return false;
         }
