@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -21,7 +21,7 @@ import {
     type DatabaseMigrationRuntime,
     migratePrimaryDatabaseToEncrypted,
 } from '../../src/storage/database-migration.js';
-import { openDb, openManagedDatabase, openUnmanagedDb } from '../../src/storage/db.js';
+import { openDb, openKeyedDatabase, openManagedDatabase, openUnmanagedDb } from '../../src/storage/db.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
 const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
@@ -154,6 +154,102 @@ describe('plaintext primary database encryption migration', () => {
                 },
             }),
         ).resolves.toEqual({ status: 'already-encrypted' });
+    });
+
+    it('encrypts every retained managed backup under the installation key without changing its content', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-backups-');
+        const expectedBackups = [
+            { name: 'elepha.db.bak-2026-09-01', nativeId: 'backup-older' },
+            { name: 'elepha.db.bak-2026-09-02', nativeId: 'backup-newer' },
+        ];
+        for (const expected of expectedBackups) {
+            const backupPath = path.join(directory, expected.name);
+            copyFileSync(dbPath, backupPath);
+            const backup = new Database(backupPath);
+            backup.prepare('UPDATE sessions SET native_id = ?').run(expected.nativeId);
+            backup.close();
+        }
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).resolves.toEqual({ status: 'migrated' });
+
+        const retainedBackups = readdirSync(directory)
+            .filter((entry) => entry.startsWith(`${path.basename(dbPath)}.bak-`))
+            .sort()
+            .map((entry) => path.join(directory, entry));
+        expect(retainedBackups.map((backupPath) => path.basename(backupPath))).toEqual(expectedBackups.map(({ name }) => name));
+        expect(retainedBackups.map((backupPath) => isPlaintext(backupPath))).toEqual(expectedBackups.map(() => false));
+        for (const [index, backupPath] of retainedBackups.entries()) {
+            const backup = openKeyedDatabase(backupPath, FIXED_KEY, { readonly: true, fileMustExist: true });
+            try {
+                expect(backup.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+                expect(backup.prepare('SELECT native_id FROM sessions').get()).toEqual({
+                    native_id: expectedBackups[index]?.nativeId,
+                });
+            } finally {
+                backup.close();
+            }
+        }
+    });
+
+    it('rejects an unrecognized managed backup before creating migration state or changing the plaintext canonical', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-invalid-backup-');
+        const invalidBackup = `${dbPath}.bak-2026-09-01`;
+        const invalidContents = Buffer.from('not a SQLite database');
+        writeFileSync(invalidBackup, invalidContents);
+        const migrationRuntime = runtime(directory);
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).rejects.toThrow(
+            `Managed backup is unrecognized or unverifiable: ${invalidBackup}`,
+        );
+
+        assertPlaintextOpenable(dbPath);
+        expect(readFileSync(invalidBackup)).toEqual(invalidContents);
+        expect(existsSync(migrationRuntime.statePaths?.manifest ?? '')).toBe(false);
+        expect(existsSync(migrationRuntime.keyFilePath?.(dbPath) ?? '')).toBe(false);
+    });
+
+    it('resumes after one managed backup is durably replaced while the canonical remains plaintext', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-backup-resume-');
+        const expectedBackups = [
+            { path: `${dbPath}.bak-2026-09-01`, nativeId: 'resume-older' },
+            { path: `${dbPath}.bak-2026-09-02`, nativeId: 'resume-newer' },
+        ];
+        for (const expected of expectedBackups) {
+            copyFileSync(dbPath, expected.path);
+            const backup = new Database(expected.path);
+            backup.prepare('UPDATE sessions SET native_id = ?').run(expected.nativeId);
+            backup.close();
+        }
+        let replaced = 0;
+        const interrupted = runtime(directory, {
+            failpoint: (point) => {
+                if (point === 'after_managed_backup_replaced' && ++replaced === 1) {
+                    expect(hasLifecycleIntent(dbPath)).toBe(true);
+                    throw new Error('stop after first managed backup replacement');
+                }
+            },
+        });
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, interrupted)).rejects.toThrow('stop after first managed backup replacement');
+
+        assertPlaintextOpenable(dbPath);
+        expect(expectedBackups.map((backup) => isPlaintext(backup.path))).toEqual([false, true]);
+        expect(hasLifecycleIntent(dbPath)).toBe(true);
+        expect(JSON.parse(readFileSync(interrupted.statePaths?.manifest ?? '', 'utf8'))).toMatchObject({
+            stage: 'key_committed',
+            backups: [{ stage: 'prepared' }, { stage: 'pending' }],
+        });
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).resolves.toEqual({ status: 'migrated' });
+        await assertEncryptedOpenable(dbPath, runtime(directory));
+        expect(expectedBackups.map((backup) => isPlaintext(backup.path))).toEqual([false, false]);
+        for (const expected of expectedBackups) {
+            const backup = openKeyedDatabase(expected.path, FIXED_KEY, { readonly: true, fileMustExist: true });
+            expect(backup.prepare('SELECT native_id FROM sessions').get()).toEqual({ native_id: expected.nativeId });
+            backup.close();
+        }
+        expect(existsSync(interrupted.statePaths?.manifest ?? '')).toBe(false);
+        expect(hasLifecycleIntent(dbPath)).toBe(false);
     });
 
     it.each([

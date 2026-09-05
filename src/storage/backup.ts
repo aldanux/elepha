@@ -27,14 +27,17 @@ export function writeBackup(db: Database.Database, dbPath: string): string {
 
 // The ISO-derived filename suffix sorts chronologically, so filename order
 // determines the retained snapshots.
-export function pruneBackups(dbPath: string, keep: number): string[] {
+export function listManagedBackups(dbPath: string): string[] {
     const dir = path.dirname(dbPath);
     const prefix = `${path.basename(dbPath)}${BACKUP_MARKER}`;
-    const backups = readdirSync(dir)
+    return readdirSync(dir)
         .filter((f) => f.startsWith(prefix))
         .map((f) => path.join(dir, f))
         .sort();
+}
 
+export function pruneBackups(dbPath: string, keep: number): string[] {
+    const backups = listManagedBackups(dbPath);
     const toDelete = backups.length > keep ? backups.slice(0, backups.length - keep) : [];
     for (const p of toDelete) {
         unlinkSync(p);

@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import {
+    type BigIntStats,
     chmodSync,
     closeSync,
     existsSync,
@@ -34,6 +35,7 @@ import {
 import { elephaPaths } from '../config/paths.js';
 import { errorMessage } from '../util/error.js';
 import { atomicCopyPrivateFile } from '../util/fs.js';
+import { listManagedBackups } from './backup.js';
 import {
     type DatabaseEncryptionRuntime,
     type EncryptionBackend,
@@ -46,7 +48,13 @@ import {
     writeEncryptionMetadata,
     writePrivateFileAtomic,
 } from './database-encryption.js';
-import { type ExclusiveDatabaseLifecycleLease, withExclusiveDatabaseLifecycle } from './database-lifecycle.js';
+import { type ExclusiveDatabaseLifecycleLease, pinSQLitePathForOpen, withExclusiveDatabaseLifecycle } from './database-lifecycle.js';
+import {
+    assertEncryptedDatabaseFile,
+    createPrivateEmptyDatabaseDescriptor,
+    inspectPrivateEmptyDatabaseDescriptor,
+    writeEncryptedDatabaseSnapshotWithKey,
+} from './encrypted-database-export.js';
 
 export const DATABASE_MIGRATION_IN_PROGRESS = 'migration_in_progress';
 export const DATABASE_KEY_COMMITMENT_INDETERMINATE =
@@ -61,6 +69,7 @@ const MIGRATION_STAGES = [
     'sidecar_encrypted',
     'key_commitment_started',
     'key_committed',
+    'backups_encrypted',
     'plaintext_closed',
     'wal_cleaned',
     'rolled_back_key_retained',
@@ -70,6 +79,15 @@ const MIGRATION_STAGES = [
 ] as const;
 
 type MigrationStage = (typeof MIGRATION_STAGES)[number];
+type ManagedBackupMigrationStage = 'pending' | 'prepared' | 'replaced';
+
+export interface ManagedBackupMigration {
+    sourcePath: string;
+    originalSha256: string;
+    encryptedPath: string;
+    encryptedSha256: string | null;
+    stage: ManagedBackupMigrationStage;
+}
 
 export interface DatabaseMigrationManifest {
     version: 1;
@@ -80,6 +98,7 @@ export interface DatabaseMigrationManifest {
     originalSha256: string;
     rollbackPath: string;
     sidecarPath: string;
+    backups: ManagedBackupMigration[];
     keySha256: string | null;
     stage: MigrationStage;
 }
@@ -259,6 +278,10 @@ function migrationArtifactPaths(databasePath: string, migrationId: string): { ro
     };
 }
 
+function managedBackupArtifactPath(databasePath: string, migrationId: string, index: number): string {
+    return path.join(path.dirname(databasePath), `.${path.basename(databasePath)}.migration-${migrationId}.backup-${index}.encrypted`);
+}
+
 function malformedManifest(file: string): never {
     throw new Error(`Database migration manifest is unreadable or malformed: ${file}; refusing to guess recovery state.`);
 }
@@ -298,6 +321,33 @@ function readManifest(file: string, databasePath: string): DatabaseMigrationMani
     }
     const expected = migrationArtifactPaths(manifest.sourcePath, manifest.migrationId);
     if (path.resolve(manifest.rollbackPath) !== expected.rollback || path.resolve(manifest.sidecarPath) !== expected.sidecar) {
+        return malformedManifest(file);
+    }
+    if (!Array.isArray(manifest.backups)) {
+        return malformedManifest(file);
+    }
+    const backupDirectory = path.dirname(manifest.sourcePath);
+    const backupPrefix = `${path.basename(manifest.sourcePath)}.bak-`;
+    for (const [index, backup] of manifest.backups.entries()) {
+        if (
+            !backup ||
+            typeof backup !== 'object' ||
+            typeof backup.sourcePath !== 'string' ||
+            path.dirname(backup.sourcePath) !== backupDirectory ||
+            !path.basename(backup.sourcePath).startsWith(backupPrefix) ||
+            typeof backup.originalSha256 !== 'string' ||
+            !/^[0-9a-f]{64}$/.test(backup.originalSha256) ||
+            backup.encryptedPath !== managedBackupArtifactPath(manifest.sourcePath, manifest.migrationId, index) ||
+            (backup.encryptedSha256 !== null &&
+                (typeof backup.encryptedSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(backup.encryptedSha256))) ||
+            (backup.stage !== 'pending' && backup.stage !== 'prepared' && backup.stage !== 'replaced') ||
+            (backup.stage === 'pending') !== (backup.encryptedSha256 === null)
+        ) {
+            return malformedManifest(file);
+        }
+    }
+    const backupPaths = manifest.backups.map((backup) => backup.sourcePath);
+    if (new Set(backupPaths).size !== backupPaths.length || JSON.stringify(backupPaths) !== JSON.stringify([...backupPaths].sort())) {
         return malformedManifest(file);
     }
     const requiresKeyDigest = !['quiesced', 'rollback_copied', 'sidecar_copied'].includes(manifest.stage);
@@ -454,6 +504,95 @@ function assertMatchesSnapshot(db: Database.Database, expected: DatabaseSnapshot
     }
 }
 
+function managedBackupVerificationError(backupPath: string, cause: unknown): Error {
+    return new Error(`Managed backup is unrecognized or unverifiable: ${backupPath}: ${errorMessage(cause)}`, { cause });
+}
+
+function managedBackupOpenCleanupCause(primary: unknown, db?: Database.Database, seal?: ReturnType<typeof pinSQLitePathForOpen>): unknown {
+    const failures = [primary];
+    if (db !== undefined) {
+        try {
+            db.close();
+        } catch (error) {
+            failures.push(error);
+        }
+    }
+    if (seal !== undefined) {
+        try {
+            seal.release();
+        } catch (error) {
+            failures.push(error);
+        }
+    }
+    return failures.length === 1
+        ? primary
+        : new AggregateError(failures, 'Managed backup validation and cleanup both failed.', { cause: primary });
+}
+
+function openVerifiedPlaintextManagedBackup(backupPath: string, expectedSha256?: string): Database.Database {
+    let stats: BigIntStats;
+    let plaintext: boolean;
+    try {
+        stats = lstatSync(backupPath, { bigint: true });
+        plaintext = hasPlaintextHeader(backupPath);
+    } catch (error) {
+        throw managedBackupVerificationError(backupPath, error);
+    }
+    if (!stats.isFile() || stats.isSymbolicLink() || !plaintext) {
+        const cause = new Error('expected a regular plaintext SQLite database');
+        throw managedBackupVerificationError(backupPath, cause);
+    }
+    if (expectedSha256 !== undefined) {
+        let actualSha256: string;
+        try {
+            actualSha256 = hashFile(backupPath);
+        } catch (error) {
+            throw managedBackupVerificationError(backupPath, error);
+        }
+        if (actualSha256 !== expectedSha256) {
+            const cause = new Error('contents changed after migration preflight');
+            throw managedBackupVerificationError(backupPath, cause);
+        }
+    }
+    let seal: ReturnType<typeof pinSQLitePathForOpen>;
+    try {
+        seal = pinSQLitePathForOpen(backupPath, {
+            dev: stats.dev,
+            ino: stats.ino,
+            ctimeNs: stats.ctimeNs,
+            nlink: stats.nlink,
+        });
+    } catch (error) {
+        throw managedBackupVerificationError(backupPath, error);
+    }
+    let db: Database.Database;
+    try {
+        db = new Database(seal.sqlitePath, { fileMustExist: true, timeout: 0 });
+    } catch (error) {
+        throw managedBackupVerificationError(backupPath, managedBackupOpenCleanupCause(error, undefined, seal));
+    }
+    try {
+        seal.confirmOpen(db);
+        assertIntegrity(db, 'Managed backup');
+    } catch (error) {
+        throw managedBackupVerificationError(backupPath, managedBackupOpenCleanupCause(error, db, seal));
+    }
+    try {
+        seal.release();
+    } catch (error) {
+        throw managedBackupVerificationError(backupPath, managedBackupOpenCleanupCause(error, db));
+    }
+    return db;
+}
+
+function preflightManagedBackups(databasePath: string): Array<Pick<ManagedBackupMigration, 'sourcePath' | 'originalSha256'>> {
+    return listManagedBackups(databasePath).map((backupPath) => {
+        const backup = openVerifiedPlaintextManagedBackup(backupPath);
+        backup.close();
+        return { sourcePath: backupPath, originalSha256: hashFile(backupPath) };
+    });
+}
+
 function preflightPlaintextDatabase(databasePath: string, runtime: DatabaseMigrationRuntime): void {
     assertEnoughSpace(databasePath, runtime);
     const db = new Database(databasePath, { readonly: true, fileMustExist: true, timeout: 0 });
@@ -593,6 +732,119 @@ function syncFile(file: string): void {
     }
 }
 
+function transitionManagedBackup(
+    manifestPath: string,
+    manifest: DatabaseMigrationManifest,
+    index: number,
+    backup: ManagedBackupMigration,
+    runtime: DatabaseMigrationRuntime,
+): DatabaseMigrationManifest {
+    const backups = manifest.backups.map((current, currentIndex) => (currentIndex === index ? backup : current));
+    const next = { ...manifest, backups };
+    writeManifest(manifestPath, manifest.sourcePath, next);
+    hit(runtime, `after_manifest_backup_${backup.stage}`);
+    return next;
+}
+
+function assertManagedBackupSet(manifest: DatabaseMigrationManifest): void {
+    const expected = manifest.backups.map((backup) => backup.sourcePath);
+    if (JSON.stringify(listManagedBackups(manifest.sourcePath)) !== JSON.stringify(expected)) {
+        throw new Error('Managed backup set changed after migration preflight; refusing to continue.');
+    }
+}
+
+function verifyEncryptedManagedBackup(databasePath: string, encryptedSha256: string, key: Buffer, label: string): void {
+    if (hashFile(databasePath) !== encryptedSha256) {
+        throw new Error(`${label} changed after encryption verification.`);
+    }
+    assertEncryptedDatabaseFile(databasePath, key, label);
+    const db = openKeyedDatabase(databasePath, key, true);
+    try {
+        assertIntegrity(db, label);
+    } finally {
+        db.close();
+    }
+}
+
+function buildEncryptedManagedBackup(backup: ManagedBackupMigration, key: Buffer): string {
+    removeFile(backup.encryptedPath);
+    const source = openVerifiedPlaintextManagedBackup(backup.sourcePath, backup.originalSha256);
+    let descriptor: number | undefined;
+    try {
+        descriptor = createPrivateEmptyDatabaseDescriptor(backup.encryptedPath);
+        const identity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
+        closeSync(descriptor);
+        descriptor = undefined;
+        writeEncryptedDatabaseSnapshotWithKey(source, backup.encryptedPath, identity, key);
+    } catch (error) {
+        if (descriptor !== undefined) {
+            closeSync(descriptor);
+        }
+        removeFile(backup.encryptedPath);
+        throw error;
+    } finally {
+        source.close();
+    }
+    syncFile(backup.encryptedPath);
+    fsyncDirectory(path.dirname(backup.encryptedPath));
+    const encryptedSha256 = hashFile(backup.encryptedPath);
+    verifyEncryptedManagedBackup(backup.encryptedPath, encryptedSha256, key, 'Encrypted managed backup replacement');
+    const unchanged = openVerifiedPlaintextManagedBackup(backup.sourcePath, backup.originalSha256);
+    unchanged.close();
+    return encryptedSha256;
+}
+
+function convertManagedBackups(
+    manifestPath: string,
+    initialManifest: DatabaseMigrationManifest,
+    key: Buffer,
+    runtime: DatabaseMigrationRuntime,
+): DatabaseMigrationManifest {
+    let manifest = initialManifest;
+    assertManagedBackupSet(manifest);
+    for (let index = 0; index < manifest.backups.length; index++) {
+        let backup = manifest.backups[index];
+        if (backup === undefined) {
+            throw new Error('Database migration manifest lost a managed backup entry.');
+        }
+        if (backup.stage === 'replaced') {
+            verifyEncryptedManagedBackup(backup.sourcePath, backup.encryptedSha256 ?? '', key, 'Encrypted managed backup');
+            continue;
+        }
+        if (backup.stage === 'prepared' && !existsSync(backup.encryptedPath) && !hasPlaintextHeader(backup.sourcePath)) {
+            verifyEncryptedManagedBackup(backup.sourcePath, backup.encryptedSha256 ?? '', key, 'Encrypted managed backup');
+            manifest = transitionManagedBackup(manifestPath, manifest, index, { ...backup, stage: 'replaced' }, runtime);
+            continue;
+        }
+        if (backup.stage === 'pending' || !existsSync(backup.encryptedPath)) {
+            const encryptedSha256 = buildEncryptedManagedBackup(backup, key);
+            backup = { ...backup, encryptedSha256, stage: 'prepared' };
+            manifest = transitionManagedBackup(manifestPath, manifest, index, backup, runtime);
+        } else {
+            verifyEncryptedManagedBackup(backup.encryptedPath, backup.encryptedSha256 ?? '', key, 'Encrypted managed backup replacement');
+        }
+        const original = openVerifiedPlaintextManagedBackup(backup.sourcePath, backup.originalSha256);
+        original.close();
+        renameSync(backup.encryptedPath, backup.sourcePath);
+        fsyncDirectory(path.dirname(backup.sourcePath));
+        hit(runtime, 'after_managed_backup_replaced');
+        verifyEncryptedManagedBackup(backup.sourcePath, backup.encryptedSha256 ?? '', key, 'Encrypted managed backup');
+        manifest = transitionManagedBackup(manifestPath, manifest, index, { ...backup, stage: 'replaced' }, runtime);
+    }
+    assertManagedBackupSet(manifest);
+    return manifest;
+}
+
+function assertManagedBackupsEncrypted(manifest: DatabaseMigrationManifest, key: Buffer): void {
+    assertManagedBackupSet(manifest);
+    for (const backup of manifest.backups) {
+        if (backup.stage !== 'replaced' || backup.encryptedSha256 === null) {
+            throw new Error('Database migration reached canonical replacement before every managed backup was encrypted.');
+        }
+        verifyEncryptedManagedBackup(backup.sourcePath, backup.encryptedSha256, key, 'Encrypted managed backup');
+    }
+}
+
 function encryptAndVerifySidecar(
     manifest: DatabaseMigrationManifest,
     key: Buffer,
@@ -655,6 +907,9 @@ function cleanupUncommittedMigration(
     runtime: DatabaseMigrationRuntime,
     completeReplacement: () => void,
 ): void {
+    for (const backup of manifest.backups) {
+        removeFile(backup.encryptedPath);
+    }
     removeFile(manifest.sidecarPath);
     removeFile(manifest.rollbackPath);
     fsyncDirectory(path.dirname(manifest.sourcePath));
@@ -785,6 +1040,7 @@ function finalVerify(
     } finally {
         committed.close();
     }
+    assertManagedBackupsEncrypted(manifest, key);
     const writable = openKeyedDatabase(manifest.sourcePath, key);
     writable.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
     writable.close();
@@ -803,6 +1059,9 @@ function finalVerify(
 }
 
 function finalizeMigration(manifestPath: string, manifest: DatabaseMigrationManifest, runtime: DatabaseMigrationRuntime): void {
+    for (const backup of manifest.backups) {
+        removeFile(backup.encryptedPath);
+    }
     removeFile(manifest.rollbackPath);
     removeFile(manifest.sidecarPath);
     fsyncDirectory(path.dirname(manifest.sourcePath));
@@ -858,6 +1117,7 @@ async function resumeFromPlaintext(
             manifest = transitionManifest(manifestPath, manifest, 'key_committed', runtime);
         } else if (
             manifest.stage === 'key_committed' ||
+            manifest.stage === 'backups_encrypted' ||
             manifest.stage === 'plaintext_closed' ||
             manifest.stage === 'wal_cleaned' ||
             manifest.stage === 'rolled_back_key_retained' ||
@@ -905,6 +1165,11 @@ async function resumeFromPlaintext(
                 sidecar.close();
             }
         }
+        manifest = convertManagedBackups(manifestPath, manifest, key, runtime);
+        if (manifest.stage === 'key_committed') {
+            manifest = transitionManifest(manifestPath, manifest, 'backups_encrypted', runtime);
+        }
+        assertManagedBackupsEncrypted(manifest, key);
         closePlaintextDatabase(db, runtime);
         manifest = transitionManifest(manifestPath, manifest, 'plaintext_closed', runtime);
         removeInactiveWalFiles(manifest.sourcePath, runtime);
@@ -932,13 +1197,19 @@ async function resumeManifest(
     runtime: DatabaseMigrationRuntime,
     completeReplacement: () => void,
 ): Promise<DatabaseMigrationResult> {
-    if (manifest.stage === 'verified') {
-        completeReplacement();
-        finalizeMigration(manifestPath, manifest, runtime);
-        return { status: 'migrated' };
-    }
-    if (manifest.stage === 'committed_verified') {
-        manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
+    if (manifest.stage === 'verified' || manifest.stage === 'committed_verified') {
+        const key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
+        if (key === undefined) {
+            throw new Error('The database migration manifest records a committed key, but the key is absent.');
+        }
+        try {
+            assertManagedBackupsEncrypted(manifest, key);
+        } finally {
+            key.fill(0);
+        }
+        if (manifest.stage === 'committed_verified') {
+            manifest = transitionManifest(manifestPath, manifest, 'verified', runtime);
+        }
         completeReplacement();
         finalizeMigration(manifestPath, manifest, runtime);
         return { status: 'migrated' };
@@ -1059,6 +1330,7 @@ export async function migratePrimaryDatabaseToEncrypted(
                 return { status: 'already-encrypted' };
             }
             preflightPlaintextDatabase(pinnedDatabasePath, runtime);
+            const managedBackups = preflightManagedBackups(pinnedDatabasePath);
             return withMigrationLock(runtime, async (manifestPath) => {
                 const interrupted = readManifest(manifestPath, pinnedDatabasePath);
                 if (interrupted !== undefined) {
@@ -1083,6 +1355,12 @@ export async function migratePrimaryDatabaseToEncrypted(
                         originalSha256: hashFile(pinnedDatabasePath),
                         rollbackPath: artifacts.rollback,
                         sidecarPath: artifacts.sidecar,
+                        backups: managedBackups.map((backup, index) => ({
+                            ...backup,
+                            encryptedPath: managedBackupArtifactPath(pinnedDatabasePath, migrationId, index),
+                            encryptedSha256: null,
+                            stage: 'pending',
+                        })),
                         keySha256: null,
                         stage: 'quiesced',
                     };

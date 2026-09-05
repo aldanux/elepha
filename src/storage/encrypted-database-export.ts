@@ -43,6 +43,8 @@ interface AttachedExportState {
     attached: boolean;
 }
 
+type AttachedEncryption = { kind: 'inherited'; cipherSalt: string } | { kind: 'explicit'; key: Buffer };
+
 function privateEmptyDatabaseIdentity(descriptor: number): DatabaseFileSeal {
     fchmodSync(descriptor, PRIVATE_FILE_MODE);
     const stats = fstatSync(descriptor, { bigint: true });
@@ -98,14 +100,18 @@ export function writeEncryptedAttachedDatabase(
     destinationPath: string,
     expectedIdentity: DatabaseFileSeal,
     writer: (targetSchema: string) => void,
+    encryptionKey?: Buffer,
 ): void {
-    const sourceCipherSalt = encryptedConnectionSalt(source);
+    const encryption: AttachedEncryption =
+        encryptionKey === undefined
+            ? { kind: 'inherited', cipherSalt: encryptedConnectionSalt(source) }
+            : { kind: 'explicit', key: encryptionKey };
     const seal = pinSQLitePathForOpen(destinationPath, expectedIdentity);
     const state: AttachedExportState = { attached: false };
     let primaryError: unknown;
     const cleanupFailures: unknown[] = [];
     try {
-        runAttachedEncryptedExport(source, sourceCipherSalt, seal, writer, state);
+        runAttachedEncryptedExport(source, encryption, seal, writer, state);
     } catch (error) {
         primaryError = error;
     }
@@ -140,7 +146,7 @@ export function writeEncryptedAttachedDatabase(
 
 function runAttachedEncryptedExport(
     source: Database.Database,
-    sourceCipherSalt: string,
+    encryption: AttachedEncryption,
     seal: ReturnType<typeof pinSQLitePathForOpen>,
     writer: (targetSchema: string) => void,
     state: AttachedExportState,
@@ -150,7 +156,17 @@ function runAttachedEncryptedExport(
             throw new Error(BACKUP_DESTINATION_COMPANION_ERROR);
         }
     }
-    source.prepare(`ATTACH DATABASE ? AS ${quoteIdentifier(ATTACHED_EXPORT_SCHEMA)}`).run(seal.sqlitePath);
+    if (encryption.kind === 'explicit') {
+        source.pragma("cipher='chacha20'");
+        const rawKey = Buffer.from(`raw:${encryption.key.toString('hex')}`, 'ascii');
+        try {
+            source.prepare(`ATTACH DATABASE ? AS ${quoteIdentifier(ATTACHED_EXPORT_SCHEMA)} KEY ?`).run(seal.sqlitePath, rawKey);
+        } finally {
+            rawKey.fill(0);
+        }
+    } else {
+        source.prepare(`ATTACH DATABASE ? AS ${quoteIdentifier(ATTACHED_EXPORT_SCHEMA)}`).run(seal.sqlitePath);
+    }
     state.attached = true;
     seal.confirmOpen(source, ATTACHED_EXPORT_SCHEMA);
     const opened = fstatSync(seal.descriptor, { bigint: true });
@@ -158,8 +174,12 @@ function runAttachedEncryptedExport(
         throw new Error('Backup temporary changed before its first encrypted page write.');
     }
     const targetCipherSalt = attachedPragma(source, 'cipher_salt', { simple: true });
-    if (typeof targetCipherSalt !== 'string' || targetCipherSalt.toUpperCase() !== sourceCipherSalt) {
-        throw new Error('Backup target did not inherit the selected source encryption key.');
+    if (
+        typeof targetCipherSalt !== 'string' ||
+        !/^[0-9a-f]{32}$/i.test(targetCipherSalt) ||
+        (encryption.kind === 'inherited' && targetCipherSalt.toUpperCase() !== encryption.cipherSalt)
+    ) {
+        throw new Error('Backup target did not receive the selected encryption key.');
     }
     const journalMode = attachedPragma(source, 'journal_mode = MEMORY', { simple: true });
     if (journalMode !== 'memory') {
@@ -310,6 +330,21 @@ export function writeEncryptedDatabaseSnapshot(
     writeEncryptedAttachedDatabase(source, destinationPath, expectedIdentity, (targetSchema) => {
         cloneFullDatabase(source, targetSchema);
     });
+}
+
+export function writeEncryptedDatabaseSnapshotWithKey(
+    source: Database.Database,
+    destinationPath: string,
+    expectedIdentity: DatabaseFileSeal,
+    encryptionKey: Buffer,
+): void {
+    writeEncryptedAttachedDatabase(
+        source,
+        destinationPath,
+        expectedIdentity,
+        (targetSchema) => cloneFullDatabase(source, targetSchema),
+        encryptionKey,
+    );
 }
 
 export function assertEncryptedDatabaseFile(databasePath: string, encryptionKey: Buffer, label: string): void {
