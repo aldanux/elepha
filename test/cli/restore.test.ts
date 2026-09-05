@@ -17,7 +17,13 @@ import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { exportAll } from '../../src/cli/commands/backup.js';
-import { REQUIRED_RESTORE_TABLES, RESTORE_TOMBSTONES_CHANGED_ERROR, runRestoreOperation } from '../../src/cli/commands/restore.js';
+import {
+    REQUIRED_RESTORE_TABLES,
+    RESTORE_CONSENT_CHANGED_ERROR,
+    RESTORE_CONSENT_TRIGGER_ERROR,
+    RESTORE_TOMBSTONES_CHANGED_ERROR,
+    runRestoreOperation,
+} from '../../src/cli/commands/restore.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { writeBackup } from '../../src/storage/backup.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
@@ -178,6 +184,15 @@ function counts(dbPath: string): Record<string, number> {
                 Number((db.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
             ]),
         );
+    } finally {
+        db.close();
+    }
+}
+
+function consentRows(dbPath: string): unknown[] {
+    const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+    try {
+        return db.prepare('SELECT ulid, path, state, decided_at, source, nudged_at FROM consent_roots ORDER BY ulid').all();
     } finally {
         db.close();
     }
@@ -891,6 +906,241 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             expect.soft(measuredUsage).toEqual({ total_bytes: 0 });
         } finally {
             inspected.close();
+        }
+    });
+
+    it('aborts before mutation when approved consent is revoked during confirmation', async () => {
+        const active = createTestDb('elepha-restore-consent-race-active-');
+        const candidate = createTestDb('elepha-restore-consent-race-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const consentPath = active.directory;
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        active.store.consent.grant(consentPath);
+        candidate.store.consent.grant(consentPath);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        let markConfirmationStarted!: () => void;
+        const confirmationStarted = new Promise<void>((resolve) => {
+            markConfirmationStarted = resolve;
+        });
+        let releaseConfirmation!: () => void;
+        const confirmationRelease = new Promise<void>((resolve) => {
+            releaseConfirmation = resolve;
+        });
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+        let previewShownWhenConfirmationStarted = false;
+        const restore = runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: async () => {
+                previewShownWhenConfirmationStarted = output.includes(`Restore preview: ${backup}`);
+                markConfirmationStarted();
+                await confirmationRelease;
+                return true;
+            },
+        });
+
+        await confirmationStarted;
+        const current = new MemoryStore(openUnmanagedDb(active.dbPath));
+        try {
+            current.consent.revoke(consentPath);
+        } finally {
+            current.database.close();
+        }
+        const activeBytesAfterRevoke = readFileSync(active.dbPath);
+        releaseConfirmation();
+        const outcome = await restore.then(
+            () => ({ status: 'resolved' as const, message: undefined }),
+            (error: unknown) => ({
+                status: 'rejected' as const,
+                message: error instanceof Error ? error.message : String(error),
+            }),
+        );
+        log.mockRestore();
+
+        const inspected = new MemoryStore(openUnmanagedDb(active.dbPath));
+        try {
+            expect.soft(outcome).toEqual({
+                status: 'rejected',
+                message: RESTORE_CONSENT_CHANGED_ERROR,
+            });
+            expect.soft(previewShownWhenConfirmationStarted).toBe(true);
+            expect.soft(readFileSync(active.dbPath)).toEqual(activeBytesAfterRevoke);
+            expect.soft(inspected.consent.consentState(consentPath)).toBe('denied');
+            expect.soft(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        } finally {
+            inspected.database.close();
+        }
+    });
+
+    it('overlays exact current consent without deleting durable rows for a revoked root', async () => {
+        const active = createTestDb('elepha-restore-consent-overlay-active-');
+        const candidate = createTestDb('elepha-restore-consent-overlay-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const consentPath = active.directory;
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        active.store.consent.revoke(consentPath);
+        candidate.store.consent.grant(consentPath);
+        const project = candidate.store.upsertProject(consentPath);
+        const nativeId = 'revoked-root-durable-copy';
+        const session = candidate.store.upsertSession('codex', nativeId, project.id, path.join(candidate.directory, `${nativeId}.jsonl`));
+        candidate.store.recordTurn(
+            {
+                tool: 'codex',
+                sessionId: nativeId,
+                sourcePath: session.source_path,
+                projectPath: project.path,
+                turnIndex: 0,
+                startedAt: '2026-08-01T00:00:00.000Z',
+                endedAt: '2026-08-01T00:00:01.000Z',
+                userMessage: 'retained while revoked',
+                assistantText: 'durable response',
+                toolCalls: [],
+                cursor: '0',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            },
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'ok' },
+            true,
+        );
+        const expectedConsent = consentRows(active.dbPath);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = new MemoryStore(openUnmanagedDb(active.dbPath));
+        try {
+            expect(consentRows(active.dbPath)).toEqual(expectedConsent);
+            expect(restored.consent.consentState(consentPath)).toBe('denied');
+            expect(
+                restored.database
+                    .prepare(
+                        `SELECT COUNT(*) AS count
+                         FROM filtered_turns ft
+                         JOIN memories m ON m.id = ft.memory_id
+                         JOIN sessions s ON s.id = m.session_id
+                         WHERE s.tool = ? AND s.native_id = ?`,
+                    )
+                    .get('codex', nativeId),
+            ).toEqual({ count: 1 });
+        } finally {
+            restored.database.close();
+        }
+    });
+
+    it('rejects a candidate consent trigger before preview or active mutation', async () => {
+        const active = createTestDb('elepha-restore-consent-trigger-active-');
+        const candidate = createTestDb('elepha-restore-consent-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const consentPath = active.directory;
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        active.store.consent.revoke(consentPath);
+        candidate.store.consent.grant(consentPath);
+        candidate.db.exec(`
+            CREATE TRIGGER candidate_consent_expand
+            AFTER INSERT ON consent_roots
+            BEGIN
+              INSERT OR IGNORE INTO consent_roots
+              VALUES (NULL, 'evil-ulid', '/tmp/expanded', 'approved', '2026-09-06T00:00:00.000Z', 'cli', NULL);
+            END;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        const expectedConsent = consentRows(active.dbPath);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).then(
+            () => ({ status: 'resolved' as const, message: undefined }),
+            (error: unknown) => ({
+                status: 'rejected' as const,
+                message: error instanceof Error ? error.message : String(error),
+            }),
+        );
+        log.mockRestore();
+
+        expect.soft(outcome).toEqual({
+            status: 'rejected',
+            message: RESTORE_CONSENT_TRIGGER_ERROR,
+        });
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(output).not.toContain(`Restore preview: ${backup}`);
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+        expect.soft(consentRows(active.dbPath)).toEqual(expectedConsent);
+        expect.soft(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        expect.soft(consentRows(active.dbPath)).not.toContainEqual(expect.objectContaining({ path: '/tmp/expanded', state: 'approved' }));
+    });
+
+    it.each([
+        { mutation: 'grant', initialState: 'denied' as const },
+        { mutation: 'identity substitution', initialState: 'approved' as const },
+    ])('invalidates the consent preview after concurrent $mutation', async ({ mutation, initialState }) => {
+        const active = createTestDb('elepha-restore-consent-change-active-');
+        const candidate = createTestDb('elepha-restore-consent-change-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const consentPath = active.directory;
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        if (initialState === 'approved') {
+            active.store.consent.grant(consentPath);
+        } else {
+            active.store.consent.revoke(consentPath);
+        }
+        candidate.store.consent.grant(consentPath);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                confirm: async () => {
+                    const current = new MemoryStore(openUnmanagedDb(active.dbPath));
+                    try {
+                        if (mutation === 'grant') {
+                            current.consent.grant(consentPath);
+                        } else {
+                            current.database
+                                .prepare('UPDATE consent_roots SET ulid = ? WHERE path = ?')
+                                .run('01JCONSENTSUBSTITUTION00000', consentPath);
+                        }
+                    } finally {
+                        current.database.close();
+                    }
+                    return true;
+                },
+            }),
+        ).rejects.toThrow(RESTORE_CONSENT_CHANGED_ERROR);
+
+        expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        const current = new MemoryStore(openUnmanagedDb(active.dbPath));
+        try {
+            expect(current.consent.consentState(consentPath)).toBe(mutation === 'grant' ? 'approved' : initialState);
+        } finally {
+            current.database.close();
         }
     });
 

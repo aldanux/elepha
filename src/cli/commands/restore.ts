@@ -38,11 +38,22 @@ export const REQUIRED_RESTORE_TABLES = [
 ] as const;
 export const RESTORE_TOMBSTONES_CHANGED_ERROR =
     'Restore preview is stale because active transcript tombstones changed. Run restore again to review the current state.';
+export const RESTORE_CONSENT_CHANGED_ERROR =
+    'Restore preview is stale because active consent changed. Run restore again to review the current state.';
+export const RESTORE_CONSENT_TRIGGER_ERROR = 'Backup is unsafe because it contains a consent-root trigger.';
 
 type RequiredRestoreTable = (typeof REQUIRED_RESTORE_TABLES)[number];
 type RestoreCounts = Record<RequiredRestoreTable, number>;
 type TableColumn = { name: string; type: string };
 type TranscriptIdentity = { tool: string; native_id: string };
+type ConsentRoot = {
+    ulid: string;
+    path: string;
+    state: string;
+    decided_at: string;
+    source: string;
+    nudged_at: string | null;
+};
 
 const TOMBSTONE_TABLES = [
     { table: 'purged_transcripts', timestampColumn: 'purged_at' },
@@ -53,6 +64,7 @@ const DATABASE_COMPANION_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
 type TombstoneTable = (typeof TOMBSTONE_TABLES)[number]['table'];
 type TranscriptTombstones = Record<TombstoneTable, TranscriptIdentity[]>;
 type TranscriptTombstonePlan = { tombstones: TranscriptTombstones; fingerprint: string };
+type ConsentPlan = { roots: ConsentRoot[]; fingerprint: string };
 
 interface RestoreCommandOptions {
     skipConfirmation: boolean;
@@ -206,14 +218,21 @@ function inspectCandidate(stagedPath: string, candidatePath: string, encryptionK
             encryptionKey === undefined
                 ? new Database(stagedPath, { readonly: true, fileMustExist: true })
                 : openKeyedDatabase(stagedPath, encryptionKey, { readonly: true, fileMustExist: true });
-        const missing = missingRequiredTables(candidate);
-        if (missing.length > 0) {
-            validationError = `Backup is incomplete (missing required table(s): ${missing.join(', ')}). Project exports cannot be restored; use the future elepha import command instead.`;
+        const consentTrigger = candidate
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'consent_roots' COLLATE NOCASE LIMIT 1")
+            .get();
+        if (consentTrigger !== undefined) {
+            validationError = RESTORE_CONSENT_TRIGGER_ERROR;
         } else {
-            counts = candidateCounts(candidate);
-            const errors = verifyDatabase(candidate, counts);
-            if (errors.length > 0) {
-                validationError = `Backup failed validation: ${errors.join('; ')}`;
+            const missing = missingRequiredTables(candidate);
+            if (missing.length > 0) {
+                validationError = `Backup is incomplete (missing required table(s): ${missing.join(', ')}). Project exports cannot be restored; use the future elepha import command instead.`;
+            } else {
+                counts = candidateCounts(candidate);
+                const errors = verifyDatabase(candidate, counts);
+                if (errors.length > 0) {
+                    validationError = `Backup failed validation: ${errors.join('; ')}`;
+                }
             }
         }
     } catch (error) {
@@ -306,6 +325,64 @@ async function activeTranscriptTombstones(
         return transcriptTombstonePlan(tombstones);
     } finally {
         active.close();
+    }
+}
+
+function consentPlan(roots: ConsentRoot[]): ConsentPlan {
+    const normalized = [...roots].sort((left, right) => {
+        const leftIdentity = JSON.stringify([left.ulid, left.path]);
+        const rightIdentity = JSON.stringify([right.ulid, right.path]);
+        return leftIdentity < rightIdentity ? -1 : leftIdentity > rightIdentity ? 1 : 0;
+    });
+    const serialized = JSON.stringify(
+        normalized.map(({ ulid, path, state, decided_at, source, nudged_at }) => [ulid, path, state, decided_at, source, nudged_at]),
+    );
+    return { roots: normalized, fingerprint: createHash('sha256').update(serialized).digest('hex') };
+}
+
+async function activeConsent(
+    dbPath: string,
+    encryption?: DatabaseEncryptionRuntime,
+    lifecycle?: ExclusiveDatabaseLifecycleLease,
+): Promise<ConsentPlan> {
+    if (!existsSync(dbPath)) {
+        return consentPlan([]);
+    }
+    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
+    try {
+        return consentPlan(
+            active.prepare('SELECT ulid, path, state, decided_at, source, nudged_at FROM consent_roots').all() as ConsentRoot[],
+        );
+    } finally {
+        active.close();
+    }
+}
+
+async function overlayConsent(
+    dbPath: string,
+    roots: ConsentRoot[],
+    lifecycle: ExclusiveDatabaseLifecycleLease,
+    encryption?: DatabaseEncryptionRuntime,
+): Promise<void> {
+    const restored = await openDb(dbPath, { encryption, lifecycle });
+    try {
+        const replace = restored.transaction(() => {
+            restored.prepare('DELETE FROM consent_roots').run();
+            const insert = restored.prepare(
+                `INSERT INTO consent_roots (ulid, path, state, decided_at, source, nudged_at)
+                 VALUES (@ulid, @path, @state, @decided_at, @source, @nudged_at)`,
+            );
+            for (const root of roots) {
+                insert.run(root);
+            }
+        });
+        replace();
+        const checkpoint = restored.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
+        if (checkpoint[0]?.busy !== 0) {
+            throw new Error('Could not checkpoint preserved consent state.');
+        }
+    } finally {
+        restored.close();
     }
 }
 
@@ -445,6 +522,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             console.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
         }
         const tombstonePlan = await activeTranscriptTombstones(dbPath, runtime.encryption);
+        const currentConsentPlan = await activeConsent(dbPath, runtime.encryption);
         printPreview(dbPath, candidatePath, counts, tombstonePlan.tombstones);
         if (runtime.confirm && !(await runtime.confirm())) {
             return { cancelled: true };
@@ -465,6 +543,10 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             if (currentTombstonePlan.fingerprint !== tombstonePlan.fingerprint) {
                 throw new Error(RESTORE_TOMBSTONES_CHANGED_ERROR);
             }
+            const confirmedConsentPlan = await activeConsent(dbPath, runtime.encryption, lifecycle);
+            if (confirmedConsentPlan.fingerprint !== currentConsentPlan.fingerprint) {
+                throw new Error(RESTORE_CONSENT_CHANGED_ERROR);
+            }
             const active = await checkpointActiveDatabase(dbPath, lifecycle, runtime.encryption);
             let snapshotPath: string;
             try {
@@ -481,6 +563,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 assertInstalledRestoreHash(installedHash, stagedHash);
                 removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
                 await verifyRestoredDatabase(dbPath, counts, lifecycle, runtime.encryption);
+                await overlayConsent(dbPath, confirmedConsentPlan.roots, lifecycle, runtime.encryption);
                 await unionTranscriptTombstones(dbPath, currentTombstonePlan.tombstones, lifecycle, runtime.encryption);
                 // Read-only verification can create fresh empty WAL bookkeeping files;
                 // remove them too so no sidecar from before the replacement can survive.
