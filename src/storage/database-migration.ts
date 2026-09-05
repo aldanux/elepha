@@ -49,6 +49,8 @@ import {
 import { type ExclusiveDatabaseLifecycleLease, withExclusiveDatabaseLifecycle } from './database-lifecycle.js';
 
 export const DATABASE_MIGRATION_IN_PROGRESS = 'migration_in_progress';
+export const DATABASE_KEY_COMMITMENT_INDETERMINATE =
+    'Database key commitment is indeterminate; migration remains blocked with the plaintext canonical.';
 
 const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
 const MIGRATION_STAGES = [
@@ -57,6 +59,7 @@ const MIGRATION_STAGES = [
     'sidecar_copied',
     'key_prepared',
     'sidecar_encrypted',
+    'key_commitment_started',
     'key_committed',
     'plaintext_closed',
     'wal_cleaned',
@@ -667,43 +670,37 @@ async function commitKey(
     manifest: DatabaseMigrationManifest,
     key: Buffer,
     runtime: DatabaseMigrationRuntime,
-): Promise<DatabaseMigrationManifest | undefined> {
+): Promise<DatabaseMigrationManifest> {
+    const committing = transitionManifest(manifestPath, manifest, 'key_commitment_started', runtime);
     const metadata = encryptionMetadata(manifest);
+    let writeError: unknown;
     try {
         await storeDatabaseKey(manifest.sourcePath, metadata, key, runtime);
-    } catch (writeError) {
-        let stored: Buffer | undefined;
-        try {
-            stored = await readStoredDatabaseKey(manifest.sourcePath, metadata, runtime);
-        } catch (readError) {
-            throw new AggregateError(
-                [writeError, readError],
-                'Database key commit is indeterminate; retaining the migration manifest and plaintext rollback.',
-            );
-        }
-        if (stored === undefined) {
-            return undefined;
-        }
-        const matches = keyMatchesManifest(stored, manifest);
-        stored.fill(0);
-        if (!matches) {
-            throw new Error('Database key commit returned a different key; retaining the migration manifest and plaintext rollback.');
-        }
+    } catch (error) {
+        writeError = error;
     }
-    hit(runtime, 'after_key_stored');
-    const readBack = await readStoredDatabaseKey(manifest.sourcePath, metadata, runtime);
+    let readBack: Buffer | undefined;
+    try {
+        readBack = await readStoredDatabaseKey(manifest.sourcePath, metadata, runtime);
+    } catch (readError) {
+        if (writeError !== undefined) {
+            throw new AggregateError([writeError, readError], DATABASE_KEY_COMMITMENT_INDETERMINATE);
+        }
+        throw new Error(DATABASE_KEY_COMMITMENT_INDETERMINATE, { cause: readError });
+    }
     if (readBack === undefined) {
-        return undefined;
+        throw new Error(DATABASE_KEY_COMMITMENT_INDETERMINATE, writeError === undefined ? undefined : { cause: writeError });
     }
-    if (!readBack.equals(key)) {
-        readBack.fill(0);
+    const matches = readBack.equals(key) && keyMatchesManifest(readBack, committing);
+    readBack.fill(0);
+    if (!matches) {
         throw new Error('Database key failed byte-for-byte read-back verification.');
     }
-    readBack.fill(0);
+    hit(runtime, 'after_key_stored');
     hit(runtime, 'after_key_read_back');
     writeEncryptionMetadata(manifest.sourcePath, metadata);
     hit(runtime, 'after_encryption_metadata_written');
-    return transitionManifest(manifestPath, manifest, 'key_committed', runtime);
+    return transitionManifest(manifestPath, committing, 'key_committed', runtime);
 }
 
 function removeInactiveWalFiles(databasePath: string, runtime: DatabaseMigrationRuntime): void {
@@ -851,6 +848,14 @@ async function resumeFromPlaintext(
             writeEncryptionMetadata(manifest.sourcePath, encryptionMetadata(manifest));
             hit(runtime, 'after_encryption_metadata_written');
             manifest = transitionManifest(manifestPath, manifest, 'key_committed', runtime);
+        } else if (manifest.stage === 'key_commitment_started') {
+            key = await storedMigrationKey(manifest.sourcePath, manifest, runtime);
+            if (key === undefined) {
+                throw new Error(DATABASE_KEY_COMMITMENT_INDETERMINATE);
+            }
+            writeEncryptionMetadata(manifest.sourcePath, encryptionMetadata(manifest));
+            hit(runtime, 'after_encryption_metadata_written');
+            manifest = transitionManifest(manifestPath, manifest, 'key_committed', runtime);
         } else if (
             manifest.stage === 'key_committed' ||
             manifest.stage === 'plaintext_closed' ||
@@ -881,13 +886,7 @@ async function resumeFromPlaintext(
             });
             encryptAndVerifySidecar(manifest, key, expected, runtime);
             manifest = transitionManifest(manifestPath, manifest, 'sidecar_encrypted', runtime);
-            const committed = await commitKey(manifestPath, manifest, key, runtime);
-            if (committed === undefined) {
-                closePlaintextDatabase(db, runtime);
-                cleanupUncommittedMigration(manifestPath, manifest, runtime, completeReplacement);
-                return { status: 'recovered-plaintext' };
-            }
-            manifest = committed;
+            manifest = await commitKey(manifestPath, manifest, key, runtime);
         }
 
         if (key === undefined) {

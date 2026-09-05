@@ -1,11 +1,13 @@
 import { type ChildProcess, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import Database from 'better-sqlite3-multiple-ciphers';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DATABASE_KEYRING_TIMEOUT_MS } from '../../src/config/constants.js';
 import { elephaPaths } from '../../src/config/paths.js';
 import { encryptionKeyPath, encryptionMetadataPath, type KeyringEntry } from '../../src/storage/database-encryption.js';
 import {
@@ -14,7 +16,11 @@ import {
     DATABASE_LIFECYCLE_BUSY,
     databaseLifecyclePaths,
 } from '../../src/storage/database-lifecycle.js';
-import { type DatabaseMigrationRuntime, migratePrimaryDatabaseToEncrypted } from '../../src/storage/database-migration.js';
+import {
+    DATABASE_KEY_COMMITMENT_INDETERMINATE,
+    type DatabaseMigrationRuntime,
+    migratePrimaryDatabaseToEncrypted,
+} from '../../src/storage/database-migration.js';
 import { openDb, openManagedDatabase, openUnmanagedDb } from '../../src/storage/db.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -522,7 +528,7 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         },
     );
 
-    it('finishes unchanged when a failed secret-store commit is confirmed absent', async () => {
+    it('blocks with the plaintext canonical when a failed secret-store commit reads back absent', async () => {
         const { directory, dbPath } = fixture('elepha-database-key-absent-');
         const absent: KeyringEntry = {
             getSecret: async () => undefined,
@@ -536,17 +542,33 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
             createKeyringEntry: async () => absent,
         });
 
-        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).resolves.toEqual({ status: 'recovered-plaintext' });
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).rejects.toThrow(DATABASE_KEY_COMMITMENT_INDETERMINATE);
         assertPlaintextOpenable(dbPath);
-        expect(existsSync(migrationRuntime.statePaths?.manifest ?? '')).toBe(false);
+        expect(JSON.parse(readFileSync(migrationRuntime.statePaths?.manifest ?? '', 'utf8'))).toMatchObject({
+            stage: 'key_commitment_started',
+            installationId: INSTALLATION_ID,
+            backend: 'keyring',
+        });
         expect(existsSync(encryptionMetadataPath(dbPath))).toBe(false);
+
+        const recoveredEntry: KeyringEntry = {
+            getSecret: async () => Buffer.from(FIXED_KEY),
+            setSecret: async () => undefined,
+            deleteCredential: async () => false,
+        };
+        await expect(
+            migratePrimaryDatabaseToEncrypted(
+                dbPath,
+                runtime(directory, { platform: 'darwin', createKeyringEntry: async () => recoveredEntry }),
+            ),
+        ).resolves.toEqual({ status: 'migrated' });
     });
 
     it.each(['after_uncommitted_artifacts_removed', 'after_manifest_removed'])(
-        'recovers after a kill during confirmed-absent key cleanup at %s',
-        async (killPoint) => {
-            const { directory, dbPath } = fixture(`elepha-database-key-cleanup-${killPoint}-`);
-            let killed = false;
+        'does not reach post-invocation uncommitted cleanup at %s',
+        async (forbiddenCleanupPoint) => {
+            const { directory, dbPath } = fixture(`elepha-database-key-cleanup-${forbiddenCleanupPoint}-`);
+            let cleanupReached = false;
             const absent: KeyringEntry = {
                 getSecret: async () => undefined,
                 setSecret: async () => {
@@ -558,23 +580,108 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
                 platform: 'darwin',
                 createKeyringEntry: async () => absent,
                 failpoint: (point) => {
-                    if (!killed && point === killPoint) {
-                        killed = true;
-                        throw new Error(`killed at ${point}`);
+                    if (point === forbiddenCleanupPoint) {
+                        cleanupReached = true;
                     }
                 },
             });
 
-            await expect(migratePrimaryDatabaseToEncrypted(dbPath, interrupted)).rejects.toThrow(`killed at ${killPoint}`);
-            expect(killed).toBe(true);
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, interrupted)).rejects.toThrow(DATABASE_KEY_COMMITMENT_INDETERMINATE);
+            expect(cleanupReached).toBe(false);
             assertPlaintextOpenable(dbPath);
+            expect(JSON.parse(readFileSync(interrupted.statePaths?.manifest ?? '', 'utf8'))).toMatchObject({
+                stage: 'key_commitment_started',
+                installationId: INSTALLATION_ID,
+            });
 
-            const recovered = runtime(directory, { platform: 'darwin', createKeyringEntry: async () => absent });
-            await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovered)).resolves.toEqual({ status: 'recovered-plaintext' });
-            assertPlaintextOpenable(dbPath);
+            const matching: KeyringEntry = {
+                getSecret: async () => Buffer.from(FIXED_KEY),
+                setSecret: async () => undefined,
+                deleteCredential: async () => false,
+            };
+            const recovered = runtime(directory, { platform: 'darwin', createKeyringEntry: async () => matching });
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovered)).resolves.toEqual({ status: 'migrated' });
             expect(existsSync(recovered.statePaths?.manifest ?? '')).toBe(false);
         },
     );
+
+    it('blocks after a crash between the commitment manifest fsync and key-store invocation', async () => {
+        const { directory, dbPath } = fixture('elepha-database-key-before-invocation-');
+        let setCalls = 0;
+        const absent: KeyringEntry = {
+            getSecret: async () => undefined,
+            setSecret: async () => {
+                setCalls++;
+            },
+            deleteCredential: async () => false,
+        };
+        const interrupted = runtime(directory, {
+            platform: 'darwin',
+            createKeyringEntry: async () => absent,
+            failpoint: (point) => {
+                if (point === 'after_manifest_key_commitment_started') {
+                    throw new Error('crash before key-store invocation');
+                }
+            },
+        });
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, interrupted)).rejects.toThrow('crash before key-store invocation');
+        expect(setCalls).toBe(0);
+        assertPlaintextOpenable(dbPath);
+        const manifestPath = interrupted.statePaths?.manifest ?? '';
+        const beforeRetry = readFileSync(manifestPath, 'utf8');
+        expect(JSON.parse(beforeRetry)).toMatchObject({
+            stage: 'key_commitment_started',
+            installationId: INSTALLATION_ID,
+            backend: 'keyring',
+            keySha256: createHash('sha256').update(FIXED_KEY).digest('hex'),
+        });
+
+        await expect(
+            migratePrimaryDatabaseToEncrypted(
+                dbPath,
+                runtime(directory, {
+                    platform: 'darwin',
+                    createKeyringEntry: async () => absent,
+                    randomBytes: () => {
+                        throw new Error('blocked migration generated another key');
+                    },
+                }),
+            ),
+        ).rejects.toThrow(DATABASE_KEY_COMMITMENT_INDETERMINATE);
+        expect(setCalls).toBe(0);
+        expect(readFileSync(manifestPath, 'utf8')).toBe(beforeRetry);
+        assertPlaintextOpenable(dbPath);
+
+        const mismatching: KeyringEntry = {
+            getSecret: async () => Buffer.from(FIXED_KEY).fill(0xff),
+            setSecret: async () => undefined,
+            deleteCredential: async () => false,
+        };
+        await expect(
+            migratePrimaryDatabaseToEncrypted(
+                dbPath,
+                runtime(directory, {
+                    platform: 'darwin',
+                    createKeyringEntry: async () => mismatching,
+                    randomBytes: () => {
+                        throw new Error('mismatched migration generated another key');
+                    },
+                }),
+            ),
+        ).rejects.toThrow('The stored database key does not match the active migration manifest.');
+        expect(readFileSync(manifestPath, 'utf8')).toBe(beforeRetry);
+        assertPlaintextOpenable(dbPath);
+
+        const matching: KeyringEntry = {
+            getSecret: async () => Buffer.from(FIXED_KEY),
+            setSecret: async () => undefined,
+            deleteCredential: async () => false,
+        };
+        await expect(
+            migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory, { platform: 'darwin', createKeyringEntry: async () => matching })),
+        ).resolves.toEqual({ status: 'migrated' });
+    });
 
     it('continues when the key write reports failure but read-back returns the intended key', async () => {
         const { directory, dbPath } = fixture('elepha-database-key-succeeded-');
@@ -597,7 +704,188 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         expect(stored).toEqual(FIXED_KEY);
     });
 
-    it('finishes unchanged when a successful key write cannot be read back', async () => {
+    it('retains one key and identity when a timed-out secret-store write commits late before an absent read-back', async () => {
+        const { directory, dbPath } = fixture('elepha-database-key-late-commit-');
+        const secondMigrationId = '33333333-3333-4333-8333-333333333333';
+        const secondInstallationId = '44444444-4444-4444-8444-444444444444';
+        const secondKey = Buffer.from(Array.from({ length: 32 }, (_, index) => 255 - index));
+        const identities = [MIGRATION_ID, INSTALLATION_ID, secondMigrationId, secondInstallationId];
+        const generatedKeys = [FIXED_KEY, secondKey];
+        const credentials = new Map<string, Buffer>();
+        const credentialReads = new Map<string, number>();
+        const accessedIdentities = new Set<string>();
+        const cleanupPoints: string[] = [];
+        const events: string[] = [];
+        let uuidCalls = 0;
+        let keyCalls = 0;
+        let setCalls = 0;
+        let releaseSetStart: (() => void) | undefined;
+        let releaseSetSettlement: (() => void) | undefined;
+        let releaseSetSettled: (() => void) | undefined;
+        let firstSetSecret: Uint8Array | undefined;
+        const setStarted = new Promise<void>((resolve) => {
+            releaseSetStart = resolve;
+        });
+        const allowSetSettlement = new Promise<void>((resolve) => {
+            releaseSetSettlement = resolve;
+        });
+        const setSettled = new Promise<void>((resolve) => {
+            releaseSetSettled = resolve;
+        });
+        const migrationRuntime = runtime(directory, {
+            platform: 'darwin',
+            randomUUID: () => {
+                const identity = identities[uuidCalls++];
+                if (identity === undefined) {
+                    throw new Error('migration generated a third identity');
+                }
+                return identity;
+            },
+            randomBytes: () => {
+                const key = generatedKeys[keyCalls++];
+                if (key === undefined) {
+                    throw new Error('migration generated a third key');
+                }
+                return Buffer.from(key);
+            },
+            createKeyringEntry: async (_service, account) => {
+                accessedIdentities.add(account);
+                return {
+                    getSecret: async () => {
+                        const reads = (credentialReads.get(account) ?? 0) + 1;
+                        credentialReads.set(account, reads);
+                        if (account === INSTALLATION_ID && reads <= 2) {
+                            events.push(reads === 1 ? 'initial read absent' : 'immediate read absent after late commit');
+                            if (reads === 2 && credentials.get(account)?.equals(FIXED_KEY)) {
+                                events.push('late commit proven before absent read');
+                            }
+                            return undefined;
+                        }
+                        return credentials.get(account);
+                    },
+                    setSecret: async (secret, signal) => {
+                        setCalls++;
+                        if (account !== INSTALLATION_ID) {
+                            credentials.set(account, Buffer.from(secret));
+                            return;
+                        }
+                        const manifestAtInvocation = JSON.parse(readFileSync(migrationRuntime.statePaths?.manifest ?? '', 'utf8')) as {
+                            stage: string;
+                        };
+                        events.push(`first set observed ${manifestAtInvocation.stage}`);
+                        events.push('first set started');
+                        firstSetSecret = secret;
+                        releaseSetStart?.();
+                        await new Promise<void>((resolve) => {
+                            const commitLate = () => {
+                                queueMicrotask(() => {
+                                    credentials.set(account, Buffer.from(secret));
+                                    events.push('first set committed after timeout');
+                                    resolve();
+                                });
+                            };
+                            if (signal?.aborted) {
+                                commitLate();
+                            } else {
+                                signal?.addEventListener('abort', commitLate, { once: true });
+                            }
+                        });
+                        await allowSetSettlement;
+                        events.push('first set settled');
+                        releaseSetSettled?.();
+                    },
+                    deleteCredential: async () => false,
+                };
+            },
+            failpoint: (point) => {
+                if (point === 'after_uncommitted_artifacts_removed' || point === 'after_manifest_removed') {
+                    cleanupPoints.push(point);
+                }
+            },
+        });
+
+        vi.useFakeTimers();
+        try {
+            const firstAttempt = migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime).then(
+                (result) => ({ result, error: undefined }),
+                (error: unknown) => ({ result: undefined, error: error instanceof Error ? error.message : String(error) }),
+            );
+            await setStarted;
+            await vi.advanceTimersByTimeAsync(DATABASE_KEYRING_TIMEOUT_MS);
+            const { result: firstResult, error: firstError } = await firstAttempt;
+            const manifestPath = migrationRuntime.statePaths?.manifest ?? '';
+            const storedManifest = existsSync(manifestPath)
+                ? (JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>)
+                : undefined;
+            const retainedManifest = storedManifest
+                ? {
+                      stage: storedManifest.stage,
+                      installationId: storedManifest.installationId,
+                      backend: storedManifest.backend,
+                      keySha256: storedManifest.keySha256,
+                  }
+                : undefined;
+            const plaintextAfterIndeterminateWrite = isPlaintext(dbPath);
+            const cleanupAfterFirstAttempt = [...cleanupPoints];
+            const retainedKeyAfterFirstAttempt = Buffer.from(firstSetSecret ?? []);
+
+            const retryResult = await migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime);
+            releaseSetSettlement?.();
+            await setSettled;
+            await Promise.resolve();
+            const erasedKeyAfterSettlement = Buffer.from(firstSetSecret ?? []);
+
+            expect({
+                firstResult,
+                firstError,
+                retainedManifest,
+                plaintextAfterIndeterminateWrite,
+                cleanupAfterFirstAttempt,
+                retainedKeyAfterFirstAttempt,
+                erasedKeyAfterSettlement,
+                events,
+                retryResult,
+                uuidCalls,
+                keyCalls,
+                setCalls,
+                accessedIdentities: [...accessedIdentities],
+                credentialIdentities: [...credentials.keys()],
+            }).toEqual({
+                firstResult: undefined,
+                firstError: DATABASE_KEY_COMMITMENT_INDETERMINATE,
+                retainedManifest: {
+                    stage: 'key_commitment_started',
+                    installationId: INSTALLATION_ID,
+                    backend: 'keyring',
+                    keySha256: createHash('sha256').update(FIXED_KEY).digest('hex'),
+                },
+                plaintextAfterIndeterminateWrite: true,
+                cleanupAfterFirstAttempt: [],
+                retainedKeyAfterFirstAttempt: FIXED_KEY,
+                erasedKeyAfterSettlement: Buffer.alloc(FIXED_KEY.length),
+                events: [
+                    'initial read absent',
+                    'first set observed key_commitment_started',
+                    'first set started',
+                    'first set committed after timeout',
+                    'immediate read absent after late commit',
+                    'late commit proven before absent read',
+                    'first set settled',
+                ],
+                retryResult: { status: 'migrated' },
+                uuidCalls: 2,
+                keyCalls: 1,
+                setCalls: 1,
+                accessedIdentities: [INSTALLATION_ID],
+                credentialIdentities: [INSTALLATION_ID],
+            });
+            await assertEncryptedOpenable(dbPath, migrationRuntime);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('blocks with the plaintext canonical when a successful key write reads back absent', async () => {
         const { directory, dbPath } = fixture('elepha-database-key-readback-absent-');
         const entry: KeyringEntry = {
             getSecret: async () => undefined,
@@ -609,9 +897,24 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
             createKeyringEntry: async () => entry,
         });
 
-        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).resolves.toEqual({ status: 'recovered-plaintext' });
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).rejects.toThrow(DATABASE_KEY_COMMITMENT_INDETERMINATE);
         assertPlaintextOpenable(dbPath);
-        expect(existsSync(migrationRuntime.statePaths?.manifest ?? '')).toBe(false);
+        expect(JSON.parse(readFileSync(migrationRuntime.statePaths?.manifest ?? '', 'utf8'))).toMatchObject({
+            stage: 'key_commitment_started',
+            installationId: INSTALLATION_ID,
+        });
+
+        const recoveredEntry: KeyringEntry = {
+            getSecret: async () => Buffer.from(FIXED_KEY),
+            setSecret: async () => undefined,
+            deleteCredential: async () => false,
+        };
+        await expect(
+            migratePrimaryDatabaseToEncrypted(
+                dbPath,
+                runtime(directory, { platform: 'darwin', createKeyringEntry: async () => recoveredEntry }),
+            ),
+        ).resolves.toEqual({ status: 'migrated' });
     });
 
     it('freezes with the manifest and plaintext rollback when key read-back is indeterminate', async () => {
@@ -635,7 +938,7 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
             createKeyringEntry: async () => entry,
         });
 
-        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).rejects.toThrow(/commit is indeterminate/);
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).rejects.toThrow(DATABASE_KEY_COMMITMENT_INDETERMINATE);
         assertPlaintextOpenable(dbPath);
         expect(existsSync(migrationRuntime.statePaths?.manifest ?? '')).toBe(true);
         const manifest = JSON.parse(readFileSync(migrationRuntime.statePaths?.manifest ?? '', 'utf8')) as { rollbackPath: string };

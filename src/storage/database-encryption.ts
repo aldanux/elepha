@@ -239,6 +239,19 @@ async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>): P
     }
 }
 
+async function setKeyringSecret(entry: KeyringEntry, key: Buffer): Promise<void> {
+    const retainedKey = Buffer.from(key);
+    await withTimeout(async (signal) => {
+        try {
+            await entry.setSecret(retainedKey, signal);
+        } finally {
+            // A timeout may return while the backend operation is still
+            // settling, so its exact bytes must remain intact until this point.
+            retainedKey.fill(0);
+        }
+    });
+}
+
 async function defaultKeyringEntry(service: string, account: string): Promise<KeyringEntry> {
     const { AsyncEntry } = await import('@napi-rs/keyring');
     return new AsyncEntry(service, account);
@@ -460,7 +473,7 @@ export async function storeDatabaseKey(
     }
     if (metadata.backend === 'keyring') {
         const entry = await (runtime.createKeyringEntry ?? defaultKeyringEntry)(DATABASE_CREDENTIAL_SERVICE, metadata.installationId);
-        await withTimeout((signal) => entry.setSecret(key, signal));
+        await setKeyringSecret(entry, key);
         return;
     }
     const keyPath = runtime.keyFilePath?.(databasePath) ?? encryptionPaths(databasePath).key;
