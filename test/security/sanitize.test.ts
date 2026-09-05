@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { assertNoShellSyntax, detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../../src/security/sanitize.js';
 
 const ESC = '\x1b';
+const C1_CONTROLS = ['\u0080', '\u0085', '\u0090', '\u009b', '\u009f'] as const;
 
 describe('detectShellSyntax', () => {
     const active: Array<[string, string]> = [
@@ -33,6 +34,12 @@ describe('detectShellSyntax', () => {
             expect(detectShellSyntax(text)).toBe(true);
         });
     }
+
+    it('flags every representative C1 control', () => {
+        for (const control of C1_CONTROLS) {
+            expect(detectShellSyntax(`visible${control}hidden`), `U+${control.codePointAt(0)?.toString(16)}`).toBe(true);
+        }
+    });
 
     const inert: Array<[string, string]> = [
         ['plain prose', 'Chose SQLite over Postgres for local storage'],
@@ -87,6 +94,12 @@ describe('stripShellSyntax', () => {
             expect(stripShellSyntax(once)).toBe(once);
         }
     });
+
+    it('removes C1 controls beside complete and truncated ANSI while preserving newline and tab', () => {
+        const input = `\t${C1_CONTROLS.join(`${ESC}[31m`)}${ESC}[\n`;
+        expect(stripShellSyntax(input)).toBe('\t\n');
+        expect(detectShellSyntax(stripShellSyntax(input))).toBe(false);
+    });
 });
 
 describe('escapeShellSyntax', () => {
@@ -130,6 +143,14 @@ describe('escapeShellSyntax', () => {
 
     it('does not re-escape text a previous run already escaped', () => {
         expect(escapeShellSyntax('run \\`date\\`')).toBe('run \\`date\\`');
+    });
+
+    it('removes C1 controls idempotently without removing newline or tab', () => {
+        const input = `before\n\t${C1_CONTROLS.join('')}after`;
+        const once = escapeShellSyntax(input);
+        expect(once).toBe('before\n\tafter');
+        expect(escapeShellSyntax(once)).toBe(once);
+        expect(detectShellSyntax(once)).toBe(false);
     });
 
     it('repairs even backslash parity and preserves fully escaped chain pairs', () => {

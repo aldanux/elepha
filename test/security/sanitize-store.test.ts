@@ -11,6 +11,15 @@ import { mergeRollupContent, RollupStore, type RollupWrite } from '../../src/sto
 import { applySanitize, planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import type { ParsedTurn, SummarizationOutput } from '../../src/types/index.js';
 
+const C1_CONTROLS = '\u0080\u0085\u0090\u009b\u009f';
+
+function hasC1(value: string): boolean {
+    return [...value].some((char) => {
+        const codePoint = char.codePointAt(0) ?? 0;
+        return codePoint >= 0x80 && codePoint <= 0x9f;
+    });
+}
+
 function baseWrite(overrides: Partial<RollupWrite> = {}): RollupWrite {
     return {
         sessionId: 1,
@@ -121,6 +130,61 @@ describe('Rule 3 choke points', () => {
         expect(merged.decisions).toHaveLength(1);
     });
 
+    it('removes every representative C1 control from every live stored field', () => {
+        const tainted = (label: string) => `${label}${C1_CONTROLS}`;
+        rollups.write(
+            baseWrite({
+                title: tainted('title'),
+                summary: tainted('summary'),
+                decisions: [{ what: tainted('rollup what'), why: tainted('rollup why') }],
+                pendingItems: [tainted('rollup pending')],
+            }),
+            undefined,
+        );
+        expect(
+            store.recordTurn(
+                {
+                    ...turn(0),
+                    userMessage: tainted('prompt'),
+                    assistantText: tainted('response'),
+                    toolCalls: [{ name: tainted('tool'), filePaths: [tainted('/repo/file')] }],
+                },
+                1,
+                1,
+                {
+                    decisions: [{ what: tainted('memory what'), why: tainted('memory why') }],
+                    pending_items: [tainted('memory pending')],
+                    status: 'ok',
+                },
+                true,
+            ),
+        ).toBe(true);
+
+        const rollup = rollups.get(1);
+        const memory = store.listMemoriesForSession(1)[0];
+        const filtered = db.prepare('SELECT user_prompt, assistant_response, tool_calls FROM filtered_turns').get() as {
+            user_prompt: string;
+            assistant_response: string;
+            tool_calls: string;
+        };
+        const toolCalls = JSON.parse(filtered.tool_calls) as Array<{ name: string; filePaths: string[] }>;
+        const storedLeaves = [
+            rollup?.title,
+            rollup?.summary,
+            rollup?.decisions[0]?.what,
+            rollup?.decisions[0]?.why,
+            rollup?.pending_items[0],
+            memory.decisions[0]?.what,
+            memory.decisions[0]?.why,
+            memory.pending_items[0],
+            filtered.user_prompt,
+            filtered.assistant_response,
+            toolCalls[0]?.name,
+            toolCalls[0]?.filePaths[0],
+        ];
+        expect(storedLeaves.every((value) => typeof value === 'string' && !hasC1(value) && !detectShellSyntax(value))).toBe(true);
+    });
+
     it('leaves files_touched alone - those are tool-call paths, not summarizer output', () => {
         store.recordTurn({ ...turn(0), toolCalls: [{ name: 'Edit', filePaths: ['/repo/weird`name.ts'] }] }, 1, 1, {
             decisions: [],
@@ -142,22 +206,23 @@ describe('Rule 3 backfill', () => {
 
         // Write dirty rows the way the pre-Rule-3 pipeline did: straight into
         // SQL, bypassing the choke points that now exist.
+        const tainted = (value: string) => `${value}${C1_CONTROLS}`;
         db.prepare(
             `INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at, summarizer_status)
              VALUES (1, 1, 0, 'claude-code', '2026-08-01T00:00:00.000Z', ?, '[]', ?, '2026-08-01T00:00:00.000Z', 'ok')`,
-        ).run(JSON.stringify(['set `foo` to $(bar)']), JSON.stringify(['check ${BAZ}']));
+        ).run(JSON.stringify([tainted('set `foo` to $(bar)')]), JSON.stringify([tainted('check ${BAZ}')]));
         db.prepare(
             `INSERT INTO filtered_turns
              (memory_id, included, user_prompt, assistant_response, tool_calls, filter_version, captured_at)
              VALUES (1, 1, ?, ?, ?, 1, '2026-08-01T00:00:00.000Z')`,
         ).run(
-            '|| promptneedle',
-            '&& responseneedle',
+            tainted('|| promptneedle'),
+            tainted('&& responseneedle'),
             JSON.stringify([
                 {
-                    name: '\n|| toolnameneedle',
-                    filePaths: ['  \\&& toolpathneedle'],
-                    legacy: { nested: '\\|| nestedneedle' },
+                    name: tainted('\n|| toolnameneedle'),
+                    filePaths: [tainted('  \\&& toolpathneedle')],
+                    legacy: { nested: tainted('\\|| nestedneedle') },
                 },
             ]),
         );
@@ -168,10 +233,10 @@ describe('Rule 3 backfill', () => {
              VALUES (1, 1, 'claude-code', ?, ?, ?, ?, '[]', 1, '2026-08-01T00:00:00.000Z', '2026-08-01T01:00:00.000Z',
                 'primary', NULL, 'ok', 'final', 0, '2026-08-01T01:00:00.000Z', 1)`,
         ).run(
-            'Title with `backticks`',
-            'Summary with $(cmd).',
-            JSON.stringify([{ what: 'kept `x`', why: 'because ${y}' }]),
-            JSON.stringify(['pending <<HEREDOC']),
+            tainted('Title with `backticks`'),
+            tainted('Summary with $(cmd).'),
+            JSON.stringify([{ what: tainted('kept `x`'), why: tainted('because ${y}') }]),
+            JSON.stringify([tainted('pending <<HEREDOC')]),
         );
     });
 
@@ -198,6 +263,9 @@ describe('Rule 3 backfill', () => {
     it('leaves the store with nothing the detector flags', () => {
         applySanitize(db);
         expect(verifySanitize(db)).toEqual([]);
+        for (const table of ['session_rollups', 'memories', 'filtered_turns']) {
+            expect(hasC1(JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all()))).toBe(false);
+        }
     });
 
     it('is idempotent - a second run finds nothing to do', () => {
@@ -246,7 +314,7 @@ describe('Rule 3 backfill', () => {
                 )
                 .get() as { total_bytes: number }
         ).total_bytes;
-        expect(usage).toBeGreaterThan(usageBefore);
+        expect(usage).toBeLessThan(usageBefore);
         expect(usage).toBe(measured);
 
         const storedAfterFirstApply = JSON.stringify(row);

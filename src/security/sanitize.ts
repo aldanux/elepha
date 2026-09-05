@@ -44,11 +44,11 @@ const LINE_LEADING_CHAIN_RE = /^([ \t]*)((?:\\*[|;&])+)/gm;
 // biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing control characters is the entire point of this module
 const ANSI_RE = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]?/g;
 
-// C0 controls and DEL, keeping \n and \t: those are legitimate in a summary,
+// C0 and C1 controls plus DEL, keeping \n and \t: those are legitimate in a summary,
 // and \r is not (carriage-return line-overwrite hides text from a reader who
 // only sees the rendered terminal output).
 // biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing control characters is the entire point of this module
-const CONTROL_RE = /[\x00-\x08\x0b-\x1f\x7f]/g;
+const CONTROL_RE = /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g;
 
 // Even backslash parity means the character at `index` remains shell-active.
 function precedingBackslashes(s: string, index: number): number {
