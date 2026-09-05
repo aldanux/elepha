@@ -18,12 +18,22 @@ import {
     type SharedDatabaseLifecycleLease,
 } from './database-lifecycle.js';
 import { assertDatabaseMigrationInactive } from './database-migration.js';
-import { registerParanoidDatabase } from './paranoid-gate.js';
+import { initializeParanoidAuthority, registerParanoidDatabase } from './paranoid-gate.js';
 
 export function defaultDbPath(): string {
     const override = process.env.ELEPHA_DB_PATH?.trim();
     return override ? path.resolve(override) : path.join(elephaHome(), 'elepha.db');
 }
+
+const PARANOID_AUTHORITY_SCHEMA = `
+CREATE TABLE IF NOT EXISTS paranoid_authority (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  enrolled   INTEGER NOT NULL CHECK (enrolled IN (0,1)),
+  state      TEXT NOT NULL CHECK (state IN ('locked','unlocked')),
+  generation INTEGER NOT NULL CHECK (generation >= 0),
+  CHECK (enrolled = 1 OR state = 'unlocked')
+);
+`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -160,6 +170,8 @@ CREATE TABLE IF NOT EXISTS consent_roots (
 );
 CREATE INDEX IF NOT EXISTS idx_consent_roots_state ON consent_roots(state);
 
+${PARANOID_AUTHORITY_SCHEMA}
+
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -284,6 +296,18 @@ function migrate(db: Database.Database): void {
     if (rollupColumns.includes('substantive')) {
         db.exec('ALTER TABLE session_rollups DROP COLUMN substantive');
     }
+}
+
+function initializeParanoidAuthoritySchema(db: Database.Database): void {
+    const initialize = db.transaction(() => {
+        const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'paranoid_authority'").get() !== undefined;
+        if (exists) {
+            return;
+        }
+        db.exec(PARANOID_AUTHORITY_SCHEMA);
+        db.prepare("INSERT INTO paranoid_authority (id, enrolled, state, generation) VALUES (1, 0, 'unlocked', 0)").run();
+    });
+    initialize();
 }
 
 function migrateDurableCaptureStatus(db: Database.Database): void {
@@ -603,8 +627,10 @@ function isPrimaryDatabasePath(dbPath: string): boolean {
 function initializeDatabase(db: Database.Database, dbPath: string): Database.Database {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+    initializeParanoidAuthoritySchema(db);
     db.exec(SCHEMA);
     migrate(db);
+    initializeParanoidAuthority(db);
     migrateDurableCaptureFts(db);
     migrateDurableCaptureUsage(db);
     grandfatherConsentRoots(db);

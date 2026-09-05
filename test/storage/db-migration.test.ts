@@ -53,6 +53,18 @@ describe('sessions table migration', () => {
             (c) => c.name,
         );
         expect(firstPromptSkipCols).toEqual(['session_id', 'skipped_at']);
+        expect((db.pragma('table_info(paranoid_authority)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+            'id',
+            'enrolled',
+            'state',
+            'generation',
+        ]);
+        expect(db.prepare('SELECT * FROM paranoid_authority WHERE id = 1').get()).toEqual({
+            id: 1,
+            enrolled: 0,
+            state: 'unlocked',
+            generation: 0,
+        });
         expect((db.pragma('table_info(filtered_turns)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
             'memory_id',
             'included',

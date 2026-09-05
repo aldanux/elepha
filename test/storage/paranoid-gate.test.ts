@@ -1,4 +1,5 @@
-import { chmodSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { refuseLockedCliRead } from '../../src/cli/read-gate.js';
@@ -107,106 +108,126 @@ function codexHookText(result: { output: Record<string, unknown> } | { reason: s
     return typeof specific.additionalContext === 'string' ? specific.additionalContext : undefined;
 }
 
+async function expectRepresentativeReadsLocked(seeded: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+    expect(isMemoryLocked(seeded.db)).toBe(true);
+    const cliOutput: string[] = [];
+    expect(refuseLockedCliRead(seeded.db, (message) => cliOutput.push(message))).toBe(true);
+    expect(cliOutput).toEqual([LOCKED_MEMORY_MESSAGE]);
+
+    const reader = new SessionReader(seeded.db);
+    const prepare = vi.spyOn(seeded.db, 'prepare');
+    await expect(reader.render(seeded.served)).resolves.toEqual({
+        state: 'locked',
+        reason: 'locked',
+        content_coverage: LOCKED_CONTENT_COVERAGE,
+    });
+    // The authoritative singleton is the gate check; no session, memory, FTS,
+    // or transcript read may occur before it returns locked.
+    expect(prepare.mock.calls.map(([sql]) => sql)).toEqual(['SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1']);
+    prepare.mockRestore();
+
+    const query = tokenizeRecallQuery('before lock');
+    if (query === undefined) {
+        throw new Error('query unexpectedly empty');
+    }
+    await expect(lexicalRecall(reader, [seeded.projectSet], query, 'global', undefined, undefined, 'lax')).resolves.toEqual({
+        body: LOCKED_MEMORY_MESSAGE,
+        sessionIds: [],
+        state: 'locked',
+        content_coverage: LOCKED_CONTENT_COVERAGE,
+    });
+
+    const mcp = new ElephaMcpService(seeded.db);
+    const publicId = Buffer.from(JSON.stringify({ tool: 'codex', nativeId: seeded.session.native_id, segmentIndex: 0 })).toString(
+        'base64url',
+    );
+    for (const response of [
+        mcp.listProjects(),
+        mcp.listSessions({ project: seeded.projectPath }),
+        await mcp.getSession({ id: publicId }),
+    ]) {
+        expect(response.content).toEqual([{ type: 'text', text: LOCKED_MEMORY_MESSAGE }]);
+        expect(response.structuredContent).toEqual(LOCKED_MCP_RESULT);
+    }
+
+    const startup = await runSessionStart(
+        JSON.stringify({
+            session_id: 'current',
+            cwd: seeded.projectPath,
+            hook_event_name: 'SessionStart',
+            source: 'startup',
+            model: 'gpt-5.6',
+            permission_mode: 'default',
+        }),
+        'codex',
+        {
+            dbPath: seeded.dbPath,
+            openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
+            readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG } }),
+            projectResolver: () => {
+                throw new Error('locked output must not resolve or read protected projects');
+            },
+        },
+    );
+    const startupInjection = seeded.db
+        .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
+        .get('codex', 'current') as { injection_id: string; body: string } | undefined;
+    expect(startupInjection?.body).toBe(LOCKED_MEMORY_MESSAGE);
+    expect(codexHookText(startup)).toBe(
+        startupInjection === undefined ? undefined : wrap('notify', startupInjection.injection_id, LOCKED_MEMORY_MESSAGE),
+    );
+
+    const prompt = await runUserPromptSubmit(
+        JSON.stringify({
+            session_id: 'current',
+            cwd: seeded.projectPath,
+            hook_event_name: 'UserPromptSubmit',
+            prompt: 'elepha:list',
+            model: 'gpt-5.6',
+            permission_mode: 'default',
+        }),
+        'codex',
+        {
+            dbPath: seeded.dbPath,
+            openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
+            projectResolver: () => {
+                throw new Error('locked output must not resolve or read protected projects');
+            },
+        },
+    );
+    const promptInjections = seeded.db
+        .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
+        .all('codex', 'current') as Array<{ injection_id: string; body: string }>;
+    expect(promptInjections.map((injection) => injection.body)).toEqual([LOCKED_MEMORY_MESSAGE]);
+    expect(codexHookText(prompt)).toMatch(/^\[\[elepha:brief:[0-9A-Z]{26}]]\n/);
+    expect(codexHookText(prompt)?.split('\n').slice(1, -1).join('\n')).toBe(LOCKED_MEMORY_MESSAGE);
+
+    const provider = { rollup: vi.fn(), merge: vi.fn() };
+    const rollup = new RollupService({ store: seeded.store, rollups: new RollupStore(seeded.db), provider });
+    await expect(rollup.rollupSession(seeded.session, 'primary', null, 'final')).resolves.toEqual({
+        wrote: false,
+        complete: false,
+        deferred: 'locked',
+    });
+    expect(provider.rollup).not.toHaveBeenCalled();
+    expect(provider.merge).not.toHaveBeenCalled();
+}
+
 describe('paranoid read gate', () => {
     it('C11 sentinel-wraps locked hook output while the gate blocks every protected serving surface', async () => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);
 
-        expect(isMemoryLocked(seeded.db)).toBe(true);
         expect(statSync(paranoidStatePath(seeded.dbPath)).mode & 0o777).toBe(0o600);
-        expect(JSON.parse(readFileSync(paranoidStatePath(seeded.dbPath), 'utf8'))).toMatchObject({
+        const externalState = JSON.parse(readFileSync(paranoidStatePath(seeded.dbPath), 'utf8')) as Record<string, unknown>;
+        expect(externalState).toMatchObject({
             mode: 'paranoid',
             epoch: 1,
             state: 'locked',
         });
+        expect(Object.keys(externalState).sort()).toEqual(['epoch', 'hmac', 'mode', 'salt', 'state', 'verifier']);
         expect(() => enableParanoidMode(seeded.db, 'replacement passphrase')).toThrow('Paranoid mode is already enabled.');
-        const cliOutput: string[] = [];
-        expect(refuseLockedCliRead(seeded.db, (message) => cliOutput.push(message))).toBe(true);
-        expect(cliOutput).toEqual([LOCKED_MEMORY_MESSAGE]);
-
-        const reader = new SessionReader(seeded.db);
-        const prepare = vi.spyOn(seeded.db, 'prepare');
-        await expect(reader.render(seeded.served)).resolves.toEqual({
-            state: 'locked',
-            reason: 'locked',
-            content_coverage: LOCKED_CONTENT_COVERAGE,
-        });
-        expect(prepare).not.toHaveBeenCalled();
-
-        const query = tokenizeRecallQuery('before lock');
-        if (query === undefined) {
-            throw new Error('query unexpectedly empty');
-        }
-        await expect(lexicalRecall(reader, [seeded.projectSet], query, 'global', undefined, undefined, 'lax')).resolves.toEqual({
-            body: LOCKED_MEMORY_MESSAGE,
-            sessionIds: [],
-            state: 'locked',
-            content_coverage: LOCKED_CONTENT_COVERAGE,
-        });
-
-        const mcp = new ElephaMcpService(seeded.db);
-        const publicId = Buffer.from(JSON.stringify({ tool: 'codex', nativeId: seeded.session.native_id, segmentIndex: 0 })).toString(
-            'base64url',
-        );
-        for (const response of [
-            mcp.listProjects(),
-            mcp.listSessions({ project: seeded.projectPath }),
-            await mcp.getSession({ id: publicId }),
-        ]) {
-            expect(response.content).toEqual([{ type: 'text', text: LOCKED_MEMORY_MESSAGE }]);
-            expect(response.structuredContent).toEqual(LOCKED_MCP_RESULT);
-        }
-
-        const startup = await runSessionStart(
-            JSON.stringify({
-                session_id: 'current',
-                cwd: seeded.projectPath,
-                hook_event_name: 'SessionStart',
-                source: 'startup',
-                model: 'gpt-5.6',
-                permission_mode: 'default',
-            }),
-            'codex',
-            {
-                dbPath: seeded.dbPath,
-                openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
-                readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG } }),
-                projectResolver: () => {
-                    throw new Error('locked output must not resolve or read protected projects');
-                },
-            },
-        );
-        const startupInjection = seeded.db
-            .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
-            .get('codex', 'current') as { injection_id: string; body: string } | undefined;
-        expect(startupInjection?.body).toBe(LOCKED_MEMORY_MESSAGE);
-        expect(codexHookText(startup)).toBe(
-            startupInjection === undefined ? undefined : wrap('notify', startupInjection.injection_id, LOCKED_MEMORY_MESSAGE),
-        );
-        const prompt = await runUserPromptSubmit(
-            JSON.stringify({
-                session_id: 'current',
-                cwd: seeded.projectPath,
-                hook_event_name: 'UserPromptSubmit',
-                prompt: 'elepha:list',
-                model: 'gpt-5.6',
-                permission_mode: 'default',
-            }),
-            'codex',
-            {
-                dbPath: seeded.dbPath,
-                openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
-                projectResolver: () => {
-                    throw new Error('locked output must not resolve or read protected projects');
-                },
-            },
-        );
-        const promptInjections = seeded.db
-            .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
-            .all('codex', 'current') as Array<{ injection_id: string; body: string }>;
-        expect(promptInjections.map((injection) => injection.body)).toEqual([LOCKED_MEMORY_MESSAGE]);
-        expect(codexHookText(prompt)).toMatch(/^\[\[elepha:brief:[0-9A-Z]{26}]]\n/);
-        expect(codexHookText(prompt)?.split('\n').slice(1, -1).join('\n')).toBe(LOCKED_MEMORY_MESSAGE);
+        await expectRepresentativeReadsLocked(seeded);
 
         expect(
             seeded.store.recordTurn(
@@ -290,16 +311,6 @@ describe('paranoid read gate', () => {
         };
         expect(seeded.store.applyPurgePlan(onlyPurged, NOW).sessions.map((session) => session.id)).toEqual([purged.id]);
 
-        const provider = { rollup: vi.fn(), merge: vi.fn() };
-        const rollup = new RollupService({ store: seeded.store, rollups: new RollupStore(seeded.db), provider });
-        await expect(rollup.rollupSession(seeded.session, 'primary', null, 'final')).resolves.toEqual({
-            wrote: false,
-            complete: false,
-            deferred: 'locked',
-        });
-        expect(provider.rollup).not.toHaveBeenCalled();
-        expect(provider.merge).not.toHaveBeenCalled();
-
         expect(unlockMemory(seeded.db, 'wrong passphrase')).toBe('incorrect');
         expect(isMemoryLocked(seeded.db)).toBe(true);
         expect(unlockMemory(seeded.db, PASSPHRASE)).toBe('unlocked');
@@ -321,17 +332,129 @@ describe('paranoid read gate', () => {
         seeded.db.close();
     });
 
-    it('treats a hand-edited state with a bad HMAC as locked', async () => {
+    it('fails every representative read closed after an enrolled locked gate disappears', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        unlinkSync(paranoidStatePath(seeded.dbPath));
+
+        await expectRepresentativeReadsLocked(seeded);
+        seeded.db.close();
+    });
+
+    it.each([
+        {
+            name: 'malformed',
+            mutate: (seeded: Awaited<ReturnType<typeof fixture>>) => writeFileSync(paranoidStatePath(seeded.dbPath), '{not-json\n'),
+        },
+        {
+            name: 'invalid-hmac',
+            mutate: (seeded: Awaited<ReturnType<typeof fixture>>) => {
+                const file = paranoidStatePath(seeded.dbPath);
+                const state = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+                state.state = 'unlocked';
+                writeFileSync(file, `${JSON.stringify(state)}\n`);
+            },
+        },
+        {
+            name: 'database-file-mismatch',
+            mutate: (seeded: Awaited<ReturnType<typeof fixture>>) => {
+                seeded.db.prepare("UPDATE paranoid_authority SET state = 'unlocked' WHERE id = 1").run();
+            },
+        },
+    ])('treats $name external gate state as locked', async ({ mutate }) => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        mutate(seeded);
+
+        expect(isMemoryLocked(seeded.db)).toBe(true);
+        await expect(new SessionReader(seeded.db).render(seeded.served)).resolves.toMatchObject({ state: 'locked', reason: 'locked' });
+        seeded.db.close();
+    });
+
+    it('treats an injected unreadable external gate as locked', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        const gatePath = paranoidStatePath(seeded.dbPath);
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalOpenSync = mutableFs.openSync;
+        mutableFs.openSync = ((file, flags, mode) => {
+            if (path.resolve(file.toString()) === gatePath) {
+                const error = new Error('injected unreadable paranoid gate') as NodeJS.ErrnoException;
+                error.code = 'EACCES';
+                throw error;
+            }
+            return originalOpenSync(file, flags, mode);
+        }) as typeof import('node:fs').openSync;
+        syncBuiltinESMExports();
+
+        try {
+            expect(isMemoryLocked(seeded.db)).toBe(true);
+            await expect(new SessionReader(seeded.db).render(seeded.served)).resolves.toMatchObject({ state: 'locked', reason: 'locked' });
+        } finally {
+            mutableFs.openSync = originalOpenSync;
+            syncBuiltinESMExports();
+            seeded.db.close();
+        }
+    });
+
+    it('adopts an authentic legacy gate once and preserves that authority on reopen', async () => {
+        const seeded = await fixture();
+        enableParanoidMode(seeded.db, PASSPHRASE);
+        seeded.db.exec('DROP TABLE IF EXISTS paranoid_authority');
+        seeded.db.close();
+
+        const adopted = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(adopted.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get()).toEqual({
+            enrolled: 1,
+            state: 'locked',
+            generation: 1,
+        });
+        expect(isMemoryLocked(adopted)).toBe(true);
+        adopted.close();
+
+        const reopened = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(reopened.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get()).toEqual({
+            enrolled: 1,
+            state: 'locked',
+            generation: 1,
+        });
+        expect(isMemoryLocked(reopened)).toBe(true);
+        reopened.prepare('DELETE FROM paranoid_authority WHERE id = 1').run();
+        reopened.close();
+
+        const missingAuthority = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(missingAuthority.prepare('SELECT * FROM paranoid_authority WHERE id = 1').get()).toBeUndefined();
+        expect(isMemoryLocked(missingAuthority)).toBe(true);
+        missingAuthority.close();
+    });
+
+    it('does not adopt an invalid present legacy gate and fails closed on reopen', async () => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);
         const file = paranoidStatePath(seeded.dbPath);
         const state = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
         state.state = 'unlocked';
         writeFileSync(file, `${JSON.stringify(state)}\n`);
-        chmodSync(file, 0o600);
-
-        expect(isMemoryLocked(seeded.db)).toBe(true);
-        await expect(new SessionReader(seeded.db).render(seeded.served)).resolves.toMatchObject({ state: 'locked', reason: 'locked' });
+        seeded.db.exec('DROP TABLE IF EXISTS paranoid_authority');
         seeded.db.close();
+
+        const reopened = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(reopened.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get()).toEqual({
+            enrolled: 1,
+            state: 'locked',
+            generation: 0,
+        });
+        expect(isMemoryLocked(reopened)).toBe(true);
+        reopened.close();
+
+        unlinkSync(file);
+        const missingGate = await openDb(seeded.dbPath, { encryption: seeded.runtime });
+        expect(isMemoryLocked(missingGate)).toBe(true);
+        expect(missingGate.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get()).toEqual({
+            enrolled: 1,
+            state: 'locked',
+            generation: 0,
+        });
+        missingGate.close();
     });
 });

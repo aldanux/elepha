@@ -57,6 +57,12 @@ interface ParsedGateState {
     authentic: boolean;
 }
 
+interface ParanoidAuthority {
+    enrolled: 0 | 1;
+    state: GateServeState;
+    generation: number;
+}
+
 const DATABASE_REGISTRY_SYMBOL = Symbol.for('dev.elepha.paranoid.database-registry');
 
 // Test runners and bundled consumers can load this module through more than
@@ -172,31 +178,124 @@ function invalidLockedPayload(): GatePayload {
     return { mode: 'paranoid', salt: '', verifier: '', epoch: 1, state: 'locked' };
 }
 
-export function memoryServeState(db: Database.Database): GateServeState {
+function readAuthority(db: Database.Database): ParanoidAuthority | undefined {
+    let row: unknown;
+    try {
+        row = db.prepare('SELECT enrolled, state, generation FROM paranoid_authority WHERE id = 1').get();
+    } catch {
+        return undefined;
+    }
+    if (
+        !row ||
+        typeof row !== 'object' ||
+        !('enrolled' in row) ||
+        (row.enrolled !== 0 && row.enrolled !== 1) ||
+        !('state' in row) ||
+        (row.state !== 'locked' && row.state !== 'unlocked') ||
+        !('generation' in row) ||
+        typeof row.generation !== 'number' ||
+        !Number.isSafeInteger(row.generation) ||
+        row.generation < 0 ||
+        (row.enrolled === 0 && row.state !== 'unlocked')
+    ) {
+        return undefined;
+    }
+    return { enrolled: row.enrolled, state: row.state, generation: row.generation };
+}
+
+function pristineAuthority(authority: ParanoidAuthority): boolean {
+    return authority.enrolled === 0 && authority.state === 'unlocked' && authority.generation === 0;
+}
+
+function authorityForPayload(payload: GatePayload): ParanoidAuthority {
+    const enrolled = payload.mode === 'paranoid' ? 1 : 0;
+    return {
+        enrolled,
+        state: enrolled === 1 ? payload.state : 'unlocked',
+        generation: payload.epoch,
+    };
+}
+
+function authorityMatches(authority: ParanoidAuthority, stored: ParsedGateState): boolean {
+    const external = authorityForPayload(stored.payload);
+    return (
+        stored.authentic &&
+        external.enrolled === authority.enrolled &&
+        external.state === authority.state &&
+        external.generation === authority.generation
+    );
+}
+
+export function initializeParanoidAuthority(db: Database.Database): void {
+    if (registeredDatabases.get(db) === undefined) {
+        return;
+    }
+    const authority = readAuthority(db);
+    if (authority === undefined || !pristineAuthority(authority)) {
+        return;
+    }
     const stored = readRegisteredState(db);
     if (stored === undefined) {
+        return;
+    }
+    // An invalid legacy anchor cannot prove its old state or generation. Mark
+    // the installation enrolled and locked without copying any untrusted field
+    // so deleting that anchor later cannot recreate a never-enabled default.
+    const adopted: ParanoidAuthority = stored.authentic
+        ? authorityForPayload(stored.payload)
+        : { enrolled: 1, state: 'locked', generation: 0 };
+    const adoptOrQuarantine = db.transaction(() => {
+        const current = readAuthority(db);
+        if (current === undefined || !pristineAuthority(current)) {
+            return;
+        }
+        db.prepare('UPDATE paranoid_authority SET enrolled = ?, state = ?, generation = ? WHERE id = 1').run(
+            adopted.enrolled,
+            adopted.state,
+            adopted.generation,
+        );
+    });
+    adoptOrQuarantine();
+}
+
+export function memoryServeState(db: Database.Database): GateServeState {
+    if (registeredDatabases.get(db) === undefined) {
         return 'unlocked';
     }
-    if (!stored.authentic) {
+    const authority = readAuthority(db);
+    if (authority === undefined) {
         return 'locked';
     }
-    return stored.payload.mode === 'paranoid' ? stored.payload.state : 'unlocked';
+    const stored = readRegisteredState(db);
+    if (pristineAuthority(authority) && stored === undefined) {
+        return 'unlocked';
+    }
+    if (stored === undefined || !authorityMatches(authority, stored)) {
+        return 'locked';
+    }
+    return authority.state;
 }
 
 export function isMemoryLocked(db: Database.Database): boolean {
     return memoryServeState(db) === 'locked';
 }
 
-function registeredStateForMutation(db: Database.Database): { registered: RegisteredDatabase; stored?: ParsedGateState } {
+function registeredStateForMutation(db: Database.Database): {
+    registered: RegisteredDatabase;
+    authority: ParanoidAuthority;
+    stored?: ParsedGateState;
+} {
     const registered = registeredDatabases.get(db);
     if (registered === undefined) {
         throw new Error('Paranoid mode requires a managed encrypted elepha database.');
     }
+    const authority = readAuthority(db);
     const stored = readRegisteredState(db);
-    if (stored !== undefined && !stored.authentic) {
+    const validPristineState = authority !== undefined && pristineAuthority(authority) && stored === undefined;
+    if (authority === undefined || (!validPristineState && (stored === undefined || !authorityMatches(authority, stored)))) {
         throw new Error('Paranoid gate state failed authentication. Memory remains locked.');
     }
-    return { registered, stored };
+    return { registered, authority, stored };
 }
 
 function verifier(passphrase: string, salt: Buffer): Buffer {
@@ -208,28 +307,46 @@ function verifier(passphrase: string, salt: Buffer): Buffer {
     });
 }
 
-function writeState(registered: RegisteredDatabase, payload: GatePayload): void {
+function writeState(db: Database.Database, registered: RegisteredDatabase, previous: ParanoidAuthority, payload: GatePayload): void {
     const file: GateFile = { ...payload, hmac: encodedSignature(payload, registered.key) };
     writePrivateFileAtomic(paranoidStatePath(registered.databasePath), Buffer.from(`${JSON.stringify(file)}\n`, 'utf8'), true);
+    const next = authorityForPayload(payload);
+    const update = db.transaction(() => {
+        const result = db
+            .prepare(
+                `UPDATE paranoid_authority
+                 SET enrolled = ?, state = ?, generation = ?
+                 WHERE id = 1 AND enrolled = ? AND state = ? AND generation = ?`,
+            )
+            .run(next.enrolled, next.state, next.generation, previous.enrolled, previous.state, previous.generation);
+        if (result.changes !== 1) {
+            throw new Error('Paranoid database authority changed during update. Memory remains locked.');
+        }
+    });
+    update();
 }
 
-function nextEpoch(stored: ParsedGateState | undefined): number {
-    return (stored?.payload.epoch ?? 0) + 1;
+function nextGeneration(authority: ParanoidAuthority): number {
+    const next = authority.generation + 1;
+    if (!Number.isSafeInteger(next)) {
+        throw new Error('Paranoid gate generation is exhausted. Memory remains locked.');
+    }
+    return next;
 }
 
 export function enableParanoidMode(db: Database.Database, passphrase: string): void {
-    const { registered, stored } = registeredStateForMutation(db);
-    if (stored?.payload.mode === 'paranoid') {
+    const { registered, authority } = registeredStateForMutation(db);
+    if (authority.enrolled === 1) {
         throw new Error('Paranoid mode is already enabled.');
     }
     const salt = randomBytes(PARANOID_SCRYPT_SALT_BYTES);
     const derived = verifier(passphrase, salt);
     try {
-        writeState(registered, {
+        writeState(db, registered, authority, {
             mode: 'paranoid',
             salt: salt.toString('base64'),
             verifier: derived.toString('base64'),
-            epoch: nextEpoch(stored),
+            epoch: nextGeneration(authority),
             state: 'locked',
         });
     } finally {
@@ -252,34 +369,39 @@ function verifyPassphrase(stored: ParsedGateState, passphrase: string): boolean 
 }
 
 export function unlockMemory(db: Database.Database, passphrase: string): 'unlocked' | 'incorrect' | 'not_enabled' {
-    const { registered, stored } = registeredStateForMutation(db);
-    if (stored === undefined || stored.payload.mode !== 'paranoid') {
+    const { registered, authority, stored } = registeredStateForMutation(db);
+    if (authority.enrolled === 0 || stored === undefined || stored.payload.mode !== 'paranoid') {
         return 'not_enabled';
     }
     if (!verifyPassphrase(stored, passphrase)) {
         return 'incorrect';
     }
-    writeState(registered, { ...stored.payload, epoch: nextEpoch(stored), state: 'unlocked' });
+    writeState(db, registered, authority, { ...stored.payload, epoch: nextGeneration(authority), state: 'unlocked' });
     return 'unlocked';
 }
 
 export function lockMemory(db: Database.Database): 'locked' | 'not_enabled' {
-    const { registered, stored } = registeredStateForMutation(db);
-    if (stored === undefined || stored.payload.mode !== 'paranoid') {
+    const { registered, authority, stored } = registeredStateForMutation(db);
+    if (authority.enrolled === 0 || stored === undefined || stored.payload.mode !== 'paranoid') {
         return 'not_enabled';
     }
-    writeState(registered, { ...stored.payload, epoch: nextEpoch(stored), state: 'locked' });
+    writeState(db, registered, authority, { ...stored.payload, epoch: nextGeneration(authority), state: 'locked' });
     return 'locked';
 }
 
 export function disableParanoidMode(db: Database.Database, passphrase: string): 'disabled' | 'incorrect' | 'not_enabled' {
-    const { registered, stored } = registeredStateForMutation(db);
-    if (stored === undefined || stored.payload.mode !== 'paranoid') {
+    const { registered, authority, stored } = registeredStateForMutation(db);
+    if (authority.enrolled === 0 || stored === undefined || stored.payload.mode !== 'paranoid') {
         return 'not_enabled';
     }
     if (!verifyPassphrase(stored, passphrase)) {
         return 'incorrect';
     }
-    writeState(registered, { ...stored.payload, mode: 'default', epoch: nextEpoch(stored), state: 'unlocked' });
+    writeState(db, registered, authority, {
+        ...stored.payload,
+        mode: 'default',
+        epoch: nextGeneration(authority),
+        state: 'unlocked',
+    });
     return 'disabled';
 }
