@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -47,5 +48,85 @@ describe('durable capture remains inert', () => {
         expect(stored).not.toContain('THINKING_SECRET');
         expect(stored).not.toContain('TOOL_OUTPUT_SECRET');
         expect(stored).not.toContain('FETCHED_CONTENT_SECRET');
+    });
+
+    it('neutralizes both characters of every persisted leading chain operator', () => {
+        const store = new MemoryStore(openUnmanagedDb(':memory:'));
+        const project = store.upsertProject('/repo');
+        const session = store.upsertSession('codex', 'chain-operators', project.id, '/repo/chain-operators.jsonl');
+        const marker = 'C08_RHS_EXECUTED';
+        const parsedTurn = {
+            tool: 'codex',
+            sessionId: 'chain-operators',
+            sourcePath: '/repo/chain-operators.jsonl',
+            projectPath: '/repo',
+            turnIndex: 0,
+            startedAt: '2026-09-05T00:00:00.000Z',
+            endedAt: '2026-09-05T00:00:01.000Z',
+            userMessage: `  || printf ${marker}`,
+            assistantText: `\t&& printf ${marker}`,
+            toolCalls: [
+                {
+                    name: `\n|| printf ${marker}`,
+                    filePaths: [
+                        `\n  && printf ${marker}`,
+                        `\n  ${String.raw`\\||`} printf ${marker}`,
+                        `\n\t${String.raw`\\&&`} printf ${marker}`,
+                    ],
+                },
+            ],
+            cursor: '100|1',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        } satisfies ParsedTurn;
+
+        expect(
+            store.recordTurn(
+                parsedTurn,
+                session.id,
+                project.id,
+                {
+                    decisions: [{ what: `  \\|| printf ${marker}`, why: `\t\\&& printf ${marker}` }],
+                    pending_items: [],
+                    status: 'ok',
+                },
+                true,
+            ),
+        ).toBe(true);
+
+        const filtered = store.database.prepare('SELECT user_prompt, assistant_response, tool_calls FROM filtered_turns').get() as {
+            user_prompt: string;
+            assistant_response: string;
+            tool_calls: string;
+        };
+        const memory = store.database.prepare('SELECT decisions FROM memories').get() as { decisions: string };
+        const toolCalls = JSON.parse(filtered.tool_calls) as Array<{ name: string; filePaths: string[] }>;
+        const decisions = JSON.parse(memory.decisions) as Array<{ what: string; why: string }>;
+        const leaves = [
+            filtered.user_prompt,
+            filtered.assistant_response,
+            decisions[0]?.what ?? '',
+            decisions[0]?.why ?? '',
+            ...toolCalls.flatMap((call) => [call.name, ...call.filePaths]),
+        ];
+
+        expect(leaves).toEqual([
+            `\\|\\| printf ${marker}`,
+            `\\&\\& printf ${marker}`,
+            `  \\|\\| printf ${marker}`,
+            `\t\\&\\& printf ${marker}`,
+            `\n\\|\\| printf ${marker}`,
+            `\n  \\&\\& printf ${marker}`,
+            `\n  ${String.raw`\\\|\|`} printf ${marker}`,
+            `\n\t${String.raw`\\\&\&`} printf ${marker}`,
+        ]);
+        for (const leaf of leaves) {
+            const command = leaf.trimStart();
+            const lhs = command.includes('&') ? 'true' : 'false';
+            const oracle = spawnSync('sh', ['-c', `${lhs} ${command}`], { encoding: 'utf8' });
+            expect(oracle.error).toBeUndefined();
+            expect(oracle.status).toBe(lhs === 'true' ? 0 : 1);
+            expect(oracle.stdout).not.toContain(marker);
+        }
     });
 });

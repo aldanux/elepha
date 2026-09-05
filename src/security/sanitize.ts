@@ -33,10 +33,10 @@ const HEREDOC = '<<';
 
 // Command chaining is only shell-active at the start of a command, so the test
 // is line-leading rather than "anywhere" - a `;` mid-sentence is punctuation
-// and mangling it would corrupt ordinary prose. Escaped by PREFIXING a
-// backslash to the whole run (`&&` -> `\&&`), never infixing: `&\&` would
-// still start the line with `&` and the transform would not be idempotent.
-const LINE_LEADING_CHAIN_RE = /^([ \t]*)(\|\||&&|[|;&])/gm;
+// and mangling it would corrupt ordinary prose. Capture every backslash run
+// around the leading operators so activity is decided by parity, not by one
+// fixed legacy spelling.
+const LINE_LEADING_CHAIN_RE = /^([ \t]*)((?:\\*[|;&])+)/gm;
 
 // CSI (`\x1b[...`), OSC (`\x1b]...` terminated by BEL or ST), and any other
 // two-character escape. Matched longest-first so a CSI is never chewed up by
@@ -63,6 +63,35 @@ function precedingBackslashes(s: string, index: number): number {
 
 function isActive(s: string, index: number): boolean {
     return precedingBackslashes(s, index) % 2 === 0;
+}
+
+function hasActiveChainCharacter(chain: string): boolean {
+    for (let i = 0; i < chain.length; i++) {
+        if (chain[i] !== '\\' && isActive(chain, i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function rewriteLeadingChains(input: string, rewrite: (chain: string) => string): string {
+    return input.replace(LINE_LEADING_CHAIN_RE, (match, indentation: string, chain: string) => {
+        return hasActiveChainCharacter(chain) ? indentation + rewrite(chain) : match;
+    });
+}
+
+function detectActiveLeadingChain(input: string): boolean {
+    LINE_LEADING_CHAIN_RE.lastIndex = 0;
+    let match = LINE_LEADING_CHAIN_RE.exec(input);
+    while (match !== null) {
+        if (hasActiveChainCharacter(match[2] ?? '')) {
+            LINE_LEADING_CHAIN_RE.lastIndex = 0;
+            return true;
+        }
+        match = LINE_LEADING_CHAIN_RE.exec(input);
+    }
+    LINE_LEADING_CHAIN_RE.lastIndex = 0;
+    return false;
 }
 
 function stripControls(s: string): string {
@@ -116,7 +145,7 @@ export function stripShellSyntax(input: string): string {
 
         s = s.split('`').join('');
         s = s.split(HEREDOC).join('');
-        s = s.replace(LINE_LEADING_CHAIN_RE, '$1');
+        s = rewriteLeadingChains(s, () => '');
 
         if (s === before) {
             break;
@@ -158,8 +187,18 @@ export function escapeShellSyntax(input: string): string {
     }
     s = out;
 
-    // Only a leading command chain is shell-active in this form.
-    s = s.replace(LINE_LEADING_CHAIN_RE, '$1\\$2');
+    // Escape each character in a leading chain. Prefixing only the pair as a
+    // whole leaves its second character active (`\||` and `\&&`).
+    s = rewriteLeadingChains(s, (chain) => {
+        let escaped = '';
+        for (let i = 0; i < chain.length; i++) {
+            if (chain[i] !== '\\' && isActive(chain, i)) {
+                escaped += '\\';
+            }
+            escaped += chain[i];
+        }
+        return escaped;
+    });
 
     return s;
 }
@@ -190,10 +229,7 @@ export function detectShellSyntax(input: string): boolean {
         }
     }
 
-    LINE_LEADING_CHAIN_RE.lastIndex = 0;
-    const hit = LINE_LEADING_CHAIN_RE.test(input);
-    LINE_LEADING_CHAIN_RE.lastIndex = 0;
-    return hit;
+    return detectActiveLeadingChain(input);
 }
 
 // Read-time ASSERTION, not read-time sanitization.

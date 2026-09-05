@@ -1,6 +1,6 @@
-// Security Rule 3 backfill. The choke points in RollupStore.write() and
-// MemoryStore.recordTurn/reingestTurn() clean everything written from now on;
-// this cleans what the store already holds.
+// Security Rule 3 backfill. The rollup, memory, and durable-capture store
+// choke points clean everything written from now on; this cleans what the
+// store already holds.
 //
 // Rule 3 debt is real, not hypothetical - the live corpus has rollup rows and
 // memory rows carrying backticks and `$(`. Benign today (markdown-ish quoting
@@ -23,7 +23,7 @@ import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 
 export interface SanitizeChange {
-    table: 'session_rollups' | 'memories';
+    table: 'session_rollups' | 'memories' | 'filtered_turns';
     rowId: number;
     field: string;
     before: string;
@@ -35,6 +35,7 @@ export interface SanitizePlan {
     // Rows touched, as opposed to individual field edits.
     rollupRows: number;
     memoryRows: number;
+    filteredTurnRows: number;
 }
 
 type JsonMapper = (parsed: unknown) => unknown;
@@ -78,6 +79,19 @@ const sanitizeDecisionsJson: JsonMapper = (parsed) => {
 const sanitizeStringsJson: JsonMapper = (parsed) =>
     Array.isArray(parsed) ? parsed.map((s) => (typeof s === 'string' ? stripShellSyntax(s) : s)) : parsed;
 
+const sanitizeStringLeaves: JsonMapper = (parsed) => {
+    if (typeof parsed === 'string') {
+        return escapeShellSyntax(parsed);
+    }
+    if (Array.isArray(parsed)) {
+        return parsed.map(sanitizeStringLeaves);
+    }
+    if (parsed && typeof parsed === 'object') {
+        return Object.fromEntries(Object.entries(parsed).map(([key, value]) => [key, sanitizeStringLeaves(value)]));
+    }
+    return parsed;
+};
+
 export function sanitizeRollupDisplayField(raw: string): string {
     return stripShellSyntax(raw);
 }
@@ -109,7 +123,13 @@ const MEMORY_FIELDS: FieldSpec[] = [
     { field: 'pending_items', json: true, transform: (raw) => mapJsonField(raw, sanitizeStringsJson) },
 ];
 
-function collect(db: Database, table: 'session_rollups' | 'memories', idColumn: string, fields: FieldSpec[]): SanitizeChange[] {
+const FILTERED_TURN_FIELDS: FieldSpec[] = [
+    { field: 'user_prompt', json: false, transform: escapeShellSyntax },
+    { field: 'assistant_response', json: false, transform: escapeShellSyntax },
+    { field: 'tool_calls', json: true, transform: (raw) => mapJsonField(raw, sanitizeStringLeaves) },
+];
+
+function collect(db: Database, table: SanitizeChange['table'], idColumn: string, fields: FieldSpec[]): SanitizeChange[] {
     const columns = fields.map((f) => f.field).join(', ');
     const rows = db.prepare(`SELECT ${idColumn} AS __id, ${columns} FROM ${table}`).all() as Array<Record<string, string | number>>;
 
@@ -130,11 +150,16 @@ function collect(db: Database, table: 'session_rollups' | 'memories', idColumn: 
 }
 
 export function planSanitize(db: Database): SanitizePlan {
-    const changes = [...collect(db, 'session_rollups', 'session_id', ROLLUP_FIELDS), ...collect(db, 'memories', 'id', MEMORY_FIELDS)];
+    const changes = [
+        ...collect(db, 'session_rollups', 'session_id', ROLLUP_FIELDS),
+        ...collect(db, 'memories', 'id', MEMORY_FIELDS),
+        ...collect(db, 'filtered_turns', 'memory_id', FILTERED_TURN_FIELDS),
+    ];
     return {
         changes,
         rollupRows: new Set(changes.filter((c) => c.table === 'session_rollups').map((c) => c.rowId)).size,
         memoryRows: new Set(changes.filter((c) => c.table === 'memories').map((c) => c.rowId)).size,
+        filteredTurnRows: new Set(changes.filter((c) => c.table === 'filtered_turns').map((c) => c.rowId)).size,
     };
 }
 
@@ -143,7 +168,7 @@ export function applySanitize(db: Database): SanitizePlan {
     const plan = planSanitize(db);
     const apply = db.transaction(() => {
         for (const c of plan.changes) {
-            const idColumn = c.table === 'session_rollups' ? 'session_id' : 'id';
+            const idColumn = c.table === 'session_rollups' ? 'session_id' : c.table === 'filtered_turns' ? 'memory_id' : 'id';
             db.prepare(`UPDATE ${c.table} SET ${c.field} = ? WHERE ${idColumn} = ?`).run(c.after, c.rowId);
         }
     });
@@ -164,7 +189,7 @@ export interface SanitizeResidue {
 // than trusting the plan it just applied.
 export function verifySanitize(db: Database): SanitizeResidue[] {
     const residue: SanitizeResidue[] = [];
-    const check = (table: 'session_rollups' | 'memories', idColumn: string, fields: FieldSpec[]) => {
+    const check = (table: SanitizeChange['table'], idColumn: string, fields: FieldSpec[]) => {
         const columns = fields.map((f) => f.field).join(', ');
         const rows = db.prepare(`SELECT ${idColumn} AS __id, ${columns} FROM ${table}`).all() as Array<Record<string, string | number>>;
         for (const row of rows) {
@@ -183,6 +208,7 @@ export function verifySanitize(db: Database): SanitizeResidue[] {
     };
     check('session_rollups', 'session_id', ROLLUP_FIELDS);
     check('memories', 'id', MEMORY_FIELDS);
+    check('filtered_turns', 'memory_id', FILTERED_TURN_FIELDS);
     return residue;
 }
 

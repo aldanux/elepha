@@ -147,6 +147,21 @@ describe('Rule 3 backfill', () => {
              VALUES (1, 1, 0, 'claude-code', '2026-08-01T00:00:00.000Z', ?, '[]', ?, '2026-08-01T00:00:00.000Z', 'ok')`,
         ).run(JSON.stringify(['set `foo` to $(bar)']), JSON.stringify(['check ${BAZ}']));
         db.prepare(
+            `INSERT INTO filtered_turns
+             (memory_id, included, user_prompt, assistant_response, tool_calls, filter_version, captured_at)
+             VALUES (1, 1, ?, ?, ?, 1, '2026-08-01T00:00:00.000Z')`,
+        ).run(
+            '|| promptneedle',
+            '&& responseneedle',
+            JSON.stringify([
+                {
+                    name: '\n|| toolnameneedle',
+                    filePaths: ['  \\&& toolpathneedle'],
+                    legacy: { nested: '\\|| nestedneedle' },
+                },
+            ]),
+        );
+        db.prepare(
             `INSERT INTO session_rollups (session_id, project_id, tool, title, summary, decisions, pending_items, files_touched,
                 turn_count, started_at, ended_at, kind, parent_session_id, summarizer_status, rollup_state,
                 rolled_up_through_turn_index, computed_at, rollup_version)
@@ -164,7 +179,11 @@ describe('Rule 3 backfill', () => {
         const plan = planSanitize(db);
         expect(plan.rollupRows).toBe(1);
         expect(plan.memoryRows).toBe(1);
+        expect(plan.filteredTurnRows).toBe(1);
         expect(plan.changes.map((c) => `${c.table}.${c.field}`).sort()).toEqual([
+            'filtered_turns.assistant_response',
+            'filtered_turns.tool_calls',
+            'filtered_turns.user_prompt',
             'memories.decisions',
             'memories.pending_items',
             'session_rollups.decisions',
@@ -186,6 +205,55 @@ describe('Rule 3 backfill', () => {
         expect(planSanitize(db).changes).toEqual([]);
         applySanitize(db);
         expect(verifySanitize(db)).toEqual([]);
+    });
+
+    it('repairs filtered turns while preserving JSON and exact FTS and usage maintenance', () => {
+        db.exec('CREATE VIRTUAL TABLE temp.sanitize_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+        const termsBefore = db.prepare('SELECT term, doc, col, offset FROM temp.sanitize_terms ORDER BY term, doc, col, offset').all();
+        const usageBefore = (db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number })
+            .total_bytes;
+
+        applySanitize(db);
+
+        const row = db.prepare('SELECT user_prompt, assistant_response, tool_calls FROM filtered_turns').get() as {
+            user_prompt: string;
+            assistant_response: string;
+            tool_calls: string;
+        };
+        expect(row.user_prompt).toBe('\\|\\| promptneedle');
+        expect(row.assistant_response).toBe('\\&\\& responseneedle');
+        expect(JSON.parse(row.tool_calls)).toEqual([
+            {
+                name: '\n\\|\\| toolnameneedle',
+                filePaths: ['  \\&\\& toolpathneedle'],
+                legacy: { nested: '\\|\\| nestedneedle' },
+            },
+        ]);
+        expect(db.prepare('SELECT term, doc, col, offset FROM temp.sanitize_terms ORDER BY term, doc, col, offset').all()).toEqual(
+            termsBefore,
+        );
+        const usage = (db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number })
+            .total_bytes;
+        const measured = (
+            db
+                .prepare(
+                    `SELECT COALESCE(SUM(
+                       length(CAST(user_prompt AS BLOB)) +
+                       length(CAST(assistant_response AS BLOB)) +
+                       length(CAST(tool_calls AS BLOB))
+                     ), 0) AS total_bytes
+                     FROM filtered_turns`,
+                )
+                .get() as { total_bytes: number }
+        ).total_bytes;
+        expect(usage).toBeGreaterThan(usageBefore);
+        expect(usage).toBe(measured);
+
+        const storedAfterFirstApply = JSON.stringify(row);
+        expect(applySanitize(db).changes).toEqual([]);
+        expect(JSON.stringify(db.prepare('SELECT user_prompt, assistant_response, tool_calls FROM filtered_turns').get())).toBe(
+            storedAfterFirstApply,
+        );
     });
 
     it('preserves the words while neutralizing the syntax', () => {

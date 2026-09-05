@@ -67,7 +67,10 @@ function printSanitizePlan(plan: SanitizePlan): void {
         console.log(`    before: ${truncateForDisplay(c.before)}`);
         console.log(`    after:  ${truncateForDisplay(c.after)}`);
     }
-    console.log(`\n${plan.changes.length} field(s) across ${plan.rollupRows} rollup row(s) and ${plan.memoryRows} memory row(s).`);
+    console.log(
+        `\n${plan.changes.length} field(s) across ${plan.rollupRows} rollup row(s), ${plan.memoryRows} memory row(s), ` +
+            `and ${plan.filteredTurnRows} filtered turn row(s).`,
+    );
 }
 
 function truncateForDisplay(s: string | null): string {
