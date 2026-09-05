@@ -4,9 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DURABLE_CAPTURE_FILTER_VERSION } from '../../src/config/constants.js';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
+import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { filterTurn } from '../../src/rendering/filtered-turn.js';
 import { openProviderTranscript } from '../../src/security/provider-transcript.js';
+import { type openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { type DurableCaptureBackfillSession, DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
+import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
@@ -68,14 +71,40 @@ function enabledConfig() {
     return { config: { ...DEFAULT_MEMORY_CONFIG, durableCapture: true } };
 }
 
+async function recordCommandBody(dbPath: string, projectPath: string, nativeSessionId: string): Promise<string> {
+    const result = await runUserPromptSubmit(
+        JSON.stringify({
+            session_id: nativeSessionId,
+            cwd: projectPath,
+            hook_event_name: 'UserPromptSubmit',
+            prompt: 'elepha:help',
+        }),
+        'claude-code',
+        {
+            dbPath,
+            now: () => Date.parse('2026-09-04T00:00:01.000Z'),
+            openDatabase: ((path: string) => openUnmanagedDb(path)) as typeof openDb,
+        },
+    );
+    expect('output' in result).toBe(true);
+    const db = openUnmanagedDb(dbPath);
+    const injection = db
+        .prepare('SELECT body FROM injections WHERE tool = ? AND native_session_id = ?')
+        .get('claude-code', nativeSessionId) as { body: string } | undefined;
+    db.close();
+    expect(injection).toBeDefined();
+    return injection!.body;
+}
+
 describe('daemon durable capture backfill', () => {
     afterEach(() => vi.unstubAllEnvs());
 
-    it('suppresses an injection recorded after turn start in both live capture and later backfill', async () => {
-        const injectionBody = 'The same turn quote back contains the unique c10samequotebackneedle from Elepha output.';
+    it('C11 suppresses an echoed in-chat command output in both live capture and later backfill', async () => {
         const liveFixture = createTestDb('elepha-live-same-turn-quote-back-');
         const liveProject = seedProject(liveFixture);
         liveFixture.store.consent.grant(liveProject.path);
+        liveFixture.close();
+        const injectionBody = await recordCommandBody(liveFixture.dbPath, liveProject.path, 'live-same-turn');
         const liveSource = path.join(liveFixture.directory, 'live.jsonl');
         writeFileSync(liveSource, '{}\n');
         const liveTurn = {
@@ -85,17 +114,12 @@ describe('daemon durable capture backfill', () => {
             endedAt: '2026-09-04T00:00:02.000Z',
             userMessage: `The assistant quoted this later in the same turn: ${injectionBody}`,
         };
-        liveFixture.store.recordInjection({
-            tool: 'claude-code',
-            nativeSessionId: liveTurn.sessionId,
-            injectedAt: '2026-09-04T00:00:01.000Z',
-            injectionId: '01J00000000000000000000010',
-            body: injectionBody,
-        });
+        const liveDb = openUnmanagedDb(liveFixture.dbPath);
+        const liveStore = new MemoryStore(liveDb);
         const summarize = vi.fn().mockResolvedValue({ decisions: [], pending_items: [], status: 'ok' });
         const liveAdapter = adapterFor(new Map(), []);
         const liveDaemon = new IngestionDaemon({
-            store: liveFixture.store,
+            store: liveStore,
             summarizer: { summarize },
             adapters: [liveAdapter],
             watchRoots: [],
@@ -120,6 +144,10 @@ describe('daemon durable capture backfill', () => {
             sourcePath: backfillSource,
         });
         seedMemory(backfillFixture, { project: backfillProject, session: backfillSession, turnIndex: 0 });
+        backfillFixture.close();
+        await recordCommandBody(backfillFixture.dbPath, backfillProject.path, backfillSession.native_id);
+        const backfillDb = openUnmanagedDb(backfillFixture.dbPath);
+        const backfillStore = new MemoryStore(backfillDb);
         const backfillTurn = {
             ...parsedTurn(backfillSource, backfillSession.native_id, 0),
             projectPath: backfillProject.path,
@@ -127,16 +155,9 @@ describe('daemon durable capture backfill', () => {
             endedAt: '2026-09-04T00:00:02.000Z',
             assistantText: `The assistant quoted this later in the same turn: ${injectionBody}`,
         };
-        backfillFixture.store.recordInjection({
-            tool: 'claude-code',
-            nativeSessionId: backfillTurn.sessionId,
-            injectedAt: '2026-09-04T00:00:01.000Z',
-            injectionId: '01J00000000000000000000011',
-            body: injectionBody,
-        });
         const backfillParsed: string[] = [];
         const backfillDaemon = new IngestionDaemon({
-            store: backfillFixture.store,
+            store: backfillStore,
             adapters: [adapterFor(new Map([[backfillSource, [backfillTurn]]]), backfillParsed)],
             watchRoots: [],
             heartbeatPath: path.join(backfillFixture.directory, 'heartbeat.json'),
@@ -146,9 +167,9 @@ describe('daemon durable capture backfill', () => {
         });
         backfillDaemon.start();
         await waitFor(() => {
-            const status = backfillFixture.db
-                .prepare('SELECT state FROM durable_capture_status WHERE session_id = ?')
-                .get(backfillSession.id) as { state: string } | undefined;
+            const status = backfillDb.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(backfillSession.id) as
+                | { state: string }
+                | undefined;
             return status !== undefined && status.state !== 'backfilling';
         });
         await backfillDaemon.stop();
@@ -156,22 +177,16 @@ describe('daemon durable capture backfill', () => {
         expect({
             livePersisted,
             liveSummaries: summarize.mock.calls.length,
-            liveMemories: liveFixture.db.prepare('SELECT COUNT(*) AS count FROM memories').get(),
-            liveRollups: liveFixture.db.prepare('SELECT COUNT(*) AS count FROM session_rollups').get(),
-            liveFiltered: liveFixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
-            liveFts: liveFixture.db
-                .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c10samequotebackneedle'")
-                .all(),
-            liveUsage: liveFixture.db.prepare('SELECT total_bytes FROM durable_capture_usage').get(),
+            liveMemories: liveDb.prepare('SELECT COUNT(*) AS count FROM memories').get(),
+            liveRollups: liveDb.prepare('SELECT COUNT(*) AS count FROM session_rollups').get(),
+            liveFiltered: liveDb.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
+            liveFts: liveDb.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'optionally'").all(),
+            liveUsage: liveDb.prepare('SELECT total_bytes FROM durable_capture_usage').get(),
             backfillParsed,
-            backfillState: backfillFixture.db
-                .prepare('SELECT state FROM durable_capture_status WHERE session_id = ?')
-                .get(backfillSession.id),
-            backfillFiltered: backfillFixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
-            backfillFts: backfillFixture.db
-                .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c10samequotebackneedle'")
-                .all(),
-            backfillUsage: backfillFixture.db.prepare('SELECT total_bytes FROM durable_capture_usage').get(),
+            backfillState: backfillDb.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(backfillSession.id),
+            backfillFiltered: backfillDb.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
+            backfillFts: backfillDb.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'optionally'").all(),
+            backfillUsage: backfillDb.prepare('SELECT total_bytes FROM durable_capture_usage').get(),
         }).toEqual({
             livePersisted: false,
             liveSummaries: 0,
@@ -186,6 +201,8 @@ describe('daemon durable capture backfill', () => {
             backfillFts: [],
             backfillUsage: { total_bytes: 0 },
         });
+        liveDb.close();
+        backfillDb.close();
     });
 
     it('enforces the configured byte cap while backfilling sessions', () => {

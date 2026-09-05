@@ -6,8 +6,6 @@ import type Database from 'better-sqlite3-multiple-ciphers';
 import { ELEPHA_LIST_DEFAULT_LIMIT, ELEPHA_LIST_MAX_LIMIT } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { terminalHandoff } from '../markers.js';
-import { escapeShellSyntax } from '../security/sanitize.js';
-import { buildInjectionId, wrap } from '../security/sentinel.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
     HELP,
@@ -27,6 +25,7 @@ import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookTool, parsePayload, readStdin, type UserPromptSubmitPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
+import { recordHookOutput } from './output.js';
 
 export type UserPromptCommand =
     | { kind: 'help' }
@@ -200,17 +199,37 @@ export async function runUserPromptSubmit(
         return { reason: 'database_unavailable' };
     }
     try {
+        const store = new MemoryStore(db);
+        const clock = dependencies.now ?? Date.now;
+        const emit = (body: string): UserPromptSubmitResult => {
+            const output = recordHookOutput({
+                store,
+                tool,
+                nativeSessionId: payload.session_id,
+                injectedAt: new Date(clock()).toISOString(),
+                body,
+                kind: 'brief',
+                writeInjection: dependencies.writeInjection,
+            });
+            if (output === undefined) {
+                log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
+                return { reason: 'injection_record_failed' };
+            }
+            return { output: envelope(output) };
+        };
         if (isMemoryLocked(db)) {
-            log(promptLogLine(tool, payload, 'served locked'));
-            return { output: envelope(LOCKED_MEMORY_MESSAGE) };
+            const result = emit(LOCKED_MEMORY_MESSAGE);
+            if ('output' in result) {
+                log(promptLogLine(tool, payload, 'served locked'));
+            }
+            return result;
         }
         const reader = new SessionReader(db);
-        const store = new MemoryStore(db);
         const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-        const clock = dependencies.now ?? Date.now;
         let commandOutput: string;
         let shownSessionIds: number[] | undefined;
         let storeShownSessionIds = false;
+        let successNotice: string | undefined;
         if (command?.kind === 'query') {
             const query = tokenizeRecallQuery(command.query);
             if (!query) {
@@ -222,7 +241,7 @@ export async function runUserPromptSubmit(
                         ? projectResolver(db).listConsentedStored(consent)
                         : [consentedProject(db, payload.cwd)].filter((project): project is ProjectSet => project !== undefined);
                 if (command.scope === 'here' && projects.length === 0 && consent.consentState(payload.cwd) !== 'approved') {
-                    log(promptLogLine(tool, payload, 'served notice=project_unavailable_or_unconsented'));
+                    successNotice = 'served notice=project_unavailable_or_unconsented';
                     commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`;
                 } else {
                     const matchingMode = getSetting('query-matching', process.env, dependencies.configPath).value;
@@ -270,29 +289,24 @@ export async function runUserPromptSubmit(
             storeShownSessionIds = command?.kind === 'list';
         }
         if (isMemoryLocked(db)) {
-            log(promptLogLine(tool, payload, 'served locked'));
-            return { output: envelope(LOCKED_MEMORY_MESSAGE) };
+            const result = emit(LOCKED_MEMORY_MESSAGE);
+            if ('output' in result) {
+                log(promptLogLine(tool, payload, 'served locked'));
+            }
+            return result;
         }
-        const body = escapeShellSyntax(commandOutput);
-        const injectionId = buildInjectionId();
-        const output = wrap('brief', injectionId, body);
-        const now = clock();
-        const recorded = (dependencies.writeInjection ?? ((memoryStore, input) => memoryStore.recordInjection(input)))(store, {
-            tool,
-            nativeSessionId: payload.session_id,
-            injectedAt: new Date(now).toISOString(),
-            injectionId,
-            body,
-        });
-        if (!recorded) {
-            log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
-            return { reason: 'injection_record_failed' };
+        const result = emit(commandOutput);
+        if (!('output' in result)) {
+            return result;
+        }
+        if (successNotice !== undefined) {
+            log(promptLogLine(tool, payload, successNotice));
         }
         if (storeShownSessionIds && shownSessionIds !== undefined) {
             store.shownSessionLists.replace(tool, payload.session_id, shownSessionIds);
         }
         log(promptLogLine(tool, payload, command?.kind ?? 'help'));
-        return { output: envelope(output) };
+        return result;
     } catch {
         log(promptLogLine(tool, payload, 'failed reason=hook_error'));
         return { reason: 'hook_error' };

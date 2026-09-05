@@ -16,11 +16,9 @@ import { updateAvailablePath } from '../config/paths.js';
 import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
-import { escapeShellSyntax } from '../security/sanitize.js';
-import { buildInjectionId, wrap } from '../security/sentinel.js';
 import { gitRevListCountHeadAsync, gitRevParseAbbrevRefHeadAsync } from '../security/subprocess-allowlist.js';
 import { servedContextInstructions } from '../serving/instructions.js';
-import { endedAt, hasRealContent, newestActivity, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
+import { endedAt, newestActivity, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
@@ -29,6 +27,7 @@ import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookSource, type HookTool, parsePayload, readStdin, type SessionStartPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
+import { recordHookOutput } from './output.js';
 
 export interface SessionStartDependencies {
     dbPath?: string;
@@ -236,49 +235,67 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         return { reason: 'database_unavailable' };
     }
     try {
+        const store = new MemoryStore(db);
+        const clock = dependencies.now ?? Date.now;
+        const emit = (
+            body: string,
+            kind: 'brief' | 'notify',
+            channel: 'additionalContext' | 'systemMessage',
+            emittedAt: number = clock(),
+        ): HookResult => {
+            const output = recordHookOutput({
+                store,
+                tool,
+                nativeSessionId: payload.session_id,
+                injectedAt: new Date(emittedAt).toISOString(),
+                body,
+                kind,
+                writeInjection: dependencies.writeInjection,
+            });
+            if (output === undefined) {
+                log(sessionLogLine(tool, payload, 'failed reason=injection_record_failed'));
+                return { reason: 'injection_record_failed' };
+            }
+            return { output: envelope(tool, output, channel) };
+        };
         if (isMemoryLocked(db)) {
-            log(sessionLogLine(tool, payload, 'served locked'));
-            return { output: envelope(tool, LOCKED_MEMORY_MESSAGE, notifyChannel(tool)) };
+            const result = emit(LOCKED_MEMORY_MESSAGE, 'notify', notifyChannel(tool));
+            if ('output' in result) {
+                log(sessionLogLine(tool, payload, 'served locked'));
+            }
+            return result;
         }
-        const project = consentedProject(db, payload.cwd);
-        if (!project) {
-            let canonicalCwd: string;
-            try {
-                canonicalCwd = realpathSync(payload.cwd);
-            } catch {
-                return { reason: 'project_unavailable_or_unconsented' };
-            }
-            const consent = new MemoryStore(db).consent;
-            const captureOffRoot = consent.captureOffNudge(canonicalCwd);
-            if (captureOffRoot) {
-                const reader = new SessionReader(db);
-                const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-                const consentedProjects = projectResolver(db).listConsentedStored(consent);
-                const total = reader.consentedTotal(consentedProjects);
-                const resolution = projectResolver(db).resolve(canonicalCwd);
-                const here =
-                    'project' in resolution && resolution.project !== null
-                        ? reader.sessionsFor(resolution.project).filter(hasRealContent).length
-                        : 0;
-                const countLabel = here === total ? `${total} sessions` : `${here}/${total} sessions`;
-                const grantHint =
-                    captureOffRoot !== 'refused' && captureOffRoot.state === 'pending'
-                        ? ` · run 'elepha consent grant ${captureOffRoot.path}' to capture here`
-                        : '';
-                const body = escapeShellSyntax(`🐘 elepha · ${countLabel} · capture off · type elepha:list to recall${grantHint}`);
+        let canonicalCwd: string;
+        try {
+            canonicalCwd = realpathSync(payload.cwd);
+        } catch {
+            return { reason: 'project_unavailable_or_unconsented' };
+        }
+        const captureOffRoot = store.consent.captureOffNudge(canonicalCwd);
+        if (captureOffRoot) {
+            const grantHint =
+                captureOffRoot !== 'refused' && captureOffRoot.state === 'pending'
+                    ? ` · run 'elepha consent grant ${captureOffRoot.path}' to capture here`
+                    : '';
+            const body = `🐘 elepha · capture off · type elepha:list to recall${grantHint}`;
+            const result = emit(body, 'notify', notifyChannel(tool));
+            if ('output' in result) {
                 log(sessionLogLine(tool, payload, 'emitted capture-off nudge'));
-                return { output: envelope(tool, body, notifyChannel(tool)) };
             }
+            return result;
+        }
+        const project = consentedProject(db, canonicalCwd);
+        if (!project) {
             return { reason: 'project_unavailable_or_unconsented' };
         }
         const reader = new SessionReader(db);
         const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-        const consentedProjects = projectResolver(db).listConsentedStored(new MemoryStore(db).consent);
+        const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
         if (reader.consentedTotal(consentedProjects) === 0) {
             return { reason: 'no_consented_sessions' };
         }
         const session = reader.newestSubstantive(project);
-        const now = (dependencies.now ?? Date.now)();
+        const now = clock();
         const age = session === undefined ? undefined : now - Date.parse(endedAt(session));
         let effective = mode;
         if (
@@ -335,26 +352,23 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         }
         body = withDaemonHealthWarning(body, now, dependencies.daemonHealth ?? classifyDaemonHealth);
         body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
-        body = escapeShellSyntax(body);
         if (isMemoryLocked(db)) {
-            log(sessionLogLine(tool, payload, 'served locked'));
-            return { output: envelope(tool, LOCKED_MEMORY_MESSAGE, notifyChannel(tool)) };
+            const result = emit(LOCKED_MEMORY_MESSAGE, 'notify', notifyChannel(tool));
+            if ('output' in result) {
+                log(sessionLogLine(tool, payload, 'served locked'));
+            }
+            return result;
         }
-        const injectionId = buildInjectionId();
-        const output = effective === 'auto' ? wrap('brief', injectionId, body) : body;
-        const store = new MemoryStore(db);
-        const recorded = (dependencies.writeInjection ?? ((s, input) => s.recordInjection(input)))(store, {
-            tool,
-            nativeSessionId: payload.session_id,
-            injectedAt: new Date(now).toISOString(),
-            injectionId,
+        const result = emit(
             body,
-        });
-        if (!recorded) {
-            return { reason: 'injection_record_failed' };
+            effective === 'auto' ? 'brief' : 'notify',
+            effective === 'auto' ? 'additionalContext' : notifyChannel(tool),
+            now,
+        );
+        if ('output' in result) {
+            log(sessionLogLine(tool, payload, `emitted ${effective}`));
         }
-        log(sessionLogLine(tool, payload, `emitted ${effective}`));
-        return { output: envelope(tool, output, effective === 'auto' ? 'additionalContext' : notifyChannel(tool)) };
+        return result;
     } catch (error) {
         log(sessionLogLine(tool, payload, (error as Error).message));
         return { reason: 'hook_error' };

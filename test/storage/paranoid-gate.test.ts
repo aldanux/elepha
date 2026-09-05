@@ -7,6 +7,7 @@ import { RollupService } from '../../src/daemon/rollup-service.js';
 import { runSessionStart } from '../../src/hooks/session-start.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
+import { wrap } from '../../src/security/sentinel.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import type { DatabaseEncryptionRuntime } from '../../src/storage/database-encryption.js';
@@ -107,7 +108,7 @@ function codexHookText(result: { output: Record<string, unknown> } | { reason: s
 }
 
 describe('paranoid read gate', () => {
-    it('locks every serving surface, permits writes, and reveals captured-during-lock content only after unlock', async () => {
+    it('C11 sentinel-wraps locked hook output while the gate blocks every protected serving surface', async () => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);
 
@@ -170,9 +171,18 @@ describe('paranoid read gate', () => {
                 dbPath: seeded.dbPath,
                 openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
                 readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG } }),
+                projectResolver: () => {
+                    throw new Error('locked output must not resolve or read protected projects');
+                },
             },
         );
-        expect(codexHookText(startup)).toBe(LOCKED_MEMORY_MESSAGE);
+        const startupInjection = seeded.db
+            .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
+            .get('codex', 'current') as { injection_id: string; body: string } | undefined;
+        expect(startupInjection?.body).toBe(LOCKED_MEMORY_MESSAGE);
+        expect(codexHookText(startup)).toBe(
+            startupInjection === undefined ? undefined : wrap('notify', startupInjection.injection_id, LOCKED_MEMORY_MESSAGE),
+        );
         const prompt = await runUserPromptSubmit(
             JSON.stringify({
                 session_id: 'current',
@@ -186,9 +196,17 @@ describe('paranoid read gate', () => {
             {
                 dbPath: seeded.dbPath,
                 openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
+                projectResolver: () => {
+                    throw new Error('locked output must not resolve or read protected projects');
+                },
             },
         );
-        expect(codexHookText(prompt)).toBe(LOCKED_MEMORY_MESSAGE);
+        const promptInjections = seeded.db
+            .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
+            .all('codex', 'current') as Array<{ injection_id: string; body: string }>;
+        expect(promptInjections.map((injection) => injection.body)).toEqual([LOCKED_MEMORY_MESSAGE]);
+        expect(codexHookText(prompt)).toMatch(/^\[\[elepha:brief:[0-9A-Z]{26}]]\n/);
+        expect(codexHookText(prompt)?.split('\n').slice(1, -1).join('\n')).toBe(LOCKED_MEMORY_MESSAGE);
 
         expect(
             seeded.store.recordTurn(

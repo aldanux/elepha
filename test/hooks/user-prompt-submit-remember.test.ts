@@ -264,6 +264,23 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(contextOf(result)).toContain(REMEMBER_QUERY_REQUIRED);
     });
 
+    it('does not log an unconsented here notice when injection recording fails', async () => {
+        const fixture = createTestDb('elepha-remember-unconsented-record-failure-');
+        const { projectPath } = addProject(fixture, 'denied', 'denied');
+        fixture.close();
+        const log: string[] = [];
+
+        const result = await runUserPromptSubmit(payload(projectPath, 'elepha:query:here missing'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW,
+            writeInjection: () => false,
+            log: (line) => log.push(line),
+        });
+
+        expect(result).toEqual({ reason: 'injection_record_failed' });
+        expect(log).toEqual(['user-prompt-submit codex session_id=current-session: failed reason=injection_record_failed']);
+    });
+
     it('searches other consented projects globally, keeps here local, and excludes denied projects', async () => {
         const fixture = createTestDb('elepha-remember-scope-');
         const current = addProject(fixture, 'current', 'approved');

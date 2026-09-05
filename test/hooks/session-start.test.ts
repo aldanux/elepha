@@ -12,7 +12,7 @@ import {
     type SessionStartDependencies,
 } from '../../src/hooks/session-start.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
-import { CLOSE, OPEN, open } from '../../src/security/sentinel.js';
+import { CLOSE, OPEN, open, wrap } from '../../src/security/sentinel.js';
 import { dataBlockClose, dataBlockOpen, servedContextInstructions } from '../../src/serving/instructions.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -185,7 +185,7 @@ function hookText(result: Awaited<ReturnType<typeof runSessionStart>>, tool: 'cl
 
 function normalizedHookResult(result: Awaited<ReturnType<typeof runSessionStart>>): string {
     return JSON.stringify(result)
-        .replace(/\[\[elepha:brief:[0-9A-Z]{26}]]/g, '[[elepha:brief:<id>]]')
+        .replace(/\[\[elepha:(brief|notify):[0-9A-Z]{26}]]/g, '[[elepha:$1:<id>]]')
         .replace(/\[\[elepha-(data|end) [0-9a-f-]{36}]]/g, '[[elepha-$1 <nonce>]]');
 }
 
@@ -305,7 +305,8 @@ describe('P2.8 SessionStart hook', () => {
         expect('output' in result).toBe(true);
         if ('output' in result) {
             const context = (result.output.hookSpecificOutput as Record<string, string>).additionalContext;
-            expect(context).toBe(
+            expect(context).toMatch(/^\[\[elepha:notify:[0-9A-Z]{26}]]\n/);
+            expect(context.split('\n').slice(1, -1).join('\n')).toBe(
                 '🐘 elepha · 1/2 sessions · capture on · last in Claude Code Desktop, 2m ago · type elepha:last to resume',
             );
             expect(context).not.toContain('Codex CLI, 1m ago');
@@ -371,7 +372,7 @@ describe('P2.8 SessionStart hook', () => {
         }
     });
 
-    it('keeps newestSubstantive as the auto-context selector when newer activity is one turn', async () => {
+    it('C11 keeps automatic briefs sentinel-wrapped while selecting newest substantive context', async () => {
         const { dbPath, cwd } = seededDb({ ageMs: 9 * 60 * 60 * 1000, gitCommitCount: 100, sourcePath: AUTO_SOURCE });
         addSession(dbPath, {
             nativeId: 'recent-one-turn-session',
@@ -583,7 +584,7 @@ describe('P2.8 SessionStart hook', () => {
         }
     });
 
-    it('routes capture-off consent and count outcomes through both tool channels without exposing memory', async () => {
+    it('C11 sentinel-wraps and records pending and denied capture-off output without changing its inner body', async () => {
         for (const tool of ['claude-code', 'codex'] as const) {
             for (const state of ['pending', 'denied'] as const) {
                 const { dbPath } = seededDb();
@@ -594,16 +595,28 @@ describe('P2.8 SessionStart hook', () => {
                     db.close();
                 }
                 const input = sessionStartPayload(cwd, `${state}-session`);
-                const first = await runSessionStart(input, tool, { dbPath, now: () => NOW, readConfig: () => NOTIFY_CONFIG });
-                const body = hookText(first, tool);
+                const protectedProjectRead = vi.fn(() => {
+                    throw new Error('capture-off output must not resolve or read protected projects');
+                });
+                const dependencies = {
+                    dbPath,
+                    now: () => NOW,
+                    readConfig: () => NOTIFY_CONFIG,
+                    projectResolver: protectedProjectRead,
+                };
+                const first = await runSessionStart(input, tool, dependencies);
                 const grantHint = state === 'pending' ? ` · run 'elepha consent grant ${cwd}' to capture here` : '';
-                expect(body).toBe(`🐘 elepha · 1 sessions · capture off · type elepha:list to recall${grantHint}`);
-                expect(body).not.toContain('Stored real session');
-                expect(body).not.toContain(OPEN);
-                await expect(runSessionStart(input, tool, { dbPath, now: () => NOW, readConfig: () => NOTIFY_CONFIG })).resolves.toEqual(
-                    first,
-                );
+                const innerBody = `🐘 elepha · capture off · type elepha:list to recall${grantHint}`;
                 const db = openUnmanagedDb(dbPath);
+                const injection = db
+                    .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ?')
+                    .get(tool, `${state}-session`) as { injection_id: string; body: string } | undefined;
+                expect(injection?.body).toBe(innerBody);
+                expect(hookText(first, tool)).toBe(injection === undefined ? undefined : wrap('notify', injection.injection_id, innerBody));
+                expect(hookText(first, tool)).not.toContain('Stored real session');
+                const repeated = await runSessionStart(input, tool, dependencies);
+                expect(hookText(repeated, tool)?.split('\n').slice(1, -1).join('\n')).toBe(innerBody);
+                expect(protectedProjectRead).not.toHaveBeenCalled();
                 expect(db.prepare('SELECT nudged_at FROM consent_roots WHERE path = ?').get(cwd)).toEqual({ nudged_at: null });
                 db.close();
             }
@@ -624,7 +637,8 @@ describe('P2.8 SessionStart hook', () => {
             now: () => NOW,
             readConfig: () => NOTIFY_CONFIG,
         });
-        expect(hookText(retainedResult, 'codex')).toContain('6/1 sessions');
+        expect(hookText(retainedResult, 'codex')).toContain('🐘 elepha · capture off · type elepha:list to recall');
+        expect(hookText(retainedResult, 'codex')).not.toContain('6/1 sessions');
 
         const emptyDbPath = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-capture-off-zero-')), 'elepha.db');
         const emptyCwd = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-capture-off-project-')));
@@ -634,7 +648,8 @@ describe('P2.8 SessionStart hook', () => {
             now: () => NOW,
             readConfig: () => NOTIFY_CONFIG,
         });
-        expect(hookText(emptyResult, 'codex')).toContain('0 sessions');
+        expect(hookText(emptyResult, 'codex')).toContain('🐘 elepha · capture off · type elepha:list to recall');
+        expect(hookText(emptyResult, 'codex')).not.toContain('0 sessions');
         expect(hookText(emptyResult, 'codex')).not.toContain('0/');
 
         const offCwd = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-off-project-')));
@@ -661,8 +676,13 @@ describe('P2.8 SessionStart hook', () => {
 
         const reopened = openUnmanagedDb(dbPath);
         expect(reopened.prepare('SELECT ulid, path, state, decided_at, source FROM consent_roots ORDER BY path').all()).toEqual(before);
+        const injection = reopened
+            .prepare('SELECT injection_id FROM injections WHERE tool = ? AND native_session_id = ?')
+            .get('codex', 'refused-home-session') as { injection_id: string };
         reopened.close();
-        expect(hookText(result, 'codex')).toBe('🐘 elepha · 1 sessions · capture off · type elepha:list to recall');
+        expect(hookText(result, 'codex')).toBe(
+            wrap('notify', injection.injection_id, '🐘 elepha · capture off · type elepha:list to recall'),
+        );
         expect(hookText(result, 'codex')).not.toContain('consent grant');
     });
 
@@ -831,7 +851,7 @@ describe('P2.8 SessionStart hook', () => {
 
             expect(normalizedHookResult(asynchronous), scenario.name).toBe(normalizedHookResult(baseline));
             expect(asyncLog, scenario.name).toEqual(baselineLog);
-            expect(normalizedHookResult(asynchronous).includes(`${OPEN}brief:`), scenario.name).toBe(scenario.brief);
+            expect(JSON.stringify(asynchronous).includes(`${OPEN}brief:`), scenario.name).toBe(scenario.brief);
         }
     });
 
@@ -1104,7 +1124,7 @@ describe('P2.8 SessionStart hook', () => {
         expect(seen).toEqual([cwd, cwd]);
     });
 
-    it('routes sentinel-free notify through both tools while retaining quote-back protection', async () => {
+    it('C11 sentinel-wraps notify for both tools after recording its exact inner body', async () => {
         for (const tool of ['claude-code', 'codex'] as const) {
             const { dbPath, cwd } = seededDb();
             let sawPersistentWrite = false;
@@ -1123,13 +1143,19 @@ describe('P2.8 SessionStart hook', () => {
             });
             expect(sawPersistentWrite).toBe(true);
             expect(log).toContain(`session-start ${tool} source=startup session_id=native-session: emitted notify`);
-            expect(hookText(result, tool)).toContain('capture on');
-            expect(JSON.stringify(result)).not.toContain(OPEN);
+            const db = openUnmanagedDb(dbPath);
+            const injection = db
+                .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ?')
+                .get(tool, 'native-session') as { injection_id: string; body: string };
+            db.close();
+            expect(injection.body).toContain('capture on');
+            expect(hookText(result, tool)).toBe(wrap('notify', injection.injection_id, injection.body));
         }
     });
 
     it('prints nothing when injection persistence fails', async () => {
         const { dbPath, cwd } = seededDb();
+        const log: string[] = [];
         const result = await runSessionStart(
             JSON.stringify({
                 session_id: 'native-session',
@@ -1144,9 +1170,11 @@ describe('P2.8 SessionStart hook', () => {
                 dbPath,
                 writeInjection: () => false,
                 readConfig: () => ({ config: { on_startup: 'notify', on_clear: 'notify', on_resume: 'auto', on_compact: 'off' } }),
+                log: (line) => log.push(line),
             },
         );
         expect(result).toEqual({ reason: 'injection_record_failed' });
+        expect(log).toEqual(['session-start claude-code source=startup session_id=native-session: failed reason=injection_record_failed']);
     });
 
     it('writes hook diagnostics to its configured temporary log with attributable session metadata', async () => {
