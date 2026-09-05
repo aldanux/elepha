@@ -71,6 +71,123 @@ function enabledConfig() {
 describe('daemon durable capture backfill', () => {
     afterEach(() => vi.unstubAllEnvs());
 
+    it('suppresses an injection recorded after turn start in both live capture and later backfill', async () => {
+        const injectionBody = 'The same turn quote back contains the unique c10samequotebackneedle from Elepha output.';
+        const liveFixture = createTestDb('elepha-live-same-turn-quote-back-');
+        const liveProject = seedProject(liveFixture);
+        liveFixture.store.consent.grant(liveProject.path);
+        const liveSource = path.join(liveFixture.directory, 'live.jsonl');
+        writeFileSync(liveSource, '{}\n');
+        const liveTurn = {
+            ...parsedTurn(liveSource, 'live-same-turn', 0),
+            projectPath: liveProject.path,
+            startedAt: '2026-09-04T00:00:00.000Z',
+            endedAt: '2026-09-04T00:00:02.000Z',
+            userMessage: `The assistant quoted this later in the same turn: ${injectionBody}`,
+        };
+        liveFixture.store.recordInjection({
+            tool: 'claude-code',
+            nativeSessionId: liveTurn.sessionId,
+            injectedAt: '2026-09-04T00:00:01.000Z',
+            injectionId: '01J00000000000000000000010',
+            body: injectionBody,
+        });
+        const summarize = vi.fn().mockResolvedValue({ decisions: [], pending_items: [], status: 'ok' });
+        const liveAdapter = adapterFor(new Map(), []);
+        const liveDaemon = new IngestionDaemon({
+            store: liveFixture.store,
+            summarizer: { summarize },
+            adapters: [liveAdapter],
+            watchRoots: [],
+        });
+        const livePersisted = await (
+            liveDaemon as unknown as { persistTurn(adapter: SessionAdapter, turn: ParsedTurn): Promise<boolean> }
+        ).persistTurn(liveAdapter, liveTurn);
+
+        const backfillFixture = createTestDb('elepha-backfill-same-turn-quote-back-');
+        const claudeConfigDir = path.join(backfillFixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const backfillProject = seedProject(backfillFixture);
+        backfillFixture.store.consent.grant(backfillProject.path);
+        const backfillSource = path.join(providerRoot, 'backfill-same-turn.jsonl');
+        writeFileSync(backfillSource, '{}\n');
+        const backfillSession = seedSession(backfillFixture, {
+            project: backfillProject,
+            tool: 'claude-code',
+            nativeId: 'backfill-same-turn',
+            sourcePath: backfillSource,
+        });
+        seedMemory(backfillFixture, { project: backfillProject, session: backfillSession, turnIndex: 0 });
+        const backfillTurn = {
+            ...parsedTurn(backfillSource, backfillSession.native_id, 0),
+            projectPath: backfillProject.path,
+            startedAt: '2026-09-04T00:00:00.000Z',
+            endedAt: '2026-09-04T00:00:02.000Z',
+            assistantText: `The assistant quoted this later in the same turn: ${injectionBody}`,
+        };
+        backfillFixture.store.recordInjection({
+            tool: 'claude-code',
+            nativeSessionId: backfillTurn.sessionId,
+            injectedAt: '2026-09-04T00:00:01.000Z',
+            injectionId: '01J00000000000000000000011',
+            body: injectionBody,
+        });
+        const backfillParsed: string[] = [];
+        const backfillDaemon = new IngestionDaemon({
+            store: backfillFixture.store,
+            adapters: [adapterFor(new Map([[backfillSource, [backfillTurn]]]), backfillParsed)],
+            watchRoots: [],
+            heartbeatPath: path.join(backfillFixture.directory, 'heartbeat.json'),
+            updateCheck: () => undefined,
+            readCorpus: async () => [],
+            readConfig: enabledConfig,
+        });
+        backfillDaemon.start();
+        await waitFor(() => {
+            const status = backfillFixture.db
+                .prepare('SELECT state FROM durable_capture_status WHERE session_id = ?')
+                .get(backfillSession.id) as { state: string } | undefined;
+            return status !== undefined && status.state !== 'backfilling';
+        });
+        await backfillDaemon.stop();
+
+        expect({
+            livePersisted,
+            liveSummaries: summarize.mock.calls.length,
+            liveMemories: liveFixture.db.prepare('SELECT COUNT(*) AS count FROM memories').get(),
+            liveRollups: liveFixture.db.prepare('SELECT COUNT(*) AS count FROM session_rollups').get(),
+            liveFiltered: liveFixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
+            liveFts: liveFixture.db
+                .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c10samequotebackneedle'")
+                .all(),
+            liveUsage: liveFixture.db.prepare('SELECT total_bytes FROM durable_capture_usage').get(),
+            backfillParsed,
+            backfillState: backfillFixture.db
+                .prepare('SELECT state FROM durable_capture_status WHERE session_id = ?')
+                .get(backfillSession.id),
+            backfillFiltered: backfillFixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get(),
+            backfillFts: backfillFixture.db
+                .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c10samequotebackneedle'")
+                .all(),
+            backfillUsage: backfillFixture.db.prepare('SELECT total_bytes FROM durable_capture_usage').get(),
+        }).toEqual({
+            livePersisted: false,
+            liveSummaries: 0,
+            liveMemories: { count: 0 },
+            liveRollups: { count: 0 },
+            liveFiltered: { count: 0 },
+            liveFts: [],
+            liveUsage: { total_bytes: 0 },
+            backfillParsed: [backfillSource],
+            backfillState: { state: 'parse_error' },
+            backfillFiltered: { count: 0 },
+            backfillFts: [],
+            backfillUsage: { total_bytes: 0 },
+        });
+    });
+
     it('enforces the configured byte cap while backfilling sessions', () => {
         const fixture = createTestDb('elepha-durable-backfill-cap-');
         const project = seedProject(fixture);

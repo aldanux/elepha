@@ -48,7 +48,6 @@ import { readSessionMetadata } from '../discovery/session-projects.js';
 import { installedAndLatestElephaVersionAsync } from '../install/self-update.js';
 import { filterTurn } from '../rendering/filtered-turn.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
-import { isNearVerbatim, turnText } from '../security/self-ingestion.js';
 import type { ConsentState } from '../storage/consent-store.js';
 import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
@@ -505,8 +504,7 @@ export class IngestionDaemon {
                         if (turn.droppedReason === 'sentinel') {
                             continue;
                         }
-                        const injections = this.store.injectionsForSession(turn.tool, turn.sessionId, turn.startedAt);
-                        if (injections.some((injection) => isNearVerbatim(turnText(turn), injection.body))) {
+                        if (this.store.isInjectionQuoteBack(turn)) {
                             this.log(
                                 formatDaemonLog(
                                     `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} suppressed turn ${turn.turnIndex}: self-injected content (quote-back)`,
@@ -1152,8 +1150,7 @@ export class IngestionDaemon {
         // summarizer: adapters stay DB-free, while a match must have no memory
         // side effects. The existing session's cursor is the sole exception,
         // otherwise this complete source turn would be re-read forever.
-        const injections = this.store.injectionsForSession(turn.tool, turn.sessionId, turn.startedAt);
-        if (injections.some((injection) => isNearVerbatim(turnText(turn), injection.body))) {
+        if (this.store.isInjectionQuoteBack(turn)) {
             this.store.advanceExistingSessionCursor(turn.tool, turn.sessionId, turn.cursor);
             this.log(
                 formatDaemonLog(`[elepha] dropped turn ${turn.turnIndex} of ${turn.sessionId}: self-injected content (quote-back)`, turn),

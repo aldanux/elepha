@@ -112,6 +112,10 @@ export class MemoryStore {
         return this.injections.injectionsForSession(tool, nativeSessionId, atOrBefore);
     }
 
+    isInjectionQuoteBack(turn: ParsedTurn): boolean {
+        return this.injections.isQuoteBack(turn);
+    }
+
     hasMemoryForNativeTurn(tool: ToolName, nativeId: string, turnIndex: number): boolean {
         return this.turns.hasMemoryForNativeTurn(tool, nativeId, turnIndex);
     }

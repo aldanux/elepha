@@ -205,7 +205,7 @@ describe('Rule 4 self-ingestion guard', () => {
             store.recordInjection({
                 tool,
                 nativeSessionId: SESSION,
-                injectedAt: '2026-08-17T10:00:00.000Z',
+                injectedAt: '2026-08-17T10:01:00.500Z',
                 injectionId: '01J00000000000000000000000',
                 body,
             });
@@ -247,4 +247,67 @@ describe('Rule 4 self-ingestion guard', () => {
             expect(store.findSession(tool, SESSION)?.id).toBe(session.id);
         },
     );
+
+    it('does not suppress same-turn content from another tool, another session, or a nearby nonmatch', async () => {
+        const store = new MemoryStore(openUnmanagedDb(':memory:'));
+        store.consent.grant(PROJECT);
+        const exactBody = 'The selected architecture keeps transcript capture passive and local across tools.';
+        const scopedInjection = {
+            injectedAt: '2026-08-17T10:01:00.500Z',
+            injectionId: '01J00000000000000000000000',
+            body: exactBody,
+        };
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'codex',
+                nativeSessionId: SESSION,
+            }),
+        ).toBe(true);
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'claude-code',
+                nativeSessionId: 'other-session',
+            }),
+        ).toBe(true);
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'claude-code',
+                nativeSessionId: SESSION,
+                body: 'The nearby architecture keeps browser cleanup manual and remote across unrelated teams.',
+            }),
+        ).toBe(true);
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'claude-code',
+                nativeSessionId: SESSION,
+                injectedAt: '2026-08-17T10:01:02.000Z',
+            }),
+        ).toBe(true);
+        const summarizer = new CountingSummarizer();
+        const daemon = new IngestionDaemon({ store, summarizer });
+        const turn: ParsedTurn = {
+            tool: 'claude-code',
+            sessionId: SESSION,
+            sourcePath: '/tmp/rule4-control.jsonl',
+            projectPath: PROJECT,
+            turnIndex: 0,
+            startedAt: '2026-08-17T10:01:00.000Z',
+            endedAt: '2026-08-17T10:01:01.000Z',
+            userMessage: `A different scoped injection said: ${exactBody}`,
+            assistantText: 'Continue with the nearby but nonmatching value.',
+            toolCalls: [],
+            cursor: '100|1|control',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+
+        expect(await (daemon as unknown as DaemonSeam).persistTurn(new ClaudeCodeAdapter(), turn)).toBe(true);
+        expect(summarizer.calls).toHaveLength(1);
+        expect(store.findSession('claude-code', SESSION)).toBeDefined();
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 1 });
+    });
 });
