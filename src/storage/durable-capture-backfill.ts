@@ -140,7 +140,7 @@ export class DurableCaptureBackfillStore {
             if (existing !== undefined) {
                 return { state: 'already_recorded', sessionId: memory.session_id };
             }
-            if (!this.durableCapture.record(memory.memory_id, memory.session_id, projection, capturedAt, this.maxBytes)) {
+            if (this.durableCapture.record(memory.memory_id, memory.session_id, projection, capturedAt, this.maxBytes) === 'not_retained') {
                 return { state: 'evicted' };
             }
             // DurableCaptureStore computes live coverage after every insert;

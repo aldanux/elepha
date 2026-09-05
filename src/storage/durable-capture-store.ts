@@ -30,6 +30,8 @@ interface StoredProjection {
     droppedToolRefCount: number;
 }
 
+export type DurableCaptureRecordResult = 'retained' | 'not_retained';
+
 function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredProjection {
     const entries: ProjectionEntry[] = [];
     let retainedChars = 0;
@@ -158,10 +160,10 @@ export class DurableCaptureStore {
         projection: FilteredTurnProjection,
         capturedAt: string,
         maxBytes = DURABLE_CAPTURE_MAX_BYTES,
-    ): boolean {
+    ): DurableCaptureRecordResult {
         const status = this.statusForSession.get(sessionId) as { state: DurableCaptureState } | undefined;
         if (status?.state === 'evicted') {
-            return false;
+            return 'not_retained';
         }
         const stored = projection.included
             ? boundedSanitizedProjection(projection)
@@ -180,8 +182,7 @@ export class DurableCaptureStore {
         });
         const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
         this.upsertStatus.run(sessionId, row.state, projection.filterVersion, capturedAt);
-        this.enforceMaxBytes(sessionId, maxBytes, capturedAt);
-        return true;
+        return this.enforceMaxBytes(sessionId, maxBytes, capturedAt);
     }
 
     setStatus(sessionId: number, state: DurableCaptureState, updatedAt: string): void {
@@ -194,10 +195,10 @@ export class DurableCaptureStore {
         return row.state;
     }
 
-    private enforceMaxBytes(currentSessionId: number, maxBytes: number, updatedAt: string): void {
+    private enforceMaxBytes(currentSessionId: number, maxBytes: number, updatedAt: string): DurableCaptureRecordResult {
         let totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
         if (totalBytes <= maxBytes) {
-            return;
+            return 'retained';
         }
         const candidates = this.evictionCandidates.all(currentSessionId) as Array<{ id: number; source_path: string }>;
         const recoverable: Array<{ id: number; source_path: string }> = [];
@@ -213,8 +214,11 @@ export class DurableCaptureStore {
             this.upsertStatus.run(victim.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
             totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
             if (totalBytes <= maxBytes) {
-                return;
+                return 'retained';
             }
         }
+        this.deleteSessionTurns.run(currentSessionId);
+        this.upsertStatus.run(currentSessionId, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
+        return 'not_retained';
     }
 }

@@ -255,6 +255,56 @@ describe('daemon durable capture backfill', () => {
         });
     });
 
+    it('reports one oversized current turn as evicted and finish cannot retain it', () => {
+        const fixture = createTestDb('elepha-durable-backfill-oversized-');
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const sourcePath = path.join(fixture.directory, 'oversized.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'oversized', sourcePath });
+        const memory = seedMemory(fixture, { project, session });
+        const store = new DurableCaptureBackfillStore(fixture.db, fixture.store.consent, 64);
+        const candidate: DurableCaptureBackfillSession = {
+            id: session.id,
+            projectId: session.project_id,
+            tool: session.tool,
+            nativeId: session.native_id,
+            sourcePath: session.source_path,
+        };
+        const parsed = parsedTurn(sourcePath, session.native_id, 0);
+        parsed.userMessage = `oversizedcurrentneedle-${'x'.repeat(200)}`;
+        parsed.assistantText = '';
+        parsed.toolCalls = [];
+
+        expect(store.begin(candidate, NOW)?.missingTurnIndexes).toEqual(new Set([0]));
+        expect(store.record(candidate, 0, filterTurn(parsed), NOW)).toEqual({ state: 'evicted' });
+        store.finish(candidate, new Set([session.id]), 'success', NOW);
+
+        expect(fixture.db.prepare('SELECT id FROM memories WHERE session_id = ?').get(session.id)).toEqual({ id: memory.id });
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+            state: 'evicted',
+        });
+        expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(
+            fixture.db.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'oversizedcurrentneedle'").all(),
+        ).toEqual([]);
+        const usage = fixture.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as {
+            total_bytes: number;
+        };
+        const actual = fixture.db
+            .prepare(
+                `SELECT COALESCE(SUM(
+                   length(CAST(user_prompt AS BLOB)) +
+                   length(CAST(assistant_response AS BLOB)) +
+                   length(CAST(tool_calls AS BLOB))
+                 ), 0) AS total_bytes
+                 FROM filtered_turns`,
+            )
+            .get() as { total_bytes: number };
+        expect(usage).toEqual(actual);
+        expect(usage.total_bytes).toBeLessThanOrEqual(64);
+    });
+
     it('runs after the startup sweep, fills historical memories without synthesis, and marks a missing source unavailable', async () => {
         const fixture = createTestDb('elepha-durable-backfill-');
         const claudeConfigDir = path.join(fixture.directory, 'claude-home');

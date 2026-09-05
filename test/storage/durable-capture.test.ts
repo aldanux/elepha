@@ -162,6 +162,97 @@ describe('durable capture storage', () => {
         });
     });
 
+    it('evicts the current session when its only turn cannot fit under cap 1', () => {
+        const { store, projectId, sessionId } = fixture();
+
+        expect(store.recordTurn(turn(), sessionId, projectId, summary, true, 1)).toBe(true);
+
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 1 });
+        expect(store.getSessionCursor('codex', 'durable-session')).toBe('100|1');
+        const usage = store.database.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as {
+            total_bytes: number;
+        };
+        const actual = store.database
+            .prepare(
+                `SELECT COALESCE(SUM(
+                   length(CAST(user_prompt AS BLOB)) +
+                   length(CAST(assistant_response AS BLOB)) +
+                   length(CAST(tool_calls AS BLOB))
+                 ), 0) AS total_bytes
+                 FROM filtered_turns`,
+            )
+            .get() as { total_bytes: number };
+        expect(usage).toEqual(actual);
+        expect(usage.total_bytes).toBeLessThanOrEqual(1);
+        expect(store.database.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(sessionId)).toEqual({
+            state: 'evicted',
+        });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'needle'").all()).toEqual([]);
+        expect(usage).toEqual({ total_bytes: 0 });
+    });
+
+    it('keeps source progress while repeated appends terminally evict the current session', () => {
+        const { store, projectId, sessionId } = fixture();
+        const record = (turnIndex: number, cursor: string): boolean =>
+            store.recordTurn(
+                turn({
+                    turnIndex,
+                    cursor,
+                    userMessage: `repeatcurrentneedle-${turnIndex}-${'x'.repeat(80)}`,
+                    assistantText: '',
+                    toolCalls: [],
+                }),
+                sessionId,
+                projectId,
+                summary,
+                true,
+                cap,
+            );
+
+        expect(
+            store.recordTurn(
+                turn({ userMessage: 'first retained turn', assistantText: '', toolCalls: [] }),
+                sessionId,
+                projectId,
+                summary,
+                true,
+            ),
+        ).toBe(true);
+        const cap = (
+            store.database.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as {
+                total_bytes: number;
+            }
+        ).total_bytes;
+        expect(record(1, '200|2')).toBe(true);
+        expect(record(2, '300|3')).toBe(true);
+
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 3 });
+        expect(store.getSessionCursor('codex', 'durable-session')).toBe('300|3');
+        expect(store.database.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(sessionId)).toEqual({
+            state: 'evicted',
+        });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(
+            store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'repeatcurrentneedle'").all(),
+        ).toEqual([]);
+        const usage = store.database.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as {
+            total_bytes: number;
+        };
+        const actual = store.database
+            .prepare(
+                `SELECT COALESCE(SUM(
+                   length(CAST(user_prompt AS BLOB)) +
+                   length(CAST(assistant_response AS BLOB)) +
+                   length(CAST(tool_calls AS BLOB))
+                 ), 0) AS total_bytes
+                 FROM filtered_turns`,
+            )
+            .get() as { total_bytes: number };
+        expect(usage).toEqual(actual);
+        expect(usage.total_bytes).toBeLessThanOrEqual(cap);
+    });
+
     it('evicts whole oldest recoverable sessions first and keeps the byte ledger exact', () => {
         const testDb = createTestDb('elepha-durable-cap-');
         const project = seedProject(testDb);
