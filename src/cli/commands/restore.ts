@@ -36,6 +36,8 @@ export const REQUIRED_RESTORE_TABLES = [
     'injections',
     'purged_transcripts',
 ] as const;
+export const RESTORE_TOMBSTONES_CHANGED_ERROR =
+    'Restore preview is stale because active transcript tombstones changed. Run restore again to review the current state.';
 
 type RequiredRestoreTable = (typeof REQUIRED_RESTORE_TABLES)[number];
 type RestoreCounts = Record<RequiredRestoreTable, number>;
@@ -50,6 +52,7 @@ const DATABASE_COMPANION_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
 
 type TombstoneTable = (typeof TOMBSTONE_TABLES)[number]['table'];
 type TranscriptTombstones = Record<TombstoneTable, TranscriptIdentity[]>;
+type TranscriptTombstonePlan = { tombstones: TranscriptTombstones; fingerprint: string };
 
 interface RestoreCommandOptions {
     skipConfirmation: boolean;
@@ -258,12 +261,41 @@ async function checkpointActiveDatabase(
     return db;
 }
 
-async function activeTranscriptTombstones(dbPath: string, encryption?: DatabaseEncryptionRuntime): Promise<TranscriptTombstones> {
+function transcriptTombstonePlan(tombstones: TranscriptTombstones): TranscriptTombstonePlan {
+    const normalized: TranscriptTombstones = { purged_transcripts: [], incognito_transcripts: [] };
+    for (const { table } of TOMBSTONE_TABLES) {
+        normalized[table] = [...tombstones[table]].sort((left, right) => {
+            if (left.tool < right.tool) {
+                return -1;
+            }
+            if (left.tool > right.tool) {
+                return 1;
+            }
+            if (left.native_id < right.native_id) {
+                return -1;
+            }
+            if (left.native_id > right.native_id) {
+                return 1;
+            }
+            return 0;
+        });
+    }
+    const serialized = JSON.stringify(
+        TOMBSTONE_TABLES.map(({ table }) => [table, normalized[table].map(({ tool, native_id }) => [tool, native_id])]),
+    );
+    return { tombstones: normalized, fingerprint: createHash('sha256').update(serialized).digest('hex') };
+}
+
+async function activeTranscriptTombstones(
+    dbPath: string,
+    encryption?: DatabaseEncryptionRuntime,
+    lifecycle?: ExclusiveDatabaseLifecycleLease,
+): Promise<TranscriptTombstonePlan> {
     const tombstones: TranscriptTombstones = { purged_transcripts: [], incognito_transcripts: [] };
     if (!existsSync(dbPath)) {
-        return tombstones;
+        return transcriptTombstonePlan(tombstones);
     }
-    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption });
+    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
     try {
         for (const { table } of TOMBSTONE_TABLES) {
             const exists = active.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
@@ -271,7 +303,7 @@ async function activeTranscriptTombstones(dbPath: string, encryption?: DatabaseE
                 tombstones[table] = active.prepare(`SELECT tool, native_id FROM ${table}`).all() as TranscriptIdentity[];
             }
         }
-        return tombstones;
+        return transcriptTombstonePlan(tombstones);
     } finally {
         active.close();
     }
@@ -412,8 +444,8 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         if (health.state.startsWith('STUCK')) {
             console.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
         }
-        const tombstones = await activeTranscriptTombstones(dbPath, runtime.encryption);
-        printPreview(dbPath, candidatePath, counts, tombstones);
+        const tombstonePlan = await activeTranscriptTombstones(dbPath, runtime.encryption);
+        printPreview(dbPath, candidatePath, counts, tombstonePlan.tombstones);
         if (runtime.confirm && !(await runtime.confirm())) {
             return { cancelled: true };
         }
@@ -428,6 +460,10 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             }
             if (!existsSync(dbPath)) {
                 throw new Error(`No active elepha database exists at ${dbPath}; nothing can be snapshotted before restore.`);
+            }
+            const currentTombstonePlan = await activeTranscriptTombstones(dbPath, runtime.encryption, lifecycle);
+            if (currentTombstonePlan.fingerprint !== tombstonePlan.fingerprint) {
+                throw new Error(RESTORE_TOMBSTONES_CHANGED_ERROR);
             }
             const active = await checkpointActiveDatabase(dbPath, lifecycle, runtime.encryption);
             let snapshotPath: string;
@@ -445,7 +481,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 assertInstalledRestoreHash(installedHash, stagedHash);
                 removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
                 await verifyRestoredDatabase(dbPath, counts, lifecycle, runtime.encryption);
-                await unionTranscriptTombstones(dbPath, tombstones, lifecycle, runtime.encryption);
+                await unionTranscriptTombstones(dbPath, currentTombstonePlan.tombstones, lifecycle, runtime.encryption);
                 // Read-only verification can create fresh empty WAL bookkeeping files;
                 // remove them too so no sidecar from before the replacement can survive.
                 removeAndVerifyDatabaseCompanions(dbPath, lifecycle);

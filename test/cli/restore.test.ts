@@ -17,7 +17,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { exportAll } from '../../src/cli/commands/backup.js';
-import { REQUIRED_RESTORE_TABLES, runRestoreOperation } from '../../src/cli/commands/restore.js';
+import { REQUIRED_RESTORE_TABLES, RESTORE_TOMBSTONES_CHANGED_ERROR, runRestoreOperation } from '../../src/cli/commands/restore.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { writeBackup } from '../../src/storage/backup.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
@@ -763,6 +763,134 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             ).toEqual({ count: 2 });
         } finally {
             restored.close();
+        }
+    });
+
+    it('aborts before mutation when an incognito tombstone is created during confirmation', async () => {
+        const active = createTestDb('elepha-restore-tombstone-race-active-');
+        const candidate = createTestDb('elepha-restore-tombstone-race-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        const nativeId = 'confirmation-race-incognito';
+        const needle = 'c19confirmationneedle';
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        const project = candidate.store.upsertProject(path.join(candidate.directory, 'durable-project'));
+        const session = candidate.store.upsertSession('codex', nativeId, project.id, path.join(candidate.directory, `${nativeId}.jsonl`));
+        candidate.store.recordTurn(
+            {
+                tool: 'codex',
+                sessionId: nativeId,
+                sourcePath: session.source_path,
+                projectPath: project.path,
+                turnIndex: 0,
+                startedAt: '2026-08-01T00:00:00.000Z',
+                endedAt: '2026-08-01T00:00:01.000Z',
+                userMessage: needle,
+                assistantText: 'must not be restored after the tombstone',
+                toolCalls: [],
+                cursor: '0',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            },
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'ok' },
+            true,
+        );
+        expect(candidate.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
+        expect(candidate.db.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle)).toHaveLength(1);
+        expect(
+            (candidate.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number })
+                .total_bytes,
+        ).toBeGreaterThan(0);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        let markConfirmationStarted!: () => void;
+        const confirmationStarted = new Promise<void>((resolve) => {
+            markConfirmationStarted = resolve;
+        });
+        let releaseConfirmation!: () => void;
+        const confirmationRelease = new Promise<void>((resolve) => {
+            releaseConfirmation = resolve;
+        });
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+        let previewShownWhenConfirmationStarted = false;
+        const restore = runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: async () => {
+                previewShownWhenConfirmationStarted = output.includes(`Restore preview: ${backup}`);
+                markConfirmationStarted();
+                await confirmationRelease;
+                return true;
+            },
+        });
+
+        await confirmationStarted;
+        const current = new MemoryStore(openUnmanagedDb(active.dbPath));
+        try {
+            current.recordIncognitoTranscript('codex', nativeId);
+        } finally {
+            current.database.close();
+        }
+        const activeBytesAfterTombstone = readFileSync(active.dbPath);
+        releaseConfirmation();
+        const outcome = await restore.then(
+            () => ({ status: 'resolved' as const, message: undefined }),
+            (error: unknown) => ({
+                status: 'rejected' as const,
+                message: error instanceof Error ? error.message : String(error),
+            }),
+        );
+        log.mockRestore();
+        const activeBytesAfterRestore = readFileSync(active.dbPath);
+
+        const inspected = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            inspected.exec('CREATE VIRTUAL TABLE temp.c19_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+            const rows = inspected
+                .prepare(
+                    `SELECT s.native_id,
+                            COUNT(DISTINCT m.id) AS memories,
+                            COUNT(DISTINCT ft.memory_id) AS filtered_turns
+                     FROM sessions s
+                     LEFT JOIN memories m ON m.session_id = s.id
+                     LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+                     WHERE s.tool = ? AND s.native_id = ?
+                     GROUP BY s.id, s.native_id`,
+                )
+                .all('codex', nativeId);
+            const tombstones = inspected
+                .prepare('SELECT tool, native_id FROM incognito_transcripts WHERE tool = ? AND native_id = ?')
+                .all('codex', nativeId);
+            const vocabulary = inspected.prepare('SELECT term, doc FROM temp.c19_terms WHERE term = ?').all(needle);
+            const matches = inspected.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle);
+            const usage = inspected.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get();
+            const measuredUsage = inspected
+                .prepare(
+                    `SELECT COALESCE(SUM(
+                         length(CAST(user_prompt AS BLOB)) +
+                         length(CAST(assistant_response AS BLOB)) +
+                         length(CAST(tool_calls AS BLOB))
+                     ), 0) AS total_bytes
+                     FROM filtered_turns`,
+                )
+                .get();
+
+            expect.soft(outcome).toEqual({ status: 'rejected', message: RESTORE_TOMBSTONES_CHANGED_ERROR });
+            expect.soft(previewShownWhenConfirmationStarted).toBe(true);
+            expect.soft(activeBytesAfterRestore).toEqual(activeBytesAfterTombstone);
+            expect.soft(tombstones).toEqual([{ tool: 'codex', native_id: nativeId }]);
+            expect.soft(rows).toEqual([]);
+            expect.soft(vocabulary).toEqual([]);
+            expect.soft(matches).toEqual([]);
+            expect.soft(usage).toEqual({ total_bytes: 0 });
+            expect.soft(measuredUsage).toEqual({ total_bytes: 0 });
+        } finally {
+            inspected.close();
         }
     });
 
