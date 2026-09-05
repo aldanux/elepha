@@ -70,11 +70,6 @@ describe('path comparison case handling', () => {
         expect(isWithin('/Users/test/Project', '/users/test/project/src', 'darwin')).toBe(true);
     });
 
-    it('folds case on Windows', () => {
-        expect(samePath('/Users/test/Project', '/users/test/project', 'win32')).toBe(true);
-        expect(isWithin('/Users/test/Project', '/users/test/project/src', 'win32')).toBe(true);
-    });
-
     it('preserves case on Linux', () => {
         expect(samePath('/Users/test/Project', '/users/test/project', 'linux')).toBe(false);
         expect(isWithin('/Users/test/Project', '/users/test/project/src', 'linux')).toBe(false);

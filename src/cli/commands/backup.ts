@@ -318,17 +318,15 @@ function assertDescriptorIdentity(descriptor: number, expected: DatabaseFileIden
 }
 
 function verifyThroughHeldDescriptor(databasePath: string, identity: DatabaseFileIdentity, verify: (sqlitePath: string) => void): void {
+    if (process.platform !== 'darwin' && process.platform !== 'linux') {
+        throw new Error('Backup verification is supported on macOS and Linux.');
+    }
     const descriptor = openSync(databasePath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (fsConstants.O_NOFOLLOW ?? 0));
     let primaryError: unknown;
     const cleanupFailures: unknown[] = [];
     try {
         assertDescriptorIdentity(descriptor, identity);
-        const sqlitePath =
-            process.platform === 'linux'
-                ? `/proc/self/fd/${String(descriptor)}`
-                : process.platform === 'darwin'
-                  ? `/dev/fd/${String(descriptor)}`
-                  : databasePath;
+        const sqlitePath = process.platform === 'linux' ? `/proc/self/fd/${String(descriptor)}` : `/dev/fd/${String(descriptor)}`;
         verify(sqlitePath);
         assertDescriptorIdentity(descriptor, identity);
     } catch (error: unknown) {

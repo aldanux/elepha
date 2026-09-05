@@ -4,10 +4,9 @@
 import { closeSync, constants as fsConstants, openSync } from 'node:fs';
 import { ReadStream } from 'node:tty';
 
-export async function readTtyPassphrase(prompt: string, platform: NodeJS.Platform = process.platform): Promise<string> {
+export async function readTtyPassphrase(prompt: string): Promise<string> {
     process.stderr.write(prompt);
-    const device = platform === 'win32' ? 'CONIN$' : '/dev/tty';
-    const descriptor = openSync(device, fsConstants.O_RDONLY);
+    const descriptor = openSync('/dev/tty', fsConstants.O_RDONLY);
     let input: ReadStream;
     try {
         input = new ReadStream(descriptor);

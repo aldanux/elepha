@@ -296,7 +296,7 @@ describe('ProjectResolver', () => {
         addProject(projectPath);
 
         const result = resolver().resolve(projectPath.toUpperCase());
-        if (process.platform === 'darwin' || process.platform === 'win32') {
+        if (process.platform === 'darwin') {
             expect(result).toEqual(expect.objectContaining({ project: expect.objectContaining({ paths: [projectPath] }) }));
         } else {
             expect(result).toEqual({ project: null });

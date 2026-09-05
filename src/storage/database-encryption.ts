@@ -22,6 +22,7 @@ import { errorMessage } from '../util/error.js';
 export const DATABASE_CREDENTIAL_SERVICE = 'dev.elepha.database';
 export const DATABASE_ENCRYPTION_METADATA_FILE = 'encryption.json';
 export const DATABASE_KEY_FILE = 'elepha.key';
+export const DATABASE_ENCRYPTION_PLATFORM_ERROR = 'elepha database encryption is supported on macOS and Linux.';
 const DBUS_NO_AUTO_START_FLAG = 0x02;
 
 export type EncryptionBackend = 'keyring' | 'key-file';
@@ -212,6 +213,14 @@ function isWsl(env: NodeJS.ProcessEnv, procVersion: () => string): boolean {
     }
 }
 
+function supportedPlatform(runtime: DatabaseEncryptionRuntime): 'darwin' | 'linux' {
+    const platform = runtime.platform ?? process.platform;
+    if (platform !== 'darwin' && platform !== 'linux') {
+        throw new Error(DATABASE_ENCRYPTION_PLATFORM_ERROR);
+    }
+    return platform;
+}
+
 async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -330,13 +339,10 @@ async function defaultLinuxSecretServiceProbe(): Promise<boolean> {
 }
 
 export async function selectBackend(runtime: DatabaseEncryptionRuntime): Promise<EncryptionBackend> {
-    const platform = runtime.platform ?? process.platform;
+    const platform = supportedPlatform(runtime);
     const env = runtime.env ?? process.env;
-    if (platform === 'darwin' || platform === 'win32') {
+    if (platform === 'darwin') {
         return 'keyring';
-    }
-    if (platform !== 'linux') {
-        return 'key-file';
     }
     const procVersion = runtime.procVersion ?? (() => readFileSync('/proc/version', 'utf8'));
     if (isWsl(env, procVersion) || Object.hasOwn(env, 'CI')) {
@@ -389,6 +395,7 @@ export function keyFileSecret(file: string, creating: boolean, runtime: Database
 }
 
 export async function databaseKey(databasePath: string, creating: boolean, runtime: DatabaseEncryptionRuntime = {}): Promise<Buffer> {
+    supportedPlatform(runtime);
     const paths = encryptionPaths(databasePath);
     const keyPath = runtime.keyFilePath?.(databasePath) ?? paths.key;
     let metadata = readEncryptionMetadata(paths.metadata);
@@ -411,6 +418,7 @@ export async function readStoredDatabaseKey(
     metadata: EncryptionMetadata,
     runtime: DatabaseEncryptionRuntime = {},
 ): Promise<Buffer | undefined> {
+    supportedPlatform(runtime);
     const keyPath = runtime.keyFilePath?.(databasePath) ?? encryptionPaths(databasePath).key;
     if (metadata.backend === 'key-file') {
         const key = readPrivateFile(keyPath);
@@ -437,6 +445,7 @@ export async function storeDatabaseKey(
     key: Buffer,
     runtime: DatabaseEncryptionRuntime = {},
 ): Promise<void> {
+    supportedPlatform(runtime);
     if (key.length !== DATABASE_KEY_BYTES) {
         throw new Error(`Refusing to store an elepha database key with ${key.length} bytes; expected ${DATABASE_KEY_BYTES}.`);
     }

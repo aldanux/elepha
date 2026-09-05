@@ -1,14 +1,18 @@
-import { chmodSync, existsSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, readFileSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { openMcpReadOnlyDatabase } from '../../src/mcp/server.js';
 import {
     DATABASE_CREDENTIAL_SERVICE,
+    DATABASE_ENCRYPTION_PLATFORM_ERROR,
     type DatabaseEncryptionRuntime,
     databaseKey,
     encryptionKeyPath,
     encryptionMetadataPath,
+    readStoredDatabaseKey,
+    selectBackend,
+    storeDatabaseKey,
 } from '../../src/storage/database-encryption.js';
 import { openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -155,33 +159,123 @@ describe('managed database encryption', () => {
         expect(readFileSync(target)).toEqual(FIXED_KEY);
     });
 
-    it.each(['darwin', 'win32'] as const)(
-        'uses the OS store on %s and aborts instead of falling back when it is unavailable',
-        async (platform) => {
-            const directory = withGrantableTestDir('elepha-keyring-failure-');
-            const dbPath = path.join(directory, 'elepha.db');
-            const runtime: DatabaseEncryptionRuntime = {
-                platform,
-                createKeyringEntry: async (service, account) => {
-                    expect(service).toBe(DATABASE_CREDENTIAL_SERVICE);
-                    expect(account).toBe('22222222-2222-4222-8222-222222222222');
+    it('uses the OS store on Darwin and aborts instead of falling back when it is unavailable', async () => {
+        const directory = withGrantableTestDir('elepha-keyring-failure-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const runtime: DatabaseEncryptionRuntime = {
+            platform: 'darwin',
+            createKeyringEntry: async (service, account) => {
+                expect(service).toBe(DATABASE_CREDENTIAL_SERVICE);
+                expect(account).toBe('22222222-2222-4222-8222-222222222222');
+                return {
+                    getSecret: async () => {
+                        throw new Error('locked');
+                    },
+                    setSecret: async () => undefined,
+                    deleteCredential: async () => false,
+                };
+            },
+            randomUUID: () => '22222222-2222-4222-8222-222222222222',
+        };
+
+        await expect(openDb(dbPath, { encryption: runtime })).rejects.toThrow(/locked/);
+        expect(metadata(dbPath).backend).toBe('keyring');
+        expect(existsSync(encryptionKeyPath(dbPath))).toBe(false);
+        expect(existsSync(dbPath)).toBe(false);
+    });
+
+    it('rejects native Win32 before inspecting existing encryption state', async () => {
+        const directory = withGrantableTestDir('elepha-unsupported-win32-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const metadataPath = encryptionMetadataPath(dbPath);
+        const databaseBytes = Buffer.from('existing encrypted database bytes');
+        const metadataBytes = Buffer.from('{"installationId":"win32-install","backend":"keyring","mode":"default"}\n');
+        writeFileSync(dbPath, databaseBytes, { mode: 0o600 });
+        writeFileSync(metadataPath, metadataBytes, { mode: 0o600 });
+        const filesBefore = readdirSync(directory);
+        const events: string[] = [];
+        let returnedKey: Buffer | undefined;
+        let failure: unknown;
+
+        try {
+            returnedKey = await databaseKey(dbPath, false, {
+                platform: 'win32',
+                keyFilePath: () => {
+                    events.push('key-file path');
+                    return path.join(directory, 'unexpected.key');
+                },
+                createKeyringEntry: async () => {
+                    events.push('keyring entry');
                     return {
                         getSecret: async () => {
-                            throw new Error('locked');
+                            events.push('credential read');
+                            return FIXED_KEY;
                         },
-                        setSecret: async () => undefined,
+                        setSecret: async () => {
+                            events.push('credential write');
+                        },
                         deleteCredential: async () => false,
                     };
                 },
-                randomUUID: () => '22222222-2222-4222-8222-222222222222',
-            };
+            });
+        } catch (error) {
+            failure = error;
+        }
 
-            await expect(openDb(dbPath, { encryption: runtime })).rejects.toThrow(/locked/);
-            expect(metadata(dbPath).backend).toBe('keyring');
-            expect(existsSync(encryptionKeyPath(dbPath))).toBe(false);
-            expect(existsSync(dbPath)).toBe(false);
-        },
-    );
+        expect({
+            returnedKey: returnedKey?.equals(FIXED_KEY) ?? false,
+            error: failure instanceof Error ? failure.message : undefined,
+            events,
+        }).toEqual({
+            returnedKey: false,
+            error: DATABASE_ENCRYPTION_PLATFORM_ERROR,
+            events: [],
+        });
+        expect(readFileSync(dbPath)).toEqual(databaseBytes);
+        expect(readFileSync(metadataPath)).toEqual(metadataBytes);
+        expect(readdirSync(directory)).toEqual(filesBefore);
+    });
+
+    it('rejects native Win32 before parsing existing encryption metadata', async () => {
+        const directory = withGrantableTestDir('elepha-unsupported-win32-metadata-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const metadataPath = encryptionMetadataPath(dbPath);
+        const malformedMetadata = Buffer.from('{not valid encryption metadata');
+        writeFileSync(metadataPath, malformedMetadata, { mode: 0o600 });
+        const filesBefore = readdirSync(directory);
+
+        await expect(databaseKey(dbPath, false, { platform: 'win32' })).rejects.toThrow(DATABASE_ENCRYPTION_PLATFORM_ERROR);
+        expect(readFileSync(metadataPath)).toEqual(malformedMetadata);
+        expect(readdirSync(directory)).toEqual(filesBefore);
+    });
+
+    it('rejects other unsupported platforms during backend selection', async () => {
+        await expect(selectBackend({ platform: 'freebsd' })).rejects.toThrow(DATABASE_ENCRYPTION_PLATFORM_ERROR);
+    });
+
+    it('rejects native Win32 stored-key operations before accessing a backend', async () => {
+        const directory = withGrantableTestDir('elepha-unsupported-stored-key-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const filesBefore = readdirSync(directory);
+        const events: string[] = [];
+        const metadata = { installationId: 'win32-install', backend: 'keyring', mode: 'default' } as const;
+        const runtime: DatabaseEncryptionRuntime = {
+            platform: 'win32',
+            keyFilePath: () => {
+                events.push('key-file path');
+                return path.join(directory, 'unexpected.key');
+            },
+            createKeyringEntry: async () => {
+                events.push('keyring entry');
+                throw new Error('unsupported runtime reached the credential backend');
+            },
+        };
+
+        await expect(readStoredDatabaseKey(dbPath, metadata, runtime)).rejects.toThrow(DATABASE_ENCRYPTION_PLATFORM_ERROR);
+        await expect(storeDatabaseKey(dbPath, metadata, FIXED_KEY, runtime)).rejects.toThrow(DATABASE_ENCRYPTION_PLATFORM_ERROR);
+        expect(events).toEqual([]);
+        expect(readdirSync(directory)).toEqual(filesBefore);
+    });
 
     it.each([
         { label: 'CI', env: { CI: '' }, procVersion: (): string => 'Linux' },

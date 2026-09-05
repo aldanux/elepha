@@ -171,6 +171,16 @@ function assertLifecycle(condition: boolean, code: string, detail: string): asse
     }
 }
 
+function supportedDatabaseLifecyclePlatform(): 'darwin' | 'linux' {
+    const platform = process.platform;
+    assertLifecycle(
+        platform === 'darwin' || platform === 'linux',
+        DATABASE_LIFECYCLE_AMBIGUOUS,
+        `SQLite open mutation seal is unsupported on ${platform}`,
+    );
+    return platform;
+}
+
 function assertNoCleanupFailures(failures: readonly unknown[], message: string): void {
     if (failures.length > 0) {
         throw new AggregateError(failures, message);
@@ -414,6 +424,7 @@ function openAuthorizedDescriptor(
     assertAcceptable: (identity: DatabaseFileIdentity) => void,
     recordCreated: (identity: Extract<DatabaseFileIdentity, { exists: true }>, databaseFilename: string) => void,
 ): AuthorizedDescriptor {
+    const platform = supportedDatabaseLifecyclePlatform();
     let physicalPath: string;
     const directories: DirectoryPathMutationState[] = [];
     const directoryDescriptors: number[] = [];
@@ -460,27 +471,12 @@ function openAuthorizedDescriptor(
         if (!expected.exists) {
             recordCreated(identity, physicalPath);
         }
-        if (process.platform === 'win32') {
-            return {
-                descriptor,
-                directories,
-                physicalPath,
-                sqlitePath: physicalPath,
-                identity,
-                closed: false,
-            };
-        }
-        assertLifecycle(
-            process.platform === 'darwin' || process.platform === 'linux',
-            DATABASE_LIFECYCLE_AMBIGUOUS,
-            `SQLite open mutation seal is unsupported on ${process.platform}`,
-        );
-        for (const ancestor of process.platform === 'darwin' ? physicalAncestorPaths(physicalPath) : [path.dirname(physicalPath)]) {
+        for (const ancestor of platform === 'darwin' ? physicalAncestorPaths(physicalPath) : [path.dirname(physicalPath)]) {
             const ancestorDescriptor = openSync(ancestor, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | noFollowFlag());
             directoryDescriptors.push(ancestorDescriptor);
             directories.push(directoryPathMutationState(ancestorDescriptor, ancestor));
         }
-        if (process.platform === 'darwin') {
+        if (platform === 'darwin') {
             // Every non-root component has a pinned parent boundary. Root
             // itself cannot be renamed; its direct children are mutable only
             // when this OS user can write and traverse root (normally root).
@@ -497,8 +493,7 @@ function openAuthorizedDescriptor(
             // Linux resolves the SQLite filename relative to the pinned
             // parent descriptor, so swapping any ancestor cannot redirect
             // the main file or its canonical sibling sidecars.
-            sqlitePath:
-                process.platform === 'linux' ? `/proc/self/fd/${String(parent.descriptor)}/${path.basename(physicalPath)}` : physicalPath,
+            sqlitePath: platform === 'linux' ? `/proc/self/fd/${String(parent.descriptor)}/${path.basename(physicalPath)}` : physicalPath,
             identity,
             mutationState,
             closed: false,
@@ -605,45 +600,43 @@ function assertSQLiteOpenSealed(pinned: AuthorizedDescriptor, databasePath: stri
     ) {
         throw databasePathMutationError(databasePath);
     }
-    if (process.platform !== 'win32') {
-        if (pinned.descriptor === undefined || pinned.directories.length === 0 || pinned.mutationState === undefined) {
-            throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite open mutation seal is incomplete for ${databasePath}`);
-        }
-        const after = databasePathMutationState(pinned.descriptor);
-        if (!sameDatabasePathMutationState(pinned.mutationState, after)) {
+    if (pinned.descriptor === undefined || pinned.directories.length === 0 || pinned.mutationState === undefined) {
+        throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite open mutation seal is incomplete for ${databasePath}`);
+    }
+    const after = databasePathMutationState(pinned.descriptor);
+    if (!sameDatabasePathMutationState(pinned.mutationState, after)) {
+        throw databasePathMutationError(databasePath);
+    }
+    const directoryAfter = pinned.directories.map((directory) => {
+        const opened = fstatSync(directory.descriptor, { bigint: true });
+        const current = lstatSync(directory.physicalPath, { bigint: true });
+        if (
+            !opened.isDirectory() ||
+            !current.isDirectory() ||
+            current.isSymbolicLink() ||
+            !sameIdentity(opened, directory.identity) ||
+            !sameIdentity(current, directory.identity)
+        ) {
             throw databasePathMutationError(databasePath);
         }
-        const directoryAfter = pinned.directories.map((directory) => {
-            const opened = fstatSync(directory.descriptor, { bigint: true });
-            const current = lstatSync(directory.physicalPath, { bigint: true });
+        return { ctimeNs: opened.ctimeNs, mtimeNs: opened.mtimeNs };
+    });
+    if (process.platform === 'darwin' && checkAncestorMutationState) {
+        for (let index = 0; index + 1 < pinned.directories.length; index++) {
+            const before = pinned.directories[index];
+            const after = directoryAfter[index];
+            const parentBefore = pinned.directories[index + 1];
+            const parentAfter = directoryAfter[index + 1];
             if (
-                !opened.isDirectory() ||
-                !current.isDirectory() ||
-                current.isSymbolicLink() ||
-                !sameIdentity(opened, directory.identity) ||
-                !sameIdentity(current, directory.identity)
+                before !== undefined &&
+                after !== undefined &&
+                parentBefore !== undefined &&
+                parentAfter !== undefined &&
+                currentUserMayReplaceDirectoryEntry(parentBefore) &&
+                before.ctimeNs !== after.ctimeNs &&
+                (parentBefore.ctimeNs !== parentAfter.ctimeNs || parentBefore.mtimeNs !== parentAfter.mtimeNs)
             ) {
                 throw databasePathMutationError(databasePath);
-            }
-            return { ctimeNs: opened.ctimeNs, mtimeNs: opened.mtimeNs };
-        });
-        if (process.platform === 'darwin' && checkAncestorMutationState) {
-            for (let index = 0; index + 1 < pinned.directories.length; index++) {
-                const before = pinned.directories[index];
-                const after = directoryAfter[index];
-                const parentBefore = pinned.directories[index + 1];
-                const parentAfter = directoryAfter[index + 1];
-                if (
-                    before !== undefined &&
-                    after !== undefined &&
-                    parentBefore !== undefined &&
-                    parentAfter !== undefined &&
-                    currentUserMayReplaceDirectoryEntry(parentBefore) &&
-                    before.ctimeNs !== after.ctimeNs &&
-                    (parentBefore.ctimeNs !== parentAfter.ctimeNs || parentBefore.mtimeNs !== parentAfter.mtimeNs)
-                ) {
-                    throw databasePathMutationError(databasePath);
-                }
             }
         }
     }
@@ -777,15 +770,13 @@ function databaseIdentityGuard(
                 try {
                     database = open(pinned.sqlitePath);
                     assertSQLiteOpenSealed(pinned, databasePath);
-                    if (process.platform === 'linux' || process.platform === 'darwin') {
-                        // database_list does not read database content or need
-                        // a key. After the platform-specific traversal seal,
-                        // it proves that later journal/WAL companion suffixes
-                        // use the authorized physical filename.
-                        assertSQLiteCanonicalFilename(database, pinned, databasePath);
-                        assertHeld();
-                        assertAcceptable(pinned.identity);
-                    }
+                    // database_list does not read database content or need
+                    // a key. After the platform-specific traversal seal,
+                    // it proves that later journal/WAL companion suffixes
+                    // use the authorized physical filename.
+                    assertSQLiteCanonicalFilename(database, pinned, databasePath);
+                    assertHeld();
+                    assertAcceptable(pinned.identity);
                     recordOpened(database, pinned.physicalPath, pinned.identity);
                     const closeFailures = closeAuthorizedDescriptor(pinned);
                     assertNoCleanupFailures(closeFailures, `SQLite identity seal cleanup failed for ${databasePath}`);
@@ -1632,6 +1623,7 @@ function newOwnerRecord(kind: OwnerKind, databasePath: string): OwnerRecord {
 }
 
 export function acquireSharedDatabaseLifecycle(databasePath: string): SharedDatabaseLifecycleLease {
+    supportedDatabaseLifecyclePlatform();
     const canonical = path.resolve(databasePath);
     const paths = databaseLifecyclePaths(canonical);
     prepareState(paths);
@@ -1794,6 +1786,7 @@ export async function acquireExclusiveDatabaseLifecycle(
     databasePath: string,
     recoveryId?: string,
 ): Promise<ExclusiveDatabaseLifecycleLease> {
+    supportedDatabaseLifecyclePlatform();
     const canonical = path.resolve(databasePath);
     const paths = databaseLifecyclePaths(canonical);
     prepareState(paths);

@@ -172,6 +172,15 @@ interface ObservedChild {
     stderr: () => string;
 }
 
+interface UnsupportedPlatformLifecycleProbe {
+    kind: 'shared' | 'exclusive';
+    platform: NodeJS.Platform;
+    platformError: string | null;
+    error: string | null;
+    filesystemEvents: string[];
+    databaseExists: boolean;
+}
+
 function spawnWithoutLifecycleTestPreload(source: string, home: string): ObservedChild {
     // The test setup injects a repository-owned lifecycle root only when the
     // exact process.execPath spelling is used. This equivalent spelling starts
@@ -228,7 +237,102 @@ function sendChildMessage(observed: ObservedChild, message: string): void {
     observed.child.send(message);
 }
 
+async function probeUnsupportedPlatformLifecycle(
+    kind: UnsupportedPlatformLifecycleProbe['kind'],
+    databasePath: string,
+): Promise<UnsupportedPlatformLifecycleProbe> {
+    const scratchRoot = path.join(repositoryRoot, '.test-scratch');
+    const source = `import { createRequire, syncBuiltinESMExports } from 'node:module';
+Object.defineProperty(process, 'platform', { value: 'win32' });
+const mutableFs = createRequire(import.meta.url)('node:fs');
+const { acquireExclusiveDatabaseLifecycle, pinSQLitePathForOpen } = await import(${JSON.stringify(lifecycleModule)});
+const { openDb } = await import(${JSON.stringify(dbModule)});
+const databasePath = ${JSON.stringify(databasePath)};
+const scratchRoot = ${JSON.stringify(scratchRoot)};
+const filesystemEvents = [];
+const originals = new Map();
+const pathOperations = [
+    'accessSync', 'appendFileSync', 'chmodSync', 'copyFileSync', 'existsSync', 'linkSync', 'lstatSync',
+    'mkdirSync', 'mkdtempSync', 'openSync', 'opendirSync', 'readFileSync', 'readdirSync', 'readlinkSync',
+    'realpathSync', 'renameSync', 'rmSync', 'rmdirSync', 'statSync', 'symlinkSync', 'truncateSync',
+    'unlinkSync', 'writeFileSync',
+];
+const isScratchPath = (value) => typeof value === 'string' && (value === scratchRoot || value.startsWith(scratchRoot + '/'));
+for (const operation of pathOperations) {
+    const original = mutableFs[operation];
+    if (typeof original !== 'function') continue;
+    originals.set(operation, original);
+    mutableFs[operation] = (...args) => {
+        const touched = args.find(isScratchPath);
+        if (touched !== undefined) {
+            filesystemEvents.push(operation + ':' + touched);
+            throw new Error('REVIEW_LIFECYCLE_MUTATION_BEFORE_PLATFORM_REJECTION');
+        }
+        return Reflect.apply(original, mutableFs, args);
+    };
+}
+syncBuiltinESMExports();
+let platformError = null;
+try {
+    pinSQLitePathForOpen(databasePath, { dev: 0n, ino: 0n, ctimeNs: 0n, nlink: 0n });
+} catch (error) {
+    platformError = error instanceof Error ? error.message : String(error);
+}
+let error = null;
+let resource;
+try {
+    resource = ${kind === 'shared' ? 'await openDb(databasePath)' : 'await acquireExclusiveDatabaseLifecycle(databasePath)'};
+} catch (caught) {
+    error = caught instanceof Error ? caught.message : String(caught);
+}
+for (const [operation, original] of originals) mutableFs[operation] = original;
+syncBuiltinESMExports();
+if (resource !== undefined) {
+    ${kind === 'shared' ? 'resource.close();' : 'resource.release();'}
+}
+const result = {
+    kind: ${JSON.stringify(kind)},
+    platform: process.platform,
+    platformError,
+    error,
+    filesystemEvents,
+    databaseExists: mutableFs.existsSync(databasePath),
+};
+await new Promise((resolve, reject) => process.send?.(result, (sendError) => sendError ? reject(sendError) : resolve()));
+process.disconnect();`;
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', source], {
+        cwd: repositoryRoot,
+        env: process.env,
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    let stderr = '';
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+        stderr += chunk;
+    });
+    const observed = { child, stderr: () => stderr };
+    try {
+        return await receiveChildMessage<UnsupportedPlatformLifecycleProbe>(observed);
+    } finally {
+        await killOwner(child);
+    }
+}
+
 describe('managed database lifecycle', () => {
+    it.each([{ kind: 'shared' as const }, { kind: 'exclusive' as const }])(
+        'rejects native Win32 before $kind lifecycle filesystem access',
+        async ({ kind }) => {
+            const directory = withGrantableTestDir(`elepha-database-lifecycle-unsupported-${kind}-`);
+            const result = await probeUnsupportedPlatformLifecycle(kind, path.join(directory, 'elepha.db'));
+
+            expect(result.platform).toBe('win32');
+            expect(result.platformError).toMatch(new RegExp(`^${DATABASE_LIFECYCLE_AMBIGUOUS}: `));
+            expect(result.filesystemEvents).toEqual([]);
+            expect(result.error).toBe(result.platformError);
+            expect(result.databaseExists).toBe(false);
+        },
+    );
+
     it('does not let a stale dead-owner reclaimer delete a newly published exclusive owner', async () => {
         const fixture = createTestDb('elepha-database-lifecycle-owner-release-race-');
         const replacement = createTestDb('elepha-database-lifecycle-owner-release-race-replacement-');
@@ -844,9 +948,7 @@ process.disconnect();`;
             sendChildMessage(opener, 'probe');
             const probe = await probePromise;
             let writeResult: { type: 'closed'; changes: number; detachedAtWrite: boolean } | undefined;
-            // Windows refuses replacement of an open SQLite file at the OS
-            // layer; it still proves namespace convergence through the intent.
-            const drainBeforeInstall = probe.seesExclusive || process.platform === 'win32';
+            const drainBeforeInstall = probe.seesExclusive;
             if (drainBeforeInstall) {
                 const closePromise = receiveChildMessage<typeof writeResult>(opener);
                 sendChildMessage(opener, 'close');

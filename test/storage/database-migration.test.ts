@@ -820,10 +820,21 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         }
     });
 
-    it('refuses unsupported runtimes and insufficient space before creating migration state', async () => {
-        const { directory, dbPath } = fixture('elepha-database-preflight-');
+    it.each([
+        { runtimeName: 'ia32', overrides: { arch: 'ia32' } },
+        { runtimeName: 'native Win32', overrides: { platform: 'win32' } },
+    ] as const)('refuses the unsupported $runtimeName runtime before creating migration state', async ({ runtimeName, overrides }) => {
+        const { directory, dbPath } = fixture(`elepha-database-preflight-${runtimeName}-`);
         const paths = runtime(directory).statePaths;
-        await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory, { arch: 'ia32' }))).rejects.toThrow(/unsupported/);
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory, overrides))).rejects.toThrow(/unsupported/);
+        expect(existsSync(paths?.manifest ?? '')).toBe(false);
+        expect(existsSync(paths?.lock ?? '')).toBe(false);
+        expect(existsSync(encryptionKeyPath(dbPath))).toBe(false);
+    });
+
+    it('refuses insufficient space before creating migration state', async () => {
+        const { directory, dbPath } = fixture('elepha-database-preflight-space-');
+        const paths = runtime(directory).statePaths;
         await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory, { availableBytes: () => 0n }))).rejects.toThrow(
             /requires .* free bytes/,
         );

@@ -179,7 +179,7 @@ describe('mergeRollupContent', () => {
             pendingItems: [],
             filesTouched: ['/repo/A.ts', '/repo/b.ts'],
         });
-        if (process.platform === 'darwin' || process.platform === 'win32') {
+        if (process.platform === 'darwin') {
             expect(merged.filesTouched).toEqual(['/repo/a.ts', '/repo/b.ts']);
         } else {
             expect(merged.filesTouched).toEqual(['/repo/a.ts', '/repo/A.ts', '/repo/b.ts']);

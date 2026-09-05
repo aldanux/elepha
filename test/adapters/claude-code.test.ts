@@ -47,7 +47,7 @@ describe('ClaudeCodeAdapter.matches', () => {
     it('matches case variants according to the host filesystem semantics', () => {
         withConfigDir('/Users/x/.claude', () => {
             const adapter = new ClaudeCodeAdapter();
-            if (process.platform === 'darwin' || process.platform === 'win32') {
+            if (process.platform === 'darwin') {
                 expect(adapter.matches('/Users/X/.Claude/Projects/Foo/abc.jsonl')).toBe(true);
             } else {
                 expect(adapter.matches('/Users/X/.Claude/Projects/Foo/abc.jsonl')).toBe(false);

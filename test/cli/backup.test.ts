@@ -21,6 +21,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard.js';
 import { defaultBackupPath, exportAll, exportProject, listFullBackups } from '../../src/cli/commands/backup.js';
 import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
+import { isSupportedPlatform } from '../../src/install/platform.js';
 import { openKeyedDatabase, rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { BACKUP_DESTINATION_COMPANION_ERROR } from '../../src/storage/encrypted-database-export.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
@@ -1882,7 +1883,7 @@ describe('elepha backup exports', () => {
         expect(temporaryFilesFor(output).filter((entry) => entry !== path.basename(companionPath))).toEqual([]);
     });
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(!isSupportedPlatform())(
         'refuses an unknown direct FIFO journal without opening or mutating it',
         async () => {
             const { fixture } = seedExportFixture();
@@ -1987,7 +1988,7 @@ describe('elepha backup exports', () => {
         expect(temporaryFilesFor(output)).toEqual([]);
     });
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(!isSupportedPlatform())(
         'does not block when an identity-checked verification link is replaced by a FIFO before header proof',
         async () => {
             const { fixture } = seedExportFixture();
@@ -3364,7 +3365,7 @@ describe('elepha backup exports', () => {
         expect(readdirSync(fixture.directory).filter((entry) => entry.endsWith('.rollback'))).toEqual([]);
     });
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(!isSupportedPlatform())(
         'refuses an existing FIFO before force replacement opens it',
         async () => {
             const { fixture } = seedExportFixture();
@@ -3441,7 +3442,7 @@ describe('elepha backup exports', () => {
         15000,
     );
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(!isSupportedPlatform())(
         'does not block when a force-authorized destination is replaced by a FIFO before preservation',
         async () => {
             const { fixture } = seedExportFixture();
@@ -3545,7 +3546,7 @@ describe('elepha backup exports', () => {
         15000,
     );
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(!isSupportedPlatform())(
         'does not block when a precreated output is replaced by a FIFO before lifecycle pinning',
         async () => {
             const { fixture } = seedExportFixture();
@@ -3657,7 +3658,7 @@ describe('elepha backup exports', () => {
         15000,
     );
 
-    it.skipIf(process.platform === 'win32')(
+    it.skipIf(!isSupportedPlatform())(
         'does not block when the lifecycle pin is replaced by a FIFO before identity reinspection',
         async () => {
             const { fixture } = seedExportFixture();
