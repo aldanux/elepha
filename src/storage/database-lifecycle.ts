@@ -677,7 +677,7 @@ function expectedSQLiteFileError(pinned: AuthorizedDescriptor, expected: SQLiteF
 }
 
 // Backup/export code precreates an empty private inode, then asks SQLite to
-// open that exact object. Keep C01's file and ancestor descriptors pinned so
+// open that exact object. Keep the file and ancestor descriptors pinned so
 // the caller can validate database_list before admitting any key, read, or
 // write through the SQLite handle.
 export function pinSQLitePathForOpen(databasePath: string, expected: SQLiteFileIdentitySeal): SQLitePathOpenSeal {

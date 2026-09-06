@@ -155,8 +155,8 @@ describe('escapeShellSyntax', () => {
 
     it('repairs even backslash parity and preserves fully escaped chain pairs', () => {
         const cases = [
-            [String.raw`\\|| printf C08_DOUBLE_ESCAPE_EXECUTED`, String.raw`\\\|\| printf C08_DOUBLE_ESCAPE_EXECUTED`],
-            [String.raw`\\&& printf C08_DOUBLE_ESCAPE_EXECUTED`, String.raw`\\\&\& printf C08_DOUBLE_ESCAPE_EXECUTED`],
+            [String.raw`\\|| printf DOUBLE_ESCAPE_RHS_EXECUTED`, String.raw`\\\|\| printf DOUBLE_ESCAPE_RHS_EXECUTED`],
+            [String.raw`\\&& printf DOUBLE_ESCAPE_RHS_EXECUTED`, String.raw`\\\&\& printf DOUBLE_ESCAPE_RHS_EXECUTED`],
         ] as const;
         for (const [input, expected] of cases) {
             expect(detectShellSyntax(input)).toBe(true);

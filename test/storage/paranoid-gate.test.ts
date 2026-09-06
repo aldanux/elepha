@@ -362,7 +362,7 @@ describe('paranoid read gate', () => {
         seeded.db.close();
     });
 
-    it('C11 sentinel-wraps locked hook output while the gate blocks every protected serving surface', async () => {
+    it('sentinel-wraps locked hook output while the gate blocks every protected serving surface', async () => {
         const seeded = await fixture();
         enableParanoidMode(seeded.db, PASSPHRASE);
 

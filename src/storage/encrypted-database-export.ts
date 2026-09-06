@@ -550,7 +550,7 @@ export function writeEncryptedDatabaseImport(
 
 // The selected SQLite connection owns the authoritative snapshot and the
 // codec. Its attached empty target inherits that exact codec before any page
-// write, while C01's opened-object seal proves the attachment reached the
+// write, while the opened-object seal proves the attachment reached the
 // precreated destination inode.
 export function writeEncryptedDatabaseSnapshot(
     source: Database.Database,

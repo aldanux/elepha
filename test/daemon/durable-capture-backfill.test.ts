@@ -100,7 +100,7 @@ async function recordCommandBody(dbPath: string, projectPath: string, nativeSess
 describe('daemon durable capture backfill', () => {
     afterEach(() => vi.unstubAllEnvs());
 
-    it('C11 suppresses an echoed in-chat command output in both live capture and later backfill', async () => {
+    it('suppresses an echoed in-chat command output in both live capture and later backfill', async () => {
         const liveFixture = createTestDb('elepha-live-same-turn-quote-back-');
         const liveProject = seedProject(liveFixture);
         liveFixture.store.consent.grant(liveProject.path);

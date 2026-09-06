@@ -372,7 +372,7 @@ describe('P2.8 SessionStart hook', () => {
         }
     });
 
-    it('C11 keeps automatic briefs sentinel-wrapped while selecting newest substantive context', async () => {
+    it('keeps automatic briefs sentinel-wrapped while selecting newest substantive context', async () => {
         const { dbPath, cwd } = seededDb({ ageMs: 9 * 60 * 60 * 1000, gitCommitCount: 100, sourcePath: AUTO_SOURCE });
         addSession(dbPath, {
             nativeId: 'recent-one-turn-session',
@@ -584,7 +584,7 @@ describe('P2.8 SessionStart hook', () => {
         }
     });
 
-    it('C11 sentinel-wraps and records pending and denied capture-off output without changing its inner body', async () => {
+    it('sentinel-wraps and records pending and denied capture-off output without changing its inner body', async () => {
         for (const tool of ['claude-code', 'codex'] as const) {
             for (const state of ['pending', 'denied'] as const) {
                 const { dbPath } = seededDb();
@@ -598,6 +598,7 @@ describe('P2.8 SessionStart hook', () => {
                 const protectedProjectRead = vi.fn(() => {
                     throw new Error('capture-off output must not resolve or read protected projects');
                 });
+                //noinspection JSUnusedGlobalSymbols
                 const dependencies = {
                     dbPath,
                     now: () => NOW,
@@ -1124,7 +1125,7 @@ describe('P2.8 SessionStart hook', () => {
         expect(seen).toEqual([cwd, cwd]);
     });
 
-    it('C11 sentinel-wraps notify for both tools after recording its exact inner body', async () => {
+    it('sentinel-wraps notify for both tools after recording its exact inner body', async () => {
         for (const tool of ['claude-code', 'codex'] as const) {
             const { dbPath, cwd } = seededDb();
             let sawPersistentWrite = false;

@@ -347,7 +347,7 @@ describe('Rule 3 backfill', () => {
     });
 });
 
-const SANITIZE_SECRET = 'c18-secret-value $(exposed)';
+const SANITIZE_SECRET = 'sanitize-secret-value $(exposed)';
 const PARANOID_PASSPHRASE = 'correct horse battery staple';
 
 interface ManagedSanitizeFixture {

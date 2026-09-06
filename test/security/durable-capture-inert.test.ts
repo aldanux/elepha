@@ -54,7 +54,7 @@ describe('durable capture remains inert', () => {
         const store = new MemoryStore(openUnmanagedDb(':memory:'));
         const project = store.upsertProject('/repo');
         const session = store.upsertSession('codex', 'chain-operators', project.id, '/repo/chain-operators.jsonl');
-        const marker = 'C08_RHS_EXECUTED';
+        const marker = 'CHAIN_RHS_EXECUTED';
         const parsedTurn = {
             tool: 'codex',
             sessionId: 'chain-operators',

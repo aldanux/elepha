@@ -790,7 +790,7 @@ describe('elepha backup exports', () => {
         }
     }, 15000);
 
-    it('C04 residual: rejects post-write path substitution without deleting the unknown inode or prior destination', async () => {
+    it('rejects post-write path substitution without deleting the unknown inode or prior destination', async () => {
         const { fixture } = seedExportFixture();
         fixture.db.pragma('wal_checkpoint(TRUNCATE)');
         const sourceBytes = readFileSync(fixture.dbPath);
@@ -886,7 +886,7 @@ describe('elepha backup exports', () => {
         expect(readFileSync(path.join(fixture.directory, rollbackFiles[0] ?? 'missing'))).toEqual(priorDestination);
     }, 15000);
 
-    it('C04 residual: every publication-race SIGKILL survivor remains ciphertext', async () => {
+    it('keeps every publication-race SIGKILL survivor ciphertext', async () => {
         const { fixture } = seedExportFixture();
         const marker = 'publication-sigkill-encrypted-secret';
         fixture.db.prepare("UPDATE sessions SET title = ? WHERE native_id = 'primary-session'").run(marker);
@@ -1086,7 +1086,7 @@ describe('elepha backup exports', () => {
         30000,
     );
 
-    it('C04 residual: never opens the raw source stream that an in-place overwrite could corrupt', async () => {
+    it('never opens the raw source stream that an in-place overwrite could corrupt', async () => {
         const { fixture } = seedExportFixture();
         fixture.db.pragma('wal_checkpoint(TRUNCATE)');
         const sourceBytes = readFileSync(fixture.dbPath);
@@ -1174,7 +1174,7 @@ describe('elepha backup exports', () => {
         expect(readFileSync(substitute).includes(Buffer.from(marker))).toBe(true);
     }, 15000);
 
-    it('C04 residual: exports one SQLite snapshot while a keyed WAL writer checkpoints', async () => {
+    it('exports one SQLite snapshot while a keyed WAL writer checkpoints', async () => {
         const { fixture } = seedExportFixture();
         const rowCount = 1_024;
         const payloadBytes = 64 * 1024;
@@ -1323,7 +1323,7 @@ describe('elepha backup exports', () => {
         }
     }, 60000);
 
-    it('C04 residual: exports the selected connection when its pathname is replaced by same-key ciphertext', async () => {
+    it('exports the selected connection when its pathname is replaced by same-key ciphertext', async () => {
         const selected = seedExportFixture();
         const substitute = seedExportFixture();
         const selectedMarker = 'selected-source-row';
@@ -1403,7 +1403,7 @@ describe('elepha backup exports', () => {
         expect(readFileSync(substituteSurvivor)).toEqual(substituteBytes);
     }, 15000);
 
-    it('C04 residual: preserves int64 session ids and their dependent project rows', () => {
+    it('preserves int64 session ids and their dependent project rows', () => {
         const { fixture, project } = seedExportFixture();
         const originalSession = fixture.db.prepare("SELECT id FROM sessions WHERE native_id = 'primary-session'").safeIntegers().get() as {
             id: bigint;

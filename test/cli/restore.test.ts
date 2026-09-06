@@ -155,24 +155,24 @@ function canReadDatabase(dbPath: string, key?: Buffer): boolean {
     }
 }
 
-const C22_SOURCE_COMPANIONS = ['-wal', '-shm', '-journal'] as const;
+const IMPORT_SOURCE_COMPANIONS = ['-wal', '-shm', '-journal'] as const;
 
-function removeC22SourceCompanions(dbPath: string): void {
-    for (const suffix of C22_SOURCE_COMPANIONS) {
+function removeImportSourceCompanions(dbPath: string): void {
+    for (const suffix of IMPORT_SOURCE_COMPANIONS) {
         if (existsSync(`${dbPath}${suffix}`)) unlinkSync(`${dbPath}${suffix}`);
     }
 }
 
-function c22SourceStat(dbPath: string) {
+function importSourceStat(dbPath: string) {
     const stat = lstatSync(dbPath, { bigint: true });
     return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs, nlink: stat.nlink };
 }
 
-function c22Schema(db: Database.Database): unknown[] {
+function importSchema(db: Database.Database): unknown[] {
     return db.prepare('SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type, name').all();
 }
 
-function c22ShadowRows(db: Database.Database): Record<string, unknown[]> {
+function importShadowRows(db: Database.Database): Record<string, unknown[]> {
     const tables = db
         .prepare("SELECT name, wr FROM pragma_table_list WHERE schema = 'main' AND type = 'shadow' ORDER BY name")
         .all() as Array<{ name: string; wr: number }>;
@@ -433,8 +433,8 @@ describe('elepha restore', () => {
     it.each([
         { encrypted: false, label: 'plaintext' },
         { encrypted: true, label: 'same-key encrypted' },
-    ])('C22 imports a sealed readonly $label source into a pre-keyed stage with exact native fidelity', ({ encrypted }) => {
-        const fixture = createTestDb(`elepha-c22-native-${encrypted ? 'encrypted' : 'plaintext'}-`);
+    ])('imports a sealed readonly $label source into a pre-keyed stage with exact native fidelity', ({ encrypted }) => {
+        const fixture = createTestDb(`elepha-native-import-${encrypted ? 'encrypted' : 'plaintext'}-`);
         fixture.close();
         const sourcePath = path.join(fixture.directory, 'clean-wal-source.db');
         const destinationPath = path.join(fixture.directory, 'encrypted-stage.db');
@@ -458,24 +458,24 @@ describe('elepha restore', () => {
         `);
         source.prepare('INSERT INTO import_probe (id, payload) VALUES (?, ?)').run(73, Buffer.from([255, 0, 128, 7]));
         source.prepare('INSERT INTO import_rowid_probe (rowid, payload) VALUES (?, ?)').run(9_007_199_254_740_993n, Buffer.from([9, 0, 7]));
-        source.prepare('INSERT INTO import_fts_probe (rowid, content) VALUES (?, ?)').run(91, 'c22 native import token');
+        source.prepare('INSERT INTO import_fts_probe (rowid, content) VALUES (?, ?)').run(91, 'native import token');
         source.prepare('INSERT INTO import_fts_probe (rowid, content) VALUES (?, ?)').run(107, 'deleted token');
         source.prepare('DELETE FROM import_fts_probe WHERE rowid = ?').run(107);
         source.pragma('wal_checkpoint(TRUNCATE)');
         source.close();
-        removeC22SourceCompanions(sourcePath);
+        removeImportSourceCompanions(sourcePath);
 
         const expected = encrypted
             ? openKeyedDatabase(sourcePath, FIXED_KEY, { readonly: true, fileMustExist: true })
             : new Database(sourcePath, { readonly: true, fileMustExist: true });
-        const expectedSchema = c22Schema(expected);
-        const expectedShadows = c22ShadowRows(expected);
+        const expectedSchema = importSchema(expected);
+        const expectedShadows = importShadowRows(expected);
         const expectedSequence = expected.prepare('SELECT name, seq FROM sqlite_sequence ORDER BY name').safeIntegers().all();
         expect(() => expected.prepare("UPDATE import_probe SET payload = X'00'").run()).toThrow(
             expect.objectContaining({ code: 'SQLITE_READONLY' }),
         );
         expected.close();
-        const admitted = C22_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`)).map((suffix) => ({
+        const admitted = IMPORT_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`)).map((suffix) => ({
             suffix,
             size: statSync(`${sourcePath}${suffix}`).size,
         }));
@@ -483,9 +483,9 @@ describe('elepha restore', () => {
             { suffix: '-wal', size: 0 },
             { suffix: '-shm', size: 32_768 },
         ]);
-        removeC22SourceCompanions(sourcePath);
+        removeImportSourceCompanions(sourcePath);
         const sourceBytes = readFileSync(sourcePath);
-        const sourceStat = c22SourceStat(sourcePath);
+        const sourceStat = importSourceStat(sourcePath);
 
         const destinationDescriptor = createPrivateEmptyDatabaseDescriptor(destinationPath);
         const destinationIdentity = inspectPrivateEmptyDatabaseDescriptor(destinationDescriptor);
@@ -506,20 +506,20 @@ describe('elepha restore', () => {
         importSource();
 
         expect(readFileSync(sourcePath)).toEqual(sourceBytes);
-        expect(c22SourceStat(sourcePath)).toEqual(sourceStat);
-        expect(C22_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`))).toEqual([]);
+        expect(importSourceStat(sourcePath)).toEqual(sourceStat);
+        expect(IMPORT_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`))).toEqual([]);
         expect(readFileSync(destinationPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
         expect(canReadDatabase(destinationPath)).toBe(false);
         const imported = openKeyedDatabase(destinationPath, FIXED_KEY, { fileMustExist: true });
-        expect(c22Schema(imported)).toEqual(expectedSchema);
-        expect(c22ShadowRows(imported)).toEqual(expectedShadows);
+        expect(importSchema(imported)).toEqual(expectedSchema);
+        expect(importShadowRows(imported)).toEqual(expectedShadows);
         expect(imported.prepare('SELECT name, seq FROM sqlite_sequence ORDER BY name').safeIntegers().all()).toEqual(expectedSequence);
         expect(imported.prepare('SELECT rowid, hex(payload) FROM import_rowid_probe').raw().safeIntegers().get()).toEqual([
             9_007_199_254_740_993n,
             '090007',
         ]);
         expect(imported.prepare("SELECT rowid, content FROM import_fts_probe WHERE import_fts_probe MATCH 'native'").all()).toEqual([
-            { rowid: 91, content: 'c22 native import token' },
+            { rowid: 91, content: 'native import token' },
         ]);
         expect(imported.prepare('SELECT * FROM import_probe_view').all()).toEqual([{ id: 73, payload_hex: 'FF008007' }]);
         imported.prepare('UPDATE import_probe SET payload = ? WHERE id = ?').run(Buffer.from([1]), 73);
@@ -560,8 +560,8 @@ describe('elepha restore', () => {
                 db.exec(`CREATE VIEW metadata_view AS SELECT '${'x'.repeat(DATABASE_SCHEMA_METADATA_MAX_CHARS)}' AS value`);
             },
         },
-    ])('C22 rejects $label before encrypted reconstruction materializes unbounded metadata', ({ expectedRows, populate }) => {
-        const directory = withGrantableTestDir('elepha-c22-schema-metadata-');
+    ])('rejects $label before encrypted reconstruction materializes unbounded metadata', ({ expectedRows, populate }) => {
+        const directory = withGrantableTestDir('elepha-schema-metadata-import-');
         const sourcePath = path.join(directory, 'source.db');
         const destinationPath = path.join(directory, 'encrypted-stage.db');
         const source = new Database(sourcePath);
@@ -581,16 +581,16 @@ describe('elepha restore', () => {
         closeSync(descriptor);
 
         expect(() =>
-            writeEncryptedDatabaseImport(sourcePath, c22SourceStat(sourcePath), destinationPath, destinationIdentity, FIXED_KEY),
+            writeEncryptedDatabaseImport(sourcePath, importSourceStat(sourcePath), destinationPath, destinationIdentity, FIXED_KEY),
         ).toThrow(DATABASE_SCHEMA_METADATA_LIMIT_ERROR);
     });
 
     it.each([
         { encrypted: false, label: 'plaintext' },
         { encrypted: true, label: 'encrypted' },
-    ])('C22 rejects excessive schema metadata before $label restore confirmation or active mutation', async ({ encrypted }) => {
-        const active = createTestDb('elepha-c22-schema-active-');
-        const candidate = createTestDb('elepha-c22-schema-candidate-');
+    ])('rejects excessive schema metadata before $label restore confirmation or active mutation', async ({ encrypted }) => {
+        const active = createTestDb('elepha-schema-limit-active-');
+        const candidate = createTestDb('elepha-schema-limit-candidate-');
         candidate.db.exec(`CREATE VIEW metadata_view AS SELECT '${'x'.repeat(DATABASE_SCHEMA_METADATA_MAX_CHARS)}' AS value`);
         candidate.close();
         active.close();
@@ -618,8 +618,8 @@ describe('elepha restore', () => {
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
     });
 
-    it('C22 leaves only ciphertext stage data when native import fails foreign-key verification', () => {
-        const fixture = createTestDb('elepha-c22-import-failure-');
+    it('leaves only ciphertext stage data when native import fails foreign-key verification', () => {
+        const fixture = createTestDb('elepha-import-foreign-key-failure-');
         fixture.close();
         const sourcePath = path.join(fixture.directory, 'invalid-clean-wal-source.db');
         const stagePath = path.join(fixture.directory, 'failed-encrypted-stage.db');
@@ -633,9 +633,9 @@ describe('elepha restore', () => {
         `);
         source.pragma('wal_checkpoint(TRUNCATE)');
         source.close();
-        removeC22SourceCompanions(sourcePath);
+        removeImportSourceCompanions(sourcePath);
         const sourceBytes = readFileSync(sourcePath);
-        const sourceStat = c22SourceStat(sourcePath);
+        const sourceStat = importSourceStat(sourcePath);
         const descriptor = createPrivateEmptyDatabaseDescriptor(stagePath);
         const stageIdentity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
         closeSync(descriptor);
@@ -646,8 +646,8 @@ describe('elepha restore', () => {
         expect(canReadDatabase(stagePath)).toBe(false);
         expect(canReadDatabase(stagePath, FIXED_KEY)).toBe(true);
         expect(readFileSync(sourcePath)).toEqual(sourceBytes);
-        expect(c22SourceStat(sourcePath)).toEqual(sourceStat);
-        expect(C22_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`))).toEqual([]);
+        expect(importSourceStat(sourcePath)).toEqual(sourceStat);
+        expect(IMPORT_SOURCE_COMPANIONS.filter((suffix) => existsSync(`${sourcePath}${suffix}`))).toEqual([]);
     });
 
     it('restores an encrypted full export with identical schema and row counts using the installation key', async () => {
@@ -701,8 +701,8 @@ describe('elepha restore', () => {
         expect(readFileSync(result.snapshotPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
     });
 
-    it('C22 imports a plaintext legacy backup into the active encrypted installation and preserves its locked authority', async () => {
-        const active = createTestDb('elepha-c22-plaintext-active-');
+    it('imports a plaintext legacy backup into the active encrypted installation and preserves its locked authority', async () => {
+        const active = createTestDb('elepha-plaintext-legacy-active-');
         active.db.pragma('wal_checkpoint(TRUNCATE)');
         const backup = path.join(active.directory, 'plaintext-legacy.db');
         copyFileSync(active.dbPath, backup);
@@ -721,7 +721,7 @@ describe('elepha restore', () => {
         const encryption = encryptionRuntime();
         await encryptDatabase(active.dbPath, encryption);
         const enrolled = await openDb(active.dbPath, { encryption });
-        enableParanoidMode(enrolled, 'c22 restore passphrase');
+        enableParanoidMode(enrolled, 'restore passphrase');
         const authorityBefore = enrolled
             .prepare('SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1')
             .get();
@@ -779,9 +779,9 @@ describe('elepha restore', () => {
         expect.soft(readFileSync(result.snapshotPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
     });
 
-    it('C22 preserves a hook injection recorded after the backup so its quote-back remains suppressed', async () => {
-        const active = createTestDb('elepha-c22-injection-active-');
-        populate(active.dbPath, 'c22-injection');
+    it('preserves a hook injection recorded after the backup so its quote-back remains suppressed', async () => {
+        const active = createTestDb('elepha-current-injection-active-');
+        populate(active.dbPath, 'injection-restore');
         active.close();
         const encryption = encryptionRuntime();
         await encryptDatabase(active.dbPath, encryption);
@@ -794,7 +794,7 @@ describe('elepha restore', () => {
         const output = recordHookOutput({
             store,
             tool: 'codex',
-            nativeSessionId: 'c22-current-chat',
+            nativeSessionId: 'current-hook-session',
             body,
             kind: 'brief',
             injectedAt: '2026-09-06T01:00:00.000Z',
@@ -810,12 +810,12 @@ describe('elepha restore', () => {
 
         const restored = await openDb(active.dbPath, { encryption });
         const restoredStore = new MemoryStore(restored);
-        const rows = restoredStore.injectionsForSession('codex', 'c22-current-chat', '2026-09-06T01:00:01.000Z');
+        const rows = restoredStore.injectionsForSession('codex', 'current-hook-session', '2026-09-06T01:00:01.000Z');
         expect.soft(restored.prepare('SELECT body FROM injections').all()).toEqual([{ body }]);
         const quoteBack = restoredStore.isInjectionQuoteBack({
             tool: 'codex',
-            sessionId: 'c22-current-chat',
-            sourcePath: path.join(active.directory, 'c22-current-chat.jsonl'),
+            sessionId: 'current-hook-session',
+            sourcePath: path.join(active.directory, 'current-hook-session.jsonl'),
             projectPath: active.directory,
             turnIndex: 1,
             startedAt: '2026-09-06T01:00:00.000Z',
@@ -829,19 +829,19 @@ describe('elepha restore', () => {
         });
         restored.close();
 
-        expect.soft(rows).toEqual([expect.objectContaining({ body, tool: 'codex', native_session_id: 'c22-current-chat' })]);
+        expect.soft(rows).toEqual([expect.objectContaining({ body, tool: 'codex', native_session_id: 'current-hook-session' })]);
         expect.soft(quoteBack).toBe(true);
     });
 
-    it('C22 preserves current terminal eviction through restore so backfill and search cannot resurrect it', async () => {
-        const active = createTestDb('elepha-c22-eviction-active-');
+    it('preserves current terminal eviction through restore so backfill and search cannot resurrect it', async () => {
+        const active = createTestDb('elepha-terminal-eviction-active-');
         const project = seedProject(active, { path: path.join(active.directory, 'project') });
         active.store.consent.grant(project.path);
         const sourcePath = path.join(active.directory, 'terminal-session.jsonl');
         writeFileSync(sourcePath, '{}\n');
-        const session = seedSession(active, { project, nativeId: 'c22-terminal-session', sourcePath });
+        const session = seedSession(active, { project, nativeId: 'terminal-session', sourcePath });
         seedMemory(active, { project, session, turnIndex: 0 });
-        const candidateOnly = seedSession(active, { project, nativeId: 'c22-candidate-terminal', sourcePath });
+        const candidateOnly = seedSession(active, { project, nativeId: 'candidate-terminal', sourcePath });
         seedMemory(active, { project, session: candidateOnly, turnIndex: 0 });
         active.close();
         const encryption = encryptionRuntime();
@@ -862,7 +862,7 @@ describe('elepha restore', () => {
         const currentOnlyProject = currentStore.upsertProject(currentOnlyProjectPath);
         const currentOnlySourcePath = path.join(active.directory, 'current-only.jsonl');
         writeFileSync(currentOnlySourcePath, '{}\n');
-        const currentOnly = currentStore.upsertSession('codex', 'c22-current-only-absent', currentOnlyProject.id, currentOnlySourcePath);
+        const currentOnly = currentStore.upsertSession('codex', 'current-only-absent', currentOnlyProject.id, currentOnlySourcePath);
         current
             .prepare('UPDATE projects SET first_seen_at = ?, last_seen_at = ? WHERE id = ?')
             .run('2026-09-06T01:57:00.000Z', '2026-09-06T01:58:00.000Z', currentOnlyProject.id);
@@ -888,14 +888,14 @@ describe('elepha restore', () => {
                  FROM sessions s
                  JOIN projects p ON p.id = s.project_id
                  JOIN durable_capture_status d ON d.session_id = s.id
-                 WHERE s.tool = 'codex' AND s.native_id = 'c22-current-only-absent'`,
+                 WHERE s.tool = 'codex' AND s.native_id = 'current-only-absent'`,
             )
             .get() as Record<string, unknown>;
         expect.soft(anchor).toEqual({
             id: expect.any(Number),
             project_id: expect.any(Number),
             tool: 'codex',
-            native_id: 'c22-current-only-absent',
+            native_id: 'current-only-absent',
             segment_index: 2,
             source_path: currentOnlySourcePath,
             started_at: '2026-09-06T01:58:00.000Z',
@@ -908,13 +908,13 @@ describe('elepha restore', () => {
         const ingested = restoredStore.recordIngestedTurn(
             {
                 tool: 'codex',
-                sessionId: 'c22-current-only-absent',
+                sessionId: 'current-only-absent',
                 sourcePath: currentOnlySourcePath,
                 projectPath: currentOnlyProjectPath,
                 turnIndex: 0,
                 startedAt: '2026-09-06T02:01:00.000Z',
                 endedAt: '2026-09-06T02:01:01.000Z',
-                userMessage: 'c22terminalresurrectionneedle',
+                userMessage: 'terminalresurrectionneedle',
                 assistantText: 'raw response',
                 toolCalls: [],
                 cursor: '1',
@@ -942,7 +942,7 @@ describe('elepha restore', () => {
                     candidate,
                     turnIndex,
                     filterTurn({
-                        userMessage: 'c22terminalresurrectionneedle',
+                        userMessage: 'terminalresurrectionneedle',
                         assistantText: 'backfilled response',
                         toolCalls: [],
                     }),
@@ -965,34 +965,32 @@ describe('elepha restore', () => {
                     .all(),
             )
             .toEqual([
-                { native_id: 'c22-candidate-terminal', state: 'evicted' },
-                { native_id: 'c22-current-only-absent', state: 'evicted' },
-                { native_id: 'c22-terminal-session', state: 'evicted' },
+                { native_id: 'candidate-terminal', state: 'evicted' },
+                { native_id: 'current-only-absent', state: 'evicted' },
+                { native_id: 'terminal-session', state: 'evicted' },
             ]);
         expect.soft(restored.prepare('SELECT memory_id FROM filtered_turns').all()).toEqual([]);
         expect
             .soft(
-                restored
-                    .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c22terminalresurrectionneedle'")
-                    .all(),
+                restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'terminalresurrectionneedle'").all(),
             )
             .toEqual([]);
         expect.soft(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
         restored.close();
     });
 
-    it('C22 preserves plaintext-active injection provenance and terminal eviction', async () => {
-        const active = createTestDb('elepha-c22-plaintext-controls-');
+    it('preserves plaintext-active injection provenance and terminal eviction', async () => {
+        const active = createTestDb('elepha-plaintext-controls-');
         const project = seedProject(active, { path: path.join(active.directory, 'project') });
         active.store.consent.grant(project.path);
         const sourcePath = path.join(active.directory, 'plaintext-terminal.jsonl');
         writeFileSync(sourcePath, '{}\n');
-        const session = seedSession(active, { project, nativeId: 'c22-plaintext-terminal', sourcePath });
-        seedMemory(active, { project, session, assistantText: 'c22plaintextresurrectionneedle' });
+        const session = seedSession(active, { project, nativeId: 'plaintext-terminal', sourcePath });
+        seedMemory(active, { project, session, assistantText: 'plaintextresurrectionneedle' });
         recordHookOutput({
             store: active.store,
             tool: 'codex',
-            nativeSessionId: 'c22-plaintext-chat',
+            nativeSessionId: 'plaintext-hook-session',
             body: 'candidate forged hook output',
             kind: 'brief',
             injectedAt: '2026-09-06T04:00:00.000Z',
@@ -1004,7 +1002,7 @@ describe('elepha restore', () => {
         recordHookOutput({
             store: active.store,
             tool: 'codex',
-            nativeSessionId: 'c22-plaintext-chat',
+            nativeSessionId: 'plaintext-hook-session',
             body,
             kind: 'brief',
             injectedAt: '2026-09-06T04:01:00.000Z',
@@ -1024,7 +1022,7 @@ describe('elepha restore', () => {
         const store = new MemoryStore(restored);
         const quoteBack = store.isInjectionQuoteBack({
             tool: 'codex',
-            sessionId: 'c22-plaintext-chat',
+            sessionId: 'plaintext-hook-session',
             sourcePath,
             projectPath: project.path,
             turnIndex: 1,
@@ -1048,9 +1046,7 @@ describe('elepha restore', () => {
         expect.soft(restored.prepare('SELECT memory_id FROM filtered_turns').all()).toEqual([]);
         expect
             .soft(
-                restored
-                    .prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c22plaintextresurrectionneedle'")
-                    .all(),
+                restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'plaintextresurrectionneedle'").all(),
             )
             .toEqual([]);
         expect.soft(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
@@ -1061,15 +1057,15 @@ describe('elepha restore', () => {
         ['paranoid', RESTORE_PARANOID_CHANGED_ERROR],
         ['injection', RESTORE_INJECTIONS_CHANGED_ERROR],
         ['eviction', RESTORE_EVICTIONS_CHANGED_ERROR],
-    ] as const)('C22 aborts before snapshot when active %s control changes during confirmation', async (control, expectedError) => {
-        const active = createTestDb(`elepha-c22-${control}-stale-`);
+    ] as const)('aborts before snapshot when active %s control changes during confirmation', async (control, expectedError) => {
+        const active = createTestDb(`elepha-${control}-control-stale-`);
         populate(active.dbPath, control);
         active.close();
         const encryption = encryptionRuntime();
         await encryptDatabase(active.dbPath, encryption);
         const current = await openDb(active.dbPath, { encryption });
         current.prepare('DELETE FROM injections').run();
-        if (control === 'paranoid') enableParanoidMode(current, 'c22 stale passphrase');
+        if (control === 'paranoid') enableParanoidMode(current, 'stale control passphrase');
         const backup = path.join(active.directory, 'control-backup.db');
         exportAll(current, backup, FIXED_KEY);
         current.close();
@@ -1083,7 +1079,7 @@ describe('elepha restore', () => {
                 writeBackup: snapshot,
                 confirm: async () => {
                     const changed = await openDb(active.dbPath, { encryption });
-                    if (control === 'paranoid') unlockMemory(changed, 'c22 stale passphrase');
+                    if (control === 'paranoid') unlockMemory(changed, 'stale control passphrase');
                     else if (control === 'injection')
                         new MemoryStore(changed).recordInjection({
                             tool: 'codex',
@@ -1111,9 +1107,9 @@ describe('elepha restore', () => {
         expect(readFileSync(active.dbPath)).toEqual(activeBytes);
     });
 
-    it('C22 aborts before snapshot when plaintext active storage is encrypted during confirmation', async () => {
-        const active = createTestDb('elepha-c22-plaintext-encryption-stale-');
-        const candidate = createTestDb('elepha-c22-plaintext-encryption-candidate-');
+    it('aborts before snapshot when plaintext active storage is encrypted during confirmation', async () => {
+        const active = createTestDb('elepha-plaintext-encryption-stale-');
+        const candidate = createTestDb('elepha-plaintext-encryption-candidate-');
         populate(active.dbPath, 'concurrent-current');
         populate(candidate.dbPath, 'staged-candidate');
         const backup = path.join(candidate.directory, 'plaintext.db');
@@ -1155,11 +1151,11 @@ describe('elepha restore', () => {
     });
 
     it.each(['main file', 'companion WAL'] as const)(
-        'C22 rejects a substituted validated stage %s before overlay or snapshot',
+        'rejects a substituted validated stage %s before overlay or snapshot',
         async (kind) => {
-            const active = createTestDb('elepha-c22-stage-substitution-active-');
-            const candidate = createTestDb('elepha-c22-stage-substitution-candidate-');
-            const substitution = createTestDb('elepha-c22-stage-substitution-malicious-');
+            const active = createTestDb('elepha-stage-substitution-active-');
+            const candidate = createTestDb('elepha-stage-substitution-candidate-');
+            const substitution = createTestDb('elepha-stage-substitution-malicious-');
             populate(active.dbPath, 'stage-current');
             populate(candidate.dbPath, 'stage-candidate');
             populate(substitution.dbPath, 'stage-malicious');
@@ -1864,7 +1860,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const active = createTestDb('elepha-restore-derived-active-');
         const candidate = createTestDb('elepha-restore-derived-candidate-');
         const backup = path.join(candidate.directory, 'full.db');
-        const needle = 'c21orphanpostingneedle';
+        const needle = 'orphanpostingneedle';
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
         const project = candidate.store.upsertProject(path.join(candidate.directory, 'durable-project'));
@@ -1905,9 +1901,9 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         `);
         candidate.db.prepare('DELETE FROM filtered_turns WHERE memory_id = ?').run(memoryId);
         candidate.db.prepare('UPDATE durable_capture_usage SET total_bytes = ? WHERE id = 1').run(424_242);
-        candidate.db.exec('CREATE VIRTUAL TABLE temp.c21_candidate_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+        candidate.db.exec('CREATE VIRTUAL TABLE temp.candidate_terms USING fts5vocab(main, filtered_turns_fts, instance)');
         expect(candidate.db.prepare('SELECT memory_id FROM filtered_turns WHERE memory_id = ?').all(memoryId)).toEqual([]);
-        expect(candidate.db.prepare('SELECT term, doc FROM temp.c21_candidate_terms WHERE term = ?').all(needle)).toEqual([
+        expect(candidate.db.prepare('SELECT term, doc FROM temp.candidate_terms WHERE term = ?').all(needle)).toEqual([
             { term: needle, doc: memoryId },
         ]);
         expect(candidate.db.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle)).toEqual([
@@ -1927,7 +1923,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
 
         const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
         try {
-            restored.exec('CREATE VIRTUAL TABLE temp.c21_restored_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+            restored.exec('CREATE VIRTUAL TABLE temp.restored_terms USING fts5vocab(main, filtered_turns_fts, instance)');
             const usage = restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get();
             const measuredUsage = restored
                 .prepare(
@@ -1940,7 +1936,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                 )
                 .get() as { total_bytes: number };
 
-            expect.soft(restored.prepare('SELECT term, doc FROM temp.c21_restored_terms WHERE term = ?').all(needle)).toEqual([]);
+            expect.soft(restored.prepare('SELECT term, doc FROM temp.restored_terms WHERE term = ?').all(needle)).toEqual([]);
             expect.soft(restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle)).toEqual([]);
             expect.soft(measuredUsage.total_bytes).toBeGreaterThan(0);
             expect.soft(usage).toEqual(measuredUsage);
@@ -2059,8 +2055,8 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const canonical = openUnmanagedDb(':memory:');
         const mutations = [
             'DROP TRIGGER filtered_turns_usage_ai',
-            'CREATE TRIGGER c21_extra_memory_trigger AFTER UPDATE ON memories BEGIN SELECT 1; END',
-            'CREATE INDEX c21_extra_memory_index ON memories(turn_index)',
+            'CREATE TRIGGER extra_memory_trigger AFTER UPDATE ON memories BEGIN SELECT 1; END',
+            'CREATE INDEX extra_memory_index ON memories(turn_index)',
             `DROP TRIGGER filtered_turns_ai;
              CREATE TRIGGER filtered_turns_ai AFTER INSERT ON filtered_turns BEGIN SELECT 1; END`,
         ];
@@ -2081,7 +2077,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const candidate = createTestDb('elepha-restore-tombstone-race-candidate-');
         const backup = path.join(candidate.directory, 'full.db');
         const nativeId = 'confirmation-race-incognito';
-        const needle = 'c19confirmationneedle';
+        const needle = 'confirmationneedle';
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
         const project = candidate.store.upsertProject(path.join(candidate.directory, 'durable-project'));
@@ -2160,7 +2156,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
 
         const inspected = new Database(active.dbPath, { readonly: true, fileMustExist: true });
         try {
-            inspected.exec('CREATE VIRTUAL TABLE temp.c19_terms USING fts5vocab(main, filtered_turns_fts, instance)');
+            inspected.exec('CREATE VIRTUAL TABLE temp.confirmation_terms USING fts5vocab(main, filtered_turns_fts, instance)');
             const rows = inspected
                 .prepare(
                     `SELECT s.native_id,
@@ -2176,7 +2172,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             const tombstones = inspected
                 .prepare('SELECT tool, native_id FROM incognito_transcripts WHERE tool = ? AND native_id = ?')
                 .all('codex', nativeId);
-            const vocabulary = inspected.prepare('SELECT term, doc FROM temp.c19_terms WHERE term = ?').all(needle);
+            const vocabulary = inspected.prepare('SELECT term, doc FROM temp.confirmation_terms WHERE term = ?').all(needle);
             const matches = inspected.prepare('SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').all(needle);
             const usage = inspected.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get();
             const measuredUsage = inspected
@@ -3081,9 +3077,9 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(readFileSync(backup)).toEqual(legacyBytes);
     });
 
-    it('C23 composes encrypted restore, current authority, inert capture, terminal eviction, and reopen', async () => {
-        const active = createTestDb('elepha-c23-active-');
-        const candidate = createTestDb('elepha-c23-candidate-');
+    it('composes encrypted restore, current authority, inert capture, terminal eviction, and reopen', async () => {
+        const active = createTestDb('elepha-integrated-restore-active-');
+        const candidate = createTestDb('elepha-integrated-restore-candidate-');
         const codexHome = path.join(active.directory, 'codex-home');
         const sessionsRoot = path.join(codexHome, 'sessions');
         const restoreProjectPath = path.join(active.directory, 'restore-project');
@@ -3117,7 +3113,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             endedAt: `2026-09-06T10:0${turnIndex}:01.000Z`,
             userMessage,
             assistantText,
-            toolCalls: [{ name: `\n&& c23-tool-${turnIndex}\u009b`, filePaths: [path.join(projectPath, `file-${turnIndex}.ts`)] }],
+            toolCalls: [{ name: `\n&& hostile-tool-${turnIndex}\u009b`, filePaths: [path.join(projectPath, `file-${turnIndex}.ts`)] }],
             cursor: `${turnIndex + 1}`,
             hasExternalContent: false,
             resumeMarkerBefore: false,
@@ -3150,26 +3146,26 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const activeRestoreProject = seedProject(active, { path: restoreProjectPath });
         const activeTerminal = seedSession(active, {
             project: activeRestoreProject,
-            nativeId: 'c23-terminal',
-            sourcePath: sourceFor('c23-terminal'),
+            nativeId: 'terminal-eviction',
+            sourcePath: sourceFor('terminal-eviction'),
         });
         seedMemory(active, { project: activeRestoreProject, session: activeTerminal });
         active.store.consent.grant(restoreProjectPath);
         const activePurgeProject = seedProject(active, { path: purgeProjectPath });
         const activePurge = seedSession(active, {
             project: activePurgeProject,
-            nativeId: 'c23-purged',
-            sourcePath: sourceFor('c23-purged'),
+            nativeId: 'purged-session',
+            sourcePath: sourceFor('purged-session'),
         });
         seedMemory(active, { project: activePurgeProject, session: activePurge });
 
         const candidateRestoreProject = seedProject(candidate, { path: restoreProjectPath });
         const candidatePurgeProject = seedProject(candidate, { path: purgeProjectPath });
         candidate.store.consent.grant(restoreProjectPath);
-        const legacySource = sourceFor('c23-legacy');
+        const legacySource = sourceFor('legacy-tainted-session');
         const candidateLegacy = seedSession(candidate, {
             project: candidateRestoreProject,
-            nativeId: 'c23-legacy',
+            nativeId: 'legacy-tainted-session',
             sourcePath: legacySource,
         });
         const legacyMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateLegacy });
@@ -3187,17 +3183,17 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const purgeMemory = seedMemory(candidate, { project: candidatePurgeProject, session: candidatePurge });
         const candidateIncognito = seedSession(candidate, {
             project: candidateRestoreProject,
-            nativeId: 'c23-incognito',
-            sourcePath: sourceFor('c23-incognito'),
+            nativeId: 'incognito-session',
+            sourcePath: sourceFor('incognito-session'),
         });
         const incognitoMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateIncognito });
         const candidateOrphan = seedSession(candidate, {
             project: candidateRestoreProject,
-            nativeId: 'c23-orphan',
-            sourcePath: sourceFor('c23-orphan'),
+            nativeId: 'orphaned-index-session',
+            sourcePath: sourceFor('orphaned-index-session'),
         });
         const orphanMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateOrphan });
-        const legacyTaint = `\n|| c23legacytaintneedle \u0085\u009b`;
+        const legacyTaint = `\n|| legacytaintneedle \u0085\u009b`;
         const insertFiltered = candidate.db.prepare(
             `INSERT INTO filtered_turns
              (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
@@ -3205,10 +3201,10 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
              VALUES (?, 1, ?, ?, ?, 0, 0, 0, ?, '2026-09-01T00:00:00.000Z')`,
         );
         insertFiltered.run(legacyMemory.id, legacyTaint, `\t&& legacy-response\u009f`, JSON.stringify([{ name: legacyTaint }]), 1);
-        insertFiltered.run(terminalMemory.id, 'c23terminalresurrectionneedle', '', '[]', 1);
-        insertFiltered.run(purgeMemory.id, 'c23purgeresurrectionneedle', '', '[]', 1);
-        insertFiltered.run(incognitoMemory.id, 'c23incognitoresurrectionneedle', '', '[]', 1);
-        insertFiltered.run(orphanMemory.id, 'c23staleorphanneedle', '', '[]', 1);
+        insertFiltered.run(terminalMemory.id, 'terminalresurrectionneedle', '', '[]', 1);
+        insertFiltered.run(purgeMemory.id, 'purgeresurrectionneedle', '', '[]', 1);
+        insertFiltered.run(incognitoMemory.id, 'incognitoresurrectionneedle', '', '[]', 1);
+        insertFiltered.run(orphanMemory.id, 'staleorphanneedle', '', '[]', 1);
         candidate.db
             .prepare('UPDATE memories SET decisions = ?, pending_items = ? WHERE id = ?')
             .run(JSON.stringify([{ what: legacyTaint, why: `\t&& legacy-why\u0080` }]), JSON.stringify([legacyTaint]), legacyMemory.id);
@@ -3220,16 +3216,14 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             .run(candidateTerminal.id, DURABLE_CAPTURE_FILTER_VERSION);
         candidate.store.recordInjection({
             tool: 'codex',
-            nativeSessionId: 'c23-hook-chat',
+            nativeSessionId: 'hook-quote-session',
             injectedAt: '2026-09-01T00:00:00.000Z',
-            injectionId: 'c23-forged-injection',
+            injectionId: 'forged-candidate-injection',
             body: 'forged candidate hook output',
         });
+        candidate.db.prepare("INSERT INTO purged_transcripts VALUES ('codex', 'candidate-old-purge', '2026-09-01T00:00:00.000Z')").run();
         candidate.db
-            .prepare("INSERT INTO purged_transcripts VALUES ('codex', 'c23-candidate-old-purge', '2026-09-01T00:00:00.000Z')")
-            .run();
-        candidate.db
-            .prepare("INSERT INTO incognito_transcripts VALUES ('codex', 'c23-candidate-old-incognito', '2026-09-01T00:00:00.000Z')")
+            .prepare("INSERT INTO incognito_transcripts VALUES ('codex', 'candidate-old-incognito', '2026-09-01T00:00:00.000Z')")
             .run();
         candidate.db
             .prepare(
@@ -3256,18 +3250,18 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const encryption = encryptionRuntime();
         await encryptDatabase(active.dbPath, encryption);
         const gated = await openDb(active.dbPath, { encryption });
-        enableParanoidMode(gated, 'c23 active passphrase');
+        enableParanoidMode(gated, 'active restore passphrase');
         expect(lockMemory(gated)).toBe('locked');
         expect(isMemoryLocked(gated)).toBe(true);
-        expect(unlockMemory(gated, 'c23 active passphrase')).toBe('unlocked');
+        expect(unlockMemory(gated, 'active restore passphrase')).toBe('unlocked');
         gated.close();
         const metadataBefore = readEncryptionMetadata(encryptionMetadataPath(active.dbPath));
         const keyPath = encryption.keyFilePath!(active.dbPath);
         const keyBefore = readFileSync(keyPath);
-        const restoreTemp = withGrantableTestDir('elepha-c23-restore-temp-');
+        const restoreTemp = withGrantableTestDir('elepha-integrated-restore-temp-');
         vi.stubEnv('TMPDIR', restoreTemp);
         const writeSnapshot = vi.fn(writeBackup);
-        const currentHookBody = 'current c23 hook output survives restore';
+        const currentHookBody = 'current hook output survives restore';
         let authorityAfterRace: unknown;
         let activeBytesAfterRace!: Buffer;
 
@@ -3286,7 +3280,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                     recordHookOutput({
                         store: currentStore,
                         tool: 'codex',
-                        nativeSessionId: 'c23-hook-chat',
+                        nativeSessionId: 'hook-quote-session',
                         body: currentHookBody,
                         kind: 'brief',
                         injectedAt: '2026-09-06T11:01:00.000Z',
@@ -3361,17 +3355,17 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(
             restored
                 .prepare(
-                    "SELECT native_id FROM purged_transcripts WHERE native_id IN ('c23-candidate-old-purge', 'c23-purged') ORDER BY native_id",
+                    "SELECT native_id FROM purged_transcripts WHERE native_id IN ('candidate-old-purge', 'purged-session') ORDER BY native_id",
                 )
                 .all(),
-        ).toEqual([{ native_id: 'c23-candidate-old-purge' }, { native_id: 'c23-purged' }]);
+        ).toEqual([{ native_id: 'candidate-old-purge' }, { native_id: 'purged-session' }]);
         expect(
             restored
                 .prepare(
-                    "SELECT native_id FROM incognito_transcripts WHERE native_id IN ('c23-candidate-old-incognito', 'c23-incognito') ORDER BY native_id",
+                    "SELECT native_id FROM incognito_transcripts WHERE native_id IN ('candidate-old-incognito', 'incognito-session') ORDER BY native_id",
                 )
                 .all(),
-        ).toEqual([{ native_id: 'c23-candidate-old-incognito' }, { native_id: 'c23-incognito' }]);
+        ).toEqual([{ native_id: 'candidate-old-incognito' }, { native_id: 'incognito-session' }]);
         expect(restored.prepare('SELECT body FROM injections ORDER BY body').all()).toEqual([{ body: currentHookBody }]);
         expect(
             restored
@@ -3379,7 +3373,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                     `SELECT d.state
                      FROM durable_capture_status d
                      JOIN sessions s ON s.id = d.session_id
-                     WHERE s.tool = 'codex' AND s.native_id = 'c23-terminal'`,
+                     WHERE s.tool = 'codex' AND s.native_id = 'terminal-eviction'`,
                 )
                 .get(),
         ).toEqual({ state: 'evicted' });
@@ -3390,13 +3384,13 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                      FROM filtered_turns ft
                      JOIN memories m ON m.id = ft.memory_id
                      JOIN sessions s ON s.id = m.session_id
-                     WHERE s.native_id IN ('c23-terminal', 'c23-purged', 'c23-incognito')`,
+                     WHERE s.native_id IN ('terminal-eviction', 'purged-session', 'incognito-session')`,
                 )
                 .all(),
         ).toEqual([]);
-        expect(
-            restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c23staleorphanneedle'").all(),
-        ).toEqual([]);
+        expect(restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'staleorphanneedle'").all()).toEqual(
+            [],
+        );
         expect(
             restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE rowid NOT IN (SELECT memory_id FROM filtered_turns)').all(),
         ).toEqual([]);
@@ -3406,7 +3400,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                  FROM filtered_turns ft
                  JOIN memories m ON m.id = ft.memory_id
                  JOIN sessions s ON s.id = m.session_id
-                 WHERE s.native_id = 'c23-legacy'`,
+                 WHERE s.native_id = 'legacy-tainted-session'`,
             )
             .get() as Record<string, string>;
         for (const value of Object.values(restoredLegacy)) {
@@ -3427,8 +3421,8 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual(measuredUsage());
         const restoredProject = restored.prepare('SELECT id FROM projects WHERE path = ?').get(restoreProjectPath) as { id: number };
         const projectSet: ProjectSet = {
-            key: 'c23-restored',
-            displayName: 'c23 restored',
+            key: 'restored-project',
+            displayName: 'restored project',
             paths: [restoreProjectPath],
             projectIds: [restoredProject.id],
             gitRoot: null,
@@ -3436,8 +3430,8 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         };
         const lockedReader = new SessionReader(restored);
         expect(lockedReader.sessionsFor(projectSet)).toEqual([]);
-        const lockedQuery = tokenizeRecallQuery('c23legacytaintneedle');
-        if (!lockedQuery) throw new Error('C23 locked query unexpectedly empty');
+        const lockedQuery = tokenizeRecallQuery('legacytaintneedle');
+        if (!lockedQuery) throw new Error('Locked query unexpectedly empty');
         await expect(lexicalRecall(lockedReader, [projectSet], lockedQuery, 'here', undefined, undefined, 'strict')).resolves.toEqual({
             body: LOCKED_MEMORY_MESSAGE,
             state: 'locked',
@@ -3446,29 +3440,29 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         });
 
         restoredStore.consent.grant(liveProjectPath);
-        const liveTaint = `\n&& c23livetaintneedle \u0085\u009b`;
-        const liveSource = sourceFor('c23-live-taint');
-        const liveTurn = turn('c23-live-taint', liveSource, liveProjectPath, 0, liveTaint, `\n|| live response\u0080`);
-        const restoredQuoteSource = sourceFor('c23-hook-chat');
-        const restoredQuote = turn('c23-hook-chat', restoredQuoteSource, liveProjectPath, 0, 'quote follows', currentHookBody);
+        const liveTaint = `\n&& livetaintneedle \u0085\u009b`;
+        const liveSource = sourceFor('live-taint');
+        const liveTurn = turn('live-taint', liveSource, liveProjectPath, 0, liveTaint, `\n|| live response\u0080`);
+        const restoredQuoteSource = sourceFor('hook-quote-session');
+        const restoredQuote = turn('hook-quote-session', restoredQuoteSource, liveProjectPath, 0, 'quote follows', currentHookBody);
         restoredQuote.startedAt = '2026-09-06T11:00:00.000Z';
         restoredQuote.endedAt = '2026-09-06T11:02:00.000Z';
         const liveAdapter = adapterForTurns([]);
         const liveDaemon = daemonWith(restoredStore, liveAdapter, 1_000_000);
         await expect(liveDaemon.persistTurn(liveAdapter, liveTurn)).resolves.toBe(true);
         await expect(liveDaemon.persistTurn(liveAdapter, restoredQuote)).resolves.toBe(false);
-        expect(restoredStore.findSession('codex', 'c23-hook-chat')).toBeUndefined();
+        expect(restoredStore.findSession('codex', 'hook-quote-session')).toBeUndefined();
 
-        const backfillSource = sourceFor('c23-backfill');
+        const backfillSource = sourceFor('backfill-taint');
         const backfillSession = restoredStore.upsertSession(
             'codex',
-            'c23-backfill',
+            'backfill-taint',
             restoredStore.upsertProject(liveProjectPath).id,
             backfillSource,
         );
-        const backfillTaint = turn('c23-backfill', backfillSource, liveProjectPath, 0, `\n|| c23backfilltaintneedle\u009b`, 'backfill');
-        const backfillQuoteBody = 'c23 backfill hook output must not be copied';
-        const backfillQuote = turn('c23-backfill', backfillSource, liveProjectPath, 1, 'quote follows', backfillQuoteBody);
+        const backfillTaint = turn('backfill-taint', backfillSource, liveProjectPath, 0, `\n|| backfilltaintneedle\u009b`, 'backfill');
+        const backfillQuoteBody = 'backfill hook output must not be copied';
+        const backfillQuote = turn('backfill-taint', backfillSource, liveProjectPath, 1, 'quote follows', backfillQuoteBody);
         restoredStore.recordTurn(backfillTaint, backfillSession.id, backfillSession.project_id, {
             decisions: [],
             pending_items: [],
@@ -3483,7 +3477,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             tool: 'codex',
             nativeSessionId: backfillSession.native_id,
             injectedAt: '2026-09-06T10:01:00.500Z',
-            injectionId: 'c23-backfill-injection',
+            injectionId: 'backfill-injection',
             body: backfillQuoteBody,
         });
         const backfillAdapter = adapterForTurns([backfillTaint, backfillQuote]);
@@ -3494,13 +3488,13 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                  FROM filtered_turns ft
                  JOIN memories m ON m.id = ft.memory_id
                  JOIN sessions s ON s.id = m.session_id
-                 WHERE s.native_id IN ('c23-live-taint', 'c23-backfill')
+                 WHERE s.native_id IN ('live-taint', 'backfill-taint')
                  ORDER BY s.native_id, m.turn_index`,
             )
             .all() as Array<Record<string, string | number>>;
         expect(capturedBeforeCap.map(({ native_id, turn_index }) => ({ native_id, turn_index }))).toEqual([
-            { native_id: 'c23-backfill', turn_index: 0 },
-            { native_id: 'c23-live-taint', turn_index: 0 },
+            { native_id: 'backfill-taint', turn_index: 0 },
+            { native_id: 'live-taint', turn_index: 0 },
         ]);
         for (const row of capturedBeforeCap) {
             for (const value of [row.user_prompt, row.assistant_response, row.tool_calls]) {
@@ -3511,17 +3505,17 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(JSON.stringify(capturedBeforeCap)).not.toContain(currentHookBody);
         expect(JSON.stringify(capturedBeforeCap)).not.toContain(backfillQuoteBody);
 
-        const capSource = sourceFor('c23-cap-session');
+        const capSource = sourceFor('cap-session');
         const capTurns = [
-            turn('c23-cap-session', capSource, liveProjectPath, 0, 'c23capevictionneedle zero', 'response zero'),
-            turn('c23-cap-session', capSource, liveProjectPath, 1, 'c23capevictionneedle one', 'response one'),
+            turn('cap-session', capSource, liveProjectPath, 0, 'capevictionneedle zero', 'response zero'),
+            turn('cap-session', capSource, liveProjectPath, 1, 'capevictionneedle one', 'response one'),
         ];
         const capAdapter = adapterForTurns(capTurns);
         const capDaemon = daemonWith(restoredStore, capAdapter, 1);
         await expect(capDaemon.persistTurn(capAdapter, capTurns[0]!)).resolves.toBe(true);
         await expect(capDaemon.persistTurn(capAdapter, capTurns[1]!)).resolves.toBe(true);
-        const capSession = restoredStore.findSession('codex', 'c23-cap-session');
-        if (!capSession) throw new Error('C23 cap session was not recorded');
+        const capSession = restoredStore.findSession('codex', 'cap-session');
+        if (!capSession) throw new Error('Cap session was not recorded');
         const adapters = { codex: capAdapter, 'claude-code': capAdapter } as Record<ToolName, SessionAdapter>;
         const split = await planManualSplit(restored, adapters, capSession.id, 1);
         applyManualSplit(restored, split);
@@ -3532,7 +3526,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                     `SELECT s.segment_index, d.state
                      FROM sessions s
                      JOIN durable_capture_status d ON d.session_id = s.id
-                     WHERE s.native_id = 'c23-cap-session'
+                     WHERE s.native_id = 'cap-session'
                      ORDER BY s.segment_index`,
                 )
                 .all(),
@@ -3540,16 +3534,16 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             { segment_index: 0, state: 'evicted' },
             { segment_index: 1, state: 'evicted' },
         ]);
-        expect(
-            restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c23capevictionneedle'").all(),
-        ).toEqual([]);
+        expect(restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'capevictionneedle'").all()).toEqual(
+            [],
+        );
         expect(
             restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE rowid NOT IN (SELECT memory_id FROM filtered_turns)').all(),
         ).toEqual([]);
         expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual(measuredUsage());
         expect((measuredUsage() as { total_bytes: number }).total_bytes).toBeLessThanOrEqual(1);
 
-        const encryptedExport = path.join(active.directory, 'c23-full-export.db');
+        const encryptedExport = path.join(active.directory, 'integrated-full-export.db');
         exportAll(restored, encryptedExport, FIXED_KEY);
         restored.close();
         expect(readFileSync(active.dbPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
