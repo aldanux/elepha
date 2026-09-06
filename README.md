@@ -9,7 +9,7 @@
 <p align="center">Reads existing transcripts and serves context via MCP.</p>
 
 <p align="center">
-  <a href="https://www.npmjs.com/package/elepha"><img src="https://img.shields.io/npm/v/elepha?color=2ab7d4" alt="npm version"></a>
+  <a href="https://www.npmjs.com/package/elepha"><img src="https://img.shields.io/node/v/elepha?color=2ab7d4" alt="Node.js version"></a>
   <a href="https://github.com/aldanux/elepha/actions/workflows/ci.yml"><img src="https://github.com/aldanux/elepha/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MPL--2.0-2ab7d4" alt="License: MPL-2.0"></a>
 </p>
