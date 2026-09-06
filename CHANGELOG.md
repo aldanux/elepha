@@ -1,5 +1,9 @@
 # elepha
 
+## 0.4.1
+
+- Keep self-update compatible with 0.3.x launchers and show terminal progress while update and daemon health commands run by [@aldanux](https://github.com/aldanux) in [#52](https://github.com/aldanux/elepha/pull/52)
+
 ## 0.4.0
 
 Elepha 0.4.0 introduces opt-in durable capture and encrypted local storage. Approved sessions can retain a bounded, searchable filtered copy after the original transcript disappears. This release also adds encrypted backup and restore, purge and incognito deletion, optional paranoid locking, automatic migration of existing plaintext databases, and moved-project recovery. Node.js 22.12.0 or newer is required.
