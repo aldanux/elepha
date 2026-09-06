@@ -1,7 +1,7 @@
 // Re-derives the bounded body-search document for each stored segment from
 // its first retained turn. It never changes turns, boundaries, or rollups.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { isReadableProviderSource } from '../config/paths.js';
 import type { SessionAdapter, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';

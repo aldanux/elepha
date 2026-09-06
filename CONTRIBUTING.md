@@ -23,7 +23,7 @@ Issues.
 
 ## Prerequisites
 
-elepha is a TypeScript project and requires **Node.js 22 or newer**, as declared in
+elepha is a TypeScript project and requires **Node.js 22.12.0 or newer**, as declared in
 [package.json](package.json). The development dependencies include TypeScript, so no
 global TypeScript installation is required.
 
@@ -71,7 +71,9 @@ Early discussion helps avoid work on an approach that does not fit the project.
 3. Run the required checks:
 
    ```console
+   npm run build
    npm run typecheck
+   npm run typecheck:tests
    npm run format:check
    npm test
    ```
@@ -79,7 +81,7 @@ Early discussion helps avoid work on an approach that does not fit the project.
 4. Add a changeset when the change should appear in release notes, as described in [Changelog](#changelog).
 5. Open a pull request with a clear title and complete description.
 
-All three required checks must pass before review.
+All five required checks must pass before review.
 
 ### Pull request description
 

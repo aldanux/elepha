@@ -1,8 +1,14 @@
 import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { REMEMBER_SCAN_BUDGET_MS, REMEMBER_SESSION_RECENCY_CAP, SESSION_CHAR_BUDGET } from '../../src/config/constants.js';
+import {
+    DURABLE_CAPTURE_FILTER_VERSION,
+    REMEMBER_SCAN_BUDGET_MS,
+    REMEMBER_SESSION_RECENCY_CAP,
+    SESSION_CHAR_BUDGET,
+} from '../../src/config/constants.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { parseUserPromptCommand, runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
@@ -14,9 +20,9 @@ import {
     SELECT_HINT,
 } from '../../src/serving/instructions.js';
 import { lexicalRecall, STRICT_RECALL_FALLBACK_NOTICE, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
-import type { ServedSession, SessionReader } from '../../src/serving/session-reader.js';
+import { type ServedSession, SessionReader } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { TestDatabase } from '../helpers/db.js';
@@ -146,6 +152,43 @@ function addSession(
     return session;
 }
 
+function addDurableCopy(
+    fixture: TestDatabase,
+    session: ReturnType<typeof seedSession>,
+    turns: Array<{ assistant?: string; tools?: string; user?: string }>,
+    state: 'complete' | 'complete_truncated' | 'disabled_gap' | 'evicted' | null = 'complete',
+): void {
+    const memories = fixture.db
+        .prepare('SELECT id, turn_index FROM memories WHERE session_id = ? ORDER BY turn_index')
+        .all(session.id) as Array<{ id: number; turn_index: number }>;
+    const insert = fixture.db.prepare(
+        `INSERT INTO filtered_turns
+         (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
+          dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+         VALUES (?, 1, ?, ?, ?, 0, 0, ?, ?, ?)`,
+    );
+    for (const memory of memories) {
+        const turn = turns[memory.turn_index] ?? {};
+        insert.run(
+            memory.id,
+            turn.user ?? '',
+            turn.assistant ?? '',
+            turn.tools ?? '[]',
+            state === 'complete_truncated' ? 1 : 0,
+            DURABLE_CAPTURE_FILTER_VERSION,
+            new Date(NOW).toISOString(),
+        );
+    }
+    if (state !== null) {
+        fixture.db
+            .prepare(
+                `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+                 VALUES (?, ?, ?, ?)`,
+            )
+            .run(session.id, state, DURABLE_CAPTURE_FILTER_VERSION, new Date(NOW).toISOString());
+    }
+}
+
 function payload(cwd: string, prompt: string): string {
     return JSON.stringify({
         session_id: 'current-session',
@@ -221,6 +264,23 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(contextOf(result)).toContain(REMEMBER_QUERY_REQUIRED);
     });
 
+    it('does not log an unconsented here notice when injection recording fails', async () => {
+        const fixture = createTestDb('elepha-remember-unconsented-record-failure-');
+        const { projectPath } = addProject(fixture, 'denied', 'denied');
+        fixture.close();
+        const log: string[] = [];
+
+        const result = await runUserPromptSubmit(payload(projectPath, 'elepha:query:here missing'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW,
+            writeInjection: () => false,
+            log: (line) => log.push(line),
+        });
+
+        expect(result).toEqual({ reason: 'injection_record_failed' });
+        expect(log).toEqual(['user-prompt-submit codex session_id=current-session: failed reason=injection_record_failed']);
+    });
+
     it('searches other consented projects globally, keeps here local, and excludes denied projects', async () => {
         const fixture = createTestDb('elepha-remember-scope-');
         const current = addProject(fixture, 'current', 'approved');
@@ -266,7 +326,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(global.split('\n').at(-2)).toBe(SELECT_HINT);
         expect(here).not.toContain('Approved remote match');
         expect(here).toContain(
-            `No recall matches found for “cross project needle” in current. Search every project with elepha:query cross project needle.\n\n${SELECT_HINT}`,
+            `No recall matches found for “cross project needle” in current. Search every project with elepha:query cross project needle.\n\nPartial coverage (partial durable copies): searched 1 of 1 projects and 1 of 1 sessions. Content coverage: 0 complete, 0 complete_truncated, 0 incomplete, 0 evicted, 1 never durably captured. Absence is not conclusive.\n\n${SELECT_HINT}`,
         );
         expect(here).not.toContain('\n\n\n');
         expect(here.split('\n').at(-2)).toBe(SELECT_HINT);
@@ -302,22 +362,26 @@ describe('UserPromptSubmit lexical recall', () => {
         const writeInjection = vi.fn(() => true);
         const log: string[] = [];
 
-        queueMicrotask(() => {
-            const revokingDb = openDb(fixture.dbPath);
+        const revokeDuringRecall = () => {
+            const revokingDb = openUnmanagedDb(fixture.dbPath);
             new ConsentStore(revokingDb).revoke(remote.projectPath);
             revokingDb.close();
-        });
+        };
         const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query revocation race needle'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW,
             writeInjection,
             log: (line) => log.push(line),
+            projectResolver: (db) => {
+                queueMicrotask(revokeDuringRecall);
+                return new ProjectResolver(db);
+            },
         });
 
         expect(result).toEqual({ reason: 'project_unavailable_or_unconsented' });
         expect(JSON.stringify(result)).not.toContain('Revoked global transcript result');
         expect(writeInjection).not.toHaveBeenCalled();
-        const verificationDb = openDb(fixture.dbPath);
+        const verificationDb = openUnmanagedDb(fixture.dbPath);
         expect(verificationDb.prepare('SELECT COUNT(*) AS count FROM injections').get()).toEqual({ count: 0 });
         verificationDb.close();
         expect(log).toContain('user-prompt-submit codex session_id=current-session: discarded reason=project_unavailable_or_unconsented');
@@ -335,14 +399,21 @@ describe('UserPromptSubmit lexical recall', () => {
         fixture.close();
         const log: string[] = [];
 
-        queueMicrotask(() => {
-            const revokingDb = openDb(fixture.dbPath);
+        const revokeDuringRecall = () => {
+            const revokingDb = openUnmanagedDb(fixture.dbPath);
             new ConsentStore(revokingDb).revoke(current.projectPath);
             revokingDb.close();
-        });
+        };
+        let revocationScheduled = false;
         const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query:here local revocation needle'), 'codex', {
             dbPath: fixture.dbPath,
-            now: () => NOW,
+            now: () => {
+                if (!revocationScheduled) {
+                    revocationScheduled = true;
+                    queueMicrotask(revokeDuringRecall);
+                }
+                return NOW;
+            },
             log: (line) => log.push(line),
         });
 
@@ -351,7 +422,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(body).toBe(`${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`);
         expect(context).not.toContain('Revoked here transcript result');
         expect(context).not.toContain('stale local answer');
-        const verificationDb = openDb(fixture.dbPath);
+        const verificationDb = openUnmanagedDb(fixture.dbPath);
         expect(verificationDb.prepare('SELECT body FROM injections').all()).toEqual([{ body }]);
         verificationDb.close();
         expect(log).toContain('user-prompt-submit codex session_id=current-session: discarded reason=project_unavailable_or_unconsented');
@@ -422,7 +493,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(openedContext).toContain('second cross-project answer');
         expect(openedContext).not.toContain('first current-project answer');
 
-        const db = openDb(fixture.dbPath);
+        const db = openUnmanagedDb(fixture.dbPath);
         db.prepare("UPDATE consent_roots SET state = 'denied' WHERE path = ?").run(remote.projectPath);
         db.close();
         const blocked = await runUserPromptSubmit(payload(current.projectPath, 'elepha:select:2'), 'codex', {
@@ -607,6 +678,284 @@ describe('UserPromptSubmit lexical recall', () => {
         const result = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, 'strict');
 
         expect(result.sessionIds).toEqual([1, 2, 3]);
+    });
+
+    it('finds terms across stored filtered turns without exposing the stored conversation', async () => {
+        const fixture = createTestDb('elepha-query-content-');
+        const current = addProject(fixture, 'current', 'approved');
+        const session = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'content-only',
+            title: 'Routine cache follow-up',
+            timestamp: '2026-08-22T11:00:00.000Z',
+            turns: [
+                { user: 'ordinary opening request', assistant: 'ordinary opening response' },
+                { user: 'the buried term is aurora', assistant: 'the paired term is zephyr' },
+            ],
+        });
+        addDurableCopy(fixture, session, [
+            { user: 'ordinary opening request', assistant: 'ordinary opening response' },
+            { user: 'the buried term is aurora', assistant: 'the paired term is zephyr' },
+        ]);
+        fixture.close();
+
+        const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query:here aurora zephyr'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW,
+        });
+        const context = contextOf(result);
+
+        expect(context).toContain('Routine cache follow-up');
+        expect(context).not.toContain('the buried term is aurora');
+        expect(context).not.toContain('the paired term is zephyr');
+    });
+
+    it('surfaces a content-only match beyond the metadata recency cap', async () => {
+        const total = REMEMBER_SESSION_RECENCY_CAP.here + 1;
+        const project: ProjectSet = {
+            key: 'old-content-project',
+            displayName: 'old-content-project',
+            paths: ['/old-content-project'],
+            projectIds: [1],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const sessions = Array.from({ length: total }, (_, index) =>
+            recallSession(index + 1, `Routine session ${index}`, new Date(NOW - index * 1_000).toISOString()),
+        );
+        const oldest = sessions.at(-1);
+        expect(oldest).toBeDefined();
+        if (!oldest) return;
+        const storedContentRecallFor = vi.fn(() => ({
+            coverage: { complete: 1, completeTruncated: 0, incomplete: 0, evicted: 0, neverCaptured: total - 1, total },
+            matches: new Map([[oldest.id, { bm25: -1, texts: ['outsidecapneedle'] }]]),
+            rowCapReached: false,
+            timeBudgetReached: false,
+        }));
+        const reader = {
+            sessionsFor: () => sessions,
+            storedContentRecallFor,
+        } as unknown as SessionReader;
+        const query = tokenizeRecallQuery('outsidecapneedle');
+        expect(query).toBeDefined();
+        if (!query) return;
+
+        const result = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, 'strict');
+
+        expect(result.sessionIds).toEqual([oldest.id]);
+        expect(result.body).toContain(oldest.title);
+        expect(storedContentRecallFor).toHaveBeenCalledWith(
+            sessions,
+            ['"outsidecapneedle"'],
+            REMEMBER_SESSION_RECENCY_CAP.here,
+            expect.any(Function),
+        );
+    });
+
+    it('ranks title above stored content, stored content above an opening-prompt body match, and content by BM25 then recency', async () => {
+        const fixture = createTestDb('elepha-query-content-ranking-');
+        const current = addProject(fixture, 'current', 'approved');
+        const title = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'title-match',
+            title: 'Rankingneedle title',
+            timestamp: '2026-08-22T07:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        const body = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'body-match',
+            title: 'Newest opening match',
+            timestamp: '2026-08-22T11:00:00.000Z',
+            turns: [{ user: 'rankingneedle in the opening', assistant: 'ordinary response' }],
+        });
+        const strongContent = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'strong-content',
+            title: 'Old repeated content',
+            timestamp: '2026-08-22T08:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        const newerContent = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'newer-content',
+            title: 'New tied content',
+            timestamp: '2026-08-22T10:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        const olderContent = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'older-content',
+            title: 'Old tied content',
+            timestamp: '2026-08-22T09:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        addDurableCopy(fixture, strongContent, [{ assistant: 'rankingneedle rankingneedle rankingneedle rankingneedle' }]);
+        addDurableCopy(fixture, newerContent, [{ assistant: 'rankingneedle' }]);
+        addDurableCopy(fixture, olderContent, [{ assistant: 'rankingneedle' }]);
+
+        const project: ProjectSet = {
+            key: 'current',
+            displayName: 'current',
+            paths: [current.projectPath],
+            projectIds: [current.project.id],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const query = tokenizeRecallQuery('rankingneedle');
+        expect(query).toBeDefined();
+        if (!query) return;
+
+        const result = await lexicalRecall(new SessionReader(fixture.db), [project], query, 'here', () => 0, NOW, 'strict');
+
+        expect(result.sessionIds).toEqual([title.id, strongContent.id, newerContent.id, olderContent.id, body.id]);
+    });
+
+    it('keeps tombstoned and revoked content out of search and serving while retaining the copy for re-approval', async () => {
+        const fixture = createTestDb('elepha-query-content-scope-');
+        const approved = addProject(fixture, 'approved', 'approved');
+        const revoked = addProject(fixture, 'revoked', 'approved');
+        const visible = addSession(fixture, approved.project, approved.projectPath, {
+            nativeId: 'visible-content',
+            title: 'Visible durable work',
+            timestamp: '2026-08-22T11:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        const purged = addSession(fixture, approved.project, approved.projectPath, {
+            nativeId: 'purged-content',
+            title: 'Purged durable work',
+            timestamp: '2026-08-22T10:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        const incognito = addSession(fixture, approved.project, approved.projectPath, {
+            nativeId: 'incognito-content',
+            title: 'Incognito durable work',
+            timestamp: '2026-08-22T09:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        const revokedSession = addSession(fixture, revoked.project, revoked.projectPath, {
+            nativeId: 'revoked-content',
+            title: 'Revoked durable work',
+            timestamp: '2026-08-22T08:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        for (const session of [visible, purged, incognito, revokedSession]) {
+            addDurableCopy(fixture, session, [{ assistant: 'scopedcontentneedle' }]);
+        }
+        fixture.db
+            .prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)')
+            .run(purged.tool, purged.native_id, new Date(NOW).toISOString());
+        fixture.db
+            .prepare('INSERT INTO incognito_transcripts (tool, native_id, tombstoned_at) VALUES (?, ?, ?)')
+            .run(incognito.tool, incognito.native_id, new Date(NOW).toISOString());
+        fixture.close();
+
+        const beforeRevoke = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW,
+        });
+        expect(contextOf(beforeRevoke)).toContain('Revoked durable work');
+        const servedBeforeRevoke = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 1,
+        });
+        expect(contextOf(servedBeforeRevoke)).toContain('scopedcontentneedle');
+
+        const revokeDb = openUnmanagedDb(fixture.dbPath);
+        const copyBeforeRevoke = revokeDb
+            .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+            .all(revokedSession.id);
+        new ConsentStore(revokeDb).revoke(revoked.projectPath);
+        expect(
+            revokeDb
+                .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                .all(revokedSession.id),
+        ).toEqual(copyBeforeRevoke);
+        revokeDb.close();
+
+        const blockedServe = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 2,
+        });
+        expect(blockedServe).toEqual({ reason: 'project_unavailable_or_unconsented' });
+        const whileRevoked = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 3,
+        });
+        const revokedContext = contextOf(whileRevoked);
+
+        expect(revokedContext).toContain('Visible durable work');
+        expect(revokedContext).not.toContain('Purged durable work');
+        expect(revokedContext).not.toContain('Incognito durable work');
+        expect(revokedContext).not.toContain('Revoked durable work');
+
+        const grantDb = openUnmanagedDb(fixture.dbPath);
+        new ConsentStore(grantDb).grant(revoked.projectPath);
+        expect(
+            grantDb
+                .prepare('SELECT * FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)')
+                .all(revokedSession.id),
+        ).toEqual(copyBeforeRevoke);
+        grantDb.close();
+        const afterReapproval = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:query scopedcontentneedle'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 4,
+        });
+        expect(contextOf(afterReapproval)).toContain('Revoked durable work');
+        const servedAfterReapproval = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW + 5,
+        });
+        expect(contextOf(servedAfterReapproval)).toContain('scopedcontentneedle');
+    });
+
+    it('reports durable content coverage and makes partial-copy misses explicitly inconclusive', async () => {
+        const fixture = createTestDb('elepha-query-content-coverage-');
+        const current = addProject(fixture, 'current', 'approved');
+        const sessions = (['complete', 'complete_truncated', 'disabled_gap', 'evicted', null] as const).map((state, index) => {
+            const session = addSession(fixture, current.project, current.projectPath, {
+                nativeId: `coverage-${index}`,
+                title: `Coverage session ${index}`,
+                timestamp: new Date(NOW - index * 1_000).toISOString(),
+                turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+            });
+            if (state !== null) {
+                addDurableCopy(fixture, session, [{ assistant: 'unrelated captured response' }], state);
+            }
+            return session;
+        });
+        const project: ProjectSet = {
+            key: 'current',
+            displayName: 'current',
+            paths: [current.projectPath],
+            projectIds: [current.project.id],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const query = tokenizeRecallQuery('absentcopyneedle');
+        expect(query).toBeDefined();
+        if (!query) return;
+
+        const result = await lexicalRecall(new SessionReader(fixture.db), [project], query, 'here', () => 0, NOW, 'strict');
+
+        expect(result.sessionIds).toEqual([]);
+        expect(result.body).toContain(
+            `Partial coverage (partial durable copies): searched 1 of 1 projects and ${sessions.length} of ${sessions.length} sessions. Content coverage: 1 complete, 1 complete_truncated, 1 incomplete, 1 evicted, 1 never durably captured. Absence is not conclusive.`,
+        );
+    });
+
+    it('quotes and binds FTS syntax characters as normalized token literals', async () => {
+        const fixture = createTestDb('elepha-query-content-syntax-');
+        const current = addProject(fixture, 'current', 'approved');
+        const session = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'syntax-content',
+            title: 'Safe syntax handling',
+            timestamp: '2026-08-22T11:00:00.000Z',
+            turns: [{ user: 'ordinary opening', assistant: 'ordinary response' }],
+        });
+        addDurableCopy(fixture, session, [{ assistant: 'literalneedle near' }]);
+        fixture.close();
+
+        const result = await runUserPromptSubmit(payload(current.projectPath, 'elepha:query:here literalneedle " * NEAR -'), 'codex', {
+            dbPath: fixture.dbPath,
+            now: () => NOW,
+        });
+
+        expect(contextOf(result)).toContain('Safe syntax handling');
     });
 
     it('falls back from strict to labelled lax matches without changing true misses', async () => {
@@ -1010,5 +1359,75 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(body).toContain('Older complete target');
         expect(body).toContain('Oldest complete target');
         expect(body).not.toContain('Partial coverage (time budget)');
+    });
+
+    it('completes a 651-session stored-content query within the recall scan budget', async () => {
+        const fixture = createTestDb('elepha-query-content-corpus-');
+        const current = addProject(fixture, 'current', 'approved');
+        const insertSession = fixture.db.prepare(
+            `INSERT INTO sessions
+             (tool, native_id, project_id, source_path, started_at, last_ingested_at, last_turn_at,
+              title, first_prompt_search)
+             VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, 'ordinary opening')`,
+        );
+        const insertMemory = fixture.db.prepare(
+            `INSERT INTO memories
+             (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched,
+              pending_items, created_at, summarizer_status, has_external_content)
+             VALUES (?, ?, 0, 'codex', ?, '[]', '[]', '[]', ?, 'ok', 0)`,
+        );
+        const insertFiltered = fixture.db.prepare(
+            `INSERT INTO filtered_turns
+             (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
+              dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+             VALUES (?, 1, 'ordinary prompt', ?, '[]', 0, 0, 0, ?, ?)`,
+        );
+        const insertStatus = fixture.db.prepare(
+            `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+             VALUES (?, 'complete', ?, ?)`,
+        );
+        fixture.db.transaction(() => {
+            for (let index = 0; index < 651; index++) {
+                const timestamp = new Date(NOW - index * 1_000).toISOString();
+                const sessionId = Number(
+                    insertSession.run(
+                        `corpus-${index}`,
+                        current.project.id,
+                        path.join(current.projectPath, `corpus-${index}.jsonl`),
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                        `Corpus session ${index}`,
+                    ).lastInsertRowid,
+                );
+                const memoryId = Number(insertMemory.run(current.project.id, sessionId, timestamp, timestamp).lastInsertRowid);
+                insertFiltered.run(
+                    memoryId,
+                    index === 650 ? 'fullcorpusneedle' : `routine response ${index}`,
+                    DURABLE_CAPTURE_FILTER_VERSION,
+                    timestamp,
+                );
+                insertStatus.run(sessionId, DURABLE_CAPTURE_FILTER_VERSION, timestamp);
+            }
+        })();
+        const project: ProjectSet = {
+            key: 'current',
+            displayName: 'current',
+            paths: [current.projectPath],
+            projectIds: [current.project.id],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const query = tokenizeRecallQuery('fullcorpusneedle');
+        expect(query).toBeDefined();
+        if (!query) return;
+
+        const startedAt = performance.now();
+        const result = await lexicalRecall(new SessionReader(fixture.db), [project], query, 'here', undefined, NOW, 'strict');
+        const elapsed = performance.now() - startedAt;
+
+        expect(result.sessionIds).toHaveLength(1);
+        expect(result.body).toContain('Corpus session 650');
+        expect(elapsed).toBeLessThan(REMEMBER_SCAN_BUDGET_MS);
     });
 });

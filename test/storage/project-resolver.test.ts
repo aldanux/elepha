@@ -5,11 +5,11 @@ import { normalizeForCompare } from '../../src/config/paths.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
-type Db = ReturnType<typeof openDb>;
+type Db = ReturnType<typeof openUnmanagedDb>;
 
 describe('ProjectResolver', () => {
     let db: Db;
@@ -17,7 +17,7 @@ describe('ProjectResolver', () => {
     let roots: Map<string, string | null>;
 
     beforeEach(() => {
-        db = openDb(':memory:');
+        db = openUnmanagedDb(':memory:');
         root = withGrantableTestDir('elepha-project-resolver-');
         roots = new Map();
     });
@@ -296,7 +296,7 @@ describe('ProjectResolver', () => {
         addProject(projectPath);
 
         const result = resolver().resolve(projectPath.toUpperCase());
-        if (process.platform === 'darwin' || process.platform === 'win32') {
+        if (process.platform === 'darwin') {
             expect(result).toEqual(expect.objectContaining({ project: expect.objectContaining({ paths: [projectPath] }) }));
         } else {
             expect(result).toEqual({ project: null });

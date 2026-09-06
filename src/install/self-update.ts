@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { MINIMUM_NODE_MAJOR } from '../config/constants.js';
+import { MINIMUM_NODE_VERSION } from '../config/constants.js';
 import { updateAvailablePath } from '../config/paths.js';
 import {
     npmInstallGlobalElepha,
@@ -8,6 +8,8 @@ import {
     npmViewElephaLatest,
     npmViewElephaLatestAsync,
 } from '../security/subprocess-allowlist.js';
+import { migratePrimaryDatabaseToEncrypted } from '../storage/database-migration.js';
+import { defaultDbPath } from '../storage/db.js';
 import { errorMessage } from '../util/error.js';
 import { removeFileIfExists } from '../util/fs.js';
 import { type ResolvedElephaBin, resolveInstalledElephaBin } from './binary.js';
@@ -27,11 +29,13 @@ export interface SelfUpdateRuntime {
     platform?: NodeJS.Platform;
     resolveInstalledBin?: () => ResolvedElephaBin;
     readPackageVersion?: (packageRoot: string) => string;
-    detectBackend?: (options: { packageRoot: string; sourceBin: string; minimumNodeMajor: number }) => LauncherBackend;
+    detectBackend?: (options: { packageRoot: string; sourceBin: string; minimumNodeVersion: string }) => LauncherBackend;
     npm?: SelfUpdateNpm;
     service?: ServiceBackend;
-    approvedRoots: number;
+    approvedRoots?: number;
+    readApprovedRoots?: () => Promise<number>;
     reconcile?: Reconcile;
+    migrateDatabase?: () => Promise<unknown>;
 }
 
 export type SelfUpdateResult =
@@ -52,7 +56,8 @@ export function packageVersion(packageRoot: string): string {
     return manifest.version;
 }
 
-// Daemon-only registry query. Foreground self-update remains synchronous.
+// Daemon-only registry query. Foreground package operations stay synchronous,
+// while its stopped-service migration phase is awaited before reconciliation.
 export async function installedAndLatestElephaVersionAsync(
     runtime: Pick<SelfUpdateRuntime, 'resolveInstalledBin' | 'readPackageVersion' | 'detectBackend'> = {},
 ): Promise<{ installedVersion: string; latestVersion: string }> {
@@ -61,7 +66,7 @@ export async function installedAndLatestElephaVersionAsync(
     const backend = (runtime.detectBackend ?? detectLauncherBackend)({
         packageRoot: resolved.packageRoot,
         sourceBin: resolved.bin,
-        minimumNodeMajor: MINIMUM_NODE_MAJOR,
+        minimumNodeVersion: MINIMUM_NODE_VERSION,
     });
     const latestVersion = await npmViewElephaLatestAsync(npmInvocationForBackend(backend));
     return { installedVersion, latestVersion };
@@ -82,8 +87,15 @@ class ServiceNotInstalledError extends Error {
     }
 }
 
-function restart(service: ServiceBackend, approvedRoots: number, reconcile: Reconcile): void {
+async function restart(
+    service: ServiceBackend,
+    readApprovedRoots: () => Promise<number>,
+    reconcile: Reconcile,
+    migrateDatabase: () => Promise<unknown>,
+): Promise<void> {
     service.stop();
+    await migrateDatabase();
+    const approvedRoots = await readApprovedRoots();
     const status = reconcile(service, approvedRoots);
     if (status === 'not installed') {
         throw new ServiceNotInstalledError();
@@ -96,8 +108,8 @@ function restart(service: ServiceBackend, approvedRoots: number, reconcile: Reco
 // Updates the globally-installed elepha package and restarts its managed
 // capture service. Rollback restores only the prior code and healthy service;
 // additive schema migrations are intentionally left in place.
-export function selfUpdate(runtime: SelfUpdateRuntime): SelfUpdateResult;
-export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()): SelfUpdateResult {
+export function selfUpdate(runtime: SelfUpdateRuntime): Promise<SelfUpdateResult>;
+export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()): Promise<SelfUpdateResult> {
     const platform = runtime.platform ?? process.platform;
     if (!isSupportedPlatform(platform)) {
         throw new Error('elepha self-update is supported on macOS and Linux.');
@@ -108,12 +120,20 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
     const backend = (runtime.detectBackend ?? detectLauncherBackend)({
         packageRoot: resolved.packageRoot,
         sourceBin: resolved.bin,
-        minimumNodeMajor: MINIMUM_NODE_MAJOR,
+        minimumNodeVersion: MINIMUM_NODE_VERSION,
     });
     const npm = runtime.npm ?? defaultNpm(backend);
     const service = runtime.service ?? serviceBackend({ platform });
-    const approvedRoots = runtime.approvedRoots;
     const reconcile: Reconcile = runtime.reconcile ?? reconcileCaptureService;
+    const migrateDatabase = runtime.migrateDatabase ?? (() => migratePrimaryDatabaseToEncrypted(defaultDbPath()));
+    const readApprovedRoots =
+        runtime.readApprovedRoots ??
+        (async () => {
+            if (runtime.approvedRoots === undefined) {
+                throw new Error('selfUpdate requires an approved-root count reader');
+            }
+            return runtime.approvedRoots;
+        });
 
     let latestVersion: string;
     try {
@@ -135,7 +155,7 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
 
     let installedVersion: string;
     try {
-        restart(service, approvedRoots, reconcile);
+        await restart(service, readApprovedRoots, reconcile, migrateDatabase);
         installedVersion = (runtime.readPackageVersion ?? packageVersion)(resolved.packageRoot);
     } catch (updateError) {
         const updateFailure = errorMessage(updateError);
@@ -150,7 +170,7 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
             throw new Error(`${prefix}; rollback to ${previousVersion} failed: ${errorMessage(rollbackError)}; run elepha doctor`);
         }
         try {
-            restart(service, approvedRoots, reconcile);
+            await restart(service, readApprovedRoots, reconcile, migrateDatabase);
         } catch (serviceError) {
             if (serviceError instanceof ServiceNotInstalledError) {
                 throw new Error(
@@ -169,5 +189,5 @@ export function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()):
 }
 
 function missingApprovedRoots(): never {
-    throw new Error('selfUpdate requires an injected approved-root count');
+    throw new Error('selfUpdate requires an injected approved-root count reader');
 }

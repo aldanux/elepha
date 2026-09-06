@@ -1,7 +1,7 @@
 # Deleting memory
 
 `elepha purge` permanently removes selected sessions, turns, and rollups from elepha's
-local memory. It may also remove a project row left with no sessions. The original 
+local memory. It may also remove a project row left with no sessions. The original
 session transcripts on disk are never changed.
 
 Purge is deliberately separate from consent. Pausing permission keeps existing
@@ -26,18 +26,23 @@ skips only the prompt; it does not skip the preview, backup, or verification.
 elepha purge --project my-app --apply
 ```
 
-Purged transcripts are recorded so the capture service does not silently ingest them
-again. Restoring the pre-purge database backup is the recovery path if you later need
-that memory.
+Purged transcript identities are recorded so capture and restore cannot silently
+resurrect them. Treat an applied purge as permanent. The automatic pre-purge snapshot
+protects the database if the operation fails; it is not a supported undo mechanism,
+because restore preserves the current purge tombstones.
 
-## Choose one scope
+## Choose one base scope
 
-Each invocation accepts exactly one scope. `--project <pathOrName>` selects all memory
-for the project resolved from a path or display name.
+Each invocation accepts at most one base scope: `--project <pathOrName>`, `--here`,
+`--external-agent-imports`, `--orphan`, `--revoked`, or `--all`. `--here` selects the
+currently consented project. `--project` selects all project rows resolved from a path
+or display name.
 
 Time scopes accept either a duration such as `24h`, `7d`, or `90d`, or an ISO date.
 `--newer-than <durationOrDate>` selects sessions ingested at or after the cutoff, while
-`--older-than <durationOrDate>` selects sessions ingested at or before it.
+`--older-than <durationOrDate>` selects sessions ingested at or before it. A time
+filter can stand alone or narrow the project, `--here`, `--orphan`, `--revoked`, or
+`--all` scope. It cannot be combined with `--external-agent-imports`.
 
 `--external-agent-imports` selects Codex sessions identified as imported from external
 agents. `--orphan` selects memory for temporary project directories and directories
@@ -56,5 +61,6 @@ elepha purge --all --apply --skip-confirmation
 ```
 
 An empty match stays empty; no scope falls back to deleting everything. See
-[Protecting and moving memory](storage.md) to create your own portable backup before
-a large deletion or to restore a full backup.
+[Protecting and recovering memory](storage.md) to create an encrypted
+same-installation archive before a large deletion or to restore a complete database
+for disaster recovery. A backup does not override purge tombstones.

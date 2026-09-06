@@ -6,10 +6,10 @@ export function registerInternal(program: Command): void {
 
     internal
         .command('launcher-probe')
-        .argument('<minimumMajor>')
+        .argument('<minimumVersion>')
         .description('Internal launcher package-ownership check')
-        .action((minimumMajor: string) => {
-            const result = launcherProbe(Number(minimumMajor));
+        .action((minimumVersion: string) => {
+            const result = launcherProbe(minimumVersion);
             if (!result.passes) {
                 console.error(formatLauncherProbeFailure(result.failure));
                 process.exitCode = 66;

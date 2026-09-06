@@ -6,7 +6,7 @@ import { elephaConfigPath } from './paths.js';
 const UPDATE_CHECK_KEY = 'update-check';
 const BOOLEAN_SETTING_VALUES = ['true', 'false', '1', '0', 'on', 'off'] as const;
 
-export const SETTING_KEYS = [UPDATE_CHECK_KEY, 'capture-claude-code', 'capture-codex', 'query-matching'] as const;
+export const SETTING_KEYS = [UPDATE_CHECK_KEY, 'capture-claude-code', 'capture-codex', 'durable-capture', 'query-matching'] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
 export type SettingSource = 'config' | 'env' | 'default';
 export type QueryMatchingMode = 'strict' | 'lax';
@@ -29,6 +29,7 @@ export const SETTING_SCHEMA = {
     'update-check': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-claude-code': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-codex': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
+    'durable-capture': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
     'query-matching': { kind: 'enum', values: ['strict', 'lax'], default: 'strict' },
 } as const satisfies Record<SettingKey, SettingSchema>;
 

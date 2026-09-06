@@ -7,13 +7,14 @@
 // reported and skipped; there is no silent branch/files-only fallback.
 
 import { existsSync } from 'node:fs';
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths, isWithinProviderStore } from '../config/paths.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';
 import type { ParsedTurn, SessionAdapter, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
 import { errorMessage } from '../util/error.js';
+import { DurableCaptureStore } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 import { assessSegmentBoundary, evaluateSegmentBoundary, type SegmentBoundaryEvidence, type SegmentBoundaryInput } from './segmentation.js';
 import { titleForSegment } from './session-title.js';
@@ -464,6 +465,46 @@ function deleteAffectedRollups(db: Database, sessionIds: number[]): void {
     );
 }
 
+function snapshotDurableStatusReconciliation(db: Database, tool: ToolName, nativeId: string): () => void {
+    // Row ids can be replaced by re-segmentation, so terminal provenance is
+    // captured and reapplied through the provider's stable native identity.
+    const evicted =
+        db
+            .prepare(
+                `SELECT 1
+                 FROM durable_capture_status dcs
+                 JOIN sessions s ON s.id = dcs.session_id
+                 WHERE s.tool = ? AND s.native_id = ? AND dcs.state = 'evicted'
+                 LIMIT 1`,
+            )
+            .get(tool, nativeId) !== undefined;
+    return () => {
+        const sessions = db
+            .prepare('SELECT id FROM sessions WHERE tool = ? AND native_id = ? ORDER BY segment_index')
+            .all(tool, nativeId) as Array<{
+            id: number;
+        }>;
+        const durableCapture = new DurableCaptureStore(db);
+        const updatedAt = new Date().toISOString();
+        if (evicted) {
+            db.prepare(
+                `DELETE FROM filtered_turns
+                 WHERE memory_id IN (
+                     SELECT m.id FROM memories m JOIN sessions s ON s.id = m.session_id
+                     WHERE s.tool = ? AND s.native_id = ?
+                 )`,
+            ).run(tool, nativeId);
+            for (const session of sessions) {
+                durableCapture.setStatus(session.id, 'evicted', updatedAt);
+            }
+            return;
+        }
+        for (const session of sessions) {
+            durableCapture.refreshStatus(session.id, updatedAt);
+        }
+    };
+}
+
 function ensureCorrectionsTable(db: Database): void {
     // Created only inside an applied correction's transaction. A dry-run must
     // not mutate schema just because this is the first segment command run.
@@ -547,6 +588,7 @@ export function applyResegmentation(db: Database, plan: ResegmentationPlan): Res
     const apply = db.transaction(() => {
         for (const group of ready) {
             assertPlanStillMatches(db, group);
+            const reconcileDurableStatus = snapshotDurableStatusReconciliation(db, group.tool, group.nativeId);
             deleteAffectedRollups(db, group.existingSessionIds);
             db.prepare(
                 `UPDATE sessions SET segment_index = segment_index + ? WHERE id IN (${group.existingSessionIds.map(() => '?').join(',')})`,
@@ -575,6 +617,7 @@ export function applyResegmentation(db: Database, plan: ResegmentationPlan): Res
                 // Rollups for removed rows were already deleted by deleteAffectedRollups, so no reparenting is needed.
                 db.prepare(`DELETE FROM sessions WHERE id IN (${removed.map(() => '?').join(',')})`).run(...removed);
             }
+            reconcileDurableStatus();
         }
     });
     apply();
@@ -750,6 +793,7 @@ export function applyManualSplit(db: Database, plan: ManualSplitPlan): number {
         if (currentIds.join(',') !== [...plan.left.memoryIds, ...plan.right.memoryIds].join(',')) {
             throw new Error(`session ${source.id} changed after preview`);
         }
+        const reconcileDurableStatus = snapshotDurableStatusReconciliation(db, source.tool, source.native_id);
         deleteAffectedRollups(db, [source.id]);
         if (plan.laterSessionIds.length > 0) {
             db.prepare(
@@ -769,6 +813,7 @@ export function applyManualSplit(db: Database, plan: ManualSplitPlan): number {
             `INSERT INTO segment_corrections (ulid, tool, native_id, direction, first_session_id, second_session_id, turn_index, created_at)
              VALUES (?, ?, ?, 'split', ?, ?, ?, ?)`,
         ).run(newUlid(), source.tool, source.native_id, source.id, newSessionId, plan.atTurnIndex, new Date().toISOString());
+        reconcileDurableStatus();
         return newSessionId;
     });
     return apply();
@@ -836,6 +881,7 @@ export function applyManualMerge(db: Database, plan: ManualMergePlan): number {
         if (currentIds.join(',') !== plan.merged.memoryIds.join(',')) {
             throw new Error(`segments ${left.id}/${right.id} changed after preview`);
         }
+        const reconcileDurableStatus = snapshotDurableStatusReconciliation(db, left.tool, left.native_id);
         deleteAffectedRollups(db, [left.id, right.id]);
         const move = db.prepare('UPDATE memories SET session_id = ? WHERE id = ?');
         for (const memoryId of plan.merged.memoryIds) {
@@ -856,6 +902,7 @@ export function applyManualMerge(db: Database, plan: ManualMergePlan): number {
             `INSERT INTO segment_corrections (ulid, tool, native_id, direction, first_session_id, second_session_id, turn_index, created_at)
              VALUES (?, ?, ?, 'merge', ?, ?, NULL, ?)`,
         ).run(newUlid(), left.tool, left.native_id, left.id, right.id, new Date().toISOString());
+        reconcileDurableStatus();
         return left.id;
     });
     return apply();

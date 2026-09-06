@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { RollupService } from '../../src/daemon/rollup-service.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { PreviousRollup, RollupTurnInput } from '../../src/summarizer/rollup-prompt.js';
@@ -106,7 +106,7 @@ function turn(index: number, startedAt: string, branch: string, file: string): P
 }
 
 describe('IngestionDaemon session segmentation', () => {
-    let db: ReturnType<typeof openDb>;
+    let db: ReturnType<typeof openUnmanagedDb>;
     let store: MemoryStore;
     let rollups: RollupStore;
     let adapter: FixedAdapter;
@@ -115,7 +115,7 @@ describe('IngestionDaemon session segmentation', () => {
     let daemon: DaemonIngestionSeam;
 
     beforeEach(() => {
-        db = openDb(':memory:');
+        db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         store.consent.grant(PROJECT);
         rollups = new RollupStore(db);

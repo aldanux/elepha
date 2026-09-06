@@ -1,7 +1,7 @@
 import { mkdirSync, symlinkSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -31,7 +31,7 @@ describe('ingest tombstone write guard', () => {
     let store: MemoryStore;
 
     beforeEach(() => {
-        store = new MemoryStore(openDb(':memory:'));
+        store = new MemoryStore(openUnmanagedDb(':memory:'));
     });
 
     it.each(['purged', 'incognito'] as const)('does not recreate a %s transcript after the early scan gate', (blocker) => {
@@ -94,7 +94,7 @@ describe('ingest tombstone write guard', () => {
 
     it('uses the same denied-consent guard for ordinary and dropped turns', () => {
         for (const path of ['ordinary', 'dropped'] as const) {
-            const guardedStore = new MemoryStore(openDb(':memory:'));
+            const guardedStore = new MemoryStore(openUnmanagedDb(':memory:'));
             const turn = makeTurn({ sessionId: `denied-${path}`, projectPath: `/Users/test/denied-${path}` });
             guardedStore.consent.revoke(turn.projectPath);
 
@@ -107,6 +107,81 @@ describe('ingest tombstone write guard', () => {
             expect(guardedStore.database.prepare('SELECT COUNT(*) AS count FROM sessions').get()).toEqual({ count: 0 });
             expect(guardedStore.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 0 });
         }
+    });
+
+    it('deletes every existing durable segment when denial records incognito and never recreates the copy', () => {
+        const turn = makeTurn({
+            sessionId: 'approved-then-denied',
+            projectPath: '/Users/test/approved-then-denied',
+            userMessage: 'incognitouniqueneedle',
+            assistantText: 'sensitive captured response',
+        });
+        store.consent.grant(turn.projectPath);
+        const first = store.recordIngestedTurn(turn, {}, false, summary, true);
+        expect(first).toBeDefined();
+        if (!first) return;
+        const second = store.startNextSegment(first.session, first.project.id, turn.sourcePath);
+        expect(
+            store.recordTurn(
+                { ...turn, turnIndex: 1, cursor: '200|2', userMessage: 'non-durable segment' },
+                second.id,
+                first.project.id,
+                summary,
+            ),
+        ).toBe(true);
+        expect(
+            store.database
+                .prepare('SELECT COUNT(*) AS count FROM sessions WHERE tool = ? AND native_id = ?')
+                .get(turn.tool, turn.sessionId),
+        ).toEqual({
+            count: 2,
+        });
+        expect(
+            store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'incognitouniqueneedle'").all(),
+        ).toHaveLength(1);
+
+        store.consent.revoke(turn.projectPath);
+        expect(store.recordIngestedTurn({ ...turn, turnIndex: 2, cursor: '300|3' }, {}, false, summary, true)).toBeUndefined();
+
+        expect(store.isTranscriptIncognito(turn.tool, turn.sessionId)).toBe(true);
+        expect(
+            store.database
+                .prepare('SELECT COUNT(*) AS count FROM sessions WHERE tool = ? AND native_id = ?')
+                .get(turn.tool, turn.sessionId),
+        ).toEqual({
+            count: 2,
+        });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 2 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+        expect(
+            store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'incognitouniqueneedle'").all(),
+        ).toEqual([]);
+
+        store.consent.grant(turn.projectPath);
+        expect(store.recordIngestedTurn({ ...turn, turnIndex: 2, cursor: '300|3' }, {}, false, summary, true)).toBeUndefined();
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+    });
+
+    it('records the incognito veto and deletes its durable copy atomically', () => {
+        const turn = makeTurn({ sessionId: 'atomic-incognito', projectPath: '/Users/test/atomic-incognito' });
+        store.consent.grant(turn.projectPath);
+        const captured = store.recordIngestedTurn(turn, {}, false, summary, true);
+        expect(captured).toBeDefined();
+        store.database.exec(`
+            CREATE TRIGGER fail_incognito_filtered_delete
+            BEFORE DELETE ON filtered_turns
+            BEGIN
+                SELECT RAISE(ABORT, 'forced filtered delete failure');
+            END;
+        `);
+
+        expect(() => store.recordIncognitoTranscript(turn.tool, turn.sessionId)).toThrow('forced filtered delete failure');
+
+        expect(store.isTranscriptIncognito(turn.tool, turn.sessionId)).toBe(false);
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 1 });
     });
 
     it('writes a non-tombstoned transcript normally', () => {

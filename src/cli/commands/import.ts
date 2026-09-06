@@ -1,13 +1,15 @@
+import { statSync } from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
+import { SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
 import { canonicalizeExisting, isWithinProviderStore, normalizeForCompare } from '../../config/paths.js';
 import { readSessionMetadata } from '../../discovery/session-projects.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
 import { stripShellSyntax } from '../../security/sanitize.js';
 import { writeBackup } from '../../storage/backup.js';
 import { validateCandidateSemantics } from '../../storage/candidate-validator.js';
-import { defaultDbPath } from '../../storage/db.js';
+import { defaultDbPath, hasPlaintextDatabaseHeader, openManagedDatabase } from '../../storage/db.js';
 import { firstPromptSearch } from '../../storage/first-prompt-search.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver } from '../../storage/project-resolver.js';
@@ -24,6 +26,8 @@ import { runImportWizard } from '../import-wizard.js';
 import { confirmYesNo } from '../shared.js';
 
 export const IMPORTED_TABLES = ['projects', 'sessions', 'memories', 'session_rollups'] as const;
+export const PORTABLE_ENCRYPTED_IMPORT_UNSUPPORTED_MESSAGE =
+    'Portable encrypted import is not supported yet; import currently accepts a plaintext export.';
 
 type ImportedTable = (typeof IMPORTED_TABLES)[number];
 type SqlValue = string | number | bigint | Buffer | null;
@@ -216,6 +220,18 @@ function validateCandidate(db: Database.Database): void {
 }
 
 function openCandidate(candidatePath: string): Database.Database {
+    let plaintext: boolean;
+    try {
+        plaintext = hasPlaintextDatabaseHeader(candidatePath);
+    } catch (error) {
+        throw new Error(`Not a valid SQLite backup at ${candidatePath}: ${errorMessage(error)}`);
+    }
+    if (!plaintext && statSync(candidatePath).size < SQLITE_MINIMUM_DATABASE_BYTES) {
+        throw new Error(`Not a valid SQLite backup at ${candidatePath}.`);
+    }
+    if (!plaintext) {
+        throw new Error(PORTABLE_ENCRYPTED_IMPORT_UNSUPPORTED_MESSAGE);
+    }
     let candidate: Database.Database | undefined;
     try {
         candidate = new Database(candidatePath, { readonly: true, fileMustExist: true });
@@ -403,7 +419,7 @@ async function buildPlan(active: Database.Database, candidate: Database.Database
 }
 
 async function readPlan(dbPath: string, candidate: Database.Database): Promise<ImportPlan> {
-    const active = new Database(dbPath, { readonly: true, fileMustExist: true });
+    const active = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true });
     try {
         active.pragma('query_only = ON');
         return await buildPlan(active, candidate);
@@ -632,15 +648,15 @@ function applyMerge(db: Database.Database, candidate: Database.Database, plan: I
     }
 }
 
-function applyImport(
+async function applyImport(
     dbPath: string,
     candidate: Database.Database,
     plan: ImportPlan,
     overwrite: boolean,
     snapshotWriter: (db: Database.Database, dbPath: string) => string,
     beforeVerify?: (db: Database.Database) => void,
-): string {
-    const active = new Database(dbPath, { fileMustExist: true });
+): Promise<string> {
+    const active = await openManagedDatabase(dbPath, { fileMustExist: true });
     let snapshotPath: string | undefined;
     try {
         active.pragma('journal_mode = WAL');
@@ -694,7 +710,14 @@ export async function runImportOperation(candidatePath: string, overwrite: boole
             };
         }
 
-        const snapshotPath = applyImport(dbPath, candidate, plan, overwrite, runtime.writeBackup ?? writeBackup, runtime.beforeVerify);
+        const snapshotPath = await applyImport(
+            dbPath,
+            candidate,
+            plan,
+            overwrite,
+            runtime.writeBackup ?? writeBackup,
+            runtime.beforeVerify,
+        );
         const overwritten = overwrite ? plan.counts.existing : 0;
         const skipped =
             plan.counts.outsideStore +

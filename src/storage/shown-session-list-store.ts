@@ -1,4 +1,4 @@
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import type { ToolName } from '../types/index.js';
 
 interface ShownSessionListRow {

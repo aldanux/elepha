@@ -3,13 +3,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
     installElepha: vi.fn(),
-    openDb: vi.fn(() => ({})),
+    migrateDatabase: vi.fn(async () => undefined),
+    openDb: vi.fn(async () => ({})),
     printInstallation: vi.fn(),
     spinner: vi.fn(),
+    service: {
+        status: vi.fn(() => ({ loaded: false, disabled: false, unknown: false })),
+        stop: vi.fn(),
+    },
 }));
 
 vi.mock('@clack/prompts', () => ({ spinner: mocks.spinner }));
 vi.mock('../../src/install/installer.js', () => ({ installElepha: mocks.installElepha }));
+vi.mock('../../src/install/service-backend.js', () => ({ serviceBackend: () => mocks.service }));
 vi.mock('../../src/storage/consent-store.js', () => ({
     ConsentStore: class {
         //noinspection JSUnusedGlobalSymbols
@@ -18,7 +24,8 @@ vi.mock('../../src/storage/consent-store.js', () => ({
         }
     },
 }));
-vi.mock('../../src/storage/db.js', () => ({ openDb: mocks.openDb }));
+vi.mock('../../src/storage/database-migration.js', () => ({ migratePrimaryDatabaseToEncrypted: mocks.migrateDatabase }));
+vi.mock('../../src/storage/db.js', () => ({ defaultDbPath: () => '/state/elepha.db', openDb: mocks.openDb }));
 vi.mock('../../src/cli/shared.js', () => ({ printInstallation: mocks.printInstallation }));
 
 const { createInstallProgressReporter, registerInstall } = await import('../../src/cli/commands/install.js');
@@ -104,7 +111,11 @@ describe('elepha install progress', () => {
 
         await installProgram().parseAsync(['node', 'elepha', 'install']);
 
-        expect(mocks.installElepha).toHaveBeenCalledWith(undefined, { approvedRoots: 2 });
+        expect(mocks.service.stop).toHaveBeenCalledOnce();
+        expect(mocks.migrateDatabase).toHaveBeenCalledWith('/state/elepha.db');
+        expect(mocks.installElepha).toHaveBeenCalledWith(undefined, { approvedRoots: 2, service: mocks.service });
+        expect(mocks.service.stop.mock.invocationCallOrder[0]).toBeLessThan(mocks.migrateDatabase.mock.invocationCallOrder[0]);
+        expect(mocks.migrateDatabase.mock.invocationCallOrder[0]).toBeLessThan(mocks.openDb.mock.invocationCallOrder[0]);
         expect(mocks.spinner).not.toHaveBeenCalled();
         expect(mocks.printInstallation).toHaveBeenCalledOnce();
     });

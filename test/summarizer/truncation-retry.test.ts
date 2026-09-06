@@ -136,7 +136,7 @@ describe('isRefusedProjectRoot', () => {
     it('refuses system roots and applies host case semantics', () => {
         expect(isRefusedProjectRoot('/')).toBe(true);
         expect(isRefusedProjectRoot('/etc')).toBe(true);
-        if (process.platform === 'darwin' || process.platform === 'win32') {
+        if (process.platform === 'darwin') {
             expect(isRefusedProjectRoot(home.toUpperCase())).toBe(true);
         } else {
             expect(isRefusedProjectRoot(home.toUpperCase())).toBe(false);

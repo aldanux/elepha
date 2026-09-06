@@ -71,7 +71,7 @@ function resolveCandidate(candidate: string): ResolvedElephaBin | undefined {
 
 export function resolveInstalledElephaBin(options: BinaryResolutionOptions = {}): ResolvedElephaBin {
     if ((options.platform ?? process.platform) === 'win32') {
-        throw new Error('elepha install is not supported on win32 yet.');
+        throw new Error('elepha install is not supported on win32.');
     }
     const pathValue = options.pathValue ?? process.env.PATH ?? '';
     for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {

@@ -3,7 +3,7 @@
 // source_path is re-read through CodexAdapter.classifySession(), which checks
 // event_msg.payload.turn_id for the external-import-turn- prefix.
 
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import type { CodexAdapter } from '../adapters/codex.js';
 import { isReadableProviderSource } from '../config/paths.js';
 import { errorMessage } from '../util/error.js';

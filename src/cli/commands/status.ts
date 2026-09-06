@@ -15,11 +15,11 @@ export function registerStatus(program: Command): void {
     program
         .command('status')
         .description('One-line daemon health check: running/stuck/not-running, last ingest time, turns in the last 24h')
-        .action(() => {
+        .action(async () => {
             const now = Date.now();
             const { state, healthy } = daemonHealth();
 
-            const store = new MemoryStore(openDb());
+            const store = new MemoryStore(await openDb());
             const lastIngestedAt = store.getLastIngestedAt();
             const lastIngestStr = lastIngestedAt
                 ? `${lastIngestedAt} (${humanAge(now - new Date(lastIngestedAt).getTime())} ago)`

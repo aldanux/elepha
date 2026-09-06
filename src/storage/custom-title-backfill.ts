@@ -2,7 +2,7 @@
 // sessions.custom_title. It never parses or rewrites turns, memories, rollups,
 // rendered output, or rendered_chars.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { isReadableProviderSource } from '../config/paths.js';
 import type { SessionAdapter, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';

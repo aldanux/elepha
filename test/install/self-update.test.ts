@@ -54,7 +54,13 @@ function runtimeFor(scenario: Scenario): { runtime: SelfUpdateRuntime; events: s
                     events.push('service stop');
                 },
             } as ServiceBackend,
-            approvedRoots: scenario.approvedRoots ?? 1,
+            async readApprovedRoots() {
+                events.push('read approved roots');
+                return scenario.approvedRoots ?? 1;
+            },
+            async migrateDatabase() {
+                events.push('database migration');
+            },
             reconcile() {
                 events.push('service reconcile and verify heartbeat');
                 const next = scenario.reconciliation.shift();
@@ -68,46 +74,50 @@ function runtimeFor(scenario: Scenario): { runtime: SelfUpdateRuntime; events: s
 }
 
 describe('selfUpdate', () => {
-    it('updates and restarts the injected service on Linux', () => {
+    it('updates and restarts the injected service on Linux', async () => {
         const { runtime, events } = runtimeFor({ platform: 'linux', latest: '1.2.4', reconciliation: ['active'] });
 
-        expect(selfUpdate(runtime)).toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.4' });
+        await expect(selfUpdate(runtime)).resolves.toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.4' });
         expect(events).toContain('service stop');
         expect(events).toContain('service reconcile and verify heartbeat');
     });
 
-    it('refuses Windows before resolving or mutating update state', () => {
+    it('refuses Windows before resolving or mutating update state', async () => {
         const { runtime, events } = runtimeFor({ platform: 'win32', reconciliation: [] });
 
-        expect(() => selfUpdate(runtime)).toThrow('supported on macOS and Linux');
+        await expect(selfUpdate(runtime)).rejects.toThrow('supported on macOS and Linux');
         expect(events).toEqual([]);
     });
 
-    it('installs the registry version, restarts capture with approved roots, and reports the installed version after a healthy heartbeat', () => {
+    it('installs the registry version, restarts capture with approved roots, and reports the installed version after a healthy heartbeat', async () => {
         const { runtime, events } = runtimeFor({ latest: '1.2.4', approvedRoots: 1, reconciliation: ['active'] });
 
-        expect(selfUpdate(runtime)).toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.4' });
+        await expect(selfUpdate(runtime)).resolves.toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.4' });
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
         ]);
     });
 
-    it('reports updated without rollback when capture is awaiting consent', () => {
+    it('reports updated without rollback when capture is awaiting consent', async () => {
         const { runtime, events } = runtimeFor({ latest: '1.2.4', approvedRoots: 0, reconciliation: ['awaiting consent'] });
 
-        expect(selfUpdate(runtime)).toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.4' });
+        await expect(selfUpdate(runtime)).resolves.toEqual({ status: 'updated', previousVersion: '1.2.3', version: '1.2.4' });
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
         ]);
     });
 
-    it('reports current without installing or restarting when the registry version matches', () => {
+    it('reports current without installing or restarting when the registry version matches', async () => {
         const root = withGrantableTestDir('self-update-marker-');
         const previousHome = process.env.ELEPHA_HOME;
         process.env.ELEPHA_HOME = root;
@@ -117,7 +127,7 @@ describe('selfUpdate', () => {
         const { runtime, events } = runtimeFor({ latest: '1.2.3', reconciliation: ['active'] });
 
         try {
-            expect(selfUpdate(runtime)).toEqual({ status: 'current', version: '1.2.3' });
+            await expect(selfUpdate(runtime)).resolves.toEqual({ status: 'current', version: '1.2.3' });
             expect(events).toEqual(['npm view elepha@latest']);
             expect(existsSync(markerPath)).toBe(false);
         } finally {
@@ -129,23 +139,25 @@ describe('selfUpdate', () => {
         }
     });
 
-    it('aborts before stopping capture when the latest registry version cannot be resolved', () => {
+    it('aborts before stopping capture when the latest registry version cannot be resolved', async () => {
         const { runtime, events } = runtimeFor({
             latestError: new Error('npm ERR! code E404\nelepha@latest is unpublished'),
             reconciliation: [],
         });
 
-        expect(() => selfUpdate(runtime)).toThrow('self-update preflight failed: could not resolve elepha@latest: npm ERR! code E404');
+        await expect(selfUpdate(runtime)).rejects.toThrow(
+            'self-update preflight failed: could not resolve elepha@latest: npm ERR! code E404',
+        );
         expect(events).toEqual(['npm view elepha@latest']);
     });
 
-    it('restores the recorded version when the updated daemon fails its health verification', () => {
+    it('restores the recorded version when the updated daemon fails its health verification', async () => {
         const { runtime, events } = runtimeFor({
             latest: '1.2.4',
             reconciliation: [new Error('capture service did not produce a healthy heartbeat; daemon stderr: migration failed'), 'active'],
         });
 
-        expect(selfUpdate(runtime)).toEqual({
+        await expect(selfUpdate(runtime)).resolves.toEqual({
             status: 'rolled-back',
             previousVersion: '1.2.3',
             attemptedVersion: '1.2.4',
@@ -155,33 +167,39 @@ describe('selfUpdate', () => {
             'npm view elepha@latest',
             'npm install elepha@latest',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
             'npm install elepha@1.2.3',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
         ]);
     });
 
-    it('reports a failed package rollback and directs recovery to doctor', () => {
+    it('reports a failed package rollback and directs recovery to doctor', async () => {
         const { runtime, events } = runtimeFor({
             latest: '1.2.4',
             installVersionError: new Error('npm ERR! network timeout'),
             reconciliation: [new Error('updated launchctl bootstrap failed')],
         });
 
-        expect(() => selfUpdate(runtime)).toThrow(
+        await expect(selfUpdate(runtime)).rejects.toThrow(
             'self-update failed after installing 1.2.4: updated launchctl bootstrap failed; rollback to 1.2.3 failed: npm ERR! network timeout; run elepha doctor',
         );
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
             'npm install elepha@1.2.3',
         ]);
     });
 
-    it('distinguishes a reverted package from a service that failed to restart after the revert', () => {
+    it('distinguishes a reverted package from a service that failed to restart after the revert', async () => {
         const { runtime, events } = runtimeFor({
             latest: '1.2.4',
             reconciliation: [new Error('updated launchctl bootstrap failed'), new Error('rollback launchctl bootstrap failed')],
@@ -189,7 +207,7 @@ describe('selfUpdate', () => {
 
         let thrown: unknown;
         try {
-            selfUpdate(runtime);
+            await selfUpdate(runtime);
         } catch (error) {
             thrown = error;
         }
@@ -204,14 +222,18 @@ describe('selfUpdate', () => {
             'npm view elepha@latest',
             'npm install elepha@latest',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
             'npm install elepha@1.2.3',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
         ]);
     });
 
-    it('does not report a rollback failure when the package was reverted and only the service is not installed', () => {
+    it('does not report a rollback failure when the package was reverted and only the service is not installed', async () => {
         const { runtime, events } = runtimeFor({
             latest: '1.2.4',
             reconciliation: ['not installed', 'not installed'],
@@ -219,7 +241,7 @@ describe('selfUpdate', () => {
 
         let thrown: unknown;
         try {
-            selfUpdate(runtime);
+            await selfUpdate(runtime);
         } catch (error) {
             thrown = error;
         }
@@ -234,9 +256,13 @@ describe('selfUpdate', () => {
             'npm view elepha@latest',
             'npm install elepha@latest',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
             'npm install elepha@1.2.3',
             'service stop',
+            'database migration',
+            'read approved roots',
             'service reconcile and verify heartbeat',
         ]);
     });

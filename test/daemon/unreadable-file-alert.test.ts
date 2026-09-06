@@ -12,7 +12,7 @@ import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { ReadabilityGuard } from '../../src/daemon/readability-guard.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
 
@@ -100,7 +100,7 @@ describe('file-level unreadable-file alert', () => {
         prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = claudeConfigDir;
 
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(cwd);
         const adapter = new ClaudeCodeAdapter();
         vi.spyOn(adapter, 'classifySession')
@@ -157,7 +157,7 @@ describe('file-level unreadable-file alert', () => {
         writeFileSync(readableFile, ccTurnLines(cwd, 'sess-readable'));
 
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(cwd);
         daemon = new IngestionDaemon({
             store,
@@ -210,7 +210,7 @@ describe('file-level unreadable-file alert', () => {
 
         const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         daemon = new IngestionDaemon({
             store,
             watchRoots: [sessionsRoot],

@@ -1,8 +1,11 @@
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
+import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
+import { filterTurn } from '../rendering/filtered-turn.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 import type { ParsedTurn, SummarizationOutput, ToolName, TurnDecision } from '../types/index.js';
+import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 import type { SessionStore } from './session-store.js';
 
@@ -60,6 +63,7 @@ export interface MemoryRow {
 }
 
 export class TurnStore {
+    private readonly durableCapture: DurableCaptureStore;
     private readonly stmts: {
         insertMemory: Statement;
         reingestMemory: Statement;
@@ -76,6 +80,7 @@ export class TurnStore {
         private readonly db: Database,
         private readonly sessions: SessionStore,
     ) {
+        this.durableCapture = new DurableCaptureStore(db);
         this.stmts = {
             insertMemory: db.prepare(
                 `INSERT OR IGNORE INTO memories
@@ -151,13 +156,31 @@ export class TurnStore {
     // silent data loss). For deliberately overwriting an already-stored turn
     // with a re-summarized result, use reingestTurn instead - IGNORE here
     // would silently discard the fix.
-    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): boolean {
-        const run = this.db.transaction(() => this.recordTurnInTransaction(turn, sessionDbId, projectId, summary));
+    recordTurn(
+        turn: ParsedTurn,
+        sessionDbId: number,
+        projectId: number,
+        summary: SummarizationOutput,
+        durableCapture = false,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        evictionPlan?: DurableEvictionPlan,
+    ): boolean {
+        const run = this.db.transaction(() =>
+            this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes, evictionPlan),
+        );
         return run();
     }
 
     // Records a live turn while an enclosing ingestion transaction owns its session row.
-    recordTurnInTransaction(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): boolean {
+    recordTurnInTransaction(
+        turn: ParsedTurn,
+        sessionDbId: number,
+        projectId: number,
+        summary: SummarizationOutput,
+        durableCapture = false,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        evictionPlan?: DurableEvictionPlan,
+    ): boolean {
         if (this.stmts.isTranscriptPurged.get(turn.tool, turn.sessionId) !== undefined) {
             return false;
         }
@@ -175,6 +198,9 @@ export class TurnStore {
             summarizer_status: summary.status,
             has_external_content: turn.hasExternalContent ? 1 : 0,
         });
+        if (info.changes > 0 && durableCapture) {
+            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now, durableCaptureMaxBytes, evictionPlan);
+        }
         this.sessions.advanceSessionCursorAt(sessionDbId, turn.cursor, now);
         this.sessions.updateTrailingState(sessionDbId, turn);
         if (info.changes > 0) {

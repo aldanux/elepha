@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { type InitPrompts, runInit } from '../../src/cli/init.js';
 import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
 import type { DiscoveryResult } from '../../src/discovery/session-projects.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -68,7 +68,7 @@ function storedTurn(sessionId: string, projectPath: string, sourcePath: string, 
 describe('elepha init', () => {
     it('renders consent entry without the init wordmark while running the shared picker', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-entry-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const init = fakePrompts(CANCELLED, []);
         const consent = fakePrompts(CANCELLED, []);
         let initOutput = '';
@@ -127,7 +127,7 @@ describe('elepha init', () => {
 
     it('approves top-level home folders, backfills them, and renders the folder checkbox flow', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const home = homedir();
         const sites = path.join(home, 'Sites');
@@ -200,7 +200,7 @@ describe('elepha init', () => {
 
     it('does not re-grant a selected approved folder or disturb its denied descendant', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const folder = path.join(homedir(), 'Sites');
         const project = path.join(folder, `elepha-init-${path.basename(directory)}`, 'secret');
@@ -243,7 +243,7 @@ describe('elepha init', () => {
 
     it('grants a nested denied project when the user explicitly selects it', async () => {
         const directory = withGrantableTestDir('elepha-init-');
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const folder = path.join(directory, 'folder');
         const project = path.join(folder, 'secret');
@@ -277,7 +277,7 @@ describe('elepha init', () => {
 
     it('uses stored session totals for remembered projects and discovery totals for projects without sessions', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-counts-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
         const folderRoot = path.join(homedir(), `elepha-init-counts-${path.basename(directory)}`);
         const remembered = path.join(folderRoot, 'remembered');
@@ -341,7 +341,7 @@ describe('elepha init', () => {
 
     it('reports an already-paused individual project when its unchecked selection is confirmed unchanged', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const project = path.join(directory, 'project');
         const { prompts, events, output } = fakePrompts('individual', []);
@@ -373,7 +373,7 @@ describe('elepha init', () => {
 
     it('prechecks an approved individual root and denies it when unchecked without captured sessions', async () => {
         const directory = withGrantableTestDir('elepha-init-');
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const project = path.join(directory, 'project');
         store.consent.grant(project);
@@ -402,7 +402,7 @@ describe('elepha init', () => {
 
     it('makes individual selection authoritative without deleting memory and preserves nested pauses in folder mode', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const sites = path.join(homedir(), `elepha-init-root-${path.basename(directory)}`);
         const fixture = path.join(sites, 'fixture');
@@ -502,7 +502,7 @@ describe('elepha init', () => {
 
     it('pauses an unchecked folder and all approved roots beneath it without purging stored sessions', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const sites = path.join(homedir(), 'Sites');
         const fixture = path.join(sites, `elepha-init-${path.basename(directory)}`);
@@ -552,7 +552,7 @@ describe('elepha init', () => {
 
     it('aborts on Ctrl-C before consent changes', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const { prompts, events, output } = fakePrompts(CANCELLED, []);
 
@@ -576,7 +576,7 @@ describe('elepha init', () => {
 
     it('aborts on Ctrl-C from the checkbox prompt before consent changes', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const { prompts, events, output } = fakePrompts('individual', CANCELLED);
 
@@ -600,7 +600,7 @@ describe('elepha init', () => {
 
     it('refuses non-interactive input without changing consent', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-init-notty-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const error = new PassThrough();
         let rendered = '';
         error.on('data', (chunk: Buffer) => {

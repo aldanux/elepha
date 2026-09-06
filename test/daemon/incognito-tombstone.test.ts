@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type {
     ParsedTurn,
@@ -148,7 +148,7 @@ describe('capture-off incognito tombstones', () => {
         writeFileSync(pendingTranscript, `${JSON.stringify({ cwd: canonicalPendingRoot })}\n`);
 
         const dbPath = path.join(fixture, 'elepha.db');
-        const store = new MemoryStore(openDb(dbPath), {
+        const store = new MemoryStore(openUnmanagedDb(dbPath), {
             resolveGitRoot: () => null,
             resolveGitRemote: () => null,
             resolveGitRootCommit: () => null,
@@ -209,7 +209,7 @@ describe('capture-off incognito tombstones', () => {
         const transcript = path.join(watchRoot, `${MID_DENIED_SESSION}.jsonl`);
         writeFileSync(transcript, `${JSON.stringify({ cwd: canonicalApprovedRoot })}\n`);
 
-        const store = new MemoryStore(openDb(path.join(fixture, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(fixture, 'elepha.db')));
         store.consent.grant(canonicalApprovedRoot);
         store.consent.revoke(canonicalDeniedRoot);
         const adapter = new IncognitoAdapter(
@@ -245,7 +245,7 @@ describe('capture-off incognito tombstones', () => {
         writeFileSync(transcript, `${JSON.stringify({ cwd: canonicalProjectRoot })}\n`);
 
         const dbPath = path.join(fixture, 'elepha.db');
-        const store = new MemoryStore(openDb(dbPath));
+        const store = new MemoryStore(openUnmanagedDb(dbPath));
         store.consent.grant(canonicalProjectRoot);
         const adapter = new IncognitoAdapter(new Map([[REVOKED_DURING_SUMMARY_SESSION, canonicalProjectRoot]]));
         const summarizer = new PausingSummarizer();
@@ -253,7 +253,7 @@ describe('capture-off incognito tombstones', () => {
 
         const scan = daemon.scanFile(adapter, transcript, true);
         await summarizer.started;
-        const revokingStore = new MemoryStore(openDb(dbPath));
+        const revokingStore = new MemoryStore(openUnmanagedDb(dbPath));
         revokingStore.consent.revoke(canonicalProjectRoot);
         revokingStore.database.close();
         summarizer.continue();

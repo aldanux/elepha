@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { SUPPORTED_TOOLS } from '../types/index.js';
 
 export const CANDIDATE_SEMANTIC_TABLES = ['sessions', 'memories', 'session_rollups', 'consent_roots'] as const;

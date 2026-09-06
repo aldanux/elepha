@@ -21,7 +21,7 @@
 //    pending_items and files_touched by value. Applying the same merge twice
 //    yields the same arrays.
 
-import type { Database, Statement } from 'better-sqlite3';
+import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { dedupePaths } from '../config/paths.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 

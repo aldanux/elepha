@@ -2,7 +2,7 @@
 // its already-persisted turn indexes. This never changes segment boundaries,
 // memories, rollups, rendered statistics, or custom-title metadata.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { isReadableProviderSource } from '../config/paths.js';
 import type { ParsedTurn, SessionAdapter, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';

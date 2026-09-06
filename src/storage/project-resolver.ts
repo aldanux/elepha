@@ -4,7 +4,7 @@
 
 import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import { gitRevParseShowToplevel } from '../security/subprocess-allowlist.js';
 import type { ConsentStore } from './consent-store.js';

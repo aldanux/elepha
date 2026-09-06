@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 
 function claudeTranscript(cwd: string, sessionId: string): string {
@@ -88,7 +88,7 @@ describe('per-tool capture toggle', () => {
         process.env.CODEX_HOME = path.join(root, '.codex');
 
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(claudeProject);
         store.consent.grant(codexProject);
         daemon = new IngestionDaemon({
@@ -97,7 +97,9 @@ describe('per-tool capture toggle', () => {
             heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
             watcherUsePolling: true,
             log: (message) => logs.push(message),
-            readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG, captureClaudeCode: true, captureCodex: false } }),
+            readConfig: () => ({
+                config: { ...DEFAULT_MEMORY_CONFIG, captureClaudeCode: true, captureCodex: false, durableCapture: true },
+            }),
         });
         daemon.start();
 
@@ -105,6 +107,8 @@ describe('per-tool capture toggle', () => {
 
         expect(store.findSession('claude-code', claudeSessionId)).toBeDefined();
         expect(store.findSession('codex', codexSessionId)).toBeUndefined();
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
+        expect(store.database.prepare('SELECT state FROM durable_capture_status').get()).toEqual({ state: 'complete' });
         expect(logs).not.toContain(`[elepha] skipped ${codexFile}: capture is disabled for codex`);
         expect(logs.some((message) => message.includes('capture disabled: 1'))).toBe(true);
     });

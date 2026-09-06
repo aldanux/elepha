@@ -20,11 +20,12 @@ export interface LauncherOptions {
     home?: string;
     packageRoot: string;
     sourceBin: string;
-    minimumNodeMajor: number;
+    minimumNodeVersion: string;
 }
 
 const VERSION_STORE = /(?:^|\/)(?:versions\/node|node-versions|installs\/nodejs|Cellar\/node[^/]*)\//;
-const FIXED_PROBE = "var n=+process.versions.node.split('.')[0],m=+process.argv[1];process.exit(n>=m?0:65)";
+const FIXED_PROBE =
+    "var a=process.versions.node.split('.').map(Number),b=process.argv[1].split('.').map(Number);process.exit(a[0]>b[0]||a[0]===b[0]&&(a[1]>b[1]||a[1]===b[1]&&a[2]>=b[2])?0:65)";
 
 function executable(file: string): boolean {
     try {
@@ -55,7 +56,7 @@ function shellQuote(value: string): string {
     return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function readNodeMajor(packageRoot: string): number {
+function readNodeVersion(packageRoot: string): string {
     let engines: unknown;
     try {
         engines = (JSON.parse(readFileSync(path.join(packageRoot, 'package.json'), 'utf8')) as { engines?: unknown }).engines;
@@ -63,11 +64,11 @@ function readNodeMajor(packageRoot: string): number {
         throw new Error('package-invalid: elepha package.json is unreadable');
     }
     const node = engines && typeof engines === 'object' ? (engines as Record<string, unknown>).node : undefined;
-    const match = typeof node === 'string' ? /^>=(\d+)$/.exec(node) : null;
+    const match = typeof node === 'string' ? /^>=(\d+\.\d+\.\d+)$/.exec(node) : null;
     if (!match) {
-        throw new Error('package-invalid: elepha engines.node must use the canonical >=N form');
+        throw new Error('package-invalid: elepha engines.node must use the canonical >=N.N.N form');
     }
-    return Number(match[1]);
+    return match[1];
 }
 
 function resolveDefaultNvm(root: string): string | undefined {
@@ -143,9 +144,9 @@ export function detectLauncherBackend(options: LauncherOptions): LauncherBackend
     const execPath = realpathSync(options.execPath ?? process.execPath);
     const env = options.env ?? process.env;
     const home = options.home ?? env.HOME;
-    const min = readNodeMajor(options.packageRoot);
-    if (min !== options.minimumNodeMajor) {
-        throw new Error('package-invalid: launcher minimum Node major disagrees with package');
+    const min = readNodeVersion(options.packageRoot);
+    if (min !== options.minimumNodeVersion) {
+        throw new Error('package-invalid: launcher minimum Node version disagrees with package');
     }
 
     const nvmMarker = '/versions/node/';
@@ -248,9 +249,9 @@ function requiredPath(value: string | undefined): string {
 }
 
 // Render the stable, version-free POSIX launcher.
-export function renderLauncher(backend: LauncherBackend, minimumNodeMajor: number): string {
-    const versionProbe = `${shellQuote('-e')} ${shellQuote(FIXED_PROBE)} ${minimumNodeMajor}`;
-    const packageProbe = `internal launcher-probe ${minimumNodeMajor}`;
+export function renderLauncher(backend: LauncherBackend, minimumNodeVersion: string): string {
+    const versionProbe = `${shellQuote('-e')} ${shellQuote(FIXED_PROBE)} ${minimumNodeVersion}`;
+    const packageProbe = `internal launcher-probe ${minimumNodeVersion}`;
     const launch = run(backend);
     const base = ['#!/bin/sh', LAUNCHER_MARKER, 'set -eu', 'umask 077', 'PATH=/usr/bin:/bin:/usr/sbin:/sbin', 'export PATH'];
     if (backend.npmBin) {

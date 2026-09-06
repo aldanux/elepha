@@ -2,7 +2,7 @@
 // source_path comes from the consented database row and adapters own parsing.
 
 import { existsSync, realpathSync } from 'node:fs';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import {
     AUTO_BRIEF_CHAR_BUDGET,
     AUTO_BRIEF_MAX_AGE_MS,
@@ -16,21 +16,22 @@ import { updateAvailablePath } from '../config/paths.js';
 import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
-import { escapeShellSyntax } from '../security/sanitize.js';
-import { buildInjectionId, wrap } from '../security/sentinel.js';
 import { gitRevListCountHeadAsync, gitRevParseAbbrevRefHeadAsync } from '../security/subprocess-allowlist.js';
 import { servedContextInstructions } from '../serving/instructions.js';
-import { endedAt, hasRealContent, newestActivity, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
+import { endedAt, newestActivity, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
+import { LOCKED_MEMORY_MESSAGE, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookSource, type HookTool, parsePayload, readStdin, type SessionStartPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
+import { recordHookOutput } from './output.js';
 
 export interface SessionStartDependencies {
     dbPath?: string;
+    openDatabase?: typeof openDb;
     now?: () => number;
     log?: (line: string) => void;
     projectResolver?: (db: Database.Database) => ProjectResolver;
@@ -229,122 +230,140 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         }
         // Hooks must see additive schema migrations before selecting a live
         // session. `openDb` is idempotent and refuses no existing data.
-        db = openDb(dbPath);
+        db = await (dependencies.openDatabase ?? openDb)(dbPath);
     } catch {
         return { reason: 'database_unavailable' };
     }
     try {
-        const project = consentedProject(db, payload.cwd);
-        if (!project) {
+        const store = new MemoryStore(db);
+        const clock = dependencies.now ?? Date.now;
+        const emit = (
+            body: string,
+            kind: 'brief' | 'notify',
+            channel: 'additionalContext' | 'systemMessage',
+            emittedAt: number = clock(),
+        ): HookResult => {
+            const output = recordHookOutput({
+                store,
+                tool,
+                nativeSessionId: payload.session_id,
+                injectedAt: new Date(emittedAt).toISOString(),
+                body,
+                kind,
+                writeInjection: dependencies.writeInjection,
+            });
+            if (output === undefined) {
+                log(sessionLogLine(tool, payload, 'failed reason=injection_record_failed'));
+                return { reason: 'injection_record_failed' };
+            }
+            return { output: envelope(tool, output, channel) };
+        };
+        const locked = (): HookResult => {
+            const result = emit(LOCKED_MEMORY_MESSAGE, 'notify', notifyChannel(tool));
+            if ('output' in result) {
+                log(sessionLogLine(tool, payload, 'served locked'));
+            }
+            return result;
+        };
+        return await withMemoryReadGenerationAsync(db, locked, async () => {
             let canonicalCwd: string;
             try {
                 canonicalCwd = realpathSync(payload.cwd);
             } catch {
                 return { reason: 'project_unavailable_or_unconsented' };
             }
-            const consent = new MemoryStore(db).consent;
-            const captureOffRoot = consent.captureOffNudge(canonicalCwd);
+            const captureOffRoot = store.consent.captureOffNudge(canonicalCwd);
             if (captureOffRoot) {
-                const reader = new SessionReader(db);
-                const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-                const consentedProjects = projectResolver(db).listConsentedStored(consent);
-                const total = reader.consentedTotal(consentedProjects);
-                const resolution = projectResolver(db).resolve(canonicalCwd);
-                const here =
-                    'project' in resolution && resolution.project !== null
-                        ? reader.sessionsFor(resolution.project).filter(hasRealContent).length
-                        : 0;
-                const countLabel = here === total ? `${total} sessions` : `${here}/${total} sessions`;
                 const grantHint =
                     captureOffRoot !== 'refused' && captureOffRoot.state === 'pending'
                         ? ` · run 'elepha consent grant ${captureOffRoot.path}' to capture here`
                         : '';
-                const body = escapeShellSyntax(`🐘 elepha · ${countLabel} · capture off · type elepha:list to recall${grantHint}`);
-                log(sessionLogLine(tool, payload, 'emitted capture-off nudge'));
-                return { output: envelope(tool, body, notifyChannel(tool)) };
-            }
-            return { reason: 'project_unavailable_or_unconsented' };
-        }
-        const reader = new SessionReader(db);
-        const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
-        const consentedProjects = projectResolver(db).listConsentedStored(new MemoryStore(db).consent);
-        if (reader.consentedTotal(consentedProjects) === 0) {
-            return { reason: 'no_consented_sessions' };
-        }
-        const session = reader.newestSubstantive(project);
-        const now = (dependencies.now ?? Date.now)();
-        const age = session === undefined ? undefined : now - Date.parse(endedAt(session));
-        let effective = mode;
-        if (
-            session === undefined ||
-            age === undefined ||
-            !Number.isFinite(age) ||
-            age > AUTO_BRIEF_MAX_AGE_MS ||
-            (effective === 'auto' && age > AUTO_BRIEF_NOTIFY_AGE_MS)
-        ) {
-            effective = 'notify';
-        }
-        if (effective === 'auto' && session !== undefined && session.has_external_content === 1) {
-            effective = 'notify';
-            log(sessionLogLine(tool, payload, 'auto degraded: session has external content'));
-        }
-        if (effective === 'auto' && session !== undefined) {
-            const cwd = project.gitRoot ?? project.paths[0];
-            if (cwd) {
-                const { branch, count } = await probeGitState(
-                    cwd,
-                    dependencies.gitBranch ?? gitRevParseAbbrevRefHeadAsync,
-                    dependencies.gitCommitCount ?? gitRevListCountHeadAsync,
-                );
-                if (branch !== null && session.git_branch !== null && branch !== session.git_branch) {
-                    effective = 'notify';
-                    // Historical and manually resegmented rows do not have a trustworthy
-                    // baseline. Auto must fail closed to the smaller notify injection.
-                } else if (session.git_commit_count === null) {
-                    effective = 'notify';
-                    log(sessionLogLine(tool, payload, 'auto degraded: stored git commit count unavailable'));
-                } else if (count !== null && count - session.git_commit_count > AUTO_BRIEF_MAX_COMMITS_BEHIND) {
-                    effective = 'notify';
-                } else if (count === null) {
-                    log(sessionLogLine(tool, payload, 'git commit count unavailable; retaining auto'));
+                const body = `🐘 elepha · capture off · type elepha:list to recall${grantHint}`;
+                const result = emit(body, 'notify', notifyChannel(tool));
+                if ('output' in result) {
+                    log(sessionLogLine(tool, payload, 'emitted capture-off nudge'));
                 }
+                return result;
             }
-        }
-        let body: string;
-        if (effective === 'auto' && session !== undefined) {
-            const rendered = await reader.render(session, undefined, undefined, AUTO_BRIEF_CHAR_BUDGET);
-            if (!projectStillConsented(db, session.project_id)) {
-                log(sessionLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+            const project = consentedProject(db, canonicalCwd);
+            if (!project) {
                 return { reason: 'project_unavailable_or_unconsented' };
             }
-            if (!rendered.episode) {
-                log(sessionLogLine(tool, payload, `auto degraded: ${rendered.reason}`));
-                effective = 'notify';
-                body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
-            } else {
-                body = autoBody(project, session, rendered.episode.text, rendered.episode.nonce, reader, now);
+            const reader = new SessionReader(db);
+            const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
+            const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
+            if (reader.consentedTotal(consentedProjects) === 0) {
+                return { reason: 'no_consented_sessions' };
             }
-        } else {
-            body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
-        }
-        body = withDaemonHealthWarning(body, now, dependencies.daemonHealth ?? classifyDaemonHealth);
-        body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
-        body = escapeShellSyntax(body);
-        const injectionId = buildInjectionId();
-        const output = effective === 'auto' ? wrap('brief', injectionId, body) : body;
-        const store = new MemoryStore(db);
-        const recorded = (dependencies.writeInjection ?? ((s, input) => s.recordInjection(input)))(store, {
-            tool,
-            nativeSessionId: payload.session_id,
-            injectedAt: new Date(now).toISOString(),
-            injectionId,
-            body,
+            const session = reader.newestSubstantive(project);
+            const now = clock();
+            const age = session === undefined ? undefined : now - Date.parse(endedAt(session));
+            let effective = mode;
+            if (
+                session === undefined ||
+                age === undefined ||
+                !Number.isFinite(age) ||
+                age > AUTO_BRIEF_MAX_AGE_MS ||
+                (effective === 'auto' && age > AUTO_BRIEF_NOTIFY_AGE_MS)
+            ) {
+                effective = 'notify';
+            }
+            if (effective === 'auto' && session !== undefined && session.has_external_content === 1) {
+                effective = 'notify';
+                log(sessionLogLine(tool, payload, 'auto degraded: session has external content'));
+            }
+            if (effective === 'auto' && session !== undefined) {
+                const cwd = project.gitRoot ?? project.paths[0];
+                if (cwd) {
+                    const { branch, count } = await probeGitState(
+                        cwd,
+                        dependencies.gitBranch ?? gitRevParseAbbrevRefHeadAsync,
+                        dependencies.gitCommitCount ?? gitRevListCountHeadAsync,
+                    );
+                    if (branch !== null && session.git_branch !== null && branch !== session.git_branch) {
+                        effective = 'notify';
+                        // Historical and manually resegmented rows do not have a trustworthy
+                        // baseline. Auto must fail closed to the smaller notify injection.
+                    } else if (session.git_commit_count === null) {
+                        effective = 'notify';
+                        log(sessionLogLine(tool, payload, 'auto degraded: stored git commit count unavailable'));
+                    } else if (count !== null && count - session.git_commit_count > AUTO_BRIEF_MAX_COMMITS_BEHIND) {
+                        effective = 'notify';
+                    } else if (count === null) {
+                        log(sessionLogLine(tool, payload, 'git commit count unavailable; retaining auto'));
+                    }
+                }
+            }
+            let body: string;
+            if (effective === 'auto' && session !== undefined) {
+                const rendered = await reader.render(session, undefined, undefined, AUTO_BRIEF_CHAR_BUDGET);
+                if (!projectStillConsented(db, session.project_id)) {
+                    log(sessionLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+                    return { reason: 'project_unavailable_or_unconsented' };
+                }
+                if (!rendered.episode) {
+                    log(sessionLogLine(tool, payload, `auto degraded: ${rendered.reason}`));
+                    effective = 'notify';
+                    body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
+                } else {
+                    body = autoBody(project, session, rendered.episode.text, rendered.episode.nonce, reader, now);
+                }
+            } else {
+                body = notifyBody(consentedProjects, reader, project, payload.session_id, now);
+            }
+            body = withDaemonHealthWarning(body, now, dependencies.daemonHealth ?? classifyDaemonHealth);
+            body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
+            const result = emit(
+                body,
+                effective === 'auto' ? 'brief' : 'notify',
+                effective === 'auto' ? 'additionalContext' : notifyChannel(tool),
+                now,
+            );
+            if ('output' in result) {
+                log(sessionLogLine(tool, payload, `emitted ${effective}`));
+            }
+            return result;
         });
-        if (!recorded) {
-            return { reason: 'injection_record_failed' };
-        }
-        log(sessionLogLine(tool, payload, `emitted ${effective}`));
-        return { output: envelope(tool, output, effective === 'auto' ? 'additionalContext' : notifyChannel(tool)) };
     } catch (error) {
         log(sessionLogLine(tool, payload, (error as Error).message));
         return { reason: 'hook_error' };

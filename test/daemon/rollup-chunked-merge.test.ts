@@ -4,7 +4,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import { RollupService } from '../../src/daemon/rollup-service.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type SessionRow } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { PreviousRollup, RollupTurnInput } from '../../src/summarizer/rollup-prompt.js';
@@ -79,7 +79,7 @@ describe('RollupService chunked merge', () => {
     const logs: string[] = [];
 
     beforeEach(() => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
         provider = new CountingProvider();

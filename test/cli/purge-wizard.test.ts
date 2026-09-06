@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { buildPurgeScope, type PurgePrompts, runPurgeWizard } from '../../src/cli/purge-wizard.js';
 import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -55,7 +55,7 @@ describe('revoked purge scope', () => {
         'selects by the deepest explicit decision for a $parentState parent and $childState child',
         ({ parentState, childState, expectedSelected }) => {
             const directory = withGrantableTestDir('purge-revoked-scope-');
-            const db = openDb(path.join(directory, 'elepha.db'));
+            const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
             const store = new MemoryStore(db);
             const parentPath = path.join(directory, 'workspace');
             const childPath = path.join(parentPath, 'private-app');
@@ -76,7 +76,7 @@ describe('revoked purge scope', () => {
 
     it('keeps an empty revoked scope explicit when nothing is revoked', () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-revoked-empty-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         store.upsertProject(path.join(directory, 'pending-project'));
 
@@ -115,7 +115,7 @@ describe('elepha purge wizard', () => {
     it('previews the selected project, confirms through the fake seam, and applies through the existing purge engine', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-wizard-'));
         const dbPath = path.join(directory, 'elepha.db');
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const selectedPath = repositoryRoot;
         const fragmentPath = path.join(repositoryRoot, 'src');
@@ -268,7 +268,7 @@ describe('elepha purge wizard', () => {
 
     it('cancels at confirmation without changing the previewed rows', async () => {
         const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-wizard-'));
-        const db = openDb(path.join(directory, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const projectPath = repositoryRoot;
         const project = store.upsertProject(projectPath);

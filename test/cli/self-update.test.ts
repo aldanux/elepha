@@ -4,12 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
     selfUpdate: vi.fn(),
     countApproved: vi.fn(() => 1),
-    openDb: vi.fn(() => ({})),
+    openDb: vi.fn(async () => ({})),
 }));
 
 vi.mock('../../src/install/self-update.js', () => ({ selfUpdate: mocks.selfUpdate }));
 vi.mock('../../src/storage/consent-store.js', () => ({
     ConsentStore: class {
+        //noinspection JSUnusedGlobalSymbols
         countApproved(): number {
             return mocks.countApproved();
         }
@@ -51,6 +52,7 @@ describe('elepha self-update', () => {
 
         expect(stdout).toEqual([formatSelfUpdateCurrentMessage('1.2.3')]);
         expect(stderr).toEqual([]);
+        expect(mocks.openDb).not.toHaveBeenCalled();
         expect(process.exitCode).toBeUndefined();
     });
 
@@ -61,6 +63,7 @@ describe('elepha self-update', () => {
 
         expect(stdout).toEqual([formatSelfUpdateUpdatedMessage('1.2.3', '1.2.4')]);
         expect(stderr).toEqual([]);
+        expect(mocks.selfUpdate).toHaveBeenCalledWith({ readApprovedRoots: expect.any(Function) });
         expect(process.exitCode).toBeUndefined();
     });
 });

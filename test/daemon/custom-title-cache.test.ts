@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { EmptySessionAnalysis, ParsedTurn, SessionAdapter, SessionClassification } from '../../src/types/index.js';
 
@@ -66,7 +66,10 @@ function setup(): { adapter: TitleAdapter; daemon: CustomTitleSeam; filePath: st
     const directory = mkdtempSync(path.join(tmpdir(), 'elepha-custom-title-cache-'));
     const filePath = path.join(directory, 'session.jsonl');
     const adapter = new TitleAdapter();
-    const daemon = new IngestionDaemon({ store: new MemoryStore(openDb(':memory:')), adapters: [adapter] }) as unknown as CustomTitleSeam;
+    const daemon = new IngestionDaemon({
+        store: new MemoryStore(openUnmanagedDb(':memory:')),
+        adapters: [adapter],
+    }) as unknown as CustomTitleSeam;
     return { adapter, daemon, filePath };
 }
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { applyRenderedCharsBackfill, planRenderedCharsBackfill } from '../../src/storage/rendered-chars-backfill.js';
 import type { SessionAdapter, ToolName } from '../../src/types/index.js';
 
@@ -29,7 +29,7 @@ describe('rendered-chars backfill', () => {
 
     afterEach(() => vi.unstubAllEnvs());
 
-    function seed(db: ReturnType<typeof openDb>, pathToTranscript = sourcePath): number {
+    function seed(db: ReturnType<typeof openUnmanagedDb>, pathToTranscript = sourcePath): number {
         db.prepare(
             `INSERT INTO projects (id, path, first_seen_at, last_seen_at) VALUES (1, '/tmp/proj', '2026-08-01T10:00:00.000Z', '2026-08-01T10:00:00.000Z')`,
         ).run();
@@ -53,7 +53,7 @@ describe('rendered-chars backfill', () => {
         ];
 
         for (const scenario of cases) {
-            const db = openDb(':memory:');
+            const db = openUnmanagedDb(':memory:');
             const sessionId = seed(db, scenario.transcriptPath);
 
             const preview = await planRenderedCharsBackfill(db, adapters);

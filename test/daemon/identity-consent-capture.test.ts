@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { runSessionStart } from '../../src/hooks/session-start.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -87,7 +87,7 @@ function identityStore(
     commits: Record<string, string | null>,
 ): { store: MemoryStore; gitCalls: { root: number; remote: number; commit: number } } {
     const gitCalls = { root: 0, remote: 0, commit: 0 };
-    const store = new MemoryStore(openDb(dbPath), {
+    const store = new MemoryStore(openUnmanagedDb(dbPath), {
         resolveGitRoot: (cwd) => {
             gitCalls.root++;
             return roots[cwd] ?? null;

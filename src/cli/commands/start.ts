@@ -3,19 +3,29 @@ import type { Command } from 'commander';
 import { elephaLaunchFailurePath } from '../../config/paths.js';
 import { IngestionDaemon } from '../../daemon/index.js';
 import { RollupService } from '../../daemon/rollup-service.js';
-import { openDb } from '../../storage/db.js';
+import { migratePrimaryDatabaseToEncrypted } from '../../storage/database-migration.js';
+import { defaultDbPath, openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { RollupStore } from '../../storage/rollup-store.js';
 import { createConfiguredSynthesisProviders } from '../../summarizer/provider-config.js';
 
-export function registerStart(program: Command): void {
+export interface StartCommandRuntime {
+    migrateDatabase(databasePath: string): Promise<unknown>;
+}
+
+const defaultStartCommandRuntime: StartCommandRuntime = {
+    migrateDatabase: migratePrimaryDatabaseToEncrypted,
+};
+
+export function registerStart(program: Command, runtime: StartCommandRuntime = defaultStartCommandRuntime): void {
     program
         .command('start', { hidden: true })
         .description('Run the ingestion daemon in the foreground, watching sessions from supported AI coding tools')
-        .action(() => {
+        .action(async () => {
             const log = (msg: string) => console.log(msg);
             const logError = (msg: string) => console.error(msg);
-            const db = openDb();
+            await runtime.migrateDatabase(defaultDbPath());
+            const db = await openDb();
             const store = new MemoryStore(db);
             if (store.consent.list('approved').length === 0) {
                 console.log('capture is awaiting consent; run `elepha init` to choose projects, nothing to do, exiting.');

@@ -6,9 +6,9 @@
 // receives writes and reports RUNNING forever. Every path into either tool
 // must resolve through here.
 //
-// Case handling follows platform filesystem defaults: macOS and Windows are
-// case-insensitive, while Linux and other platforms are case-sensitive. Compare
-// with samePath/normalizeForCompare; store the original casing. Volume-level
+// Case handling follows supported-platform filesystem defaults: macOS is
+// case-insensitive, while Linux is case-sensitive. Compare with
+// samePath/normalizeForCompare; store the original casing. Volume-level
 // case-sensitivity detection is deliberately out of scope.
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
@@ -17,6 +17,7 @@ import path from 'node:path';
 import type { ToolName } from '../types/index.js';
 import {
     DEFAULT_ELEPHA_SERVICE_LABEL,
+    PARANOID_STATE_FILE_NAME,
     REFUSED_ABSOLUTE_PROJECT_ROOTS,
     REFUSED_HOME_PROJECT_ROOTS,
     TEMPORARY_PROJECT_ROOTS,
@@ -112,6 +113,9 @@ export function elephaPaths(home = homedir()): {
     installTransaction: string;
     launchFailure: string;
     heartbeat: string;
+    migrationLock: string;
+    migrationManifest: string;
+    paranoid: string;
     updateCheckState: string;
     updateAvailable: string;
     stdout: string;
@@ -134,6 +138,9 @@ export function elephaPaths(home = homedir()): {
         installTransaction: path.join(serviceDir, 'install-transaction.json'),
         launchFailure: path.join(serviceDir, 'launch-failure.json'),
         heartbeat: path.join(root, 'daemon.heartbeat.json'),
+        migrationLock: path.join(root, 'database-migration.lock'),
+        migrationManifest: path.join(root, 'database-migration.json'),
+        paranoid: path.join(root, PARANOID_STATE_FILE_NAME),
         updateCheckState: path.join(root, 'update-check.json'),
         updateAvailable: path.join(root, 'update-available.json'),
         stdout: path.join(logDir, 'daemon.stdout.log'),
@@ -196,13 +203,13 @@ export function daemonLaunchAgentPath(label = elephaServiceLabel()): string {
     return label === elephaServiceLabel() ? elephaPaths().launchAgent : path.join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
 }
 
-// Forward-slash form, for substring checks that must behave the same on Windows.
+// Forward-slash form for separator-independent substring checks.
 export function toPosix(p: string): string {
     return p.split(path.sep).join('/');
 }
 
-// Separator-normalized form for COMPARISON ONLY, case-folded on platforms whose
-// filesystems are case-insensitive by default. This platform check deliberately
+// Separator-normalized form for COMPARISON ONLY, case-folded on macOS where the
+// filesystem is case-insensitive by default. This platform check deliberately
 // does not detect volume-level overrides. Never persist this form: case-folding
 // destroys the real casing and can merge distinct files on case-sensitive volumes.
 export function normalizeForCompare(p: string): string;
@@ -210,7 +217,7 @@ export function normalizeForCompare(p: string, platform: NodeJS.Platform): strin
 export function normalizeForCompare(p: string, platform: unknown = process.platform): string {
     const normalized = toPosix(path.normalize(p));
     const comparePlatform = typeof platform === 'string' ? platform : process.platform;
-    return comparePlatform === 'darwin' || comparePlatform === 'win32' ? normalized.toLowerCase() : normalized;
+    return comparePlatform === 'darwin' ? normalized.toLowerCase() : normalized;
 }
 
 export function samePath(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {

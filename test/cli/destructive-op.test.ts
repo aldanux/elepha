@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { openDb } from '../../src/storage/db.js';
+import type { openUnmanagedDb } from '../../src/storage/db.js';
 
 const { backupDatabaseAndReport, daemonHealth, defaultDbPath, serviceBackend } = vi.hoisted(() => ({
     backupDatabaseAndReport: vi.fn(),
@@ -34,7 +34,7 @@ describe('runDestructiveOp daemon liveness gate', () => {
         await expect(
             runDestructiveOp({
                 applyRequested: false,
-                db: { pragma: vi.fn() } as unknown as ReturnType<typeof openDb>,
+                db: { pragma: vi.fn() } as unknown as ReturnType<typeof openUnmanagedDb>,
                 plan: () => ({ rows: 1 }),
                 describe: vi.fn(),
                 isEmpty: () => false,
@@ -59,7 +59,7 @@ describe('runDestructiveOp daemon liveness gate', () => {
         await expect(
             runDestructiveOp({
                 applyRequested: true,
-                db: { pragma: vi.fn() } as unknown as ReturnType<typeof openDb>,
+                db: { pragma: vi.fn() } as unknown as ReturnType<typeof openUnmanagedDb>,
                 operationLabel: 'purge',
                 plan: () => ({ rows: 1 }),
                 describe: vi.fn(),

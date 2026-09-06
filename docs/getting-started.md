@@ -1,15 +1,16 @@
 # Getting started
 
 elepha adds a shared local memory layer across supported AI coding CLIs. It runs as
-a global command-line tool plus a small background service that reads the session 
-files those tools already keep. Getting started means installing the package, 
+a global command-line tool plus a small background service that reads the session
+files those tools already keep. Getting started means installing the package,
 registering elepha with the tools you use, and choosing which projects it may remember.
 
 ## Requirements
 
-You need Node.js 22 or newer. elepha supports macOS and Linux, including Windows
-through WSL; native Windows is not supported. Linux installations need systemd, and
-WSL users may need to enable it as described in [WSL](#wsl).
+You need Node.js 22.12.0 or newer. elepha supports macOS and Linux, including Windows
+through WSL; native Windows is not supported. Linux requires glibc 2.35 or newer and
+systemd. The encrypted database driver ships as a prebuilt binary, so no compiler is
+needed. WSL users may need to enable systemd as described in [WSL](#wsl).
 
 ## Install the package
 
@@ -26,10 +27,10 @@ AI coding tools next:
 elepha install
 ```
 
-The installer detects supported AI coding tools, configures elepha's capture and recall 
-integrations for each one, and sets up the background capture service. It changes only 
+The installer detects supported AI coding tools, configures elepha's capture and recall
+integrations for each one, and sets up the background capture service. It changes only
 elepha-owned blocks and keys in each tool's global configuration, leaving unrelated
-settings intact. The command is safe to run again when repairing or refreshing an 
+settings intact. The command is safe to run again when repairing or refreshing an
 installation.
 
 At least one supported coding tool must already be installed. After registration,
@@ -56,12 +57,18 @@ registration or hook approval still needs attention.
 
 By default, elepha keeps its database, configuration, logs, backups, launcher, and
 service files under `~/.elepha/`. Set `ELEPHA_HOME` to use a different location.
-The memory database is `$ELEPHA_HOME/elepha.db`.
+The memory database is `$ELEPHA_HOME/elepha.db` and is encrypted in full. Its key is
+kept in the operating system's secret store where available, or in a private key file
+under `$ELEPHA_HOME` otherwise. Existing plaintext databases migrate automatically on
+upgrade; no manual export or import is required. See
+[Protecting and recovering memory](storage.md) for migration space and interrupted
+recovery requirements.
 
 Nothing is written into your project directories, and elepha never modifies the
 original Claude Code or Codex transcripts. Use the [storage tools](storage.md) to
-make portable backups instead of treating the database as disposable: it also holds
-privacy and lifecycle state that is not merely derived session content.
+make encrypted same-installation backups instead of treating the database as
+disposable: it holds privacy and lifecycle state and, when durable capture is enabled,
+may hold the only surviving sanitized copy of a deleted source transcript.
 
 ## Platform notes
 
@@ -73,8 +80,9 @@ afterward.
 
 ### Linux
 
-The background service runs as a systemd user unit and is configured to survive
-logout and reboot.
+The background service runs as a systemd user unit, starts with the user service
+manager, and restarts on failure. Remaining active after logout or starting before
+login depends on systemd lingering configured outside elepha.
 
 ### WSL
 

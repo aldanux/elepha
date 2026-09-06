@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { applyRootCommitBackfill, planRootCommitBackfill } from '../../src/storage/root-commit-backfill.js';
 
 describe('root-commit backfill', () => {
     it('fills resolvable NULL rows, preserves populated rows, reports unresolvable rows, and is idempotent', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const now = '2026-08-22T00:00:00.000Z';
         const insert = db.prepare(
             `INSERT INTO projects (path, display_name, git_root, git_root_commit, first_seen_at, last_seen_at)

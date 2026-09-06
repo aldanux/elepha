@@ -1,9 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { Command } from 'commander';
+import { describe, expect, it, vi } from 'vitest';
+import { openDb, openUnmanagedDb } from '../../src/storage/db.js';
+import { MemoryStore } from '../../src/storage/memory-store.js';
+import { enableParanoidMode } from '../../src/storage/paranoid-gate.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
+import { withGrantableTestDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
@@ -27,7 +31,7 @@ function runBackfillCli(dbPath: string, ...args: string[]) {
     });
 }
 
-function seed(fixture: ReturnType<typeof createTestDb>, sourcePath: string): void {
+function seed(fixture: ReturnType<typeof createTestDb>, sourcePath: string, close = true): void {
     const now = '2026-08-01T10:00:00.000Z';
     const project = seedProject(fixture, { path: '/tmp/proj' });
     const session = seedSession(fixture, {
@@ -39,10 +43,56 @@ function seed(fixture: ReturnType<typeof createTestDb>, sourcePath: string): voi
         lastIngestedAt: now,
     });
     seedMemory(fixture, { project, session, startedAt: now, renderedChars: 0, renderedTurns: 0 });
-    fixture.close();
+    if (close) {
+        fixture.close();
+    }
 }
 
 describe('elepha backfill-rendered-chars', () => {
+    it('redacts protected preview details while memory is locked', async () => {
+        const directory = withGrantableTestDir('elepha-rendered-chars-cli-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const db = await openDb(dbPath, {
+            encryption: {
+                platform: 'linux',
+                env: { CI: '1' },
+                keyFilePath: () => path.join(directory, 'elepha.keydata'),
+            },
+        });
+        const fixture = {
+            directory,
+            dbPath,
+            db,
+            store: new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null }),
+            close: () => db.close(),
+        };
+        const sourcePath = path.join(directory, 'claude-home', 'projects', 'session.jsonl');
+        mkdirSync(path.dirname(sourcePath), { recursive: true });
+        writeFileSync(sourcePath, TRANSCRIPT);
+        seed(fixture, sourcePath, false);
+
+        enableParanoidMode(db, 'correct horse battery staple');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(directory, 'claude-home'));
+        vi.doMock('../../src/storage/db.js', async (importOriginal) => ({
+            ...(await importOriginal<typeof import('../../src/storage/db.js')>()),
+            openDb: vi.fn().mockResolvedValue(db),
+        }));
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        const { registerBackfills } = await import('../../src/cli/commands/backfills.js');
+        const program = new Command();
+        registerBackfills(program);
+
+        await program.parseAsync(['node', 'elepha', 'backfill-rendered-chars']);
+        const preview = log.mock.calls.flat().join('\n');
+        db.close();
+
+        expect(preview).toBe(
+            '1 rendered statistics change(s) of 1 session(s) scanned; 0 transcript(s) unavailable. ' +
+                'Details hidden while elepha memory is locked.\n\n' +
+                'Dry run only - nothing was written. Re-run with --apply to store these exact counts.',
+        );
+    }, 15000);
+
     it('backs up the DB before applying and creates no backup during a dry run', () => {
         const fixture = createTestDb('elepha-rendered-chars-cli-');
         const { directory, dbPath } = fixture;
@@ -59,14 +109,14 @@ describe('elepha backfill-rendered-chars', () => {
         const backupName = readdirSync(directory).find((name) => name.startsWith('elepha.db.bak-'));
         expect(backupName).toBeDefined();
 
-        const backup = openDb(path.join(directory, backupName!));
+        const backup = openUnmanagedDb(path.join(directory, backupName!));
         expect(backup.prepare('SELECT rendered_chars, rendered_turns FROM sessions').get()).toEqual({
             rendered_chars: 0,
             rendered_turns: 0,
         });
         backup.close();
 
-        const appliedDb = openDb(dbPath);
+        const appliedDb = openUnmanagedDb(dbPath);
         const current = appliedDb.prepare('SELECT rendered_chars, rendered_turns FROM sessions').get() as {
             rendered_chars: number;
             rendered_turns: number;

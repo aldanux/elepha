@@ -3,7 +3,7 @@ import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -83,7 +83,7 @@ function createFixture(name: string): {
     mkdirSync(watchRoot, { recursive: true });
     mkdirSync(approvedRoot);
     const canonicalApprovedRoot = realpathSync(approvedRoot);
-    const store = new MemoryStore(openDb(path.join(fixture, 'elepha.db')));
+    const store = new MemoryStore(openUnmanagedDb(path.join(fixture, 'elepha.db')));
     store.consent.grant(canonicalApprovedRoot);
     return { fixture, watchRoot, approvedRoot: canonicalApprovedRoot, store };
 }
@@ -167,7 +167,7 @@ describe('approved-root backfill symlink boundary', () => {
             readCorpus: listMultiCorpus,
         });
 
-        const baselineStore = new MemoryStore(openDb(path.join(fixture, 'baseline.db')));
+        const baselineStore = new MemoryStore(openUnmanagedDb(path.join(fixture, 'baseline.db')));
         baselineStore.consent.grant(approvedRoot);
         baselineStore.consent.grant(canonicalSecondRoot);
         const listSingleCorpus = vi.fn(async (root: string) => readdir(root, { recursive: true }));

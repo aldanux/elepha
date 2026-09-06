@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerStart } from '../../src/cli/commands/start.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
+import { defaultDbPath, openUnmanagedDb } from '../../src/storage/db.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 describe('elepha start', () => {
@@ -29,8 +30,10 @@ describe('elepha start', () => {
         const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
         const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
         const start = vi.spyOn(IngestionDaemon.prototype, 'start');
+        const migrateDatabase = vi.fn(async () => undefined);
         const program = new Command();
-        registerStart(program);
+        registerStart(program, { migrateDatabase });
+        openUnmanagedDb(defaultDbPath()).close();
 
         await program.parseAsync(['node', 'elepha', 'start']);
 
@@ -39,5 +42,6 @@ describe('elepha start', () => {
         expect(log).toHaveBeenCalledWith(expect.stringContaining('elepha init'));
         expect(error).not.toHaveBeenCalled();
         expect(start).not.toHaveBeenCalled();
+        expect(migrateDatabase).toHaveBeenCalledWith(defaultDbPath());
     });
 });

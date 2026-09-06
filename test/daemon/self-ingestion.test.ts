@@ -6,7 +6,7 @@ import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { wrap } from '../../src/security/sentinel.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter, SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
 
@@ -104,7 +104,7 @@ describe('Rule 4 self-ingestion guard', () => {
         writeFileSync(file, transcript(wrap('brief', '01J00000000000000000000000', 'Do not re-ingest this context.')));
 
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         const adapter = new Adapter((message) => logs.push(message));
         const daemon = new IngestionDaemon({ store, adapters: [adapter], watchRoots: [watchRoot], log: (message) => logs.push(message) });
@@ -129,7 +129,7 @@ describe('Rule 4 self-ingestion guard', () => {
         mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, claudeTranscript(wrap('brief', '01J00000000000000000000000', 'Do not re-ingest this context.')));
 
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         expect(store.isTranscriptPurged('claude-code', SESSION)).toBe(false);
         const adapter = new ClaudeCodeAdapter();
@@ -157,7 +157,7 @@ describe('Rule 4 self-ingestion guard', () => {
         const watchRoot = path.join(root, '.claude', 'projects');
         const file = path.join(watchRoot, 'project', `${SESSION}.jsonl`);
         mkdirSync(path.dirname(file), { recursive: true });
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         const logs: string[] = [];
         const adapter = new ClaudeCodeAdapter((message) => logs.push(message));
@@ -183,7 +183,7 @@ describe('Rule 4 self-ingestion guard', () => {
         mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, codexTranscript('Continue the current task.', additionalContext));
 
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(PROJECT);
         const summarizer = new CountingSummarizer();
         const adapter = new CodexAdapter();
@@ -197,7 +197,7 @@ describe('Rule 4 self-ingestion guard', () => {
     it.each(['claude-code', 'codex'] as const)(
         'drops an eligible near-verbatim quote for %s before summary or memory persistence and advances the existing cursor',
         async (tool) => {
-            const store = new MemoryStore(openDb(':memory:'));
+            const store = new MemoryStore(openUnmanagedDb(':memory:'));
             store.consent.grant(PROJECT);
             const project = store.upsertProject(PROJECT);
             const session = store.upsertSession(tool, SESSION, project.id, '/tmp/rule4.jsonl');
@@ -205,7 +205,7 @@ describe('Rule 4 self-ingestion guard', () => {
             store.recordInjection({
                 tool,
                 nativeSessionId: SESSION,
-                injectedAt: '2026-08-17T10:00:00.000Z',
+                injectedAt: '2026-08-17T10:01:00.500Z',
                 injectionId: '01J00000000000000000000000',
                 body,
             });
@@ -247,4 +247,67 @@ describe('Rule 4 self-ingestion guard', () => {
             expect(store.findSession(tool, SESSION)?.id).toBe(session.id);
         },
     );
+
+    it('does not suppress same-turn content from another tool, another session, or a nearby nonmatch', async () => {
+        const store = new MemoryStore(openUnmanagedDb(':memory:'));
+        store.consent.grant(PROJECT);
+        const exactBody = 'The selected architecture keeps transcript capture passive and local across tools.';
+        const scopedInjection = {
+            injectedAt: '2026-08-17T10:01:00.500Z',
+            injectionId: '01J00000000000000000000000',
+            body: exactBody,
+        };
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'codex',
+                nativeSessionId: SESSION,
+            }),
+        ).toBe(true);
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'claude-code',
+                nativeSessionId: 'other-session',
+            }),
+        ).toBe(true);
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'claude-code',
+                nativeSessionId: SESSION,
+                body: 'The nearby architecture keeps browser cleanup manual and remote across unrelated teams.',
+            }),
+        ).toBe(true);
+        expect(
+            store.recordInjection({
+                ...scopedInjection,
+                tool: 'claude-code',
+                nativeSessionId: SESSION,
+                injectedAt: '2026-08-17T10:01:02.000Z',
+            }),
+        ).toBe(true);
+        const summarizer = new CountingSummarizer();
+        const daemon = new IngestionDaemon({ store, summarizer });
+        const turn: ParsedTurn = {
+            tool: 'claude-code',
+            sessionId: SESSION,
+            sourcePath: '/tmp/rule4-control.jsonl',
+            projectPath: PROJECT,
+            turnIndex: 0,
+            startedAt: '2026-08-17T10:01:00.000Z',
+            endedAt: '2026-08-17T10:01:01.000Z',
+            userMessage: `A different scoped injection said: ${exactBody}`,
+            assistantText: 'Continue with the nearby but nonmatching value.',
+            toolCalls: [],
+            cursor: '100|1|control',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+
+        expect(await (daemon as unknown as DaemonSeam).persistTurn(new ClaudeCodeAdapter(), turn)).toBe(true);
+        expect(summarizer.calls).toHaveLength(1);
+        expect(store.findSession('claude-code', SESSION)).toBeDefined();
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 1 });
+    });
 });

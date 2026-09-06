@@ -2,6 +2,7 @@
 // error, whereas an absent config keeps the documented fail-open defaults.
 
 import { readFileSync } from 'node:fs';
+import { DURABLE_CAPTURE_MAX_BYTES } from './constants.js';
 import { elephaConfigPath } from './paths.js';
 
 export type StartupMode = 'notify' | 'auto' | 'off' | 'ask';
@@ -13,6 +14,8 @@ export interface MemoryConfig {
     on_compact: StartupMode;
     captureClaudeCode?: boolean;
     captureCodex?: boolean;
+    durableCapture?: boolean;
+    durableCaptureMaxBytes?: number;
 }
 
 export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
@@ -22,6 +25,8 @@ export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
     on_compact: 'off',
     captureClaudeCode: true,
     captureCodex: true,
+    durableCapture: false,
+    durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };
 
 const KEYS = ['on_startup', 'on_clear', 'on_resume', 'on_compact'] as const;
@@ -46,14 +51,28 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         return { error: 'memory config must be an object' };
     }
+    const output: MemoryConfig = { ...DEFAULT_MEMORY_CONFIG };
+    const settings = parsed as Record<string, unknown>;
+    if (typeof settings['capture-claude-code'] === 'boolean') {
+        output.captureClaudeCode = settings['capture-claude-code'];
+    }
+    if (typeof settings['capture-codex'] === 'boolean') {
+        output.captureCodex = settings['capture-codex'];
+    }
+    if (typeof settings['durable-capture'] === 'boolean') {
+        output.durableCapture = settings['durable-capture'];
+    }
+    const durableCaptureMaxBytes = settings['durable-capture-max-bytes'];
+    if (typeof durableCaptureMaxBytes === 'number' && Number.isSafeInteger(durableCaptureMaxBytes) && durableCaptureMaxBytes > 0) {
+        output.durableCaptureMaxBytes = durableCaptureMaxBytes;
+    }
     const memory = (parsed as { memory?: unknown }).memory;
     if (memory === undefined) {
-        return { config: { ...DEFAULT_MEMORY_CONFIG } };
+        return { config: output };
     }
     if (!memory || typeof memory !== 'object' || Array.isArray(memory)) {
         return { error: 'memory config.memory must be an object' };
     }
-    const output: MemoryConfig = { ...DEFAULT_MEMORY_CONFIG };
     for (const key of KEYS) {
         const value = (memory as Record<string, unknown>)[key];
         if (value === undefined) {
@@ -63,13 +82,6 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
             return { error: `memory config ${key} is unsupported` };
         }
         output[key] = value as StartupMode;
-    }
-    const settings = parsed as Record<string, unknown>;
-    if (typeof settings['capture-claude-code'] === 'boolean') {
-        output.captureClaudeCode = settings['capture-claude-code'];
-    }
-    if (typeof settings['capture-codex'] === 'boolean') {
-        output.captureCodex = settings['capture-codex'];
     }
     return { config: output };
 }

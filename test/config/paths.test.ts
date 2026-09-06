@@ -46,6 +46,9 @@ describe('isolated elepha paths', () => {
         expect(explicit).toMatchObject({
             root: '/Users/test/.elepha',
             heartbeat: '/Users/test/.elepha/daemon.heartbeat.json',
+            migrationLock: '/Users/test/.elepha/database-migration.lock',
+            migrationManifest: '/Users/test/.elepha/database-migration.json',
+            paranoid: '/Users/test/.elepha/paranoid.json',
             launchAgent: '/Users/test/Library/LaunchAgents/com.elepha.daemon.plist',
         });
         expect(explicit.launchAgent).not.toContain(`${explicit.root}/`);
@@ -65,11 +68,6 @@ describe('path comparison case handling', () => {
     it('folds case on macOS', () => {
         expect(samePath('/Users/test/Project', '/users/test/project', 'darwin')).toBe(true);
         expect(isWithin('/Users/test/Project', '/users/test/project/src', 'darwin')).toBe(true);
-    });
-
-    it('folds case on Windows', () => {
-        expect(samePath('/Users/test/Project', '/users/test/project', 'win32')).toBe(true);
-        expect(isWithin('/Users/test/Project', '/users/test/project/src', 'win32')).toBe(true);
     });
 
     it('preserves case on Linux', () => {

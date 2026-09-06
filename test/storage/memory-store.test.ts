@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { FIRST_PROMPT_SEARCH_CAP } from '../../src/config/constants.js';
 import { renderRawTurns } from '../../src/rendering/raw-turn-renderer.js';
 import { stripShellSyntax } from '../../src/security/sanitize.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
@@ -29,7 +29,7 @@ describe('MemoryStore', () => {
     let store: MemoryStore;
 
     beforeEach(() => {
-        store = new MemoryStore(openDb(':memory:'));
+        store = new MemoryStore(openUnmanagedDb(':memory:'));
     });
 
     it('re-ingesting the same turn is a no-op, not a duplicate row', () => {
@@ -142,7 +142,7 @@ describe('MemoryStore', () => {
 
     it('keys two git working directories by one repository root and caches root lookup per cwd', () => {
         const calls = new Map<string, number>();
-        const gitStore = new MemoryStore(openDb(':memory:'), {
+        const gitStore = new MemoryStore(openUnmanagedDb(':memory:'), {
             resolveGitRoot: (cwd) => {
                 calls.set(cwd, (calls.get(cwd) ?? 0) + 1);
                 return cwd.startsWith('/repo/') ? '/repo' : null;
@@ -175,7 +175,7 @@ describe('MemoryStore', () => {
     });
 
     it('keeps non-git working directories keyed by their exact path', () => {
-        const gitStore = new MemoryStore(openDb(':memory:'), { resolveGitRoot: () => null });
+        const gitStore = new MemoryStore(openUnmanagedDb(':memory:'), { resolveGitRoot: () => null });
 
         const first = gitStore.upsertProject('/scratch/one');
         const second = gitStore.upsertProject('/scratch/two');
@@ -407,7 +407,7 @@ describe('MemoryStore', () => {
 
 describe('session metadata capture', () => {
     it('upsertSession writes surface/gitBranch/kind/customTitle on first creation, while only customTitle is refreshable', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const project = store.upsertProject('/tmp/proj');
 
@@ -450,7 +450,7 @@ describe('session metadata capture', () => {
 
 describe('trailing state', () => {
     it('recordTurn updates trailing_branch and trailing_files, capped and deduped, on every turn close', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const project = store.upsertProject('/tmp/proj3');
         const session = store.upsertSession('claude-code', 'native-3', project.id, '/tmp/z.jsonl', { kind: 'main' });
@@ -501,7 +501,7 @@ describe('trailing state', () => {
     });
 
     it('updates last_turn_at even when branch and files are unavailable', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const project = store.upsertProject('/tmp/proj-no-evidence');
         const session = store.upsertSession('codex', 'native-no-evidence', project.id, '/tmp/no-evidence.jsonl');
@@ -526,7 +526,7 @@ describe('trailing state', () => {
 
 describe('findSession ordering', () => {
     it('returns the row with the highest segment_index when more than one exists for (tool, native_id)', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
         const project = store.upsertProject('/tmp/proj4');
 

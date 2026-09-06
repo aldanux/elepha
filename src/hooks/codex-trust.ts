@@ -8,7 +8,6 @@ export interface CodexHandler {
     async?: boolean;
     statusMessage?: string;
     additionalContextLimit?: number;
-    commandWindows?: string;
 }
 
 export type CodexHookEvent = 'SessionStart' | 'UserPromptSubmit';

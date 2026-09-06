@@ -15,9 +15,9 @@ export function registerUninstall(program: Command): void {
     hook.command('uninstall').action(runUninstall);
 }
 
-function runUninstall(): void {
+async function runUninstall(): Promise<void> {
     try {
-        printInstallation(uninstallElepha(undefined, { approvedRoots: new ConsentStore(openDb()).countApproved() }), 'uninstall');
+        printInstallation(uninstallElepha(undefined, { approvedRoots: new ConsentStore(await openDb()).countApproved() }), 'uninstall');
     } catch (error) {
         console.error(errorMessage(error));
         process.exitCode = 1;

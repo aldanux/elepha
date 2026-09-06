@@ -14,9 +14,12 @@ set of in-chat `elepha:` commands. It never sends messages on your behalf and ne
 calls a model provider to *act*; it only reads local files and serves context the
 working AI requests on its own.
 
-The database is a **derived, rebuildable cache** over those transcripts. elepha never
-modifies the source transcripts, and capture is **consent-gated**: only sessions whose
-working directory falls under a granted root are ingested.
+The database is a **derived local cache** over those transcripts. Session metadata and
+summaries can be rebuilt while the source transcript remains available; an optional
+durable filtered copy may become the only surviving record after the provider removes
+its source. elepha never modifies source transcripts, and capture is
+**consent-gated**: only sessions whose working directory falls under a granted root are
+ingested.
 
 ## Security — transcripts are inert data (non-negotiable)
 

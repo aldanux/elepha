@@ -13,7 +13,7 @@ Run the onboarding wizard after installation:
 elepha init
 ```
 
-The wizard detects local sessions from supported AI coding tools and discovers eligible 
+The wizard detects local sessions from supported AI coding tools and discovers eligible
 Git projects, and asks whether you want to approve whole workspace folders or individual
 projects. Folder mode covers projects already inside the selected folder and discovers
 new projects there automatically. Individual mode gives you a project-by-project
@@ -46,16 +46,37 @@ elepha consent grant /path/to/workspace
 From inside a project, `elepha consent grant --here` grants the current directory.
 Choose either a path or `--here`, never both.
 
-Revoking a root stops new capture for that scope but keeps its existing memory
-searchable:
+Revoking a root stops new capture for that scope and hides its retained memory from
+search and recall while the root remains revoked. It does not delete the retained
+rows, durable conversation copy, or indexed search terms:
 
 ```console
 elepha consent revoke /path/to/workspace
 ```
 
 `elepha consent revoke --here` applies the same change to the current directory. A
-later grant resumes eligible capture; it does not make the deliberately private
-sessions from the revoked period backfillable.
+later grant makes pre-revocation memory eligible for search and recall again and
+resumes capture; it does not make the deliberately private sessions from the revoked
+period backfillable.
+
+## Move or rename a project
+
+If a repository moves or is renamed inside an approved folder, no consent change is
+needed. elepha groups the old and new locations by Git identity, keeps the existing
+memory, and shows the current live path after it observes the new location.
+
+If the repository was approved individually, or its new location is outside the
+approved folder, approve the new location with `elepha consent`. From inside the moved
+checkout, the direct equivalent is:
+
+```console
+elepha consent grant --here
+```
+
+The grant backfills eligible transcripts at the new location and does not require a
+database restore or delete the memory recorded under the former path. After verifying
+the new path, `elepha consent prune` can remove a missing old consent entry without
+deleting captured memory.
 
 ## Review recorded decisions
 
@@ -65,6 +86,13 @@ capture service has discovered but that you have not approved or revoked yet.
 
 Revocation is intentionally non-destructive. To remove memory already stored for a
 project, use the separate workflow in [Deleting memory](purge.md).
+
+Purge and incognito handling are destructive to the durable copy. A confirmed purge
+deletes the selected sessions' filtered turns, durable coverage rows, and full-text
+search terms. When elepha observes a session under an explicit denial, its incognito
+veto removes the same durable copy and search terms for that native transcript. A
+later grant does not backfill that deliberately private period. Revocation alone does
+none of these deletions.
 
 ## Prune stale consent roots
 
@@ -89,4 +117,4 @@ elepha consent prune --apply --skip-confirmation
 
 Pruning removes only the root's entry from `elepha consent list`. It does not delete
 captured memory. To clear memory belonging to directories that are temporary or no
-longer exist, use [`elepha purge --orphan`](purge.md#choose-one-scope).
+longer exist, use [`elepha purge --orphan`](purge.md#choose-one-base-scope).

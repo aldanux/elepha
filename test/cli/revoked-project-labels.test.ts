@@ -5,7 +5,7 @@ import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard.js';
 import { type PurgePrompts, runPurgeWizard } from '../../src/cli/purge-wizard.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 
 const CANCELLED = Symbol('cancelled');
@@ -19,7 +19,7 @@ function ttyStream(): PassThrough {
 
 function projectFixture() {
     const directory = mkdtempSync(path.join(tmpdir(), 'elepha-project-labels-'));
-    const db = openDb(path.join(directory, 'elepha.db'));
+    const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
     const store = new MemoryStore(db);
     const childPath = path.join(repositoryRoot, 'src');
     const project = store.upsertProject(repositoryRoot);

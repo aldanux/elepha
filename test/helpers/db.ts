@@ -1,8 +1,8 @@
 import path from 'node:path';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { onTestFinished } from 'vitest';
 import type { ConsentRoot, ConsentState } from '../../src/storage/consent-store.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { type MemoryRow, MemoryStore, type ProjectRow, type SessionRow } from '../../src/storage/memory-store.js';
 import { type RollupDecision, type RollupState, RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName, TurnDecision } from '../../src/types/index.js';
@@ -20,7 +20,7 @@ export interface TestDatabase {
 export function createTestDb(prefix = 'elepha-test-db-'): TestDatabase {
     const directory = withGrantableTestDir(prefix);
     const dbPath = path.join(directory, 'elepha.db');
-    const db = openDb(dbPath);
+    const db = openUnmanagedDb(dbPath);
     const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
     let closed = false;
 

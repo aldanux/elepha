@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { assertNoShellSyntax, detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../../src/security/sanitize.js';
 
 const ESC = '\x1b';
+const C1_CONTROLS = ['\u0080', '\u0085', '\u0090', '\u009b', '\u009f'] as const;
 
 describe('detectShellSyntax', () => {
     const active: Array<[string, string]> = [
@@ -20,6 +21,8 @@ describe('detectShellSyntax', () => {
         ['line-leading semicolon', 'first line\n  ; rm -rf /'],
         ['line-leading and', 'first line\n&& make'],
         ['line-leading or', 'first line\n|| true'],
+        ['partially escaped and', 'first line\n\\&& make'],
+        ['partially escaped or', 'first line\n\\|| true'],
         ['line-leading background', '& disown'],
         ['ANSI CSI', `plain${ESC}[31mred`],
         ['ANSI OSC', `title${ESC}]0;pwned\x07`],
@@ -32,6 +35,12 @@ describe('detectShellSyntax', () => {
         });
     }
 
+    it('flags every representative C1 control', () => {
+        for (const control of C1_CONTROLS) {
+            expect(detectShellSyntax(`visible${control}hidden`), `U+${control.codePointAt(0)?.toString(16)}`).toBe(true);
+        }
+    });
+
     const inert: Array<[string, string]> = [
         ['plain prose', 'Chose SQLite over Postgres for local storage'],
         ['mid-sentence semicolon', 'first; then second'],
@@ -40,6 +49,8 @@ describe('detectShellSyntax', () => {
         ['single angle bracket', 'a < b and b > c'],
         ['already-escaped backtick', 'run \\`date\\` first'],
         ['already-escaped substitution', 'rejected $\\(date) in the template'],
+        ['fully escaped and', 'first line\n\\&\\& make'],
+        ['fully escaped or', 'first line\n\\|\\| true'],
         ['newline and tab', 'line one\n\tindented'],
         ['empty', ''],
     ];
@@ -59,6 +70,7 @@ describe('stripShellSyntax', () => {
         ['unbalanced opener', 'dangling $( here', 'dangling  here'],
         ['heredoc marker', 'cat <<EOF', 'cat EOF'],
         ['line-leading chain', 'build\n&& deploy', 'build\n deploy'],
+        ['partially escaped line-leading chain', 'build\n\\|| deploy', 'build\n deploy'],
         ['indented line-leading chain', 'build\n  | tee log', 'build\n   tee log'],
         ['ANSI', `plain${ESC}[31mred`, 'plainred'],
         ['keeps ordinary punctuation', 'first; then second', 'first; then second'],
@@ -82,6 +94,12 @@ describe('stripShellSyntax', () => {
             expect(stripShellSyntax(once)).toBe(once);
         }
     });
+
+    it('removes C1 controls beside complete and truncated ANSI while preserving newline and tab', () => {
+        const input = `\t${C1_CONTROLS.join(`${ESC}[31m`)}${ESC}[\n`;
+        expect(stripShellSyntax(input)).toBe('\t\n');
+        expect(detectShellSyntax(stripShellSyntax(input))).toBe(false);
+    });
 });
 
 describe('escapeShellSyntax', () => {
@@ -91,7 +109,9 @@ describe('escapeShellSyntax', () => {
         ['parameter expansion', 'uses ${HOME}', 'uses $\\{HOME}'],
         ['heredoc', 'cat <<EOF', 'cat <\\<EOF'],
         ['here-string', 'cat <<<x', 'cat <\\<<x'],
-        ['line-leading chain prefixes, never infixes', 'build\n&& deploy', 'build\n\\&& deploy'],
+        ['line-leading and escapes both characters', 'build\n&& deploy', 'build\n\\&\\& deploy'],
+        ['line-leading or escapes both characters', 'build\n|| deploy', 'build\n\\|\\| deploy'],
+        ['repairs a partially escaped chain', 'build\n\\|| deploy', 'build\n\\|\\| deploy'],
         ['indented line-leading chain', 'build\n  ; deploy', 'build\n  \\; deploy'],
         ['ANSI is stripped, not escaped', `plain${ESC}[31mred`, 'plainred'],
     ];
@@ -123,6 +143,32 @@ describe('escapeShellSyntax', () => {
 
     it('does not re-escape text a previous run already escaped', () => {
         expect(escapeShellSyntax('run \\`date\\`')).toBe('run \\`date\\`');
+    });
+
+    it('removes C1 controls idempotently without removing newline or tab', () => {
+        const input = `before\n\t${C1_CONTROLS.join('')}after`;
+        const once = escapeShellSyntax(input);
+        expect(once).toBe('before\n\tafter');
+        expect(escapeShellSyntax(once)).toBe(once);
+        expect(detectShellSyntax(once)).toBe(false);
+    });
+
+    it('repairs even backslash parity and preserves fully escaped chain pairs', () => {
+        const cases = [
+            [String.raw`\\|| printf DOUBLE_ESCAPE_RHS_EXECUTED`, String.raw`\\\|\| printf DOUBLE_ESCAPE_RHS_EXECUTED`],
+            [String.raw`\\&& printf DOUBLE_ESCAPE_RHS_EXECUTED`, String.raw`\\\&\& printf DOUBLE_ESCAPE_RHS_EXECUTED`],
+        ] as const;
+        for (const [input, expected] of cases) {
+            expect(detectShellSyntax(input)).toBe(true);
+            expect(escapeShellSyntax(input)).toBe(expected);
+            expect(detectShellSyntax(expected)).toBe(false);
+            expect(escapeShellSyntax(expected)).toBe(expected);
+            const stripped = stripShellSyntax(input);
+            expect(detectShellSyntax(stripped)).toBe(false);
+            expect(stripShellSyntax(stripped)).toBe(stripped);
+        }
+        expect(escapeShellSyntax(String.raw`\|\| already inert`)).toBe(String.raw`\|\| already inert`);
+        expect(escapeShellSyntax(String.raw`\&\& already inert`)).toBe(String.raw`\&\& already inert`);
     });
 });
 

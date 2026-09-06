@@ -12,9 +12,24 @@ export const DOCS_URL = 'https://github.com/aldanux/elepha#readme';
 export { PACKAGE_VERSION } from './version.js';
 export const BACKUP_KEEP = 5;
 export const USER_BACKUPS_DIR_NAME = 'backups';
+export const SQLITE_MINIMUM_DATABASE_BYTES = 512;
 export const CHARS_PER_TOKEN = 4;
 export const SESSION_TOKEN_BUDGET = 20_000;
 export const SESSION_CHAR_BUDGET = SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN;
+export const DURABLE_CAPTURE_MAX_BYTES = 1024 * 1024 * 1024;
+export const DURABLE_CAPTURE_FILTER_VERSION = 1;
+export const DURABLE_CAPTURE_STATES = [
+    'complete',
+    'complete_truncated',
+    'disabled_gap',
+    'backfilling',
+    'source_unavailable',
+    'parse_error',
+    'revoked',
+    'incognito',
+    'evicted',
+] as const;
+export type DurableCaptureState = (typeof DURABLE_CAPTURE_STATES)[number];
 export const MAX_GET_SESSION_LAST_N = 500;
 export const GET_SESSION_DEADLINE_MS = 5_000;
 export const AUTO_BRIEF_TOKEN_BUDGET = 4_000;
@@ -39,10 +54,39 @@ export const REMEMBER_MATCH_SCORES = {
     title: 12_000,
     exactPhrase: 10_000,
     rollup: 6_000,
+    content: 4_500,
     body: 3_000,
 } as const;
 
 // Storage and session segmentation
+export const DATABASE_KEY_BYTES = 32;
+export const DATABASE_HEADER_BYTES = 16;
+export const DATABASE_KEYRING_TIMEOUT_MS = 5_000;
+export const DATABASE_LIFECYCLE_ACQUIRE_TIMEOUT_MS = 5_000;
+export const DATABASE_LIFECYCLE_POLL_MS = 25;
+export const DATABASE_LIFECYCLE_RECORD_MAX_BYTES = 4_096;
+export const DATABASE_LIFECYCLE_BIRTHTIME_PROOF_ANCESTOR_LIMIT = 64;
+// Millisecond-aligned leaf ctime cannot prove that an unlink/link ABA changed metadata.
+export const DATABASE_LIFECYCLE_COARSE_TIMESTAMP_QUANTUM_NS = 1_000_000n;
+export const DATABASE_LIFECYCLE_EXCLUSIVE_OWNER_PUBLICATION_ATTEMPTS = 3;
+// Retries absorb brief leaf-path mutation races; every uncertain
+// SQLite handle is closed before retry, and the fixed bound fails closed.
+export const DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS = 8;
+export const PARANOID_SCRYPT_N = 131_072;
+export const PARANOID_SCRYPT_R = 8;
+export const PARANOID_SCRYPT_P = 1;
+export const PARANOID_SCRYPT_OUTPUT_BYTES = 32;
+export const PARANOID_SCRYPT_SALT_BYTES = 16;
+export const PARANOID_SCRYPT_MAXMEM_BYTES = 192 * 1024 * 1024;
+export const PARANOID_HMAC_BYTES = 32;
+export const PARANOID_STATE_FILE_NAME = 'paranoid.json';
+export const DATABASE_MIGRATION_COPY_SPACE_NUMERATOR = 21;
+export const DATABASE_MIGRATION_COPY_SPACE_DENOMINATOR = 10;
+export const DATABASE_MIGRATION_HASH_CHUNK_BYTES = 1024 * 1024;
+export const DATABASE_EXPORT_VERIFY_CHUNK_BYTES = 1024 * 1024;
+// Restore/import metadata caps leave at least 8x row and 100x text headroom over the canonical schema.
+export const DATABASE_SCHEMA_METADATA_MAX_ROWS = 256;
+export const DATABASE_SCHEMA_METADATA_MAX_CHARS = 1024 * 1024;
 export const MAX_TITLE_CHARS = 72;
 export const TRAILING_FILES_CAP = 50;
 export const SEGMENT_UNCONDITIONAL_GAP_HOURS = 7 * 24;
@@ -56,6 +100,7 @@ export const HEARTBEAT_INTERVAL_MS = 20_000;
 export const HEARTBEAT_STALE_MS = HEARTBEAT_INTERVAL_MS * 3;
 export const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 export const FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE = 25;
+export const DURABLE_CAPTURE_BACKFILL_BATCH_SIZE = 25;
 export const UPDATE_CHECK_LOOP_INTERVAL_MS = 5 * 60 * 1000;
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_IDLE_DEBOUNCE_MS = 800;
@@ -113,7 +158,7 @@ export const TEMPORARY_PROJECT_ROOTS = ['/tmp', '/private/tmp', '/var/folders', 
 export const PRIVATE_FILE_MODE = 0o600;
 export const PRIVATE_DIR_MODE = 0o700;
 export const PRIVATE_UMASK_MASK = 0o077;
-export const MINIMUM_NODE_MAJOR = 22;
+export const MINIMUM_NODE_VERSION = '22.12.0';
 export const DEFAULT_ELEPHA_SERVICE_LABEL = 'com.elepha.daemon';
 export const PLIST_THROTTLE_INTERVAL_SECONDS = 30;
 export const PLIST_UMASK = 63;

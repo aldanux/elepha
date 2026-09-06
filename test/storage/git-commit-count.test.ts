@@ -1,9 +1,9 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 
 describe('P2.8 git_commit_count schema migration', () => {
     it('adds a NULL baseline to a pre-git_commit_count P2.1 database and preserves its rows', () => {
@@ -26,10 +26,10 @@ describe('P2.8 git_commit_count schema migration', () => {
             INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
               VALUES ('codex', 'legacy', 1, '/legacy.jsonl', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
         `);
-        // `openDb` owns the production migration; this instance is deliberately
+        // `openUnmanagedDb` owns the production migration; this instance is deliberately
         // a legacy on-disk shape only long enough to prove the additive result.
         db.close();
-        const migrated = openDb(file);
+        const migrated = openUnmanagedDb(file);
         expect(migrated.prepare('SELECT COUNT(*) AS count FROM sessions').get()).toEqual({ count: 1 });
         expect(migrated.prepare('SELECT git_commit_count FROM sessions WHERE native_id = ?').get('legacy')).toEqual({
             git_commit_count: null,

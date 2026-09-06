@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
-import { openDb } from '../../src/storage/db.js';
+import { printPurgePlan } from '../../src/cli/shared.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type PurgeScope } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
@@ -48,7 +49,7 @@ describe('purge', () => {
     let rollups: RollupStore;
 
     beforeEach(() => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
     });
@@ -95,6 +96,7 @@ describe('purge', () => {
         const plan = store.planPurge({ projectPath: '/Users/test/project-a' });
         expect(plan.sessions.map((session) => session.id)).toEqual([sessionA.id]);
         expect(plan.sessions[0]!.turnCount).toBe(1);
+        expect(plan.sessions[0]).toMatchObject({ filteredTurnCount: 0, filteredBytes: 0, filteredMemoryIds: [] });
         expect(plan.emptiedProjects.map((project) => project.id)).toEqual([projectA.id]);
         expect(purgeState(store)).toEqual(before);
 
@@ -111,6 +113,55 @@ describe('purge', () => {
 
         // Re-running the same scope finds nothing left - the verification step the CLI performs.
         expect(store.planPurge({ projectPath: '/Users/test/project-a' }).sessions).toHaveLength(0);
+    });
+
+    it('previews and explicitly removes the durable copy, its status, and its searchable FTS terms', () => {
+        const project = store.upsertProject('/Users/test/durable-purge');
+        const session = store.upsertSession('codex', 'durable-purge', project.id, '/tmp/durable-purge.jsonl');
+        store.recordTurn(
+            makeTurn({
+                tool: 'codex',
+                sessionId: session.native_id,
+                projectPath: project.path,
+                userMessage: 'purgeuniqueneedle café',
+                assistantText: 'captured answer',
+            }),
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'ok' },
+            true,
+        );
+        const stored = store.database
+            .prepare('SELECT memory_id, user_prompt, assistant_response, tool_calls FROM filtered_turns')
+            .get() as { memory_id: number; user_prompt: string; assistant_response: string; tool_calls: string };
+        const expectedBytes =
+            Buffer.byteLength(stored.user_prompt) + Buffer.byteLength(stored.assistant_response) + Buffer.byteLength(stored.tool_calls);
+        expect(
+            store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'purgeuniqueneedle'").all(),
+        ).toEqual([{ rowid: stored.memory_id }]);
+
+        const plan = store.planPurge({ projectIds: [project.id] });
+        expect(plan.sessions[0]).toMatchObject({
+            filteredTurnCount: 1,
+            filteredBytes: expectedBytes,
+            filteredMemoryIds: [stored.memory_id],
+        });
+        const logs: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: string) => logs.push(message));
+        try {
+            printPurgePlan(plan);
+        } finally {
+            log.mockRestore();
+        }
+        expect(logs).toContain(`Stored conversation copy: 1 filtered turn(s), ${expectedBytes} byte(s).`);
+
+        expect(store.applyPurgePlan(plan).sessions.map((candidate) => candidate.id)).toEqual([session.id]);
+
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+        expect(
+            store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'purgeuniqueneedle'").all(),
+        ).toEqual([]);
     });
 
     it('purges only the explicitly resolved project ids', () => {
@@ -147,7 +198,7 @@ describe('purge', () => {
         ];
 
         for (const [index, scenario] of cases.entries()) {
-            const caseStore = new MemoryStore(openDb(':memory:'));
+            const caseStore = new MemoryStore(openUnmanagedDb(':memory:'));
             const selected = caseStore.upsertProject(`/Users/test/selected-window-${index}`);
             const outside = caseStore.upsertProject(`/Users/test/outside-window-${index}`);
             const matched = caseStore.upsertSession('codex', `matched-${index}`, selected.id, `/tmp/matched-${index}.jsonl`);
@@ -203,7 +254,7 @@ describe('purge', () => {
         const dbPath = path.join(directory, 'elepha.db');
         const previousDbPath = process.env.ELEPHA_DB_PATH;
         process.env.ELEPHA_DB_PATH = dbPath;
-        const db = openDb(dbPath);
+        const db = openUnmanagedDb(dbPath);
         const fileStore = new MemoryStore(db);
         const fileRollups = new RollupStore(db);
         const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);

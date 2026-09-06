@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
@@ -47,7 +47,7 @@ describe('zero-turn skip reporting', () => {
         );
 
         const logs: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(project);
         daemon = new IngestionDaemon({
             store,

@@ -6,12 +6,12 @@ schema change.
 
 ## Update elepha
 
-`elepha self-update` runs the update workflow. On macOS, the updater finds the
-installed global build, installs the latest release, restarts the capture daemon so
-database migrations run, and verifies that capture becomes healthy again. If the
-installed version already matches the latest release, it reports that the install is
-already current and does not reinstall or restart capture. If capture is unhealthy,
-`elepha doctor` restarts the service and verifies it.
+`elepha self-update` runs the update workflow. On macOS and Linux, including WSL, the
+updater finds the installed global build, installs the latest release, restarts the
+capture daemon so database migrations run, and verifies that capture becomes healthy
+again. If the installed version already matches the latest release, it reports that
+the install is already current and does not reinstall or restart capture. If capture
+is unhealthy, `elepha doctor` restarts the service and verifies it.
 
 If the new build fails after installation, elepha makes one rollback attempt to the
 previous recorded version and restarts the service again. A failed rollback or an
@@ -28,10 +28,12 @@ hooks automatically.
 
 The commands below are tagged `[operator]`. They are runnable but hidden from the
 default `elepha -h`; use `elepha <command> -h` to see the exact flags for one command.
-The one-off maintenance and migration surface is dry-run by default: pass `--apply`
-when a command is ready to write. Commands that migrate stored data back up the
-database before changing it. Review every preview, especially when raw transcripts
-are missing or projects have moved.
+`rekey-projects`, `sanitize`, `segment`, and every `backfill-*` command on this page
+are dry-run by default; pass `--apply` after reviewing their preview. They save a
+safety backup before mutation. `rollup --rebuild` also previews and requires
+`--apply`. `self-update`, `reingest`, and ordinary `rollup` write immediately;
+`reingest` and `rollup` may call the configured provider. `stats` is read-only. Review
+every preview, especially when raw transcripts are missing or projects have moved.
 
 ### `reingest`
 
@@ -58,7 +60,9 @@ repository path; sessions and memories are moved to the selected canonical proje
 
 `elepha sanitize` finds shell-active syntax in stored turns and rollups that predate
 the current write-time sanitizer. Its preview shows each affected field before and
-after neutralization, and an applied run verifies the database again afterward.
+after neutralization, and an applied run verifies the database again afterward. When
+paranoid mode is enabled, unlock memory before running it; a lock or gate change while
+the command is in progress invalidates the operation.
 
 ### `segment`
 
@@ -78,6 +82,10 @@ per-project totals over a selected time window.
 `elepha backfill-rendered-chars` derives each session's rendered character and turn
 counts from the filtered raw turns still on disk. Missing or unreadable transcripts
 remain unset and are reported.
+
+`elepha backfill-first-prompt-search` derives each segment's bounded search document
+from its first stored user prompt. It makes no provider call; unavailable transcripts
+remain body-unsearchable and are reported.
 
 `elepha backfill-session-titles` derives segment titles from an AI-provided title or
 the first real prompt. It makes no synthesis call and leaves sessions unchanged when

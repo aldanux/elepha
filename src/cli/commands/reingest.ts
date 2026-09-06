@@ -26,7 +26,7 @@ export function registerReingest(program: Command): void {
                 return;
             }
             const limit = Number(opts.limit) || 0;
-            const store = new MemoryStore(openDb());
+            const store = new MemoryStore(await openDb());
             const cutoffIso = parseSince(opts.since);
             const sessions = store.listSessionsWithMemoriesSince(cutoffIso);
             if (sessions.length === 0) {

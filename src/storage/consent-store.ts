@@ -2,7 +2,7 @@
 // from project rows: a project row is historical capture, while consent is a
 // user decision that can cover a whole ProjectSet and later be withdrawn.
 
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { canonicalizeExisting, isRefusedProjectRoot, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import { ProjectResolver } from './project-resolver.js';
 import { newUlid } from './ulid.js';

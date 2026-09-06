@@ -118,4 +118,20 @@ describe('opened provider transcript containment', () => {
         });
         await expect(openProviderTranscript('codex', store)).resolves.toEqual({ reason: 'transcript_unreadable' });
     });
+
+    it('reports a deterministic opener failure as unreadable', async () => {
+        const directory = withTempDir('elepha-provider-open-unreadable-');
+        vi.stubEnv('CODEX_HOME', path.join(directory, '.codex'));
+        const sourcePath = path.join(codexSessionsRoot(), 'unreadable.jsonl');
+
+        await expect(
+            openProviderTranscript('codex', sourcePath, {
+                open: async () => {
+                    const error = new Error('injected unreadable transcript') as NodeJS.ErrnoException;
+                    error.code = 'EACCES';
+                    throw error;
+                },
+            }),
+        ).resolves.toEqual({ reason: 'transcript_unreadable' });
+    });
 });

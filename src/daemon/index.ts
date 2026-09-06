@@ -23,6 +23,8 @@ import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/d
 import {
     DEFAULT_IDLE_DEBOUNCE_MS,
     DEFAULT_MAX_CONCURRENT,
+    DURABLE_CAPTURE_BACKFILL_BATCH_SIZE,
+    DURABLE_CAPTURE_MAX_BYTES,
     FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
@@ -44,12 +46,14 @@ import {
 } from '../config/paths.js';
 import { readSessionMetadata } from '../discovery/session-projects.js';
 import { installedAndLatestElephaVersionAsync } from '../install/self-update.js';
+import { filterTurn } from '../rendering/filtered-turn.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
-import { isNearVerbatim, turnText } from '../security/self-ingestion.js';
 import type { ConsentState } from '../storage/consent-store.js';
-import { openDb } from '../storage/db.js';
+import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
+import { type DurableEvictionPlan, withValidatedDurableEvictionSources } from '../storage/durable-capture-store.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
-import { MemoryStore } from '../storage/memory-store.js';
+import type { IngestedTurnWritePreparation, MemoryStore } from '../storage/memory-store.js';
+import { isMemoryLocked } from '../storage/paranoid-gate.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
@@ -91,6 +95,7 @@ const NOTABLE_FILE_SKIP_CATEGORIES = new Set<FileSkipCategory>([
 ]);
 
 export const FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX = '[elepha] first-prompt search backfill:';
+export const DURABLE_CAPTURE_BACKFILL_LOG_PREFIX = '[elepha] durable capture backfill:';
 
 // How often to look for sessions that have gone quiet. Well under the idle
 // threshold so a closed session rolls up promptly rather than up to a full
@@ -135,7 +140,7 @@ export function watchRoots(): string[] {
 }
 
 export interface DaemonOptions {
-    store?: MemoryStore;
+    store: MemoryStore;
     summarizer?: SummarizationProvider;
     adapters?: SessionAdapter[];
     idleDebounceMs?: number;
@@ -177,6 +182,8 @@ export interface DaemonOptions {
     openTranscript?: ProviderTranscriptOpener;
     // Test seam; production uses FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE.
     firstPromptSearchBackfillBatchSize?: number;
+    // Test seam; production uses DURABLE_CAPTURE_BACKFILL_BATCH_SIZE.
+    durableCaptureBackfillBatchSize?: number;
 }
 
 function formatDaemonLog(message: string, context: { tool?: string; sessionId?: string } = {}): string {
@@ -203,14 +210,20 @@ export class IngestionDaemon {
     private readonly watcherPollIntervalMs: number;
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
+    private readonly durableCapture: boolean;
+    private readonly durableCaptureMaxBytes: number;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
     private readonly openTranscript: ProviderTranscriptOpener;
     private readonly firstPromptSearchBackfillBatchSize: number;
+    private readonly durableCaptureBackfillBatchSize: number;
     private sweepTimer: NodeJS.Timeout | undefined;
     private initialUpdateCheckTimer: NodeJS.Timeout | undefined;
     private updateCheckTimer: NodeJS.Timeout | undefined;
     private firstPromptSearchBackfillTimer: NodeJS.Timeout | undefined;
     private firstPromptSearchBackfillPromise: Promise<void> | undefined;
+    private startupSweepPromise: Promise<void> | undefined;
+    private durableCaptureBackfillTimer: NodeJS.Timeout | undefined;
+    private durableCaptureBackfillPromise: Promise<void> | undefined;
     private stopping = false;
     private readonly startedAt = new Date().toISOString();
 
@@ -238,7 +251,7 @@ export class IngestionDaemon {
         { size: number; mtimeMs: number; scannedTo: number; customTitle: string | undefined }
     >();
 
-    constructor(options: DaemonOptions = {}) {
+    constructor(options: DaemonOptions) {
         this.log = options.log ?? (() => {});
         this.logError = options.logError ?? console.error;
         const configResult = (options.readConfig ?? readMemoryConfig)();
@@ -247,7 +260,9 @@ export class IngestionDaemon {
         }
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
-        this.store = options.store ?? new MemoryStore(openDb());
+        this.durableCapture = configResult.config.durableCapture ?? false;
+        this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
+        this.store = options.store;
         this.openTranscript = options.openTranscript ?? openProviderTranscript;
         this.summarizer = options.summarizer;
         const warnUnknownLine = deduplicateDaemonUnknownLineWarnings(this.log);
@@ -277,6 +292,7 @@ export class IngestionDaemon {
         this.watcherPollIntervalMs = options.watcherPollIntervalMs ?? 50;
         this.readCorpus = options.readCorpus ?? ((watchRoot) => readdir(watchRoot, { recursive: true }));
         this.firstPromptSearchBackfillBatchSize = options.firstPromptSearchBackfillBatchSize ?? FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE;
+        this.durableCaptureBackfillBatchSize = options.durableCaptureBackfillBatchSize ?? DURABLE_CAPTURE_BACKFILL_BATCH_SIZE;
     }
 
     start(): void {
@@ -302,7 +318,31 @@ export class IngestionDaemon {
         this.watcher.on('change', (filePath) => this.onFileEvent(filePath));
         this.log(`[elepha] watching:\n  ${this.watchRoots.join('\n  ')}`);
 
-        void this.sweepStartupFiles();
+        const startupSweep = this.sweepStartupFiles().catch((error: unknown) => {
+            this.logError(`[elepha] startup sweep failed: ${(error as Error).message}`);
+        });
+        this.startupSweepPromise = startupSweep;
+        void startupSweep.then(() => {
+            if (this.startupSweepPromise === startupSweep) {
+                this.startupSweepPromise = undefined;
+            }
+            if (!this.durableCapture || this.stopping) {
+                return;
+            }
+            this.durableCaptureBackfillTimer = setTimeout(() => {
+                this.durableCaptureBackfillTimer = undefined;
+                const task = this.backfillDurableCapture().catch((error: unknown) => {
+                    this.logError(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} failed: ${(error as Error).message}`);
+                });
+                this.durableCaptureBackfillPromise = task;
+                void task.then(() => {
+                    if (this.durableCaptureBackfillPromise === task) {
+                        this.durableCaptureBackfillPromise = undefined;
+                    }
+                });
+            }, 0);
+            this.durableCaptureBackfillTimer.unref();
+        });
         this.firstPromptSearchBackfillTimer = setTimeout(() => {
             this.firstPromptSearchBackfillTimer = undefined;
             const task = this.backfillFirstPromptSearch().catch((error: unknown) => {
@@ -396,13 +436,133 @@ export class IngestionDaemon {
         if (this.firstPromptSearchBackfillTimer) {
             clearTimeout(this.firstPromptSearchBackfillTimer);
         }
+        if (this.durableCaptureBackfillTimer) {
+            clearTimeout(this.durableCaptureBackfillTimer);
+        }
         clearHeartbeat(this.heartbeatPath);
         for (const timer of this.idleTimers.values()) {
             clearTimeout(timer);
         }
         this.idleTimers.clear();
         await this.watcher?.close();
+        await this.startupSweepPromise;
         await this.firstPromptSearchBackfillPromise;
+        await this.durableCaptureBackfillPromise;
+    }
+
+    private async backfillDurableCapture(): Promise<void> {
+        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as Record<ToolName, SessionAdapter>;
+        const backfill = new DurableCaptureBackfillStore(this.store.database, this.store.consent, this.durableCaptureMaxBytes);
+        while (!this.stopping) {
+            const consentedProjectIds = new ProjectResolver(this.store.database)
+                .listConsentedStored(this.store.consent)
+                .flatMap((project) => project.projectIds);
+            const candidates = backfill.listCandidates(consentedProjectIds, this.durableCaptureBackfillBatchSize);
+            if (candidates.length === 0) {
+                return;
+            }
+
+            for (const session of candidates) {
+                if (this.stopping) {
+                    return;
+                }
+                const work = backfill.begin(session, new Date().toISOString());
+                if (work === undefined) {
+                    continue;
+                }
+                const affectedSessionIds = new Set([session.id]);
+                if (work.missingTurnIndexes.size === 0) {
+                    backfill.finish(session, affectedSessionIds, 'success', new Date().toISOString());
+                    continue;
+                }
+
+                const opened = await this.openTranscript(session.tool, session.sourcePath);
+                if ('reason' in opened) {
+                    backfill.finish(session, affectedSessionIds, 'source_unavailable', new Date().toISOString());
+                    this.log(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} source unavailable (${opened.reason})`);
+                    continue;
+                }
+
+                let parseFailed = false;
+                let writeUnauthorized = false;
+                let writeEvicted = false;
+                try {
+                    const adapter = adapters[session.tool];
+                    for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
+                        closeTrailingOnIdle: true,
+                        handle: opened.handle,
+                    })) {
+                        if (this.stopping) {
+                            break;
+                        }
+                        if (turn.tool !== session.tool || turn.sessionId !== session.nativeId) {
+                            parseFailed = true;
+                            break;
+                        }
+                        if (!work.missingTurnIndexes.has(turn.turnIndex)) {
+                            continue;
+                        }
+                        if (turn.droppedReason === 'sentinel') {
+                            continue;
+                        }
+                        if (this.store.isInjectionQuoteBack(turn)) {
+                            this.log(
+                                formatDaemonLog(
+                                    `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} suppressed turn ${turn.turnIndex}: self-injected content (quote-back)`,
+                                    turn,
+                                ),
+                            );
+                            continue;
+                        }
+                        const projection = filterTurn(turn);
+                        const result = await withValidatedDurableEvictionSources(
+                            this.store.database,
+                            projection,
+                            this.durableCaptureMaxBytes,
+                            { sessionId: session.id, tool: session.tool, sourcePath: session.sourcePath },
+                            (evictionPlan) => backfill.record(session, turn.turnIndex, projection, new Date().toISOString(), evictionPlan),
+                            { openTranscript: this.openTranscript },
+                        );
+                        if (result.state === 'unauthorized') {
+                            writeUnauthorized = true;
+                            break;
+                        }
+                        if (result.state === 'evicted') {
+                            writeEvicted = true;
+                            break;
+                        }
+                        if (result.state === 'memory_missing') {
+                            parseFailed = true;
+                            break;
+                        }
+                        work.missingTurnIndexes.delete(turn.turnIndex);
+                        affectedSessionIds.add(result.sessionId);
+                    }
+                } catch (error) {
+                    parseFailed = true;
+                    this.logError(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} parse failed: ${(error as Error).message}`);
+                } finally {
+                    await opened.handle.close();
+                }
+
+                // Shutdown may arrive after the last row commits but before
+                // iterator/handle cleanup finishes. Finalize covered work;
+                // leave interrupted work resumable without reading more turns.
+                if (this.stopping && work.missingTurnIndexes.size > 0) {
+                    return;
+                }
+                if (writeUnauthorized || writeEvicted) {
+                    continue;
+                }
+                backfill.finish(session, affectedSessionIds, parseFailed ? 'parse_error' : 'success', new Date().toISOString());
+                this.log(
+                    `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} processed; ` +
+                        `${work.missingTurnIndexes.size} turn(s) remained uncovered`,
+                );
+            }
+
+            await new Promise<void>((resolve) => setImmediate(resolve));
+        }
     }
 
     private async backfillFirstPromptSearch(): Promise<void> {
@@ -999,8 +1159,7 @@ export class IngestionDaemon {
         // summarizer: adapters stay DB-free, while a match must have no memory
         // side effects. The existing session's cursor is the sole exception,
         // otherwise this complete source turn would be re-read forever.
-        const injections = this.store.injectionsForSession(turn.tool, turn.sessionId, turn.startedAt);
-        if (injections.some((injection) => isNearVerbatim(turnText(turn), injection.body))) {
+        if (this.store.isInjectionQuoteBack(turn)) {
             this.store.advanceExistingSessionCursor(turn.tool, turn.sessionId, turn.cursor);
             this.log(
                 formatDaemonLog(`[elepha] dropped turn ${turn.turnIndex} of ${turn.sessionId}: self-injected content (quote-back)`, turn),
@@ -1064,7 +1223,33 @@ export class IngestionDaemon {
         if (this.summarizer) {
             this.trackOutcome(summary.status);
         }
-        const persisted = this.store.recordIngestedTurn(turn, meta, cut, summary);
+        let preparation: IngestedTurnWritePreparation | undefined;
+        const record = (evictionPlan?: DurableEvictionPlan) =>
+            this.store.recordIngestedTurn(
+                turn,
+                meta,
+                cut,
+                summary,
+                this.durableCapture,
+                this.durableCaptureMaxBytes,
+                evictionPlan,
+                preparation,
+            );
+        const persisted = this.durableCapture
+            ? await withValidatedDurableEvictionSources(
+                  this.store.database,
+                  filterTurn(turn),
+                  this.durableCaptureMaxBytes,
+                  { sessionId: cut ? undefined : session?.id, tool: turn.tool, sourcePath: turn.sourcePath },
+                  record,
+                  {
+                      openTranscript: this.openTranscript,
+                      beforeFinalIdentityCheck: () => {
+                          preparation = this.store.prepareIngestedTurnWrite(turn, cut);
+                      },
+                  },
+              )
+            : record(undefined);
         if (!persisted) {
             return false;
         }
@@ -1149,7 +1334,7 @@ export class IngestionDaemon {
     // and 'final' once the transcript has gone idle - but 'final' is only ever
     // a heuristic, and any later turn returns the session to 'live'.
     private async refreshRollup(adapter: SessionAdapter, filePath: string, nativeId: string, state: 'live' | 'final'): Promise<void> {
-        if (!this.rollupService) {
+        if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return;
         }
 
@@ -1169,7 +1354,7 @@ export class IngestionDaemon {
         classification: SessionClassification | undefined,
         state: 'live' | 'final',
     ): Promise<void> {
-        if (!this.rollupService) {
+        if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return;
         }
 
@@ -1199,7 +1384,7 @@ export class IngestionDaemon {
     // that finished during downtime would sit 'live' forever, since no further
     // file event will ever arrive for it.
     async sweepIdleSessions(now = Date.now()): Promise<number> {
-        if (!this.rollupService) {
+        if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return 0;
         }
         let closed = 0;

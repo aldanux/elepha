@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import {
     applyExternalAgentImportPurge,
     planExternalAgentImportPurge,
@@ -37,7 +37,7 @@ function turn(session: SessionRow, projectPath: string, turnIndex: number): Pars
 }
 
 describe('external-agent import purge', () => {
-    let db: ReturnType<typeof openDb>;
+    let db: ReturnType<typeof openUnmanagedDb>;
     let store: MemoryStore;
     let rollups: RollupStore;
     let importedFirst: SessionRow;
@@ -58,7 +58,7 @@ describe('external-agent import purge', () => {
         copyFileSync(IMPORTED_FIXTURE, importedSource);
         copyFileSync(NATIVE_FIXTURE, nativeSource);
 
-        db = openDb(':memory:');
+        db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
         const project = store.upsertProject(projectPath);

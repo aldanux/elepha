@@ -1,6 +1,6 @@
-import type { Database } from 'better-sqlite3';
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it, vi } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
@@ -37,7 +37,7 @@ function turn(): ParsedTurn {
 
 describe('ProjectStore git identity adoption', () => {
     it.each(['ingested', 'dropped'] as const)('never invokes git resolution while the %s write transaction is open', (turnKind) => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const assertOutsideWriteTransaction = () => {
             if (db.inTransaction) {
                 throw new Error('git resolution ran inside the write transaction');
@@ -73,7 +73,7 @@ describe('ProjectStore git identity adoption', () => {
     });
 
     it('performs zero git probes for a subsequent turn in an already-known project and session', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const resolveGitRoot = vi.fn(() => projectPath);
         const resolveGitRemote = vi.fn(() => gitRemote);
         const resolveGitRootCommit = vi.fn(() => gitRootCommit);
@@ -101,7 +101,7 @@ describe('ProjectStore git identity adoption', () => {
     });
 
     it('resolves a new project once and reuses its identity for the session commit baseline', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const checkoutPath = '/repo/packages/app';
         const repositoryRoot = '/repo';
         const resolveGitRoot = vi.fn(() => repositoryRoot);
@@ -138,7 +138,7 @@ describe('ProjectStore git identity adoption', () => {
     });
 
     it('adopts git identity onto an existing rootless row at the same path without throwing or adding a row', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const rootlessStore = new MemoryStore(db, { resolveGitRoot: () => null });
         const rootless = rootlessStore.upsertProject(projectPath);
         db.prepare('UPDATE projects SET display_name = ? WHERE id = ?').run('kept-display-name', rootless.id);
@@ -159,7 +159,7 @@ describe('ProjectStore git identity adoption', () => {
     });
 
     it('completes ingestion and advances the cursor for a previously stuck rootless row', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         new MemoryStore(db, { resolveGitRoot: () => null }).upsertProject(projectPath);
         const recoveredStore = storeWithGitRoot(db, projectPath);
         recoveredStore.consent.grant(projectPath);
@@ -172,7 +172,7 @@ describe('ProjectStore git identity adoption', () => {
     });
 
     it('is idempotent after adoption and refreshes last_seen_at without changing identity', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const rootless = new MemoryStore(db, { resolveGitRoot: () => null }).upsertProject(projectPath);
         const gitStore = storeWithGitRoot(db, projectPath);
         const adopted = gitStore.upsertProject(projectPath);
@@ -194,7 +194,7 @@ describe('ProjectStore git identity adoption', () => {
     });
 
     it('keeps a rootless cwd row separate when git resolves to a parent directory', () => {
-        const db = openDb(':memory:');
+        const db = openUnmanagedDb(':memory:');
         const childPath = '/repo/packages/app';
         const rootless = new MemoryStore(db, { resolveGitRoot: () => null }).upsertProject(childPath);
 

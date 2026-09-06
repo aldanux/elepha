@@ -5,7 +5,7 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 
 const FIXTURE_PATH = path.resolve('test/fixtures/codex/rollout-2026-07-22T15-29-54-019f88f2-145b-7853-8390-75dac88737d6.jsonl');
 const PROJECT_PATH = '/Users/test/demo-project';
@@ -49,7 +49,7 @@ function claudeCodeModelVisibleText(response: unknown): string {
 }
 
 describe('elepha MCP stdio transport', () => {
-    const databases: Array<ReturnType<typeof openDb>> = [];
+    const databases: Array<ReturnType<typeof openUnmanagedDb>> = [];
     const clients: Client[] = [];
 
     beforeAll(() => {
@@ -74,7 +74,7 @@ describe('elepha MCP stdio transport', () => {
         const sourcePath = path.join(home, '.codex', 'sessions', 'fixture.jsonl');
         mkdirSync(path.dirname(sourcePath), { recursive: true });
         copyFileSync(FIXTURE_PATH, sourcePath);
-        const db = openDb(path.join(home, '.elepha', 'elepha.db'));
+        const db = openUnmanagedDb(path.join(home, '.elepha', 'elepha.db'));
         databases.push(db);
         const projectId = Number(
             db

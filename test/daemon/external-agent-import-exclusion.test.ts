@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 
 const FIXTURE = path.resolve(
@@ -56,7 +56,7 @@ describe('external-agent import exclusion', () => {
         expect(readFileSync(FIXTURE, 'utf8').indexOf('\n')).toBeGreaterThan(4096);
 
         const logs: string[] = [];
-        const db = openDb(path.join(root, 'elepha.db'));
+        const db = openUnmanagedDb(path.join(root, 'elepha.db'));
         const store = new MemoryStore(db);
         store.consent.grant('/Users/dani/Sites/elepha-app/elepha');
         daemon = new IngestionDaemon({

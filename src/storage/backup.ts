@@ -7,8 +7,9 @@
 
 import { chmodSync, copyFileSync, readdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import type Database from 'better-sqlite3';
+import type Database from 'better-sqlite3-multiple-ciphers';
 import { BACKUP_KEEP, PRIVATE_FILE_MODE } from '../config/constants.js';
+import { hasPlaintextDatabaseHeader } from './db.js';
 
 const BACKUP_MARKER = '.bak-';
 
@@ -26,14 +27,17 @@ export function writeBackup(db: Database.Database, dbPath: string): string {
 
 // The ISO-derived filename suffix sorts chronologically, so filename order
 // determines the retained snapshots.
-export function pruneBackups(dbPath: string, keep: number): string[] {
+export function listManagedBackups(dbPath: string): string[] {
     const dir = path.dirname(dbPath);
     const prefix = `${path.basename(dbPath)}${BACKUP_MARKER}`;
-    const backups = readdirSync(dir)
+    return readdirSync(dir)
         .filter((f) => f.startsWith(prefix))
         .map((f) => path.join(dir, f))
         .sort();
+}
 
+export function pruneBackups(dbPath: string, keep: number): string[] {
+    const backups = listManagedBackups(dbPath);
     const toDelete = backups.length > keep ? backups.slice(0, backups.length - keep) : [];
     for (const p of toDelete) {
         unlinkSync(p);
@@ -41,10 +45,34 @@ export function pruneBackups(dbPath: string, keep: number): string[] {
     return toDelete;
 }
 
+export function removePlaintextManagedBackups(dbPath: string): string[] {
+    if (hasPlaintextDatabaseHeader(dbPath)) {
+        return [];
+    }
+    const dir = path.dirname(dbPath);
+    const prefix = `${path.basename(dbPath)}${BACKUP_MARKER}`;
+    const removed: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.startsWith(prefix)) {
+            continue;
+        }
+        const backupPath = path.join(dir, entry.name);
+        if (hasPlaintextDatabaseHeader(backupPath)) {
+            unlinkSync(backupPath);
+            removed.push(backupPath);
+        }
+    }
+    return removed;
+}
+
 // Writes a backup, retains the configured number of snapshots, and reports both actions.
 export function backupDatabaseAndReport(db: Database.Database, dbPath: string, log: (message: string) => void = console.log): string {
     const backupPath = writeBackup(db, dbPath);
     log(`\nBacked up ${dbPath} to ${backupPath}.`);
+    const removedPlaintext = removePlaintextManagedBackups(dbPath);
+    if (removedPlaintext.length > 0) {
+        log(`Removed ${removedPlaintext.length} plaintext managed backup(s).`);
+    }
     const pruned = pruneBackups(dbPath, BACKUP_KEEP);
     if (pruned.length > 0) {
         log(`Pruned ${pruned.length} older backup(s), keeping the ${BACKUP_KEEP} most recent.`);

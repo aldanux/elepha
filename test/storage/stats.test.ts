@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
@@ -26,7 +26,7 @@ describe('MemoryStore.getStats', () => {
     let store: MemoryStore;
 
     beforeEach(() => {
-        store = new MemoryStore(openDb(':memory:'));
+        store = new MemoryStore(openUnmanagedDb(':memory:'));
     });
 
     it('aggregates sessions/turns by tool, noise rate, files_touched misses, and pending_items accumulation', () => {

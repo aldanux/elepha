@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { RollupService } from '../../src/daemon/rollup-service.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type SessionRow } from '../../src/storage/memory-store.js';
 import { ROLLUP_VERSION, RollupStore } from '../../src/storage/rollup-store.js';
 import type { RollupTurnInput } from '../../src/summarizer/rollup-prompt.js';
@@ -66,7 +66,7 @@ describe('rebuild vs. concurrent daemon activity', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-rebuild-race-'));
         dbPath = path.join(root, 'elepha.db');
 
-        const setupDb = openDb(dbPath);
+        const setupDb = openUnmanagedDb(dbPath);
         const setupStore = new MemoryStore(setupDb);
         const setupRollups = new RollupStore(setupDb);
         const setupService = new RollupService({ store: setupStore, rollups: setupRollups, provider: new StubProvider() });
@@ -94,14 +94,14 @@ describe('rebuild vs. concurrent daemon activity', () => {
 
     it('reports complete:false (not a false success) when a concurrent writer wins the race, and the session still ends up fully covered', async () => {
         // Process A: the CLI's --rebuild pass, own DB connection.
-        const dbA = openDb(dbPath);
+        const dbA = openUnmanagedDb(dbPath);
         const storeA = new MemoryStore(dbA);
         const rollupsA = new RollupStore(dbA);
 
         // Process B: the daemon's own independent rollupSession call, own DB
         // connection - fires once, injected during A's first `merge` call
         // (i.e. after A's batch-1 `rollup` call already wrote).
-        const dbB = openDb(dbPath);
+        const dbB = openUnmanagedDb(dbPath);
         const storeB = new MemoryStore(dbB);
         const rollupsB = new RollupStore(dbB);
         const serviceB = new RollupService({ store: storeB, rollups: rollupsB, provider: new StubProvider() });

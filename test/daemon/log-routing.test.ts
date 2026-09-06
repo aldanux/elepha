@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import type { RollupService } from '../../src/daemon/rollup-service.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter, SessionClassification } from '../../src/types/index.js';
 
@@ -20,7 +20,7 @@ describe('daemon log routing', () => {
         const sourcePath = path.join(root, 'native-session.jsonl');
         const logs: string[] = [];
         const errors: string[] = [];
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant('/repo');
         const rollupService = {
             noteActivity(): void {},

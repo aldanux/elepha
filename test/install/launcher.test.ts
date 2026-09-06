@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from '
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { MINIMUM_NODE_VERSION } from '../../src/config/constants.js';
 import { detectLauncherBackend, renderLauncher } from '../../src/install/launcher.js';
 
 const fsFixture = vi.hoisted(() => ({ preserveDistroExecPath: false }));
@@ -44,7 +45,10 @@ function nvmFixture({ defaultAlias = '22', versions = ['v22.2.1'], activeVersion
     writeFileSync(path.join(root, 'nvm.sh'), '# nvm\n');
     writeFileSync(path.join(root, 'alias', 'default'), `${defaultAlias}\n`);
     writeFileSync(sourceBin, '#!/bin/sh\n');
-    writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'elepha', engines: { node: '>=22' } }));
+    writeFileSync(
+        path.join(packageRoot, 'package.json'),
+        JSON.stringify({ name: 'elepha', engines: { node: `>=${MINIMUM_NODE_VERSION}` } }),
+    );
     chmodSync(path.join(root, 'nvm-exec'), 0o755);
     chmodSync(sourceBin, 0o755);
     return { root, node, packageRoot, sourceBin };
@@ -67,7 +71,7 @@ describe('stable launcher backend', () => {
         mkdirSync(path.join(root, 'aliases'), { recursive: true });
         writeFileSync(path.join(root, 'aliases', 'default'), 'v22.2.1\n');
         mkdirSync(packageRoot, { recursive: true });
-        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: '>=22' } }));
+        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: `>=${MINIMUM_NODE_VERSION}` } }));
 
         expect(
             detectLauncherBackend({
@@ -75,7 +79,7 @@ describe('stable launcher backend', () => {
                 env: { PATH: [path.join(fixture, 'missing'), managerBin].join(path.delimiter) },
                 packageRoot,
                 sourceBin: path.join(fixture, 'global', 'bin', 'elepha'),
-                minimumNodeMajor: 22,
+                minimumNodeVersion: MINIMUM_NODE_VERSION,
             }),
         ).toEqual({ kind: 'fnm', command: fnm, root: realpathSync(root) });
     });
@@ -98,7 +102,7 @@ describe('stable launcher backend', () => {
         mkdirSync(home, { recursive: true });
         writeFileSync(path.join(home, '.tool-versions'), 'nodejs 22.2.1\n');
         mkdirSync(packageRoot, { recursive: true });
-        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: '>=22' } }));
+        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: `>=${MINIMUM_NODE_VERSION}` } }));
 
         expect(
             detectLauncherBackend({
@@ -107,7 +111,7 @@ describe('stable launcher backend', () => {
                 home,
                 packageRoot,
                 sourceBin: path.join(fixture, 'global', 'bin', 'elepha'),
-                minimumNodeMajor: 22,
+                minimumNodeVersion: MINIMUM_NODE_VERSION,
             }),
         ).toEqual({ kind: 'asdf', command: asdf, root: realpathSync(root) });
     });
@@ -116,7 +120,7 @@ describe('stable launcher backend', () => {
         const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-distro-node-'));
         const packageRoot = path.join(fixture, 'package');
         mkdirSync(packageRoot, { recursive: true });
-        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: '>=22' } }));
+        writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: `>=${MINIMUM_NODE_VERSION}` } }));
         fsFixture.preserveDistroExecPath = true;
 
         try {
@@ -126,7 +130,7 @@ describe('stable launcher backend', () => {
                     env: { PATH: '/usr/bin' },
                     packageRoot,
                     sourceBin: '/usr/bin/elepha',
-                    minimumNodeMajor: 22,
+                    minimumNodeVersion: MINIMUM_NODE_VERSION,
                 }),
             ).toEqual({ kind: 'standalone', command: '/usr/bin/elepha', node: '/usr/bin/node', npmBin: '/usr/bin' });
         } finally {
@@ -140,12 +144,12 @@ describe('stable launcher backend', () => {
             execPath: fixture.node,
             packageRoot: fixture.packageRoot,
             sourceBin: fixture.sourceBin,
-            minimumNodeMajor: 22,
+            minimumNodeVersion: MINIMUM_NODE_VERSION,
         });
 
         const canonicalRoot = realpathSync(fixture.root);
         expect(backend).toEqual({ kind: 'nvm', command: path.join(canonicalRoot, 'nvm-exec'), root: canonicalRoot });
-        const launcher = renderLauncher(backend, 22);
+        const launcher = renderLauncher(backend, MINIMUM_NODE_VERSION);
         expect(launcher).toContain('#!/bin/sh');
         expect(launcher).toContain('set -eu');
         expect(launcher).toContain('NODE_VERSION=default');
@@ -165,7 +169,7 @@ describe('stable launcher backend', () => {
                 execPath: fixture.node,
                 packageRoot: fixture.packageRoot,
                 sourceBin: fixture.sourceBin,
-                minimumNodeMajor: 22,
+                minimumNodeVersion: MINIMUM_NODE_VERSION,
             }),
         ).toThrow('default resolves to v22.23.2, active is v24.19.0');
     });
@@ -182,7 +186,7 @@ describe('stable launcher backend', () => {
                 execPath: fixture.node,
                 packageRoot: fixture.packageRoot,
                 sourceBin: fixture.sourceBin,
-                minimumNodeMajor: 22,
+                minimumNodeVersion: MINIMUM_NODE_VERSION,
             }),
         ).toMatchObject({ kind: 'nvm' });
     });
@@ -218,7 +222,7 @@ describe('stable launcher backend', () => {
                     execPath: fixture.node,
                     packageRoot: fixture.packageRoot,
                     sourceBin: fixture.sourceBin,
-                    minimumNodeMajor: 22,
+                    minimumNodeVersion: MINIMUM_NODE_VERSION,
                 }),
                 testCase.name,
             ).toMatchObject({ kind: 'nvm' });
@@ -254,7 +258,7 @@ describe('stable launcher backend', () => {
                         execPath: fixture.node,
                         packageRoot: fixture.packageRoot,
                         sourceBin: fixture.sourceBin,
-                        minimumNodeMajor: 22,
+                        minimumNodeVersion: MINIMUM_NODE_VERSION,
                     }),
                 testCase.name,
             ).toThrow('default resolves to no installed version, active is v24.19.0');

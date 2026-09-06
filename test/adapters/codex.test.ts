@@ -103,7 +103,7 @@ describe('CodexAdapter.matches', () => {
         withCodexHome('/Users/x/.codex', () => {
             const adapter = new CodexAdapter();
             const caseVariant = '/Users/X/.Codex/Sessions/2026/01/01/rollout-2026-01-01T00-00-00-abc.jsonl';
-            if (process.platform === 'darwin' || process.platform === 'win32') {
+            if (process.platform === 'darwin') {
                 expect(adapter.matches(caseVariant)).toBe(true);
             } else {
                 expect(adapter.matches(caseVariant)).toBe(false);

@@ -11,9 +11,9 @@ export function registerRekey(program: Command): void {
         .command('rekey-projects', { hidden: true })
         .description('Consolidate project rows by stable repository identity. Dry-run by default.')
         .option('--apply', 'actually perform the merge (default is a dry run that only prints the mapping)')
-        .action((opts: { apply: boolean }) => {
+        .action(async (opts: { apply: boolean }) => {
             const dbPath = defaultDbPath();
-            const store = new MemoryStore(openDb());
+            const store = new MemoryStore(await openDb());
             const resolveGitRoot = (p: string): string | null => {
                 if (!p || !existsSync(p)) {
                     return null;

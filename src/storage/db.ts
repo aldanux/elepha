@@ -1,16 +1,40 @@
 // SQLite connection + schema management. Single local DB file, zero config.
 
-import { mkdirSync } from 'node:fs';
+import { closeSync, constants as fsConstants, mkdirSync, openSync, readSync, realpathSync } from 'node:fs';
 import path from 'node:path';
-import Database from 'better-sqlite3';
-import { elephaHome } from '../config/paths.js';
+import Database from 'better-sqlite3-multiple-ciphers';
+import { DATABASE_HEADER_BYTES, DURABLE_CAPTURE_STATES } from '../config/constants.js';
+import { elephaHome, samePath } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
+import { type DatabaseEncryptionRuntime, databaseKey } from './database-encryption.js';
+import {
+    acquireSharedDatabaseLifecycle,
+    assertExclusiveDatabaseLifecycle,
+    type ExclusiveDatabaseLifecycleLease,
+    holdExclusiveDatabaseLifecycleUntilClose,
+    holdSharedDatabaseLifecycleUntilClose,
+    requireManagedDatabaseCheckpointOnClose,
+    type SharedDatabaseLifecycleLease,
+} from './database-lifecycle.js';
+import { assertDatabaseMigrationInactive } from './database-migration.js';
+import { initializeParanoidAuthority, registerParanoidDatabase } from './paranoid-gate.js';
 
 export function defaultDbPath(): string {
     const override = process.env.ELEPHA_DB_PATH?.trim();
     return override ? path.resolve(override) : path.join(elephaHome(), 'elepha.db');
 }
+
+const PARANOID_AUTHORITY_SCHEMA = `
+CREATE TABLE IF NOT EXISTS paranoid_authority (
+  id             INTEGER PRIMARY KEY CHECK (id = 1),
+  enrolled       INTEGER NOT NULL CHECK (enrolled IN (0,1)),
+  state          TEXT NOT NULL CHECK (state IN ('locked','unlocked')),
+  generation     INTEGER NOT NULL CHECK (generation >= 0),
+  credential_tag TEXT,
+  CHECK (enrolled = 1 OR state = 'unlocked')
+);
+`;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS projects (
@@ -78,6 +102,31 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE INDEX IF NOT EXISTS idx_memories_project_time ON memories(project_id, turn_started_at);
 
+CREATE TABLE IF NOT EXISTS filtered_turns (
+  memory_id               INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+  included                INTEGER NOT NULL CHECK (included IN (0,1)),
+  user_prompt             TEXT NOT NULL DEFAULT '',
+  assistant_response      TEXT NOT NULL DEFAULT '',
+  tool_calls              TEXT NOT NULL DEFAULT '[]',
+  omitted_tool_call_count INTEGER NOT NULL DEFAULT 0,
+  dropped_tool_ref_count  INTEGER NOT NULL DEFAULT 0,
+  omitted_before_chars    INTEGER NOT NULL DEFAULT 0,
+  filter_version          INTEGER NOT NULL,
+  captured_at             TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS durable_capture_status (
+  session_id     INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  state          TEXT NOT NULL CHECK (state IN (${DURABLE_CAPTURE_STATES.map((state) => `'${state}'`).join(',')})),
+  filter_version INTEGER NOT NULL,
+  updated_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS durable_capture_usage (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0)
+);
+
 -- Session-level rollups. Additive: turn rows in memories are never deleted
 -- after rollup, and a rollup can always be rebuilt from them.
 --
@@ -121,6 +170,8 @@ CREATE TABLE IF NOT EXISTS consent_roots (
   nudged_at  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_consent_roots_state ON consent_roots(state);
+
+${PARANOID_AUTHORITY_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -176,6 +227,7 @@ CREATE TABLE IF NOT EXISTS incognito_transcripts (
 // an already-existing table.
 function migrate(db: Database.Database): void {
     migrateSessionsTable(db);
+    migrateDurableCaptureStatus(db);
 
     const projectColumns = (db.pragma('table_info(projects)') as Array<{ name: string }>).map((c) => c.name);
     if (!projectColumns.includes('git_root_commit')) {
@@ -247,6 +299,144 @@ function migrate(db: Database.Database): void {
     }
 }
 
+function initializeParanoidAuthoritySchema(db: Database.Database): void {
+    const initialize = db.transaction(() => {
+        const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'paranoid_authority'").get() !== undefined;
+        if (exists) {
+            const columns = (db.pragma('table_info(paranoid_authority)') as Array<{ name: string }>).map((column) => column.name);
+            if (!columns.includes('credential_tag')) {
+                db.exec('ALTER TABLE paranoid_authority ADD COLUMN credential_tag TEXT');
+            }
+            return;
+        }
+        db.exec(PARANOID_AUTHORITY_SCHEMA);
+        db.prepare("INSERT INTO paranoid_authority (id, enrolled, state, generation) VALUES (1, 0, 'unlocked', 0)").run();
+    });
+    initialize();
+}
+
+function migrateDurableCaptureStatus(db: Database.Database): void {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'durable_capture_status'").get() as
+        | { sql: string }
+        | undefined;
+    if (schema === undefined || schema.sql.includes("'evicted'")) {
+        return;
+    }
+
+    const rebuild = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE durable_capture_status_new (
+            session_id     INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            state          TEXT NOT NULL CHECK (state IN (${DURABLE_CAPTURE_STATES.map((state) => `'${state}'`).join(',')})),
+            filter_version INTEGER NOT NULL,
+            updated_at     TEXT NOT NULL
+          );
+          INSERT INTO durable_capture_status_new (session_id, state, filter_version, updated_at)
+          SELECT session_id, state, filter_version, updated_at FROM durable_capture_status;
+          DROP TABLE durable_capture_status;
+          ALTER TABLE durable_capture_status_new RENAME TO durable_capture_status;
+        `);
+        const violations = db.pragma('foreign_key_check');
+        if (Array.isArray(violations) && violations.length > 0) {
+            throw new Error(
+                `durable_capture_status table rebuild left ${violations.length} foreign-key violation(s): ${JSON.stringify(violations)}`,
+            );
+        }
+    });
+    rebuild();
+}
+
+function migrateDurableCaptureFts(db: Database.Database): void {
+    const existed = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'filtered_turns_fts'").get() !== undefined;
+    const apply = db.transaction(() => {
+        db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS filtered_turns_fts USING fts5(
+        user_prompt,
+        assistant_response,
+        tool_calls,
+        content='filtered_turns',
+        content_rowid='memory_id'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_ai AFTER INSERT ON filtered_turns BEGIN
+        INSERT INTO filtered_turns_fts(rowid, user_prompt, assistant_response, tool_calls)
+        VALUES (new.memory_id, new.user_prompt, new.assistant_response, new.tool_calls);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_ad AFTER DELETE ON filtered_turns BEGIN
+        INSERT INTO filtered_turns_fts(filtered_turns_fts, rowid, user_prompt, assistant_response, tool_calls)
+        VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_au AFTER UPDATE ON filtered_turns BEGIN
+        INSERT INTO filtered_turns_fts(filtered_turns_fts, rowid, user_prompt, assistant_response, tool_calls)
+        VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
+        INSERT INTO filtered_turns_fts(rowid, user_prompt, assistant_response, tool_calls)
+        VALUES (new.memory_id, new.user_prompt, new.assistant_response, new.tool_calls);
+      END;
+    `);
+        // CREATE VIRTUAL TABLE does not index rows already present in its
+        // external-content table. Rebuild only on first creation; later opens
+        // rely on the sync triggers and remain a migration no-op.
+        if (!existed) {
+            db.exec("INSERT INTO filtered_turns_fts(filtered_turns_fts) VALUES ('rebuild')");
+        }
+    });
+    apply();
+}
+
+function migrateDurableCaptureUsage(db: Database.Database): void {
+    const apply = db.transaction(() => {
+        const initialized = db.prepare('SELECT 1 FROM durable_capture_usage WHERE id = 1').get() !== undefined;
+        if (!initialized) {
+            // Existing databases pay for one full measurement here. Every
+            // later content mutation updates the ledger in the same SQLite
+            // transaction, keeping the capture hot path constant-time.
+            db.exec(`
+              INSERT INTO durable_capture_usage (id, total_bytes)
+              SELECT 1, COALESCE(SUM(
+                length(CAST(user_prompt AS BLOB)) +
+                length(CAST(assistant_response AS BLOB)) +
+                length(CAST(tool_calls AS BLOB))
+              ), 0)
+              FROM filtered_turns;
+            `);
+        }
+        db.exec(`
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_ai AFTER INSERT ON filtered_turns BEGIN
+            UPDATE durable_capture_usage
+            SET total_bytes = total_bytes +
+                length(CAST(new.user_prompt AS BLOB)) +
+                length(CAST(new.assistant_response AS BLOB)) +
+                length(CAST(new.tool_calls AS BLOB))
+            WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_ad AFTER DELETE ON filtered_turns BEGIN
+            UPDATE durable_capture_usage
+            SET total_bytes = total_bytes -
+                length(CAST(old.user_prompt AS BLOB)) -
+                length(CAST(old.assistant_response AS BLOB)) -
+                length(CAST(old.tool_calls AS BLOB))
+            WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_au AFTER UPDATE OF user_prompt, assistant_response, tool_calls ON filtered_turns BEGIN
+            UPDATE durable_capture_usage
+            SET total_bytes = total_bytes -
+                length(CAST(old.user_prompt AS BLOB)) -
+                length(CAST(old.assistant_response AS BLOB)) -
+                length(CAST(old.tool_calls AS BLOB)) +
+                length(CAST(new.user_prompt AS BLOB)) +
+                length(CAST(new.assistant_response AS BLOB)) +
+                length(CAST(new.tool_calls AS BLOB))
+            WHERE id = 1;
+          END;
+        `);
+    });
+    apply();
+}
+
 // Sessions are unique by tool, native id, and segment index, with
 // surface/git_branch/kind/trailing_branch/trailing_files. SQLite has no
 // ALTER TABLE ... DROP/ADD CONSTRAINT, so a constraint change needs a full
@@ -306,16 +496,148 @@ function migrateSessionsTable(db: Database.Database): void {
     db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
 }
 
-export function openDb(dbPath: string = defaultDbPath()): Database.Database {
+const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
+
+export function isPlaintextDatabaseHeader(bytes: Uint8Array): boolean {
+    return bytes.byteLength === SQLITE_PLAINTEXT_HEADER.length && SQLITE_PLAINTEXT_HEADER.equals(bytes);
+}
+
+export interface ManagedDatabaseOpenOptions {
+    readonly?: boolean;
+    fileMustExist?: boolean;
+    encryption?: DatabaseEncryptionRuntime;
+    lifecycle?: ExclusiveDatabaseLifecycleLease;
+}
+
+function releaseLifecycleAfterFailure(lease: SharedDatabaseLifecycleLease, error: unknown): never {
+    try {
+        lease.release();
+    } catch (releaseError) {
+        throw new AggregateError([error, releaseError], 'Managed database initialization and lifecycle release both failed.');
+    }
+    throw error;
+}
+
+function closeDatabaseAfterFailure(db: Database.Database, error: unknown): never {
+    try {
+        db.close();
+    } catch (closeError) {
+        throw new AggregateError([error, closeError], 'Managed database initialization and close both failed.');
+    }
+    throw error;
+}
+
+function requireManagedDatabaseLifecycle(
+    lifecycle: SharedDatabaseLifecycleLease | ExclusiveDatabaseLifecycleLease | undefined,
+    dbPath: string,
+): SharedDatabaseLifecycleLease | ExclusiveDatabaseLifecycleLease {
+    if (lifecycle === undefined) {
+        throw new Error(`Managed database lifecycle was not acquired for ${dbPath}`);
+    }
+    return lifecycle;
+}
+
+function assertManagedDatabaseExistsWhenRequired(exists: boolean, options: ManagedDatabaseOpenOptions, dbPath: string): void {
+    if (!exists && (options.readonly || options.fileMustExist)) {
+        throw new Error(`Managed elepha database does not exist: ${dbPath}`);
+    }
+}
+
+function prepareDatabaseDirectory(dbPath: string): void {
     if (dbPath !== ':memory:') {
         mkdirSync(path.dirname(dbPath), { recursive: true });
         hardenDir(path.dirname(dbPath));
     }
-    const db = new Database(dbPath);
+}
+
+export function hasPlaintextDatabaseHeader(dbPath: string): boolean {
+    const descriptor = openSync(dbPath, fsConstants.O_RDONLY);
+    try {
+        const header = Buffer.alloc(DATABASE_HEADER_BYTES);
+        const bytesRead = readSync(descriptor, header, 0, header.length, 0);
+        return isPlaintextDatabaseHeader(header.subarray(0, bytesRead));
+    } finally {
+        closeSync(descriptor);
+    }
+}
+
+function rawDatabaseKey(key: Buffer): Buffer {
+    return Buffer.from(`raw:${key.toString('hex')}`, 'ascii');
+}
+
+function applyDatabaseKey(db: Database.Database, key: Buffer): void {
+    db.pragma("cipher='chacha20'");
+    const rawKey = rawDatabaseKey(key);
+    try {
+        db.key(rawKey);
+    } finally {
+        rawKey.fill(0);
+    }
+}
+
+export function keyDatabaseConnection(db: Database.Database, key: Buffer): void {
+    applyDatabaseKey(db, key);
+    // SQLite3MC validates a key only when the database is first read.
+    db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+}
+
+export function rekeyDatabaseConnection(db: Database.Database, key: Buffer): void {
+    db.pragma("cipher='chacha20'");
+    const rawKey = rawDatabaseKey(key);
+    try {
+        db.rekey(rawKey);
+    } finally {
+        rawKey.fill(0);
+    }
+    db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+}
+
+export function openKeyedDatabase(
+    dbPath: string,
+    key: Buffer,
+    options: { readonly?: boolean; fileMustExist?: boolean } = {},
+): Database.Database {
+    const db = new Database(dbPath, {
+        ...(options.readonly ? { readonly: true } : {}),
+        ...(options.fileMustExist ? { fileMustExist: true } : {}),
+    });
+    try {
+        keyDatabaseConnection(db, key);
+        return db;
+    } catch (error) {
+        db.close();
+        throw error;
+    }
+}
+
+function isPrimaryDatabasePath(dbPath: string): boolean {
+    const primary = defaultDbPath();
+    if (samePath(path.resolve(dbPath), path.resolve(primary))) {
+        return true;
+    }
+    try {
+        return samePath(realpathSync(dbPath), realpathSync(primary));
+    } catch {
+        try {
+            return samePath(
+                path.join(realpathSync(path.dirname(dbPath)), path.basename(dbPath)),
+                path.join(realpathSync(path.dirname(primary)), path.basename(primary)),
+            );
+        } catch {
+            return false;
+        }
+    }
+}
+
+function initializeDatabase(db: Database.Database, dbPath: string): Database.Database {
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+    initializeParanoidAuthoritySchema(db);
     db.exec(SCHEMA);
     migrate(db);
+    initializeParanoidAuthority(db);
+    migrateDurableCaptureFts(db);
+    migrateDurableCaptureUsage(db);
     grandfatherConsentRoots(db);
     canonicalizeConsentRoots(db);
     if (dbPath !== ':memory:') {
@@ -328,4 +650,128 @@ export function openDb(dbPath: string = defaultDbPath()): Database.Database {
         hardenFile(`${dbPath}-shm`);
     }
     return db;
+}
+
+// Only caller-owned private encrypted stages may bypass managed-primary discovery and lifecycle ownership.
+export function openInitializedKeyedDatabase(dbPath: string, key: Buffer): Database.Database {
+    const db = openKeyedDatabase(dbPath, key, { fileMustExist: true });
+    try {
+        return initializeDatabase(db, dbPath);
+    } catch (error) {
+        return closeDatabaseAfterFailure(db, error);
+    }
+}
+
+// Foreign/transient databases are deliberately unkeyed. Primary database
+// callers must use openDb() or openManagedDatabase() instead.
+export function openUnmanagedDb(dbPath: string = ':memory:'): Database.Database {
+    prepareDatabaseDirectory(dbPath);
+    const db = new Database(dbPath);
+    try {
+        return initializeDatabase(db, dbPath);
+    } catch (error) {
+        db.close();
+        throw error;
+    }
+}
+
+// Pin relative paths before entering this function so awaited key-store work
+// cannot redirect later filesystem, SQLite, or initialization operations.
+async function openManagedDatabaseAtPinnedPath(dbPath: string, options: ManagedDatabaseOpenOptions): Promise<Database.Database> {
+    if (dbPath === ':memory:') {
+        return new Database(dbPath);
+    }
+    const sharedLease = options.lifecycle === undefined ? acquireSharedDatabaseLifecycle(dbPath) : undefined;
+    let leaseAttached = false;
+    let db: Database.Database | undefined;
+    let key: Buffer | undefined;
+    try {
+        if (options.lifecycle !== undefined) {
+            assertExclusiveDatabaseLifecycle(options.lifecycle, dbPath);
+        }
+        const lifecycle = requireManagedDatabaseLifecycle(options.lifecycle ?? sharedLease, dbPath);
+        if (isPrimaryDatabasePath(dbPath)) {
+            assertDatabaseMigrationInactive();
+        }
+        const databaseIdentity = lifecycle.captureDatabaseIdentity();
+        const existed = databaseIdentity.exists;
+        assertManagedDatabaseExistsWhenRequired(existed, options, dbPath);
+        if (!options.readonly) {
+            prepareDatabaseDirectory(dbPath);
+        }
+        const plaintext = existed && hasPlaintextDatabaseHeader(dbPath);
+        databaseIdentity.assertCurrent();
+        key = plaintext ? undefined : await databaseKey(dbPath, !existed, options.encryption);
+        databaseIdentity.assertCurrent();
+        const opened = databaseIdentity.openDatabase(
+            (physicalPath) =>
+                new Database(physicalPath, {
+                    ...(options.readonly ? { readonly: true } : {}),
+                    ...(options.fileMustExist ? { fileMustExist: true } : {}),
+                }),
+        );
+        db = opened.database;
+        if (sharedLease !== undefined) {
+            holdSharedDatabaseLifecycleUntilClose(db, sharedLease);
+            leaseAttached = true;
+        } else if (options.lifecycle !== undefined) {
+            holdExclusiveDatabaseLifecycleUntilClose(db, options.lifecycle);
+        }
+        if (key !== undefined) {
+            applyDatabaseKey(db, key);
+        }
+        db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
+        requireManagedDatabaseCheckpointOnClose(db);
+        if (key === undefined) {
+            return db;
+        }
+        try {
+            registerParanoidDatabase(db, dbPath, key);
+        } finally {
+            key.fill(0);
+            key = undefined;
+        }
+        return db;
+    } catch (error) {
+        let failure = error;
+        key?.fill(0);
+        if (db !== undefined) {
+            try {
+                db.close();
+            } catch (closeError) {
+                failure = new AggregateError([error, closeError], 'Managed database initialization and close both failed.');
+            }
+        }
+        if (sharedLease !== undefined && !leaseAttached) {
+            return releaseLifecycleAfterFailure(sharedLease, failure);
+        }
+        throw failure;
+    }
+}
+
+export async function openManagedDatabase(
+    dbPath: string = defaultDbPath(),
+    options: ManagedDatabaseOpenOptions = {},
+): Promise<Database.Database> {
+    const databasePath = dbPath === ':memory:' ? dbPath : path.resolve(dbPath);
+    return openManagedDatabaseAtPinnedPath(databasePath, options);
+}
+
+export function openDb(dbPath: ':memory:'): Database.Database;
+export function openDb(dbPath?: string, options?: ManagedDatabaseOpenOptions): Promise<Database.Database>;
+export function openDb(
+    dbPath: string = defaultDbPath(),
+    options: ManagedDatabaseOpenOptions = {},
+): Database.Database | Promise<Database.Database> {
+    if (dbPath === ':memory:') {
+        return openUnmanagedDb(dbPath);
+    }
+    const databasePath = path.resolve(dbPath);
+    return openManagedDatabaseAtPinnedPath(databasePath, options).then((db) => {
+        try {
+            return initializeDatabase(db, databasePath);
+        } catch (error) {
+            return closeDatabaseAfterFailure(db, error);
+        }
+    });
 }

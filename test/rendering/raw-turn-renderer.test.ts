@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { DURABLE_CAPTURE_FILTER_VERSION } from '../../src/config/constants.js';
+import { filterTurn } from '../../src/rendering/filtered-turn.js';
 import { RAW_TURN_SEPARATOR, renderedChars, renderRawTurn, renderRawTurns } from '../../src/rendering/raw-turn-renderer.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
 import type { ParsedTurn } from '../../src/types/index.js';
@@ -27,6 +29,17 @@ function turn(overrides: Partial<ParsedTurn> = {}): ParsedTurn {
 }
 
 describe('raw-turn renderer', () => {
+    it('uses the versioned adapter-neutral projection shared with storage', () => {
+        expect(filterTurn(turn())).toEqual({
+            filterVersion: DURABLE_CAPTURE_FILTER_VERSION,
+            included: true,
+            userPrompt: 'inspect `src/a.ts`',
+            assistantResponse: 'I will use $(pwd) and keep `code` intact.',
+            toolCalls: [{ name: 'exec', filePaths: ['/repo/src/a.ts'] }],
+            omittedToolCallCount: 2,
+        });
+    });
+
     it('uses the golden Markdown shape, strips memory citations, preserves file-bearing calls, collapses the rest, and escapes served text', () => {
         const rendered = renderRawTurn(
             turn({

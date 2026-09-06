@@ -10,7 +10,7 @@ export function registerInit(program: Command): void {
         .description('Interactively choose which local projects elepha may remember')
         .action(async () => {
             try {
-                process.exitCode = await runInit({ store: new MemoryStore(openDb()) });
+                process.exitCode = await runInit({ store: new MemoryStore(await openDb()) });
             } catch (error) {
                 console.error(errorMessage(error));
                 process.exitCode = 1;

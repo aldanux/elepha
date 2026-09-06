@@ -5,15 +5,57 @@ service stops all new ingestion without changing which projects have consent or
 deleting anything already remembered. When capture resumes, only approved roots are
 eligible.
 
+## Durable capture
+
+Durable capture is opt-in and off by default. Enable it through the supported config
+command, then restart the background service so it reads the new setting:
+
+```console
+elepha config set durable-capture on
+elepha restart
+```
+
+When enabled, elepha persists a sanitized copy of each eligible turn inside its
+encrypted database. The copy keeps user prompts, assistant responses, and the names
+and file paths of tool calls that reference paths. It never stores the raw JSONL,
+thinking, tool output, fetched content, or tool arguments. Filtering and storage are
+local and do not require an AI provider, so conversation search and session revival
+can use a complete filtered copy even after the source transcript is deleted.
+
+After the service restarts, elepha also backfills eligible sessions already in the
+database when their source transcripts remain readable. Disabling durable capture
+stops future copies after the next restart; it does not delete copies already stored.
+Use [Deleting memory](purge.md) when deletion is intended.
+
+The schema's exact coverage-state vocabulary is `complete`, `complete_truncated`,
+`disabled_gap`, `backfilling`, `source_unavailable`, `parse_error`, `revoked`,
+`incognito`, and `evicted`. Complete coverage can serve without the source transcript;
+`complete_truncated` means one or more stored turns hit the enforced content bound.
+`disabled_gap`, `backfilling`, `source_unavailable`, and `parse_error` describe an
+incomplete backfill. `evicted` means the size cap removed the copy. `revoked` and
+`incognito` are accepted schema values; current purge and incognito paths instead
+delete the copy, its coverage row, and its indexed search terms.
+
+The durable store defaults to a 1 GiB cap. When it binds, elepha evicts the oldest
+recoverable session copies first; the active session is not exempt if further space
+is required. An evicted native session remains evicted across later turns and
+re-segmentation instead of silently refilling the durable store. Recall can still use
+its source transcript while that file remains readable. See
+[Protecting and recovering memory](storage.md#durable-conversation-copies) and
+[Configuration](configuration.md#durable-store-size).
+
 ## See what has been captured
 
-Run `elepha projects` to list projects with captured memory and their session counts.
-The default view leaves out temporary projects and paths that no longer exist. Use
-`elepha projects --all` when diagnosing old records and you also need those missing or
-temporary paths, clearly marked in the output.
+Run `elepha projects` to list projects with captured memory or effective approval.
+Captured projects include their stored session count; approved repositories without
+memory are marked `no sessions yet`. When a repository has moved, the command prefers
+its current live path over a missing stored path. The default view leaves out temporary
+projects and paths that no longer exist. Use `elepha projects --all` when diagnosing old
+records and you also need those missing or temporary paths, clearly marked in the
+output.
 
-This command reports stored projects; it does not grant or revoke permission. Manage
-that separately in [Choosing what elepha may remember](consent.md).
+This command is read-only; it does not grant or revoke permission. Manage that
+separately in [Choosing what elepha may remember](consent.md).
 
 ## Pause and resume the capture service
 

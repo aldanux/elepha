@@ -7,7 +7,7 @@ import { MAX_TRANSCRIPT_RECORD_BYTES } from '../../src/config/constants.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import type { RollupService } from '../../src/daemon/rollup-service.js';
 import { type ServedSession, SessionReader } from '../../src/serving/session-reader.js';
-import { openDb } from '../../src/storage/db.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SessionAdapter } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
@@ -99,7 +99,7 @@ describe('untrusted transcript record bounds', () => {
             })}\n`,
         );
 
-        const store = new MemoryStore(openDb(path.join(root, 'elepha.db')));
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
         store.consent.grant(cwd);
         const logs: string[] = [];
         const adapter = new CodexAdapter();

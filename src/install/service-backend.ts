@@ -3,6 +3,8 @@ import { defaultLaunchdServicePaths, LaunchdBackend } from './launchd-backend.js
 import type { LauncherBackend } from './launcher.js';
 import { defaultSystemdServicePaths, SystemdBackend } from './systemd-backend.js';
 
+export const SERVICE_BACKEND_PLATFORM_ERROR = 'elepha service management is supported on macOS and Linux.';
+
 export interface ServiceStatus {
     loaded: boolean;
     disabled: boolean;
@@ -47,9 +49,7 @@ export function serviceBackend(options: ServiceBackendOptions = {}): ServiceBack
         case 'linux':
             return new SystemdBackend(defaultSystemdServicePaths(options.home));
         default:
-            // Platform guards remain at the lifecycle entry points. Unguarded
-            // callers on other platforms retain their historical launchd behavior.
-            return launchdBackend(options.home);
+            throw new Error(SERVICE_BACKEND_PLATFORM_ERROR);
     }
 }
 

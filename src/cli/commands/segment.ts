@@ -1,3 +1,4 @@
+import type Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { ClaudeCodeAdapter } from '../../adapters/claude-code.js';
 import { CodexAdapter } from '../../adapters/codex.js';
@@ -36,7 +37,7 @@ export function registerSegment(program: Command): void {
                 return;
             }
 
-            const db = openDb();
+            const db = await openDb();
             const adapters: Record<ToolName, SessionAdapter> = {
                 'claude-code': new ClaudeCodeAdapter(),
                 codex: new CodexAdapter(),
@@ -155,7 +156,7 @@ function parseIntegerOption(value: string | undefined, name: string): number | u
     return Number(value);
 }
 
-function verifyForeignKeysOrFail(db: ReturnType<typeof openDb>): void {
+function verifyForeignKeysOrFail(db: Database.Database): void {
     const violations = db.pragma('foreign_key_check') as unknown[];
     if (violations.length > 0) {
         throw new Error(`foreign_key_check returned ${violations.length} violation(s)`);

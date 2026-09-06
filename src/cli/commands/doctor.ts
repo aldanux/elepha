@@ -1,17 +1,23 @@
 import type { Command } from 'commander';
 import { runDoctor } from '../../install/doctor.js';
+import { serviceBackend } from '../../install/service-backend.js';
 import { ConsentStore } from '../../storage/consent-store.js';
-import { openDb } from '../../storage/db.js';
+import { databaseMigrationIsActive, recoverPrimaryDatabaseMigration } from '../../storage/database-migration.js';
+import { defaultDbPath, openDb } from '../../storage/db.js';
 
 export function registerDoctor(program: Command): void {
     program
         .command('doctor')
         .description('Diagnose capture recovery prerequisites and restart only a down or stuck daemon')
-        .action(() => {
+        .action(async () => {
             let approvedRoots = 0;
             let databaseError: unknown;
             try {
-                approvedRoots = new ConsentStore(openDb()).countApproved();
+                if (databaseMigrationIsActive()) {
+                    serviceBackend().stop();
+                    await recoverPrimaryDatabaseMigration(defaultDbPath());
+                }
+                approvedRoots = new ConsentStore(await openDb()).countApproved();
             } catch (error) {
                 databaseError = error;
             }
