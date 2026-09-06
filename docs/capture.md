@@ -46,13 +46,16 @@ its source transcript while that file remains readable. See
 
 ## See what has been captured
 
-Run `elepha projects` to list projects with captured memory and their session counts.
-The default view leaves out temporary projects and paths that no longer exist. Use
-`elepha projects --all` when diagnosing old records and you also need those missing or
-temporary paths, clearly marked in the output.
+Run `elepha projects` to list projects with captured memory or effective approval.
+Captured projects include their stored session count; approved repositories without
+memory are marked `no sessions yet`. When a repository has moved, the command prefers
+its current live path over a missing stored path. The default view leaves out temporary
+projects and paths that no longer exist. Use `elepha projects --all` when diagnosing old
+records and you also need those missing or temporary paths, clearly marked in the
+output.
 
-This command reports stored projects; it does not grant or revoke permission. Manage
-that separately in [Choosing what elepha may remember](consent.md).
+This command is read-only; it does not grant or revoke permission. Manage that
+separately in [Choosing what elepha may remember](consent.md).
 
 ## Pause and resume the capture service
 

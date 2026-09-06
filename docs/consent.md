@@ -59,6 +59,25 @@ later grant makes pre-revocation memory eligible for search and recall again and
 resumes capture; it does not make the deliberately private sessions from the revoked
 period backfillable.
 
+## Move or rename a project
+
+If a repository moves or is renamed inside an approved folder, no consent change is
+needed. elepha groups the old and new locations by Git identity, keeps the existing
+memory, and shows the current live path after it observes the new location.
+
+If the repository was approved individually, or its new location is outside the
+approved folder, approve the new location with `elepha consent`. From inside the moved
+checkout, the direct equivalent is:
+
+```console
+elepha consent grant --here
+```
+
+The grant backfills eligible transcripts at the new location and does not require a
+database restore or delete the memory recorded under the former path. After verifying
+the new path, `elepha consent prune` can remove a missing old consent entry without
+deleting captured memory.
+
 ## Review recorded decisions
 
 `elepha consent list` prints every approved, denied, and pending root together with

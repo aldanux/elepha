@@ -36,7 +36,7 @@ Full guide: [docs/capture.md](capture.md).
 
 | Command                   | Description                                                                                                                                                 |
 |---------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha projects [--all]` | List projects with captured memory; `--all` includes missing and temporary paths. More details in [docs/capture.md](capture.md#see-what-has-been-captured). |
+| `elepha projects [--all]` | List captured or approved projects; `--all` includes missing and temporary paths. More details in [docs/capture.md](capture.md#see-what-has-been-captured). |
 | `elepha pause`            | Stop and disable background capture without changing consent or memory. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service). |
 | `elepha resume`           | Enable and start background capture for approved roots. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).                 |
 | `elepha restart`          | Run the pause operation followed by the resume operation. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).               |
