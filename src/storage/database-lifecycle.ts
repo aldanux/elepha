@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
     accessSync,
+    type BigIntStats,
     chmodSync,
     closeSync,
     fchmodSync,
@@ -23,6 +24,7 @@ import path from 'node:path';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import {
     DATABASE_LIFECYCLE_ACQUIRE_TIMEOUT_MS,
+    DATABASE_LIFECYCLE_BIRTHTIME_PROOF_ANCESTOR_LIMIT,
     DATABASE_LIFECYCLE_COARSE_TIMESTAMP_QUANTUM_NS,
     DATABASE_LIFECYCLE_EXCLUSIVE_OWNER_PUBLICATION_ATTEMPTS,
     DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS,
@@ -47,13 +49,6 @@ const DATABASE_LIFECYCLE_TEST_DIRECTORY = Symbol.for('dev.elepha.internal.databa
 let databaseExitCleanupInstalled = false;
 
 function databaseLifecycleDirectory(): string {
-    const injected = (globalThis as Record<symbol, unknown>)[DATABASE_LIFECYCLE_TEST_DIRECTORY];
-    if (injected !== undefined) {
-        if (typeof injected !== 'string' || !path.isAbsolute(injected) || path.resolve(injected) !== injected) {
-            throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, 'injected lifecycle test directory is invalid');
-        }
-        return injected;
-    }
     let userHome: string;
     try {
         userHome = userInfo().homedir;
@@ -76,6 +71,9 @@ type DatabaseFileIdentity =
           exists: true;
           dev: string;
           ino: string;
+          ctimeNs?: string;
+          birthtimeNs?: string;
+          birthtimeProven?: boolean;
       };
 
 interface OwnerRecord {
@@ -203,7 +201,14 @@ export function databaseLifecyclePaths(_databasePath: string): DatabaseLifecycle
     // This user-scoped root is independent of both configurable Elepha homes
     // and database spellings, so every managed hard-link alias converges before
     // any database identity or bytes are inspected.
-    const directory = DATABASE_LIFECYCLE_DIRECTORY;
+    let directory = DATABASE_LIFECYCLE_DIRECTORY;
+    const injected = (globalThis as Record<symbol, unknown>)[DATABASE_LIFECYCLE_TEST_DIRECTORY];
+    if (injected !== undefined) {
+        if (typeof injected !== 'string' || !path.isAbsolute(injected) || path.resolve(injected) !== injected) {
+            throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, 'injected lifecycle test directory is invalid');
+        }
+        directory = injected;
+    }
     return {
         directory,
         exclusive: path.join(directory, 'exclusive'),
@@ -230,7 +235,7 @@ function inspectDatabaseIdentity(databasePath: string): DatabaseFileIdentity {
         throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database cannot be opened for identity inspection: ${databasePath}`);
     }
     try {
-        const opened = fstatSync(descriptor);
+        const opened = fstatSync(descriptor, { bigint: true });
         if (!opened.isFile()) {
             throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database is not a physical file: ${databasePath}`);
         }
@@ -238,17 +243,68 @@ function inspectDatabaseIdentity(databasePath: string): DatabaseFileIdentity {
         let current: ReturnType<typeof lstatSync>;
         try {
             currentPhysicalPath = realpathSync(databasePath);
-            current = lstatSync(currentPhysicalPath);
+            current = lstatSync(currentPhysicalPath, { bigint: true });
         } catch {
             throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database identity changed while inspected: ${databasePath}`);
         }
         if (!current.isFile() || current.isSymbolicLink() || !sameIdentity(opened, current)) {
             throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database identity changed while inspected: ${databasePath}`);
         }
-        return { exists: true, dev: String(opened.dev), ino: String(opened.ino) };
+        return databaseFileIdentity(opened, currentPhysicalPath);
     } finally {
         closeSync(descriptor);
     }
+}
+
+function databaseFileIdentity(file: BigIntStats, databaseFilename: string): Extract<DatabaseFileIdentity, { exists: true }> {
+    return {
+        exists: true,
+        dev: String(file.dev),
+        ino: String(file.ino),
+        ctimeNs: String(file.ctimeNs),
+        birthtimeNs: String(file.birthtimeNs),
+        birthtimeProven: proveLinuxBirthtime(file, databaseFilename),
+    };
+}
+
+function proveLinuxBirthtime(file: BigIntStats, databaseFilename: string): boolean {
+    if (process.platform !== 'linux' || file.birthtimeNs <= 0n) {
+        return false;
+    }
+    if (file.birthtimeNs !== file.ctimeNs) {
+        return true;
+    }
+    // Fresh files can have equal real birthtime and ctime. Linux libuv uses
+    // one statx fallback for file and directory observations; a same-device
+    // ancestor sampled afterward can distinguish real birthtime from that
+    // zero/ctime fallback. Persist this observation, never infer it later.
+    let directory = path.dirname(databaseFilename);
+    for (let inspected = 0; inspected < DATABASE_LIFECYCLE_BIRTHTIME_PROOF_ANCESTOR_LIMIT; inspected++) {
+        try {
+            const descriptor = openSync(directory, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | noFollowFlag());
+            try {
+                const ancestor = fstatSync(descriptor, { bigint: true });
+                if (!ancestor.isDirectory()) {
+                    return false;
+                }
+                if (ancestor.dev === file.dev && ancestor.birthtimeNs > 0n && ancestor.birthtimeNs !== ancestor.ctimeNs) {
+                    return true;
+                }
+            } finally {
+                closeSync(descriptor);
+            }
+        } catch {
+            // Ancestor access is optional evidence; database inspection is
+            // separate and still fails on errors. Unproven reuse stays blocked.
+            return false;
+        }
+        const parent = path.dirname(directory);
+        if (parent === directory) {
+            return false;
+        }
+        directory = parent;
+    }
+    return false;
 }
 
 function inspectDatabaseLocation(databasePath: string): {
@@ -398,12 +454,21 @@ function currentUserMayReplaceDirectoryEntry(parent: DirectoryPathMutationState)
 }
 
 function assertPreciseDarwinAncestorMutationState(directories: readonly DirectoryPathMutationState[], databasePath: string): void {
+    // One aligned ctime does not establish filesystem resolution. Other pinned
+    // directories on the same device can prove precise directory ctime for this
+    // open, without lending that evidence to leaf files or another filesystem.
+    const preciseCtimeByDevice = new Map<string, bigint>();
+    for (const directory of directories) {
+        if (directory.ctimeNs % DATABASE_LIFECYCLE_COARSE_TIMESTAMP_QUANTUM_NS !== 0n) {
+            preciseCtimeByDevice.set(String(directory.identity.dev), directory.ctimeNs);
+        }
+    }
     for (let index = 0; index + 1 < directories.length; index++) {
         const directory = directories[index];
         const parent = directories[index + 1];
         if (directory !== undefined && parent !== undefined && currentUserMayReplaceDirectoryEntry(parent)) {
-            assertPreciseMutationTimestamp(directory.ctimeNs, databasePath);
-            assertPreciseMutationTimestamp(parent.ctimeNs, databasePath);
+            assertPreciseMutationTimestamp(preciseCtimeByDevice.get(String(directory.identity.dev)) ?? directory.ctimeNs, databasePath);
+            assertPreciseMutationTimestamp(preciseCtimeByDevice.get(String(parent.identity.dev)) ?? parent.ctimeNs, databasePath);
         }
     }
 }
@@ -448,20 +513,16 @@ function openAuthorizedDescriptor(
             fchmodSync(descriptor, PRIVATE_FILE_MODE);
             fsyncSync(descriptor);
         }
-        const opened = fstatSync(descriptor);
+        const opened = fstatSync(descriptor, { bigint: true });
         assertLifecycle(opened.isFile(), DATABASE_LIFECYCLE_AMBIGUOUS, `managed database is not a physical file: ${databasePath}`);
-        const identity: Extract<DatabaseFileIdentity, { exists: true }> = {
-            exists: true,
-            dev: String(opened.dev),
-            ino: String(opened.ino),
-        };
+        const identity = databaseFileIdentity(opened, physicalPath);
         const current = inspectDatabaseIdentity(databasePath);
         assertLifecycle(
             current.exists && sameDatabaseIdentity(identity, current) && (!expected.exists || sameDatabaseIdentity(expected, current)),
             DATABASE_LIFECYCLE_AMBIGUOUS,
             `managed database identity changed while opening ${databasePath}`,
         );
-        const physical = lstatSync(physicalPath);
+        const physical = lstatSync(physicalPath, { bigint: true });
         assertLifecycle(
             physical.isFile() && !physical.isSymbolicLink() && sameIdentity(opened, physical),
             DATABASE_LIFECYCLE_AMBIGUOUS,
@@ -963,7 +1024,15 @@ function validDatabaseIdentity(value: unknown): value is DatabaseFileIdentity {
         return false;
     }
     const identity = value as Partial<DatabaseFileIdentity>;
-    return identity.exists === false || (identity.exists === true && typeof identity.dev === 'string' && typeof identity.ino === 'string');
+    return (
+        identity.exists === false ||
+        (identity.exists === true &&
+            typeof identity.dev === 'string' &&
+            typeof identity.ino === 'string' &&
+            (identity.ctimeNs === undefined || (typeof identity.ctimeNs === 'string' && /^\d+$/.test(identity.ctimeNs))) &&
+            (identity.birthtimeNs === undefined || (typeof identity.birthtimeNs === 'string' && /^\d+$/.test(identity.birthtimeNs))) &&
+            (identity.birthtimeProven === undefined || typeof identity.birthtimeProven === 'boolean'))
+    );
 }
 
 function validDatabaseFilename(value: unknown): value is string {
@@ -1171,7 +1240,8 @@ function readRetiredIdentity(
 }
 
 function assertDatabaseAuthority(paths: DatabaseLifecyclePaths, databasePath: string, identity: DatabaseFileIdentity): void {
-    if (identity.exists && readRetiredIdentity(paths, identity) !== undefined) {
+    const retired = identity.exists ? readRetiredIdentity(paths, identity) : undefined;
+    if (identity.exists && retired !== undefined && !isDistinctDatabaseGeneration(retired.databaseIdentity, identity)) {
         throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database path names a retired inode: ${databasePath}`);
     }
     const authority = readAuthority(paths, databasePath);
@@ -1181,6 +1251,28 @@ function assertDatabaseAuthority(paths: DatabaseLifecyclePaths, databasePath: st
             `managed database path no longer names its authoritative inode: ${databasePath}`,
         );
     }
+}
+
+function isDistinctDatabaseGeneration(
+    retired: Extract<DatabaseFileIdentity, { exists: true }>,
+    current: Extract<DatabaseFileIdentity, { exists: true }>,
+): boolean {
+    if (
+        process.platform !== 'linux' ||
+        retired.birthtimeProven !== true ||
+        current.birthtimeProven !== true ||
+        retired.birthtimeNs === undefined ||
+        current.birthtimeNs === undefined
+    ) {
+        return false;
+    }
+    const currentBirthtime = BigInt(current.birthtimeNs);
+    const retiredBirthtime = BigInt(retired.birthtimeNs);
+    // Both snapshots must carry their own proof, because today's filesystem
+    // support cannot authenticate a legacy fallback timestamp. Clock ordering
+    // is irrelevant: equal Linux birthtimes never prove a different generation.
+    // Darwin utimes can change birthtime on the same inode, so it stays blocked.
+    return retiredBirthtime > 0n && currentBirthtime > 0n && currentBirthtime !== retiredBirthtime;
 }
 
 function finalizeExclusiveAuthority(paths: DatabaseLifecyclePaths, owner: HeldOwner): void {
@@ -1200,9 +1292,10 @@ function finalizeExclusiveAuthority(paths: DatabaseLifecyclePaths, owner: HeldOw
             );
         }
         const retiredFile = retiredIdentityPath(paths, baseline);
-        if (readRetiredIdentity(paths, baseline) === undefined) {
+        const previousRetired = readRetiredIdentity(paths, baseline);
+        if (previousRetired === undefined || isDistinctDatabaseGeneration(previousRetired.databaseIdentity, baseline)) {
             const retired: RetiredIdentityRecord = { version: 1, databaseIdentity: baseline };
-            writePrivateFileAtomic(retiredFile, Buffer.from(`${JSON.stringify(retired)}\n`, 'utf8'));
+            writePrivateFileAtomic(retiredFile, Buffer.from(`${JSON.stringify(retired)}\n`, 'utf8'), previousRetired !== undefined);
         }
     }
     if (current.exists) {

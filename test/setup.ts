@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
+import { beforeEach } from 'vitest';
 
 const workerId = process.env.VITEST_WORKER_ID ?? String(process.pid);
 const workerElephaHome = path.join(process.cwd(), '.test-scratch', `elepha-home-${workerId}`);
@@ -15,8 +17,11 @@ process.env.ELEPHA_HOME = workerElephaHome;
 // adding a product configuration surface. Node child tests receive the same
 // process-local injection before their first application module is imported.
 (globalThis as Record<symbol, unknown>)[Symbol.for(lifecycleTestDirectorySymbol)] = lifecycleTestDirectory;
-const preloadSource = `globalThis[Symbol.for(${JSON.stringify(lifecycleTestDirectorySymbol)})] = ${JSON.stringify(lifecycleTestDirectory)};`;
-const lifecyclePreload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
+beforeEach(() => {
+    // Retired aliases coordinate for the entire test, including completion
+    // cleanup; unrelated tests must not inherit those inode tombstones.
+    (globalThis as Record<symbol, unknown>)[Symbol.for(lifecycleTestDirectorySymbol)] = `${lifecycleTestDirectory}-${randomUUID()}`;
+});
 const mutableChildProcess = createRequire(import.meta.url)('node:child_process') as {
     spawn: typeof import('node:child_process').spawn;
     spawnSync: typeof import('node:child_process').spawnSync;
@@ -26,6 +31,9 @@ function injectLifecyclePreload(command: string, callArguments: unknown[]): unkn
     if (command !== process.execPath || !Array.isArray(callArguments[0])) {
         return callArguments;
     }
+    const injected = (globalThis as Record<symbol, unknown>)[Symbol.for(lifecycleTestDirectorySymbol)];
+    const preloadSource = `globalThis[Symbol.for(${JSON.stringify(lifecycleTestDirectorySymbol)})] = ${JSON.stringify(injected)};`;
+    const lifecyclePreload = `data:text/javascript,${encodeURIComponent(preloadSource)}`;
     const options = callArguments[1];
     const childOptions = options !== null && typeof options === 'object' ? options : {};
     const inheritedEnvironment =

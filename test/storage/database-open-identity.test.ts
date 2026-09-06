@@ -171,6 +171,97 @@ it.skipIf(process.platform !== 'darwin')('fails closed when ancestor timestamps 
     reopened.close();
 });
 
+it.skipIf(process.platform !== 'darwin')(
+    'admits an aligned ancestor timestamp when pinned same-device ancestors prove precise ctime',
+    async () => {
+        const directory = withGrantableTestDir('elepha-database-open-identity-aligned-ancestor-');
+        const databasePath = path.join(directory, 'elepha.db');
+        const seeded = openUnmanagedDb(databasePath);
+        seeded.close();
+        const parentIdentity = statSync(directory, { bigint: true });
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalFstatSync = mutableFs.fstatSync;
+        let alignedObservations = 0;
+        mutableFs.fstatSync = ((descriptor, options) => {
+            const state = originalFstatSync(descriptor, options as never);
+            if (
+                (options as { bigint?: boolean } | undefined)?.bigint !== true ||
+                String(state.dev) !== String(parentIdentity.dev) ||
+                String(state.ino) !== String(parentIdentity.ino)
+            ) {
+                return state;
+            }
+            return new Proxy(state, {
+                get(target, property, receiver) {
+                    if (property === 'ctimeNs') {
+                        alignedObservations++;
+                        return 1_000_000_000n;
+                    }
+                    return Reflect.get(target, property, receiver);
+                },
+            });
+        }) as typeof import('node:fs').fstatSync;
+        syncBuiltinESMExports();
+
+        try {
+            const opened = await openManagedDatabase(databasePath, { fileMustExist: true });
+            try {
+                expect(opened.prepare('SELECT 42 AS count').get()).toEqual({ count: 42 });
+                expect(alignedObservations).toBeGreaterThan(0);
+            } finally {
+                opened.close();
+            }
+        } finally {
+            mutableFs.fstatSync = originalFstatSync;
+            syncBuiltinESMExports();
+        }
+    },
+);
+
+it.skipIf(process.platform !== 'darwin').each(['another device', 'a leaf file'] as const)(
+    'does not borrow precise directory ctime evidence for %s',
+    async (targetKind) => {
+        const directory = withGrantableTestDir('elepha-database-open-identity-precision-scope-');
+        const databasePath = path.join(directory, 'elepha.db');
+        const seeded = openUnmanagedDb(databasePath);
+        seeded.close();
+        const targetIdentity = statSync(targetKind === 'a leaf file' ? databasePath : directory, { bigint: true });
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalFstatSync = mutableFs.fstatSync;
+        mutableFs.fstatSync = ((descriptor, options) => {
+            const state = originalFstatSync(descriptor, options as never);
+            if (
+                (options as { bigint?: boolean } | undefined)?.bigint !== true ||
+                String(state.dev) !== String(targetIdentity.dev) ||
+                String(state.ino) !== String(targetIdentity.ino)
+            ) {
+                return state;
+            }
+            return new Proxy(state, {
+                get(target, property, receiver) {
+                    if (property === 'ctimeNs') {
+                        return 1_000_000_000n;
+                    }
+                    if (targetKind === 'another device' && property === 'dev') {
+                        return -1n;
+                    }
+                    return Reflect.get(target, property, receiver);
+                },
+            });
+        }) as typeof import('node:fs').fstatSync;
+        syncBuiltinESMExports();
+
+        try {
+            await expect(openManagedDatabase(databasePath, { fileMustExist: true })).rejects.toThrow(
+                `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database filesystem metadata is too coarse to seal SQLite open: ${databasePath}`,
+            );
+        } finally {
+            mutableFs.fstatSync = originalFstatSync;
+            syncBuiltinESMExports();
+        }
+    },
+);
+
 it.skipIf(process.platform !== 'darwin')('preserves the identity failure when an ancestor descriptor also fails to close', async () => {
     const directory = withGrantableTestDir('elepha-database-open-identity-ancestor-cleanup-');
     const databasePath = path.join(directory, 'elepha.db');

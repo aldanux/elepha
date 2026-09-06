@@ -1,7 +1,9 @@
-import { type ChildProcess, spawn } from 'node:child_process';
+import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
     existsSync,
+    constants as fsConstants,
     linkSync,
     mkdirSync,
     readdirSync,
@@ -11,6 +13,7 @@ import {
     statSync,
     symlinkSync,
     unlinkSync,
+    utimesSync,
     writeFileSync,
 } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
@@ -319,6 +322,55 @@ process.disconnect();`;
 }
 
 describe('managed database lifecycle', () => {
+    it('reads and validates the current injected lifecycle namespace without a module reimport', () => {
+        const root = withGrantableTestDir('elepha-database-lifecycle-namespace-');
+        const symbol = Symbol.for('dev.elepha.internal.database-lifecycle-test-directory');
+        const globals = globalThis as Record<symbol, unknown>;
+        const previous = globals[symbol];
+        try {
+            for (const directory of [path.join(root, 'first'), path.join(root, 'second')]) {
+                globals[symbol] = directory;
+                expect(databaseLifecyclePaths(path.join(root, 'elepha.db')).directory).toBe(directory);
+            }
+            globals[symbol] = 'relative-lifecycle-directory';
+            expect(() => databaseLifecyclePaths(path.join(root, 'elepha.db'))).toThrow(
+                `${DATABASE_LIFECYCLE_AMBIGUOUS}: injected lifecycle test directory is invalid`,
+            );
+        } finally {
+            globals[symbol] = previous;
+        }
+    });
+
+    it('passes the current injected lifecycle namespace to exact-execPath children and grandchildren', () => {
+        const root = withGrantableTestDir('elepha-database-lifecycle-child-namespace-');
+        const symbol = Symbol.for('dev.elepha.internal.database-lifecycle-test-directory');
+        const globals = globalThis as Record<symbol, unknown>;
+        const previous = globals[symbol];
+        const directory = path.join(root, 'lifecycle');
+        const grandchildSource = `const { databaseLifecyclePaths } = await import(${JSON.stringify(lifecycleModule)});
+process.stdout.write(JSON.stringify(databaseLifecyclePaths('unused.db').directory));`;
+        const childSource = `import { spawnSync } from 'node:child_process';
+const { databaseLifecyclePaths } = await import(${JSON.stringify(lifecycleModule)});
+const grandchild = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', ${JSON.stringify(grandchildSource)}], {
+    encoding: 'utf8', timeout: 5000, env: process.env,
+});
+if (grandchild.status !== 0) throw new Error(grandchild.stderr);
+process.stdout.write(JSON.stringify({ child: databaseLifecyclePaths('unused.db').directory, grandchild: JSON.parse(grandchild.stdout) }));`;
+        try {
+            globals[symbol] = directory;
+            const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childSource], {
+                cwd: repositoryRoot,
+                encoding: 'utf8',
+                timeout: 10_000,
+                env: process.env,
+            });
+            expect(result.status, result.stderr).toBe(0);
+            expect(JSON.parse(result.stdout)).toEqual({ child: directory, grandchild: directory });
+        } finally {
+            globals[symbol] = previous;
+        }
+    });
+
     it.each([{ kind: 'shared' as const }, { kind: 'exclusive' as const }])(
         'rejects native Win32 before $kind lifecycle filesystem access',
         async ({ kind }) => {
@@ -797,6 +849,460 @@ setInterval(() => void database, 1000);`;
         const currentIdentity = statSync(fixture.dbPath);
         expect(currentIdentity.dev !== originalIdentity.dev || currentIdentity.ino !== originalIdentity.ino).toBe(true);
     });
+
+    it('rejects a genuine retired alias when clock rollback made its recorded ctime older than its unchanged birthtime', async () => {
+        const fixture = createTestDb('elepha-database-lifecycle-retired-clock-rollback-');
+        const replacement = createTestDb('elepha-database-lifecycle-retired-clock-rollback-replacement-');
+        fixture.close();
+        replacement.close();
+        const aliasPath = path.join(fixture.directory, 'retired.db');
+        linkSync(fixture.dbPath, aliasPath);
+        const original = statSync(aliasPath, { bigint: true });
+        const birthtime = 2_000_000_001n;
+        let ctime = 1_000_000_001n;
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalFstatSync = mutableFs.fstatSync;
+        mutableFs.fstatSync = ((descriptor, options) => {
+            const state = originalFstatSync(descriptor, options as never);
+            if (String(state.dev) !== String(original.dev) || String(state.ino) !== String(original.ino)) {
+                return state;
+            }
+            return new Proxy(state, {
+                get(target, property, receiver) {
+                    if (property === 'birthtimeNs') {
+                        return birthtime;
+                    }
+                    if (property === 'ctimeNs') {
+                        return ctime;
+                    }
+                    return Reflect.get(target, property, receiver);
+                },
+            });
+        }) as typeof import('node:fs').fstatSync;
+        syncBuiltinESMExports();
+
+        try {
+            const exclusive = await acquireExclusiveDatabaseLifecycle(fixture.dbPath);
+            renameSync(replacement.dbPath, fixture.dbPath);
+            exclusive.release();
+            const repointedPath = path.join(fixture.directory, 'repointed.db');
+            linkSync(aliasPath, repointedPath);
+            ctime = 3_000_000_001n;
+            await expect(
+                openManagedDatabase(repointedPath, { fileMustExist: true }).then((database) => {
+                    try {
+                        return database.prepare('SELECT 42 AS count').get();
+                    } finally {
+                        database.close();
+                    }
+                }),
+            ).rejects.toThrow(`${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${repointedPath}`);
+            const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+            if (platform === undefined) {
+                throw new Error('process.platform descriptor is unavailable');
+            }
+            try {
+                Object.defineProperty(process, 'platform', { value: 'linux' });
+                expect(() => acquireSharedDatabaseLifecycle(repointedPath)).toThrow(
+                    `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${repointedPath}`,
+                );
+            } finally {
+                Object.defineProperty(process, 'platform', platform);
+            }
+        } finally {
+            mutableFs.fstatSync = originalFstatSync;
+            syncBuiltinESMExports();
+        }
+    });
+
+    it.skipIf(process.platform !== 'darwin')('rejects a genuine retired alias after Darwin utimes changes its birthtime', async () => {
+        const fixture = createTestDb('elepha-database-lifecycle-retired-birthtime-change-');
+        const replacement = createTestDb('elepha-database-lifecycle-retired-birthtime-change-replacement-');
+        fixture.close();
+        replacement.close();
+        const aliasPath = path.join(fixture.directory, 'retired.db');
+        linkSync(fixture.dbPath, aliasPath);
+        const original = statSync(aliasPath, { bigint: true });
+        const exclusive = await acquireExclusiveDatabaseLifecycle(fixture.dbPath);
+        renameSync(replacement.dbPath, fixture.dbPath);
+        exclusive.release();
+        const earlierTime = new Date('2000-01-01T00:00:00.000Z');
+        utimesSync(aliasPath, earlierTime, earlierTime);
+        const changed = statSync(aliasPath, { bigint: true });
+        expect({ dev: changed.dev, ino: changed.ino }).toEqual({ dev: original.dev, ino: original.ino });
+        expect(changed.birthtimeNs).toBeLessThan(original.birthtimeNs);
+        await expect(openManagedDatabase(aliasPath, { fileMustExist: true })).rejects.toThrow(
+            `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${aliasPath}`,
+        );
+    });
+
+    it.each(['open', 'stat', 'close'] as const)(
+        'treats ancestor probe %s failure as unproven birthtime, not a database failure',
+        (failure) => {
+            const fixture = createTestDb('elepha-database-lifecycle-birthtime-probe-failure-');
+            fixture.close();
+            const identity = statSync(fixture.dbPath, { bigint: true });
+            const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+            const originalOpenSync = mutableFs.openSync;
+            const originalFstatSync = mutableFs.fstatSync;
+            const originalCloseSync = mutableFs.closeSync;
+            const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+            if (platform === undefined) {
+                throw new Error('process.platform descriptor is unavailable');
+            }
+            const retiredFile = path.join(
+                databaseLifecyclePaths(fixture.dbPath).retired,
+                `identity-${createHash('sha256').update(`${identity.dev}:${identity.ino}`).digest('hex')}`,
+            );
+            const previousRetired = existsSync(retiredFile) ? readFileSync(retiredFile) : undefined;
+            const probeDescriptors = new Set<number>();
+            let probeFailures = 0;
+            let failDatabaseInspection = false;
+            const probeError = Object.assign(new Error('forced ancestor probe failure'), { code: 'EACCES' });
+            const databaseError = Object.assign(new Error('forced database inspection failure'), { code: 'EACCES' });
+            mutableFs.openSync = ((filename, flags, mode) => {
+                const isProbe =
+                    filename === fixture.directory && typeof flags === 'number' && (flags & (fsConstants.O_DIRECTORY ?? 0)) !== 0;
+                if (isProbe && failure === 'open') {
+                    probeFailures++;
+                    throw probeError;
+                }
+                const descriptor = originalOpenSync(filename, flags, mode);
+                if (isProbe) probeDescriptors.add(descriptor);
+                return descriptor;
+            }) as typeof import('node:fs').openSync;
+            mutableFs.fstatSync = ((descriptor, options) => {
+                if (probeDescriptors.has(descriptor) && failure === 'stat') {
+                    probeFailures++;
+                    throw probeError;
+                }
+                const state = originalFstatSync(descriptor, options as never);
+                if (String(state.dev) !== String(identity.dev) || String(state.ino) !== String(identity.ino)) {
+                    return state;
+                }
+                if (failDatabaseInspection) throw databaseError;
+                return new Proxy(state, {
+                    get(target, property, receiver) {
+                        return property === 'birthtimeNs'
+                            ? Reflect.get(target, 'ctimeNs', receiver)
+                            : Reflect.get(target, property, receiver);
+                    },
+                });
+            }) as typeof import('node:fs').fstatSync;
+            mutableFs.closeSync = ((descriptor) => {
+                const isProbe = probeDescriptors.delete(descriptor);
+                originalCloseSync(descriptor);
+                if (isProbe && failure === 'close') {
+                    probeFailures++;
+                    throw probeError;
+                }
+            }) as typeof import('node:fs').closeSync;
+            syncBuiltinESMExports();
+            try {
+                Object.defineProperty(process, 'platform', { value: 'linux' });
+                if (previousRetired !== undefined) unlinkSync(retiredFile);
+                const ordinary = acquireSharedDatabaseLifecycle(fixture.dbPath);
+                ordinary.release();
+                expect(probeFailures).toBeGreaterThan(0);
+                expect([...probeDescriptors]).toEqual([]);
+                writeFileSync(
+                    retiredFile,
+                    JSON.stringify({
+                        version: 1,
+                        databaseIdentity: {
+                            exists: true,
+                            dev: String(identity.dev),
+                            ino: String(identity.ino),
+                            birthtimeNs: String(identity.ctimeNs - 1n),
+                            birthtimeProven: true,
+                        },
+                    }),
+                );
+                expect(() => acquireSharedDatabaseLifecycle(fixture.dbPath)).toThrow(
+                    `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${fixture.dbPath}`,
+                );
+                expect([...probeDescriptors]).toEqual([]);
+                failDatabaseInspection = true;
+                expect(() => acquireSharedDatabaseLifecycle(fixture.dbPath)).toThrow(databaseError);
+            } finally {
+                Object.defineProperty(process, 'platform', platform);
+                mutableFs.openSync = originalOpenSync;
+                mutableFs.fstatSync = originalFstatSync;
+                mutableFs.closeSync = originalCloseSync;
+                syncBuiltinESMExports();
+                for (const descriptor of probeDescriptors) originalCloseSync(descriptor);
+                if (previousRetired !== undefined) {
+                    writeFileSync(retiredFile, previousRetired);
+                } else if (existsSync(retiredFile)) {
+                    unlinkSync(retiredFile);
+                }
+            }
+        },
+    );
+
+    it.each(['same-device', 'fallback', 'other-device'] as const)(
+        'proves equal birthtime and ctime snapshots from Linux ancestors (%s)',
+        async (proof) => {
+            const supported = proof === 'same-device';
+            const fixture = createTestDb('elepha-database-lifecycle-equal-birthtime-');
+            const replacement = createTestDb('elepha-database-lifecycle-equal-birthtime-replacement-');
+            const fresh = createTestDb('elepha-database-lifecycle-equal-birthtime-fresh-');
+            fixture.close();
+            replacement.close();
+            fresh.close();
+            const aliasPath = path.join(fixture.directory, 'retired.db');
+            linkSync(fixture.dbPath, aliasPath);
+            const retiredIdentity = statSync(aliasPath, { bigint: true });
+            const freshIdentity = statSync(fresh.dbPath, { bigint: true });
+            let retiredCtime = 2_000_000_001n;
+            let ancestorSupport = proof !== 'fallback';
+            let matchingDevice = proof !== 'other-device';
+            const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+            const originalFstatSync = mutableFs.fstatSync;
+            const originalLstatSync = mutableFs.lstatSync;
+            const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+            if (platform === undefined) {
+                throw new Error('process.platform descriptor is unavailable');
+            }
+            const presentSnapshot = <T extends ReturnType<typeof statSync>>(state: T): T => {
+                if (state === undefined) {
+                    return state;
+                }
+                const isFresh = String(state.dev) === String(freshIdentity.dev) && String(state.ino) === String(freshIdentity.ino);
+                const isRetired = String(state.dev) === String(retiredIdentity.dev) && String(state.ino) === String(retiredIdentity.ino);
+                return new Proxy(state, {
+                    get(target, property, receiver) {
+                        if (state.isDirectory() && property === 'dev' && !matchingDevice) {
+                            return typeof state.dev === 'bigint' ? -1n : -1;
+                        }
+                        if (isFresh && (property === 'dev' || property === 'ino')) {
+                            return typeof target[property] === 'bigint' ? retiredIdentity[property] : Number(retiredIdentity[property]);
+                        }
+                        if (property === 'birthtimeNs') {
+                            if (isFresh) return 3_000_000_001n;
+                            if (isRetired) return 2_000_000_001n;
+                            if (state.isDirectory()) return ancestorSupport ? 1n : Reflect.get(target, 'ctimeNs', receiver);
+                        }
+                        if (property === 'ctimeNs') {
+                            if (isFresh) return 3_000_000_001n;
+                            if (isRetired) return retiredCtime;
+                        }
+                        return Reflect.get(target, property, receiver);
+                    },
+                });
+            };
+            mutableFs.fstatSync = ((descriptor, options) =>
+                presentSnapshot(originalFstatSync(descriptor, options as never))) as typeof import('node:fs').fstatSync;
+            mutableFs.lstatSync = ((filename, options) =>
+                presentSnapshot(originalLstatSync(filename, options as never))) as typeof import('node:fs').lstatSync;
+            syncBuiltinESMExports();
+            try {
+                Object.defineProperty(process, 'platform', { value: 'linux' });
+                const exclusive = await acquireExclusiveDatabaseLifecycle(fixture.dbPath);
+                renameSync(replacement.dbPath, fixture.dbPath);
+                exclusive.release();
+                const retiredFile = path.join(
+                    databaseLifecyclePaths(fixture.dbPath).retired,
+                    `identity-${createHash('sha256').update(`${retiredIdentity.dev}:${retiredIdentity.ino}`).digest('hex')}`,
+                );
+                const retiredBytes = readFileSync(retiredFile);
+                const retiredRecord = JSON.parse(retiredBytes.toString('utf8')) as {
+                    databaseIdentity: { birthtimeProven?: boolean };
+                };
+                expect(retiredRecord.databaseIdentity.birthtimeProven).toBe(supported);
+                retiredCtime = 4_000_000_001n;
+                expect(() => acquireSharedDatabaseLifecycle(aliasPath)).toThrow(
+                    `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${aliasPath}`,
+                );
+                if (supported) {
+                    try {
+                        writeFileSync(
+                            retiredFile,
+                            JSON.stringify({
+                                ...retiredRecord,
+                                databaseIdentity: { ...retiredRecord.databaseIdentity, birthtimeProven: 'true' },
+                            }),
+                        );
+                        expect(() => acquireSharedDatabaseLifecycle(fresh.dbPath)).toThrow(
+                            `${DATABASE_LIFECYCLE_AMBIGUOUS}: retired database identity is malformed: ${retiredFile}`,
+                        );
+                    } finally {
+                        writeFileSync(retiredFile, retiredBytes);
+                    }
+                    const lease = acquireSharedDatabaseLifecycle(fresh.dbPath);
+                    lease.release();
+                    if (platform.value === 'linux') {
+                        const opened = await openManagedDatabase(fresh.dbPath, { fileMustExist: true });
+                        try {
+                            expect(opened.prepare('SELECT 42 AS count').get()).toEqual({ count: 42 });
+                        } finally {
+                            opened.close();
+                        }
+                    }
+                } else {
+                    expect(() => acquireSharedDatabaseLifecycle(fresh.dbPath)).toThrow(
+                        `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${fresh.dbPath}`,
+                    );
+                    ancestorSupport = true;
+                    matchingDevice = true;
+                    expect(() => acquireSharedDatabaseLifecycle(fresh.dbPath)).toThrow(
+                        `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${fresh.dbPath}`,
+                    );
+                }
+            } finally {
+                Object.defineProperty(process, 'platform', platform);
+                mutableFs.fstatSync = originalFstatSync;
+                mutableFs.lstatSync = originalLstatSync;
+                syncBuiltinESMExports();
+            }
+        },
+    );
+
+    it.each(['forward', 'backward'] as const)(
+        'admits a new file generation reusing a retired device and inode on Linux with a %s clock, but rejects a repointed retired alias',
+        async (clock) => {
+            const fixture = createTestDb('elepha-database-lifecycle-inode-generation-');
+            const replacement = createTestDb('elepha-database-lifecycle-inode-generation-replacement-');
+            const fresh = createTestDb('elepha-database-lifecycle-inode-generation-fresh-');
+            fixture.close();
+            replacement.close();
+            fresh.close();
+            const aliasPath = path.join(fixture.directory, 'retired.db');
+            linkSync(fixture.dbPath, aliasPath);
+            const retiredIdentity = statSync(aliasPath, { bigint: true });
+            const freshIdentity = statSync(fresh.dbPath, { bigint: true });
+            const retirementPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+            if (retirementPlatform === undefined) {
+                throw new Error('process.platform descriptor is unavailable');
+            }
+            try {
+                Object.defineProperty(process, 'platform', { value: 'linux' });
+                const exclusive = await acquireExclusiveDatabaseLifecycle(fixture.dbPath);
+                renameSync(replacement.dbPath, fixture.dbPath);
+                exclusive.release();
+            } finally {
+                Object.defineProperty(process, 'platform', retirementPlatform);
+            }
+            const repointedPath = path.join(fresh.directory, 'repointed.db');
+            linkSync(aliasPath, repointedPath);
+
+            const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+            const originalFstatSync = mutableFs.fstatSync;
+            const originalLstatSync = mutableFs.lstatSync;
+            const laterBirthtime =
+                clock === 'forward' ? retiredIdentity.ctimeNs + 1_000_000_000n : retiredIdentity.birthtimeNs - 1_000_000_000n;
+            const laterCtime = laterBirthtime + 1_000_000n;
+            let birthtimeEvidence: 'supported' | 'zero' | 'ctime' = 'supported';
+            const presentGeneration = <T extends ReturnType<typeof statSync>>(state: T): T => {
+                if (state === undefined) {
+                    return state;
+                }
+                const isFresh = String(state.dev) === String(freshIdentity.dev) && String(state.ino) === String(freshIdentity.ino);
+                const isRetired = String(state.dev) === String(retiredIdentity.dev) && String(state.ino) === String(retiredIdentity.ino);
+                const isAncestor = state.isDirectory();
+                if (!isFresh && !isRetired && !isAncestor) {
+                    return state;
+                }
+                return new Proxy(state, {
+                    get(target, property, receiver) {
+                        if (isFresh && (property === 'dev' || property === 'ino')) {
+                            return typeof target[property] === 'bigint' ? retiredIdentity[property] : Number(retiredIdentity[property]);
+                        }
+                        if (isFresh && property === 'birthtimeNs') {
+                            return birthtimeEvidence === 'zero' ? 0n : birthtimeEvidence === 'ctime' ? laterCtime : laterBirthtime;
+                        }
+                        if (isAncestor && property === 'birthtimeNs' && birthtimeEvidence !== 'supported') {
+                            return birthtimeEvidence === 'zero' ? 0n : Reflect.get(target, 'ctimeNs', receiver);
+                        }
+                        if (!isAncestor && property === 'ctimeNs') {
+                            return laterCtime;
+                        }
+                        return Reflect.get(target, property, receiver);
+                    },
+                });
+            };
+            mutableFs.fstatSync = ((descriptor, options) =>
+                presentGeneration(originalFstatSync(descriptor, options as never))) as typeof import('node:fs').fstatSync;
+            mutableFs.lstatSync = ((filename, options) =>
+                presentGeneration(originalLstatSync(filename, options as never))) as typeof import('node:fs').lstatSync;
+            syncBuiltinESMExports();
+
+            const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+            if (platform === undefined) {
+                throw new Error('process.platform descriptor is unavailable');
+            }
+            try {
+                Object.defineProperty(process, 'platform', { value: 'linux' });
+                const retiredFile = path.join(
+                    databaseLifecyclePaths(fixture.dbPath).retired,
+                    `identity-${createHash('sha256').update(`${retiredIdentity.dev}:${retiredIdentity.ino}`).digest('hex')}`,
+                );
+                const retiredRecord = readFileSync(retiredFile);
+                const legacyIdentity = { exists: true, dev: String(retiredIdentity.dev), ino: String(retiredIdentity.ino) };
+                try {
+                    for (const databaseIdentity of [
+                        legacyIdentity,
+                        { ...legacyIdentity, ctimeNs: String(retiredIdentity.ctimeNs), birthtimeNs: '0' },
+                        { ...legacyIdentity, ctimeNs: String(retiredIdentity.ctimeNs), birthtimeNs: String(retiredIdentity.ctimeNs) },
+                    ]) {
+                        birthtimeEvidence = !('birthtimeNs' in databaseIdentity)
+                            ? 'supported'
+                            : databaseIdentity.birthtimeNs === '0'
+                              ? 'zero'
+                              : 'ctime';
+                        writeFileSync(retiredFile, `${JSON.stringify({ version: 1, databaseIdentity })}\n`);
+                        expect(() => acquireSharedDatabaseLifecycle(fresh.dbPath)).toThrow(
+                            `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${fresh.dbPath}`,
+                        );
+                    }
+                } finally {
+                    writeFileSync(retiredFile, retiredRecord);
+                    birthtimeEvidence = 'supported';
+                }
+                for (const evidence of ['zero', 'ctime'] as const) {
+                    birthtimeEvidence = evidence;
+                    expect(() => acquireSharedDatabaseLifecycle(fresh.dbPath)).toThrow(
+                        `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${fresh.dbPath}`,
+                    );
+                }
+                birthtimeEvidence = 'supported';
+                const freshLease = acquireSharedDatabaseLifecycle(fresh.dbPath);
+                freshLease.release();
+                if (platform.value === 'linux') {
+                    const reopened = await openManagedDatabase(fresh.dbPath, { fileMustExist: true });
+                    try {
+                        expect(reopened.prepare('SELECT count(*) AS count FROM sqlite_master').get()).toEqual({
+                            count: expect.any(Number),
+                        });
+                    } finally {
+                        reopened.close();
+                    }
+                } else {
+                    Object.defineProperty(process, 'platform', platform);
+                    await expect(openManagedDatabase(fresh.dbPath, { fileMustExist: true })).rejects.toThrow(
+                        `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${fresh.dbPath}`,
+                    );
+                    Object.defineProperty(process, 'platform', { value: 'linux' });
+                }
+                expect(() => acquireSharedDatabaseLifecycle(repointedPath)).toThrow(
+                    `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${repointedPath}`,
+                );
+                const reusedAliasPath = path.join(fresh.directory, 'reused.db');
+                linkSync(fresh.dbPath, reusedAliasPath);
+                const reusedExclusive = await acquireExclusiveDatabaseLifecycle(fresh.dbPath);
+                renameSync(fixture.dbPath, fresh.dbPath);
+                reusedExclusive.release();
+                expect(() => acquireSharedDatabaseLifecycle(reusedAliasPath)).toThrow(
+                    `${DATABASE_LIFECYCLE_AMBIGUOUS}: managed database path names a retired inode: ${reusedAliasPath}`,
+                );
+            } finally {
+                Object.defineProperty(process, 'platform', platform);
+                mutableFs.fstatSync = originalFstatSync;
+                mutableFs.lstatSync = originalLstatSync;
+                syncBuiltinESMExports();
+            }
+        },
+    );
 
     it('rejects a retired hard-link alias from a different physical directory', async () => {
         const fixture = createTestDb('elepha-database-lifecycle-cross-directory-');
