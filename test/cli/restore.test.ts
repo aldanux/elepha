@@ -32,10 +32,17 @@ import {
     RESTORE_TOMBSTONES_CHANGED_ERROR,
     runRestoreOperation,
 } from '../../src/cli/commands/restore.js';
-import { DATABASE_SCHEMA_METADATA_MAX_CHARS, DATABASE_SCHEMA_METADATA_MAX_ROWS } from '../../src/config/constants.js';
+import {
+    DATABASE_SCHEMA_METADATA_MAX_CHARS,
+    DATABASE_SCHEMA_METADATA_MAX_ROWS,
+    DURABLE_CAPTURE_FILTER_VERSION,
+} from '../../src/config/constants.js';
+import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { recordHookOutput } from '../../src/hooks/output.js';
 import { filterTurn } from '../../src/rendering/filtered-turn.js';
+import { detectShellSyntax } from '../../src/security/sanitize.js';
+import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { writeBackup } from '../../src/storage/backup.js';
 import {
@@ -57,10 +64,18 @@ import {
     writeEncryptedDatabaseImport,
 } from '../../src/storage/encrypted-database-export.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
-import { enableParanoidMode, isMemoryLocked, unlockMemory } from '../../src/storage/paranoid-gate.js';
-import { ProjectResolver } from '../../src/storage/project-resolver.js';
+import {
+    enableParanoidMode,
+    isMemoryLocked,
+    LOCKED_CONTENT_COVERAGE,
+    LOCKED_MEMORY_MESSAGE,
+    lockMemory,
+    unlockMemory,
+} from '../../src/storage/paranoid-gate.js';
+import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
+import { applyManualSplit, planManualSplit } from '../../src/storage/resegmentation.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
-import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
@@ -3064,6 +3079,495 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             restored.close();
         }
         expect(readFileSync(backup)).toEqual(legacyBytes);
+    });
+
+    it('C23 composes encrypted restore, current authority, inert capture, terminal eviction, and reopen', async () => {
+        const active = createTestDb('elepha-c23-active-');
+        const candidate = createTestDb('elepha-c23-candidate-');
+        const codexHome = path.join(active.directory, 'codex-home');
+        const sessionsRoot = path.join(codexHome, 'sessions');
+        const restoreProjectPath = path.join(active.directory, 'restore-project');
+        const purgeProjectPath = path.join(active.directory, 'purge-project');
+        const liveProjectPath = path.join(active.directory, 'live-project');
+        mkdirSync(sessionsRoot, { recursive: true });
+        mkdirSync(restoreProjectPath, { recursive: true });
+        mkdirSync(purgeProjectPath, { recursive: true });
+        mkdirSync(liveProjectPath, { recursive: true });
+        vi.stubEnv('CODEX_HOME', codexHome);
+
+        const sourceFor = (nativeId: string): string => {
+            const sourcePath = path.join(sessionsRoot, `${nativeId}.jsonl`);
+            writeFileSync(sourcePath, '{}\n');
+            return sourcePath;
+        };
+        const turn = (
+            nativeId: string,
+            sourcePath: string,
+            projectPath: string,
+            turnIndex: number,
+            userMessage: string,
+            assistantText: string,
+        ): ParsedTurn => ({
+            tool: 'codex',
+            sessionId: nativeId,
+            sourcePath,
+            projectPath,
+            turnIndex,
+            startedAt: `2026-09-06T10:0${turnIndex}:00.000Z`,
+            endedAt: `2026-09-06T10:0${turnIndex}:01.000Z`,
+            userMessage,
+            assistantText,
+            toolCalls: [{ name: `\n&& c23-tool-${turnIndex}\u009b`, filePaths: [path.join(projectPath, `file-${turnIndex}.ts`)] }],
+            cursor: `${turnIndex + 1}`,
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        });
+        const adapterForTurns = (turns: ParsedTurn[]): SessionAdapter => ({
+            tool: 'codex',
+            watchGlobs: ['*.jsonl'],
+            matches: () => true,
+            nativeSessionId: (filePath) => path.basename(filePath, '.jsonl'),
+            classifySession: async () => ({ kind: 'primary' }),
+            classifyEmptySession: async () => undefined,
+            async *parseTurns() {
+                for (const parsed of turns) yield parsed;
+            },
+        });
+        type IntegratedDaemon = {
+            persistTurn(adapter: SessionAdapter, parsed: ParsedTurn): Promise<boolean>;
+            backfillDurableCapture(): Promise<void>;
+        };
+        const daemonWith = (store: MemoryStore, adapter: SessionAdapter, maxBytes: number): IntegratedDaemon =>
+            new IngestionDaemon({
+                store,
+                adapters: [adapter],
+                watchRoots: [],
+                readConfig: () => ({
+                    config: { ...DEFAULT_MEMORY_CONFIG, durableCapture: true, durableCaptureMaxBytes: maxBytes },
+                }),
+            }) as unknown as IntegratedDaemon;
+
+        const activeRestoreProject = seedProject(active, { path: restoreProjectPath });
+        const activeTerminal = seedSession(active, {
+            project: activeRestoreProject,
+            nativeId: 'c23-terminal',
+            sourcePath: sourceFor('c23-terminal'),
+        });
+        seedMemory(active, { project: activeRestoreProject, session: activeTerminal });
+        active.store.consent.grant(restoreProjectPath);
+        const activePurgeProject = seedProject(active, { path: purgeProjectPath });
+        const activePurge = seedSession(active, {
+            project: activePurgeProject,
+            nativeId: 'c23-purged',
+            sourcePath: sourceFor('c23-purged'),
+        });
+        seedMemory(active, { project: activePurgeProject, session: activePurge });
+
+        const candidateRestoreProject = seedProject(candidate, { path: restoreProjectPath });
+        const candidatePurgeProject = seedProject(candidate, { path: purgeProjectPath });
+        candidate.store.consent.grant(restoreProjectPath);
+        const legacySource = sourceFor('c23-legacy');
+        const candidateLegacy = seedSession(candidate, {
+            project: candidateRestoreProject,
+            nativeId: 'c23-legacy',
+            sourcePath: legacySource,
+        });
+        const legacyMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateLegacy });
+        const candidateTerminal = seedSession(candidate, {
+            project: candidateRestoreProject,
+            nativeId: activeTerminal.native_id,
+            sourcePath: activeTerminal.source_path,
+        });
+        const terminalMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateTerminal });
+        const candidatePurge = seedSession(candidate, {
+            project: candidatePurgeProject,
+            nativeId: activePurge.native_id,
+            sourcePath: activePurge.source_path,
+        });
+        const purgeMemory = seedMemory(candidate, { project: candidatePurgeProject, session: candidatePurge });
+        const candidateIncognito = seedSession(candidate, {
+            project: candidateRestoreProject,
+            nativeId: 'c23-incognito',
+            sourcePath: sourceFor('c23-incognito'),
+        });
+        const incognitoMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateIncognito });
+        const candidateOrphan = seedSession(candidate, {
+            project: candidateRestoreProject,
+            nativeId: 'c23-orphan',
+            sourcePath: sourceFor('c23-orphan'),
+        });
+        const orphanMemory = seedMemory(candidate, { project: candidateRestoreProject, session: candidateOrphan });
+        const legacyTaint = `\n|| c23legacytaintneedle \u0085\u009b`;
+        const insertFiltered = candidate.db.prepare(
+            `INSERT INTO filtered_turns
+             (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
+              dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+             VALUES (?, 1, ?, ?, ?, 0, 0, 0, ?, '2026-09-01T00:00:00.000Z')`,
+        );
+        insertFiltered.run(legacyMemory.id, legacyTaint, `\t&& legacy-response\u009f`, JSON.stringify([{ name: legacyTaint }]), 1);
+        insertFiltered.run(terminalMemory.id, 'c23terminalresurrectionneedle', '', '[]', 1);
+        insertFiltered.run(purgeMemory.id, 'c23purgeresurrectionneedle', '', '[]', 1);
+        insertFiltered.run(incognitoMemory.id, 'c23incognitoresurrectionneedle', '', '[]', 1);
+        insertFiltered.run(orphanMemory.id, 'c23staleorphanneedle', '', '[]', 1);
+        candidate.db
+            .prepare('UPDATE memories SET decisions = ?, pending_items = ? WHERE id = ?')
+            .run(JSON.stringify([{ what: legacyTaint, why: `\t&& legacy-why\u0080` }]), JSON.stringify([legacyTaint]), legacyMemory.id);
+        candidate.db
+            .prepare(
+                `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+                 VALUES (?, 'complete', ?, '2026-09-01T00:00:00.000Z')`,
+            )
+            .run(candidateTerminal.id, DURABLE_CAPTURE_FILTER_VERSION);
+        candidate.store.recordInjection({
+            tool: 'codex',
+            nativeSessionId: 'c23-hook-chat',
+            injectedAt: '2026-09-01T00:00:00.000Z',
+            injectionId: 'c23-forged-injection',
+            body: 'forged candidate hook output',
+        });
+        candidate.db
+            .prepare("INSERT INTO purged_transcripts VALUES ('codex', 'c23-candidate-old-purge', '2026-09-01T00:00:00.000Z')")
+            .run();
+        candidate.db
+            .prepare("INSERT INTO incognito_transcripts VALUES ('codex', 'c23-candidate-old-incognito', '2026-09-01T00:00:00.000Z')")
+            .run();
+        candidate.db
+            .prepare(
+                "UPDATE paranoid_authority SET enrolled = 1, state = 'locked', generation = 1, credential_tag = 'forged-candidate-gate' WHERE id = 1",
+            )
+            .run();
+        candidate.db.pragma('wal_checkpoint(TRUNCATE)');
+        candidate.close();
+        const stale = new Database(candidate.dbPath);
+        stale.exec(`
+            DROP TRIGGER filtered_turns_ad;
+            DROP TRIGGER filtered_turns_usage_ad;
+            DELETE FROM filtered_turns WHERE memory_id = ${orphanMemory.id};
+            UPDATE durable_capture_usage SET total_bytes = 424242 WHERE id = 1;
+        `);
+        stale.close();
+        const recreateMaintenance = openUnmanagedDb(candidate.dbPath);
+        recreateMaintenance.close();
+        const candidateBytes = readFileSync(candidate.dbPath);
+        expect(candidateBytes.subarray(0, 16).toString('binary')).toBe('SQLite format 3\0');
+
+        active.db.pragma('wal_checkpoint(TRUNCATE)');
+        active.close();
+        const encryption = encryptionRuntime();
+        await encryptDatabase(active.dbPath, encryption);
+        const gated = await openDb(active.dbPath, { encryption });
+        enableParanoidMode(gated, 'c23 active passphrase');
+        expect(lockMemory(gated)).toBe('locked');
+        expect(isMemoryLocked(gated)).toBe(true);
+        expect(unlockMemory(gated, 'c23 active passphrase')).toBe('unlocked');
+        gated.close();
+        const metadataBefore = readEncryptionMetadata(encryptionMetadataPath(active.dbPath));
+        const keyPath = encryption.keyFilePath!(active.dbPath);
+        const keyBefore = readFileSync(keyPath);
+        const restoreTemp = withGrantableTestDir('elepha-c23-restore-temp-');
+        vi.stubEnv('TMPDIR', restoreTemp);
+        const writeSnapshot = vi.fn(writeBackup);
+        const currentHookBody = 'current c23 hook output survives restore';
+        let authorityAfterRace: unknown;
+        let activeBytesAfterRace!: Buffer;
+
+        await expect(
+            runRestoreOperation(candidate.dbPath, {
+                dbPath: active.dbPath,
+                encryption,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                writeBackup: writeSnapshot,
+                confirm: async () => {
+                    const current = await openDb(active.dbPath, { encryption });
+                    const currentStore = new MemoryStore(current);
+                    currentStore.consent.revoke(restoreProjectPath);
+                    currentStore.purge({ projectIds: [activePurgeProject.id] }, '2026-09-06T11:00:00.000Z');
+                    currentStore.recordIncognitoTranscript('codex', candidateIncognito.native_id);
+                    recordHookOutput({
+                        store: currentStore,
+                        tool: 'codex',
+                        nativeSessionId: 'c23-hook-chat',
+                        body: currentHookBody,
+                        kind: 'brief',
+                        injectedAt: '2026-09-06T11:01:00.000Z',
+                    });
+                    current
+                        .prepare(
+                            `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+                             VALUES (?, 'evicted', ?, '2026-09-06T11:02:00.000Z')
+                             ON CONFLICT (session_id) DO UPDATE SET state = 'evicted', updated_at = excluded.updated_at`,
+                        )
+                        .run(activeTerminal.id, DURABLE_CAPTURE_FILTER_VERSION);
+                    expect(lockMemory(current)).toBe('locked');
+                    authorityAfterRace = current
+                        .prepare('SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1')
+                        .get();
+                    current.pragma('wal_checkpoint(TRUNCATE)');
+                    current.close();
+                    activeBytesAfterRace = readFileSync(active.dbPath);
+                    return true;
+                },
+            }),
+        ).rejects.toThrow(RESTORE_TOMBSTONES_CHANGED_ERROR);
+        expect(writeSnapshot).not.toHaveBeenCalled();
+        expect(readFileSync(active.dbPath)).toEqual(activeBytesAfterRace);
+
+        const preRestoreIdentity = statSync(active.dbPath);
+        let competingOpener: Database.Database | undefined;
+        let intentWatcher: Promise<void> | undefined;
+        let lifecycleIntentObserved = false;
+        let restoredResult!: Awaited<ReturnType<typeof runRestoreOperation>>;
+        try {
+            restoredResult = await runRestoreOperation(candidate.dbPath, {
+                dbPath: active.dbPath,
+                encryption,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                confirm: async () => {
+                    competingOpener = await openManagedDatabase(active.dbPath, { readonly: true, fileMustExist: true, encryption });
+                    intentWatcher = (async () => {
+                        try {
+                            for (let attempts = 0; attempts < 1_000 && !hasLifecycleIntent(active.dbPath); attempts += 1) {
+                                await new Promise((resolve) => setTimeout(resolve, 5));
+                            }
+                            expect(competingOpener).toBeDefined();
+                            expect(hasLifecycleIntent(active.dbPath)).toBe(true);
+                            expect(statSync(active.dbPath)).toMatchObject({ dev: preRestoreIdentity.dev, ino: preRestoreIdentity.ino });
+                            lifecycleIntentObserved = true;
+                        } finally {
+                            competingOpener?.close();
+                            competingOpener = undefined;
+                        }
+                    })();
+                    return true;
+                },
+            });
+        } finally {
+            try {
+                await intentWatcher;
+            } finally {
+                competingOpener?.close();
+            }
+        }
+        expect(lifecycleIntentObserved).toBe(true);
+        expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
+
+        const restored = await openDb(active.dbPath, { encryption });
+        const restoredStore = new MemoryStore(restored, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        expect(isMemoryLocked(restored)).toBe(true);
+        expect(restored.prepare('SELECT enrolled, state, generation, credential_tag FROM paranoid_authority WHERE id = 1').get()).toEqual(
+            authorityAfterRace,
+        );
+        expect(restoredStore.consent.consentState(restoreProjectPath)).toBe('denied');
+        expect(
+            restored
+                .prepare(
+                    "SELECT native_id FROM purged_transcripts WHERE native_id IN ('c23-candidate-old-purge', 'c23-purged') ORDER BY native_id",
+                )
+                .all(),
+        ).toEqual([{ native_id: 'c23-candidate-old-purge' }, { native_id: 'c23-purged' }]);
+        expect(
+            restored
+                .prepare(
+                    "SELECT native_id FROM incognito_transcripts WHERE native_id IN ('c23-candidate-old-incognito', 'c23-incognito') ORDER BY native_id",
+                )
+                .all(),
+        ).toEqual([{ native_id: 'c23-candidate-old-incognito' }, { native_id: 'c23-incognito' }]);
+        expect(restored.prepare('SELECT body FROM injections ORDER BY body').all()).toEqual([{ body: currentHookBody }]);
+        expect(
+            restored
+                .prepare(
+                    `SELECT d.state
+                     FROM durable_capture_status d
+                     JOIN sessions s ON s.id = d.session_id
+                     WHERE s.tool = 'codex' AND s.native_id = 'c23-terminal'`,
+                )
+                .get(),
+        ).toEqual({ state: 'evicted' });
+        expect(
+            restored
+                .prepare(
+                    `SELECT ft.memory_id
+                     FROM filtered_turns ft
+                     JOIN memories m ON m.id = ft.memory_id
+                     JOIN sessions s ON s.id = m.session_id
+                     WHERE s.native_id IN ('c23-terminal', 'c23-purged', 'c23-incognito')`,
+                )
+                .all(),
+        ).toEqual([]);
+        expect(
+            restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c23staleorphanneedle'").all(),
+        ).toEqual([]);
+        expect(
+            restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE rowid NOT IN (SELECT memory_id FROM filtered_turns)').all(),
+        ).toEqual([]);
+        const restoredLegacy = restored
+            .prepare(
+                `SELECT ft.user_prompt, ft.assistant_response, ft.tool_calls, m.decisions, m.pending_items
+                 FROM filtered_turns ft
+                 JOIN memories m ON m.id = ft.memory_id
+                 JOIN sessions s ON s.id = m.session_id
+                 WHERE s.native_id = 'c23-legacy'`,
+            )
+            .get() as Record<string, string>;
+        for (const value of Object.values(restoredLegacy)) {
+            expect(detectShellSyntax(value)).toBe(false);
+            expect(value).not.toMatch(/[\u0080-\u009f]/u);
+        }
+        const measuredUsage = () =>
+            restored
+                .prepare(
+                    `SELECT COALESCE(SUM(
+                         length(CAST(user_prompt AS BLOB)) +
+                         length(CAST(assistant_response AS BLOB)) +
+                         length(CAST(tool_calls AS BLOB))
+                     ), 0) AS total_bytes
+                     FROM filtered_turns`,
+                )
+                .get();
+        expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual(measuredUsage());
+        const restoredProject = restored.prepare('SELECT id FROM projects WHERE path = ?').get(restoreProjectPath) as { id: number };
+        const projectSet: ProjectSet = {
+            key: 'c23-restored',
+            displayName: 'c23 restored',
+            paths: [restoreProjectPath],
+            projectIds: [restoredProject.id],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const lockedReader = new SessionReader(restored);
+        expect(lockedReader.sessionsFor(projectSet)).toEqual([]);
+        const lockedQuery = tokenizeRecallQuery('c23legacytaintneedle');
+        if (!lockedQuery) throw new Error('C23 locked query unexpectedly empty');
+        await expect(lexicalRecall(lockedReader, [projectSet], lockedQuery, 'here', undefined, undefined, 'strict')).resolves.toEqual({
+            body: LOCKED_MEMORY_MESSAGE,
+            state: 'locked',
+            sessionIds: [],
+            content_coverage: LOCKED_CONTENT_COVERAGE,
+        });
+
+        restoredStore.consent.grant(liveProjectPath);
+        const liveTaint = `\n&& c23livetaintneedle \u0085\u009b`;
+        const liveSource = sourceFor('c23-live-taint');
+        const liveTurn = turn('c23-live-taint', liveSource, liveProjectPath, 0, liveTaint, `\n|| live response\u0080`);
+        const restoredQuoteSource = sourceFor('c23-hook-chat');
+        const restoredQuote = turn('c23-hook-chat', restoredQuoteSource, liveProjectPath, 0, 'quote follows', currentHookBody);
+        restoredQuote.startedAt = '2026-09-06T11:00:00.000Z';
+        restoredQuote.endedAt = '2026-09-06T11:02:00.000Z';
+        const liveAdapter = adapterForTurns([]);
+        const liveDaemon = daemonWith(restoredStore, liveAdapter, 1_000_000);
+        await expect(liveDaemon.persistTurn(liveAdapter, liveTurn)).resolves.toBe(true);
+        await expect(liveDaemon.persistTurn(liveAdapter, restoredQuote)).resolves.toBe(false);
+        expect(restoredStore.findSession('codex', 'c23-hook-chat')).toBeUndefined();
+
+        const backfillSource = sourceFor('c23-backfill');
+        const backfillSession = restoredStore.upsertSession(
+            'codex',
+            'c23-backfill',
+            restoredStore.upsertProject(liveProjectPath).id,
+            backfillSource,
+        );
+        const backfillTaint = turn('c23-backfill', backfillSource, liveProjectPath, 0, `\n|| c23backfilltaintneedle\u009b`, 'backfill');
+        const backfillQuoteBody = 'c23 backfill hook output must not be copied';
+        const backfillQuote = turn('c23-backfill', backfillSource, liveProjectPath, 1, 'quote follows', backfillQuoteBody);
+        restoredStore.recordTurn(backfillTaint, backfillSession.id, backfillSession.project_id, {
+            decisions: [],
+            pending_items: [],
+            status: 'ok',
+        });
+        restoredStore.recordTurn(backfillQuote, backfillSession.id, backfillSession.project_id, {
+            decisions: [],
+            pending_items: [],
+            status: 'ok',
+        });
+        restoredStore.recordInjection({
+            tool: 'codex',
+            nativeSessionId: backfillSession.native_id,
+            injectedAt: '2026-09-06T10:01:00.500Z',
+            injectionId: 'c23-backfill-injection',
+            body: backfillQuoteBody,
+        });
+        const backfillAdapter = adapterForTurns([backfillTaint, backfillQuote]);
+        await daemonWith(restoredStore, backfillAdapter, 1_000_000).backfillDurableCapture();
+        const capturedBeforeCap = restored
+            .prepare(
+                `SELECT s.native_id, m.turn_index, ft.user_prompt, ft.assistant_response, ft.tool_calls
+                 FROM filtered_turns ft
+                 JOIN memories m ON m.id = ft.memory_id
+                 JOIN sessions s ON s.id = m.session_id
+                 WHERE s.native_id IN ('c23-live-taint', 'c23-backfill')
+                 ORDER BY s.native_id, m.turn_index`,
+            )
+            .all() as Array<Record<string, string | number>>;
+        expect(capturedBeforeCap.map(({ native_id, turn_index }) => ({ native_id, turn_index }))).toEqual([
+            { native_id: 'c23-backfill', turn_index: 0 },
+            { native_id: 'c23-live-taint', turn_index: 0 },
+        ]);
+        for (const row of capturedBeforeCap) {
+            for (const value of [row.user_prompt, row.assistant_response, row.tool_calls]) {
+                expect(detectShellSyntax(String(value))).toBe(false);
+                expect(String(value)).not.toMatch(/[\u0080-\u009f]/u);
+            }
+        }
+        expect(JSON.stringify(capturedBeforeCap)).not.toContain(currentHookBody);
+        expect(JSON.stringify(capturedBeforeCap)).not.toContain(backfillQuoteBody);
+
+        const capSource = sourceFor('c23-cap-session');
+        const capTurns = [
+            turn('c23-cap-session', capSource, liveProjectPath, 0, 'c23capevictionneedle zero', 'response zero'),
+            turn('c23-cap-session', capSource, liveProjectPath, 1, 'c23capevictionneedle one', 'response one'),
+        ];
+        const capAdapter = adapterForTurns(capTurns);
+        const capDaemon = daemonWith(restoredStore, capAdapter, 1);
+        await expect(capDaemon.persistTurn(capAdapter, capTurns[0]!)).resolves.toBe(true);
+        await expect(capDaemon.persistTurn(capAdapter, capTurns[1]!)).resolves.toBe(true);
+        const capSession = restoredStore.findSession('codex', 'c23-cap-session');
+        if (!capSession) throw new Error('C23 cap session was not recorded');
+        const adapters = { codex: capAdapter, 'claude-code': capAdapter } as Record<ToolName, SessionAdapter>;
+        const split = await planManualSplit(restored, adapters, capSession.id, 1);
+        applyManualSplit(restored, split);
+        await capDaemon.backfillDurableCapture();
+        expect(
+            restored
+                .prepare(
+                    `SELECT s.segment_index, d.state
+                     FROM sessions s
+                     JOIN durable_capture_status d ON d.session_id = s.id
+                     WHERE s.native_id = 'c23-cap-session'
+                     ORDER BY s.segment_index`,
+                )
+                .all(),
+        ).toEqual([
+            { segment_index: 0, state: 'evicted' },
+            { segment_index: 1, state: 'evicted' },
+        ]);
+        expect(
+            restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'c23capevictionneedle'").all(),
+        ).toEqual([]);
+        expect(
+            restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE rowid NOT IN (SELECT memory_id FROM filtered_turns)').all(),
+        ).toEqual([]);
+        expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual(measuredUsage());
+        expect((measuredUsage() as { total_bytes: number }).total_bytes).toBeLessThanOrEqual(1);
+
+        const encryptedExport = path.join(active.directory, 'c23-full-export.db');
+        exportAll(restored, encryptedExport, FIXED_KEY);
+        restored.close();
+        expect(readFileSync(active.dbPath).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        expect(readFileSync(encryptedExport).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        expect(readFileSync(restoredResult.snapshotPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        const exported = openKeyedDatabase(encryptedExport, FIXED_KEY, { readonly: true, fileMustExist: true });
+        expect(exported.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+        exported.close();
+        const reopened = await openDb(active.dbPath, { encryption });
+        expect(isMemoryLocked(reopened)).toBe(true);
+        expect(reopened.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
+        reopened.close();
+        await expect(migratePrimaryDatabaseToEncrypted(active.dbPath, migrationRuntime(active.directory))).resolves.toEqual({
+            status: 'already-encrypted',
+        });
+        expect(readEncryptionMetadata(encryptionMetadataPath(active.dbPath))).toEqual(metadataBefore);
+        expect(readFileSync(keyPath)).toEqual(keyBefore);
+        expect(readFileSync(candidate.dbPath)).toEqual(candidateBytes);
     });
 
     it('leaves the database untouched when a TTY declines confirmation', () => {
