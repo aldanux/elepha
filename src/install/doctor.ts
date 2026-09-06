@@ -3,6 +3,7 @@ import { elephaInstallTransactionPath } from '../config/paths.js';
 import { terminalHandoff } from '../markers.js';
 import { TOOL_METADATA } from '../types/index.js';
 import { errorMessage } from '../util/error.js';
+import { waitForHealthyHeartbeatAsync } from './daemon-health.js';
 import {
     type DaemonHealth,
     daemonHealth,
@@ -11,7 +12,7 @@ import {
     type LauncherHealth,
     managedLauncherHealth,
 } from './health-checks.js';
-import { reconcileCaptureService, type ServiceBackend, serviceBackend } from './service-backend.js';
+import { reconcileCaptureServiceAsync, type ServiceBackend, serviceBackend } from './service-backend.js';
 
 export interface DoctorRuntime {
     approvedRoots: number;
@@ -21,7 +22,11 @@ export interface DoctorRuntime {
     inspectDatabase?: () => void;
     inspectLauncher?: () => LauncherHealth;
     inspectInstallRecovery?: () => boolean;
-    reconcile?: (service: ServiceBackend, approvedRoots: number) => 'not installed' | 'awaiting consent' | 'active';
+    reconcile?: (
+        service: ServiceBackend,
+        approvedRoots: number,
+    ) => 'not installed' | 'awaiting consent' | 'active' | Promise<'not installed' | 'awaiting consent' | 'active'>;
+    waitForHealthy?: (service: ServiceBackend) => boolean | Promise<boolean>;
 }
 
 export interface DoctorResult {
@@ -42,8 +47,8 @@ function addNextStep(nextSteps: string[], line: string): void {
 
 // Read every recovery prerequisite, repairing only a non-healthy managed daemon.
 // The injected seams make the service lifecycle deterministic in unit tests.
-export function runDoctor(runtime: DoctorRuntime): DoctorResult;
-export function runDoctor(runtime: DoctorRuntime = missingApprovedRoots()): DoctorResult {
+export function runDoctor(runtime: DoctorRuntime): Promise<DoctorResult>;
+export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots()): Promise<DoctorResult> {
     const lines: string[] = [];
     const repairLines: string[] = [];
     const nextSteps: string[] = [];
@@ -53,7 +58,8 @@ export function runDoctor(runtime: DoctorRuntime = missingApprovedRoots()): Doct
     const inspectLauncher = runtime.inspectLauncher ?? managedLauncherHealth;
     const inspectInstallRecovery = runtime.inspectInstallRecovery ?? (() => existsSync(elephaInstallTransactionPath()));
     const service = runtime.service ?? serviceBackend();
-    const reconcile = runtime.reconcile ?? reconcileCaptureService;
+    const reconcile = runtime.reconcile ?? reconcileCaptureServiceAsync;
+    const waitForHealthy = runtime.waitForHealthy ?? ((target: ServiceBackend) => waitForHealthyHeartbeatAsync(() => target.healthy()));
 
     let installRecoveryOk = true;
     try {
@@ -99,7 +105,7 @@ export function runDoctor(runtime: DoctorRuntime = missingApprovedRoots()): Doct
             const installHandOff = terminalHandoff('install');
             try {
                 service.stop();
-                const reconciled = reconcile(service, approvedRoots);
+                const reconciled = await reconcile(service, approvedRoots);
                 if (reconciled === 'not installed') {
                     daemonOk = false;
                     repairLines.push('✗ Daemon repair: managed daemon service is not installed');
@@ -107,7 +113,7 @@ export function runDoctor(runtime: DoctorRuntime = missingApprovedRoots()): Doct
                 } else if (reconciled === 'awaiting consent') {
                     daemonOk = false;
                     repairLines.push('✗ Daemon repair: capture is awaiting consent');
-                } else if (!service.waitForHealthy()) {
+                } else if (!(await waitForHealthy(service))) {
                     daemonOk = false;
                     repairLines.push('✗ Daemon repair: restart did not produce a healthy heartbeat');
                     addNextStep(nextSteps, installHandOff);

@@ -1,4 +1,5 @@
 import { launchctl } from '../security/subprocess-allowlist.js';
+import { type AsyncDaemonHealthCheckRuntime, waitForHealthyHeartbeatAsync } from './daemon-health.js';
 import { defaultLaunchdServicePaths, LaunchdBackend } from './launchd-backend.js';
 import type { LauncherBackend } from './launcher.js';
 import { defaultSystemdServicePaths, SystemdBackend } from './systemd-backend.js';
@@ -54,7 +55,9 @@ export function serviceBackend(options: ServiceBackendOptions = {}): ServiceBack
 }
 
 // Called after consent mutations; an absent service is intentionally a no-op.
-export function reconcileCaptureService(service: ServiceBackend, approvedRoots: number): 'not installed' | 'awaiting consent' | 'active' {
+type ReconcileStatus = 'not installed' | 'awaiting consent' | 'active';
+
+function prepareCaptureService(service: ServiceBackend, approvedRoots: number): ReconcileStatus {
     if (!service.isInstalled()) {
         return 'not installed';
     }
@@ -65,7 +68,30 @@ export function reconcileCaptureService(service: ServiceBackend, approvedRoots: 
     }
     service.enable();
     service.start();
+    return 'active';
+}
+
+export function reconcileCaptureService(service: ServiceBackend, approvedRoots: number): ReconcileStatus {
+    const status = prepareCaptureService(service, approvedRoots);
+    if (status !== 'active') {
+        return status;
+    }
     if (!service.waitForHealthy()) {
+        throw service.healthFailure();
+    }
+    return 'active';
+}
+
+export async function reconcileCaptureServiceAsync(
+    service: ServiceBackend,
+    approvedRoots: number,
+    healthCheck?: AsyncDaemonHealthCheckRuntime,
+): Promise<ReconcileStatus> {
+    const status = prepareCaptureService(service, approvedRoots);
+    if (status !== 'active') {
+        return status;
+    }
+    if (!(await waitForHealthyHeartbeatAsync(() => service.healthy(), healthCheck))) {
         throw service.healthFailure();
     }
     return 'active';

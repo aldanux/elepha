@@ -14,6 +14,7 @@ export interface LauncherProbeFailure {
     declaredBin: unknown;
     packageRoot: string;
     minimum: string;
+    requiredMinimum?: string;
 }
 
 export type LauncherProbeResult = { passes: true } | { passes: false; failure: LauncherProbeFailure };
@@ -32,9 +33,18 @@ function failed(
 }
 
 export function formatLauncherProbeFailure(failure: LauncherProbeFailure): string {
-    const validMinimum = /^\d+\.\d+\.\d+$/.test(failure.minimum);
-    const expectedEngine = validMinimum ? `>=${failure.minimum}` : 'canonical >=N.N.N';
-    const expectedNodeVersion = validMinimum ? `>=${failure.minimum}` : 'semantic version';
+    const semanticMinimum = /^\d+\.\d+\.\d+$/.test(failure.minimum);
+    const legacyMajor = /^[1-9]\d*$/.test(failure.minimum);
+    const expectedEngine = semanticMinimum
+        ? `>=${failure.minimum}`
+        : legacyMajor
+          ? `canonical >=${failure.minimum}.N.N`
+          : 'canonical >=N.N.N';
+    const expectedNodeVersion = failure.requiredMinimum
+        ? `>=${failure.requiredMinimum}`
+        : semanticMinimum
+          ? `>=${failure.minimum}`
+          : 'semantic version';
     return [
         `launcher probe failed: ${failure.check}`,
         `expected: ${failure.expected}`,
@@ -51,18 +61,21 @@ export function formatLauncherProbeFailure(failure: LauncherProbeFailure): strin
 // The launcher verifies that the currently running package is elepha and the
 // selected Node version can run it. The launcher separately owns Node discovery.
 export function launcherProbe(minimum: string): LauncherProbeResult {
-    const expected = `>=${minimum}`;
     const execPath = process.execPath;
     const nodeVersion = process.versions.node;
     let packageRoot = 'unresolved';
     let packageName: unknown;
     let enginesNode: unknown;
     let declaredBin: unknown;
-    const details = () => ({ packageName, enginesNode, nodeVersion, execPath, declaredBin, packageRoot, minimum });
+    let requiredMinimum: string | undefined;
+    const details = () => ({ packageName, enginesNode, nodeVersion, execPath, declaredBin, packageRoot, minimum, requiredMinimum });
     try {
-        const minimumParts = /^\d+\.\d+\.\d+$/.test(minimum) ? minimum.split('.').map(Number) : undefined;
-        if (!minimumParts) {
-            return failed('minimum version', 'semantic version', minimum, details());
+        const semanticMinimum = /^\d+\.\d+\.\d+$/.test(minimum) ? minimum : undefined;
+        // 0.3.x launchers supplied only the major. The installed package's
+        // canonical engine floor still owns the complete Node version check.
+        const legacyMinimumMajor = /^[1-9]\d*$/.test(minimum) ? Number(minimum) : undefined;
+        if (!semanticMinimum && legacyMinimumMajor === undefined) {
+            return failed('minimum version', 'semantic version or legacy major', minimum, details());
         }
         // URL.pathname leaves percent escapes intact, including Herd's
         // "Application Support" path. Convert the URL before deriving paths.
@@ -83,16 +96,23 @@ export function launcherProbe(minimum: string): LauncherProbeResult {
         if (packageName !== 'elepha') {
             return failed('package name', '"elepha"', value(packageName), details());
         }
-        if (enginesNode !== expected) {
+        const engineMatch = typeof enginesNode === 'string' ? /^>=(\d+\.\d+\.\d+)$/.exec(enginesNode) : null;
+        if (!engineMatch) {
+            return failed('engines.node', 'canonical >=N.N.N', value(enginesNode), details());
+        }
+        requiredMinimum = engineMatch[1];
+        if (semanticMinimum ? requiredMinimum !== semanticMinimum : Number(requiredMinimum.split('.')[0]) !== legacyMinimumMajor) {
+            const expected = semanticMinimum ? `>=${semanticMinimum}` : `canonical >=${legacyMinimumMajor}.N.N`;
             return failed('engines.node', expected, value(enginesNode), details());
         }
+        const minimumParts = requiredMinimum.split('.').map(Number);
         const nodeParts = nodeVersion.split('.').map(Number);
         if (
             nodeParts[0] < minimumParts[0] ||
             (nodeParts[0] === minimumParts[0] && nodeParts[1] < minimumParts[1]) ||
             (nodeParts[0] === minimumParts[0] && nodeParts[1] === minimumParts[1] && nodeParts[2] < minimumParts[2])
         ) {
-            return failed('node version', `>=${minimum}`, nodeVersion, details());
+            return failed('node version', `>=${requiredMinimum}`, nodeVersion, details());
         }
         return { passes: true };
     } catch (error) {

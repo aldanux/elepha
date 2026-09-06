@@ -2,12 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { MINIMUM_NODE_VERSION } from '../config/constants.js';
 import { updateAvailablePath } from '../config/paths.js';
-import {
-    npmInstallGlobalElepha,
-    npmInvocationForBackend,
-    npmViewElephaLatest,
-    npmViewElephaLatestAsync,
-} from '../security/subprocess-allowlist.js';
+import { npmInstallGlobalElephaAsync, npmInvocationForBackend, npmViewElephaLatestAsync } from '../security/subprocess-allowlist.js';
 import { migratePrimaryDatabaseToEncrypted } from '../storage/database-migration.js';
 import { defaultDbPath } from '../storage/db.js';
 import { errorMessage } from '../util/error.js';
@@ -15,15 +10,16 @@ import { removeFileIfExists } from '../util/fs.js';
 import { type ResolvedElephaBin, resolveInstalledElephaBin } from './binary.js';
 import { detectLauncherBackend, type LauncherBackend } from './launcher.js';
 import { isSupportedPlatform } from './platform.js';
-import { reconcileCaptureService, type ServiceBackend, serviceBackend } from './service-backend.js';
+import { reconcileCaptureServiceAsync, type ServiceBackend, serviceBackend } from './service-backend.js';
 
 export interface SelfUpdateNpm {
-    latestVersion(): string;
-    installLatest(): void;
-    installVersion(version: string): void;
+    latestVersion(): string | Promise<string>;
+    installLatest(): void | Promise<void>;
+    installVersion(version: string): void | Promise<void>;
 }
 
-type Reconcile = (service: ServiceBackend, approvedRoots: number) => 'not installed' | 'awaiting consent' | 'active';
+type ReconcileStatus = 'not installed' | 'awaiting consent' | 'active';
+type Reconcile = (service: ServiceBackend, approvedRoots: number) => ReconcileStatus | Promise<ReconcileStatus>;
 
 export interface SelfUpdateRuntime {
     platform?: NodeJS.Platform;
@@ -56,8 +52,8 @@ export function packageVersion(packageRoot: string): string {
     return manifest.version;
 }
 
-// Daemon-only registry query. Foreground package operations stay synchronous,
-// while its stopped-service migration phase is awaited before reconciliation.
+// The daemon also uses this registry query. It remains asynchronous so update
+// checks do not block ingestion or foreground progress rendering.
 export async function installedAndLatestElephaVersionAsync(
     runtime: Pick<SelfUpdateRuntime, 'resolveInstalledBin' | 'readPackageVersion' | 'detectBackend'> = {},
 ): Promise<{ installedVersion: string; latestVersion: string }> {
@@ -75,9 +71,9 @@ export async function installedAndLatestElephaVersionAsync(
 function defaultNpm(backend: LauncherBackend): SelfUpdateNpm {
     const invocation = npmInvocationForBackend(backend);
     return {
-        latestVersion: () => npmViewElephaLatest(invocation),
-        installLatest: () => npmInstallGlobalElepha(invocation, 'latest'),
-        installVersion: (version) => npmInstallGlobalElepha(invocation, version),
+        latestVersion: () => npmViewElephaLatestAsync(invocation),
+        installLatest: () => npmInstallGlobalElephaAsync(invocation, 'latest'),
+        installVersion: (version) => npmInstallGlobalElephaAsync(invocation, version),
     };
 }
 
@@ -96,7 +92,7 @@ async function restart(
     service.stop();
     await migrateDatabase();
     const approvedRoots = await readApprovedRoots();
-    const status = reconcile(service, approvedRoots);
+    const status = await reconcile(service, approvedRoots);
     if (status === 'not installed') {
         throw new ServiceNotInstalledError();
     }
@@ -124,7 +120,7 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
     });
     const npm = runtime.npm ?? defaultNpm(backend);
     const service = runtime.service ?? serviceBackend({ platform });
-    const reconcile: Reconcile = runtime.reconcile ?? reconcileCaptureService;
+    const reconcile: Reconcile = runtime.reconcile ?? reconcileCaptureServiceAsync;
     const migrateDatabase = runtime.migrateDatabase ?? (() => migratePrimaryDatabaseToEncrypted(defaultDbPath()));
     const readApprovedRoots =
         runtime.readApprovedRoots ??
@@ -137,7 +133,7 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
 
     let latestVersion: string;
     try {
-        latestVersion = npm.latestVersion();
+        latestVersion = await npm.latestVersion();
     } catch (error) {
         throw new Error(`self-update preflight failed: could not resolve elepha@latest: ${errorMessage(error)}`);
     }
@@ -148,7 +144,7 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
     }
 
     try {
-        npm.installLatest();
+        await npm.installLatest();
     } catch (error) {
         throw new Error(`self-update failed while installing elepha@latest: ${errorMessage(error)}`);
     }
@@ -165,7 +161,7 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
         // missing or modified) is not a failed rollback, and the next step is
         // elepha install, not doctor.
         try {
-            npm.installVersion(previousVersion);
+            await npm.installVersion(previousVersion);
         } catch (rollbackError) {
             throw new Error(`${prefix}; rollback to ${previousVersion} failed: ${errorMessage(rollbackError)}; run elepha doctor`);
         }

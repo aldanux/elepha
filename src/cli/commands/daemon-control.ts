@@ -7,6 +7,7 @@ import {
     resolveCaptureService,
     resumeCaptureService,
 } from '../capture-service.js';
+import { startCliProgress } from '../progress.js';
 
 export type { DaemonControlRuntime } from '../capture-service.js';
 
@@ -42,32 +43,38 @@ function pauseCapture(runtime: DaemonControlRuntime): void {
     }
 }
 
-function resumeCapture(runtime: DaemonControlRuntime): void {
+async function resumeCapture(runtime: DaemonControlRuntime): Promise<void> {
     const service = serviceForControl(runtime);
     if (!service) {
         return;
     }
 
+    const progress = startCliProgress('Starting capture daemon');
     try {
-        const result = resumeCaptureService(service, runtime);
+        const result = await resumeCaptureService(service, runtime);
+        progress.done('Capture daemon ready');
         printHealth(result.changed ? 'Capture daemon running' : 'Capture daemon already running', result.health.state);
     } catch (error) {
+        progress.fail('Capture daemon failed to start');
         console.error(errorMessage(error));
         process.exitCode = 1;
     }
 }
 
-function restartCapture(runtime: DaemonControlRuntime): void {
+async function restartCapture(runtime: DaemonControlRuntime): Promise<void> {
     const service = serviceForControl(runtime);
     if (!service) {
         return;
     }
 
+    const progress = startCliProgress('Restarting capture daemon');
     try {
         pauseCaptureService(service);
-        const result = resumeCaptureService(service, runtime);
+        const result = await resumeCaptureService(service, runtime);
+        progress.done('Capture daemon restarted');
         printHealth('Capture daemon restarted', result.health.state);
     } catch (error) {
+        progress.fail('Capture daemon restart failed');
         console.error(errorMessage(error));
         process.exitCode = 1;
     }
