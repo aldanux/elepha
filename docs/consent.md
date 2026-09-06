@@ -46,16 +46,18 @@ elepha consent grant /path/to/workspace
 From inside a project, `elepha consent grant --here` grants the current directory.
 Choose either a path or `--here`, never both.
 
-Revoking a root stops new capture for that scope but keeps its existing memory
-searchable, including any durable conversation copy and its indexed search terms:
+Revoking a root stops new capture for that scope and hides its retained memory from
+search and recall while the root remains revoked. It does not delete the retained
+rows, durable conversation copy, or indexed search terms:
 
 ```console
 elepha consent revoke /path/to/workspace
 ```
 
 `elepha consent revoke --here` applies the same change to the current directory. A
-later grant resumes eligible capture; it does not make the deliberately private
-sessions from the revoked period backfillable.
+later grant makes pre-revocation memory eligible for search and recall again and
+resumes capture; it does not make the deliberately private sessions from the revoked
+period backfillable.
 
 ## Review recorded decisions
 
@@ -96,4 +98,4 @@ elepha consent prune --apply --skip-confirmation
 
 Pruning removes only the root's entry from `elepha consent list`. It does not delete
 captured memory. To clear memory belonging to directories that are temporary or no
-longer exist, use [`elepha purge --orphan`](purge.md#choose-one-scope).
+longer exist, use [`elepha purge --orphan`](purge.md#choose-one-base-scope).

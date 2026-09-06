@@ -60,7 +60,9 @@ service files under `~/.elepha/`. Set `ELEPHA_HOME` to use a different location.
 The memory database is `$ELEPHA_HOME/elepha.db` and is encrypted in full. Its key is
 kept in the operating system's secret store where available, or in a private key file
 under `$ELEPHA_HOME` otherwise. Existing plaintext databases migrate automatically on
-upgrade.
+upgrade; no manual export or import is required. See
+[Protecting and recovering memory](storage.md) for migration space and interrupted
+recovery requirements.
 
 Nothing is written into your project directories, and elepha never modifies the
 original Claude Code or Codex transcripts. Use the [storage tools](storage.md) to
@@ -78,8 +80,9 @@ afterward.
 
 ### Linux
 
-The background service runs as a systemd user unit and is configured to survive
-logout and reboot.
+The background service runs as a systemd user unit, starts with the user service
+manager, and restarts on failure. Remaining active after logout or starting before
+login depends on systemd lingering configured outside elepha.
 
 ### WSL
 

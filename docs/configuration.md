@@ -21,8 +21,18 @@ the built-in default.
 | `update-check`        | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls the background check for a newer elepha release. `ELEPHA_NO_UPDATE_CHECK` disables the check for one invocation without changing the stored preference.                                                    |
 | `capture-claude-code` | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of Claude Code sessions. At least one capture tool must remain enabled.                                                                                                                            |
 | `capture-codex`       | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of Codex sessions. At least one capture tool must remain enabled.                                                                                                                                  |
-| `durable-capture`     | `true`, `false`, `1`, `0`, `on`, `off` | `false`  | Stores sanitized conversation copies for provider-independent content search and session revival. Restart the capture service after changing it.                                                                   |
+| `durable-capture`     | `true`, `false`, `1`, `0`, `on`, `off` | `false`  | Stores sanitized conversation copies for provider-independent content search and session revival. Restart the capture service after changing it.                                                                    |
 | `query-matching`      | `strict`, `lax`                        | `strict` | Controls how closely recall results must match a multi-term query. A query that returns nothing under `strict` may return relevant partial matches under `lax`; the normal ranking and quality filters still apply. |
+
+## Optional synthesis
+
+Capture, storage, search, and recall do not require an AI provider. Synthesis currently
+supports Anthropic only. When `ANTHROPIC_API_KEY` is configured, elepha sends eligible
+turn text to Anthropic for synthesis under that provider's data policy.
+
+Set the key in the process environment or in `$ELEPHA_HOME/.env`, then restart the
+capture service. A value already present in the process environment takes precedence
+over the file.
 
 ## Read and change one setting
 
@@ -69,6 +79,9 @@ Restart the service after editing the value:
 elepha restart
 ```
 
-When the stored content exceeds the cap, elepha evicts the oldest sessions' copies,
-starting with sessions whose original transcript still exists. Invalid or absent
-values leave the 1 GiB default in effect.
+When stored content exceeds the cap, elepha evicts the oldest sessions' copies,
+starting with sessions whose original transcript can be opened and rebuilt. The
+active session is not exempt if further space is required. Once a native session is
+evicted, later turns and re-segmentation do not refill its durable copy; recall may
+still use the source transcript while it remains readable. Invalid or absent values
+leave the 1 GiB default in effect.

@@ -3,8 +3,12 @@
 elepha encrypts its whole SQLite database at rest, including session metadata,
 summaries, privacy state, search indexes, and any durable conversation copies.
 Existing plaintext databases migrate automatically during upgrade or the next
-installed start. The migration preserves the database contents and leaves the source
-transcripts untouched.
+installed start; no export or import step is required. The migration preserves the
+database contents and leaves the source transcripts untouched. It requires free space
+equal to at least 2.1 times the combined size of the current database and its
+write-ahead log. If an encryption migration is interrupted, the recorded recovery is
+resumed before elepha opens the database; `elepha doctor` can stop capture and run
+that recovery check.
 
 The database key is created and retrieved without a passphrase prompt. elepha keeps it
 in the operating system's secret store when a usable one is available, or in a private
@@ -21,10 +25,10 @@ transcript. Use a full backup when that copy must survive disk or database loss.
 
 The durable store is capped by `durable-capture-max-bytes`, which defaults to
 1,073,741,824 bytes (1 GiB). When the cap is exceeded, elepha evicts the oldest
-sessions' durable copies, starting with sessions whose source transcript still exists
-and can therefore be rebuilt. If more must be removed, it proceeds to copies whose
-source is unavailable. See [Configuration](configuration.md#durable-store-size) for
-the exact JSON setting.
+recoverable durable copies first, then the active session if necessary, before copies
+whose source is unavailable. Eviction remains attached to the native session across
+later capture and re-segmentation; it does not silently refill. See
+[Configuration](configuration.md#durable-store-size) for the exact JSON setting.
 
 ## Same-installation recovery
 
@@ -33,10 +37,12 @@ SQLite file, a restore replaces the active database from a complete backup, and 
 import merges eligible sessions from a plaintext export. Restore and import validate
 their input and save a snapshot of the current database before writing.
 
-User-requested backups go to `$ELEPHA_HOME/backups/` by default. They and the safety
-snapshots made automatically by destructive operations use this installation's
-database key. They are same-machine disaster-recovery files, not portable or
-cross-machine backups.
+User-requested complete backups and project exports go to `$ELEPHA_HOME/backups/` by
+default. Complete backups and the safety snapshots made automatically by destructive
+operations and encryption migration use this installation's database key and are
+same-installation recovery files. Project exports use that key too, but are encrypted
+archives rather than supported recovery inputs. All are created as ciphertext rather
+than as plaintext intermediates and are not portable across installations.
 
 ## Create a backup
 
@@ -57,10 +63,15 @@ elepha backup --project my-app --out ./my-app-memory.db
 ```
 
 A complete export preserves the whole database, including durable conversation copies,
-and is suitable for restore on the same installation. A project export is also
-encrypted with the installation key, but contains only project, session, memory, and
-rollup tables; it cannot replace the active database and does not preserve durable
-conversation copies or their search index.
+and is suitable for restore on the same installation. A project export is an encrypted
+archive containing only project, session, memory, and rollup tables; it does not
+preserve durable conversation copies or their search index. Current elepha commands
+cannot restore or import that encrypted project archive, so it is not a supported
+recovery path.
+
+Both export forms write into an encrypted SQLite destination from the first database
+write and verify that ciphertext before installing the final file. They do not stage
+a plaintext export beside the destination.
 
 ## Restore the complete database
 
@@ -77,15 +88,21 @@ Restore accepts only a complete elepha backup. A current encrypted backup can be
 opened only with the key from the installation that created it; compatible plaintext
 backups from earlier releases are also accepted. elepha validates the SQLite file,
 required tables, schema, integrity, relationships, and stored data semantics before
-showing the row counts that will replace the active database. Older compatible backups
-are staged through current migrations during validation.
+showing candidate table counts. Older compatible backups are staged through current
+migrations during validation.
 
-After confirmation, elepha checkpoints and snapshots the current database, replaces
-it atomically, and verifies the result. If post-replacement verification fails, it
-attempts to roll back from that snapshot. Current incognito transcript vetoes are
-preserved across the restore so an older backup cannot reopen deliberately private
-sessions. Use `--skip-confirmation` only for a non-interactive restore you have already
-reviewed.
+Restore keeps the active installation's consent decisions, purge and incognito
+tombstones, paranoid read-lock authority, encryption identity, and records that stop
+elepha's own injected output from being captured again. Durable-eviction markers from
+both databases remain terminal. After confirmation, elepha rechecks those controls and
+the active database identity; if the preview is stale, it aborts before replacement.
+
+Before installation, restore removes durable rows vetoed by current privacy or
+eviction state, rebuilds the filtered full-text index and byte accounting, checkpoints
+and snapshots the current database, and replaces it atomically. The restored database
+continues to use the active installation key. If post-replacement verification fails,
+elepha attempts to roll back from the encrypted snapshot. Use
+`--skip-confirmation` only for a non-interactive restore you have already reviewed.
 
 ## Merge a backup
 

@@ -2,7 +2,10 @@
 
 Run these commands in a terminal. For commands typed inside Claude Code or Codex chat, see [docs/commands-in-ai-chat.md](commands-in-ai-chat.md).
 
-Run `elepha <command> -h` for every flag. Purge and one-off maintenance or migration commands are dry-run by default; pass `--apply` to write.
+Run `elepha <command> -h` for every flag. `purge`, `rekey-projects`, `sanitize`,
+`segment`, every `backfill-*` command, and `rollup --rebuild` preview without writing
+unless you pass `--apply`. `reingest` and ordinary `rollup` write immediately and may
+call the configured provider.
 
 ## Install & remove
 
@@ -71,12 +74,12 @@ access the same installation key and files as elepha.
 
 Full guide: [docs/storage.md](storage.md). Deletion guide: [docs/purge.md](purge.md).
 
-| Command                                                                    | Description                                                                                                                                                                                                                                             |
-|----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha backup [--all \| --project <pathOrName>] [--out <path>] [--force]` | Export all memory or one project to a same-installation encrypted SQLite file. More details in [docs/storage.md](storage.md#create-a-backup).                                                                                                           |
-| `elepha restore [file] [--skip-confirmation]`                              | Replace the active database from a validated complete backup; current encrypted backups require the same installation key. More details in [docs/storage.md](storage.md#restore-the-complete-database).                                                 |
-| `elepha import [file] [--overwrite] [--skip-confirmation]`                 | Merge eligible sessions from a plaintext export, optionally replacing matches; encrypted input is rejected. More details in [docs/storage.md](storage.md#merge-a-backup).                                                                               |
-| `elepha purge [scope] [--apply] [--skip-confirmation]`                     | Preview or delete memory using `--project <pathOrName>`, `--newer-than <durationOrDate>`, `--older-than <durationOrDate>`, `--external-agent-imports`, `--orphan`, `--revoked`, or `--all`. More details in [docs/purge.md](purge.md#choose-one-scope). |
+| Command                                                                    | Description                                                                                                                                                                                                                                                                   |
+|----------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `elepha backup [--all \| --project <pathOrName>] [--out <path>] [--force]` | Export all memory or one project to a same-installation encrypted SQLite file. More details in [docs/storage.md](storage.md#create-a-backup).                                                                                                                                 |
+| `elepha restore [file] [--skip-confirmation]`                              | Replace remembered content from a validated complete backup while preserving current privacy, access, eviction, and encryption controls; encrypted backups require the same installation key. More details in [docs/storage.md](storage.md#restore-the-complete-database).    |
+| `elepha import [file] [--overwrite] [--skip-confirmation]`                 | Merge eligible sessions from a plaintext export, optionally replacing matches; encrypted input is rejected. More details in [docs/storage.md](storage.md#merge-a-backup).                                                                                                     |
+| `elepha purge [options]`                                                   | Preview or delete memory. Base scopes are `--project <pathOrName>`, `--here`, `--external-agent-imports`, `--orphan`, `--revoked`, or `--all`; time filters may stand alone or narrow supported base scopes. More details in [docs/purge.md](purge.md#choose-one-base-scope). |
 
 ## Maintenance
 
@@ -84,20 +87,21 @@ Full guide: [docs/maintenance.md](maintenance.md).
 
 `[operator]` commands are hidden from the default `elepha -h`; run `elepha <command> -h` for their flags.
 
-| Command                          | Description                                                                                                                                                    |
-|----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha self-update`             | Update the global build, restart capture, migrate, verify, and roll back once on failure. More details in [docs/maintenance.md](maintenance.md#update-elepha). |
-| `elepha reingest`                | **[operator]** Reprocess stored turns through current adapters and summarization. More details in [docs/maintenance.md](maintenance.md#reingest).              |
-| `elepha rollup [--rebuild]`      | **[operator]** Compute current rollups or preview a stale-version rebuild. More details in [docs/maintenance.md](maintenance.md#rollup).                       |
-| `elepha rekey-projects`          | **[operator]** Consolidate duplicate repository project rows. More details in [docs/maintenance.md](maintenance.md#rekey-projects).                            |
-| `elepha sanitize`                | **[operator]** Neutralize shell-active syntax in legacy stored fields. More details in [docs/maintenance.md](maintenance.md#sanitize).                         |
-| `elepha segment`                 | **[operator]** Preview re-segmentation, manual splits, or adjacent merges. More details in [docs/maintenance.md](maintenance.md#segment).                      |
-| `elepha stats`                   | **[operator]** Report read-only ingestion and summarizer instrumentation. More details in [docs/maintenance.md](maintenance.md#stats).                         |
-| `elepha backfill-rendered-chars` | **[operator]** Derive rendered character and turn counts from raw turns. More details in [docs/maintenance.md](maintenance.md#backfill-commands).              |
-| `elepha backfill-session-titles` | **[operator]** Derive stored segment titles from transcript metadata or prompts. More details in [docs/maintenance.md](maintenance.md#backfill-commands).      |
-| `elepha backfill-custom-titles`  | **[operator]** Capture Claude Code custom-title events. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                               |
-| `elepha backfill-session-fields` | **[operator]** Re-derive legacy session metadata from local transcripts. More details in [docs/maintenance.md](maintenance.md#backfill-commands).              |
-| `elepha backfill-root-commits`   | **[operator]** Populate stable root-commit identity for legacy projects. More details in [docs/maintenance.md](maintenance.md#backfill-commands).              |
+| Command                               | Description                                                                                                                                                        |
+|---------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `elepha self-update`                  | Update the global build, restart capture, migrate, verify, and roll back once on failure. More details in [docs/maintenance.md](maintenance.md#update-elepha).     |
+| `elepha reingest`                     | **[operator]** Reprocess stored turns through current adapters and summarization. More details in [docs/maintenance.md](maintenance.md#reingest).                  |
+| `elepha rollup [--rebuild]`           | **[operator]** Compute current rollups or preview a stale-version rebuild. More details in [docs/maintenance.md](maintenance.md#rollup).                           |
+| `elepha rekey-projects`               | **[operator]** Consolidate duplicate repository project rows. More details in [docs/maintenance.md](maintenance.md#rekey-projects).                                |
+| `elepha sanitize`                     | **[operator]** Neutralize shell-active syntax in legacy stored fields; unlock paranoid mode first. More details in [docs/maintenance.md](maintenance.md#sanitize). |
+| `elepha segment`                      | **[operator]** Preview re-segmentation, manual splits, or adjacent merges. More details in [docs/maintenance.md](maintenance.md#segment).                          |
+| `elepha stats`                        | **[operator]** Report read-only ingestion and summarizer instrumentation. More details in [docs/maintenance.md](maintenance.md#stats).                             |
+| `elepha backfill-rendered-chars`      | **[operator]** Derive rendered character and turn counts from raw turns. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                  |
+| `elepha backfill-first-prompt-search` | **[operator]** Derive the bounded first-prompt search document for legacy segments. More details in [docs/maintenance.md](maintenance.md#backfill-commands).       |
+| `elepha backfill-session-titles`      | **[operator]** Derive stored segment titles from transcript metadata or prompts. More details in [docs/maintenance.md](maintenance.md#backfill-commands).          |
+| `elepha backfill-custom-titles`       | **[operator]** Capture Claude Code custom-title events. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                                   |
+| `elepha backfill-session-fields`      | **[operator]** Re-derive legacy session metadata from local transcripts. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                  |
+| `elepha backfill-root-commits`        | **[operator]** Populate stable root-commit identity for legacy projects. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                  |
 
 ## Status & troubleshooting
 

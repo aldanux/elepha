@@ -10,7 +10,7 @@ This page is the full guide for in-chat recall commands.
 
 | Command                                            | Description                                                                      |
 |----------------------------------------------------|----------------------------------------------------------------------------------|
-| `elepha:last`                                      | Inject the most recent session's turns so you can continue where you stopped.    |
+| `elepha:last`                                      | Inject the newest available turns from the most recent session.                  |
 | `elepha:query <q>`                                 | Search all consented projects and return a numbered list of matching sessions.   |
 | `elepha:query:here <q>`                            | Search only the current project and return a numbered list of matching sessions. |
 | `elepha:list`                                      | List the five most recent session titles, numbered for selection.                |
@@ -24,7 +24,8 @@ This page is the full guide for in-chat recall commands.
 where it has a rollup; and, for sessions recorded with durable capture, at the stored filtered
 conversation. It never reads raw transcripts, thinking, tool output, or fetched external
 content, and it searches the local index, not the provider's files at query time. Opening a
-session brings the whole conversation back.
+session renders the newest available filtered turns from a complete durable copy or the
+source transcript. Recall is bounded and reports when older turns were omitted.
 
 ## Maintenance
 

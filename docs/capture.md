@@ -20,7 +20,7 @@ encrypted database. The copy keeps user prompts, assistant responses, and the na
 and file paths of tool calls that reference paths. It never stores the raw JSONL,
 thinking, tool output, fetched content, or tool arguments. Filtering and storage are
 local and do not require an AI provider, so conversation search and session revival
-can use a complete durable copy even after the source transcript is deleted.
+can use a complete filtered copy even after the source transcript is deleted.
 
 After the service restarts, elepha also backfills eligible sessions already in the
 database when their source transcripts remain readable. Disabling durable capture
@@ -36,9 +36,13 @@ incomplete backfill. `evicted` means the size cap removed the copy. `revoked` an
 `incognito` are accepted schema values; current purge and incognito paths instead
 delete the copy, its coverage row, and its indexed search terms.
 
-The durable store defaults to a 1 GiB cap and evicts older session copies when it
-binds. See [Protecting and recovering memory](storage.md#durable-conversation-copies)
-and [Configuration](configuration.md#durable-store-size).
+The durable store defaults to a 1 GiB cap. When it binds, elepha evicts the oldest
+recoverable session copies first; the active session is not exempt if further space
+is required. An evicted native session remains evicted across later turns and
+re-segmentation instead of silently refilling the durable store. Recall can still use
+its source transcript while that file remains readable. See
+[Protecting and recovering memory](storage.md#durable-conversation-copies) and
+[Configuration](configuration.md#durable-store-size).
 
 ## See what has been captured
 
