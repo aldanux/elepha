@@ -1,5 +1,24 @@
 # elepha
 
+## 0.4.0
+
+Elepha 0.4.0 introduces opt-in durable capture and encrypted local storage. Approved sessions can retain a bounded, searchable filtered copy after the original transcript disappears. This release also adds encrypted backup and restore, purge and incognito deletion, optional paranoid locking, automatic migration of existing plaintext databases, and moved-project recovery. Node.js 22.12.0 or newer is required.
+
+### Changes
+
+- Purge and incognito remove the stored conversation copy, including its search index by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Add opt-in durable capture: persist the filtered turns of a session locally by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Backfill durable-capture copies for sessions ingested before it was enabled by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Serve a captured session from its local copy, so it revives after the source transcript is gone by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Encrypt same-machine backups and project exports under the installation key, restore them keyed, and refuse portable encrypted import for now by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Search the stored conversation of durably captured sessions, with no AI provider by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Bound the durable-capture store to a configurable total size (default 1 GiB), evicting the oldest recoverable sessions first by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Add optional paranoid mode, a terminal-only passphrase gate for memory reads that leaves capture running while locked by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Encrypt new elepha databases at rest and atomically migrate existing plaintext primaries in default mode. Raises the minimum Node.js to 22.12.0 by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+
+- Map runtime stack traces back to embedded TypeScript source locations by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+- Show moved projects at their current path and list approved repositories before their first captured session by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
+
 ## 0.3.2
 
 - Make `elepha:query` match session summaries, recorded decisions, and pending items by [@aldanux](https://github.com/aldanux) in [#46](https://github.com/aldanux/elepha/pull/46)
