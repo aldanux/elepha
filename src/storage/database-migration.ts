@@ -3,6 +3,7 @@ import {
     type BigIntStats,
     chmodSync,
     closeSync,
+    copyFileSync,
     existsSync,
     fchmodSync,
     constants as fsConstants,
@@ -60,6 +61,7 @@ export const DATABASE_KEY_COMMITMENT_INDETERMINATE =
     'Database key commitment is indeterminate; migration remains blocked with the plaintext canonical.';
 
 const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');
+const SQLITE_COMPANION_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
 const MIGRATION_STAGES = [
     'quiesced',
     'rollback_copied',
@@ -540,11 +542,71 @@ function managedBackupOpenCleanupCause(primary: unknown, db?: Database.Database,
         : new AggregateError(failures, 'Managed backup validation and cleanup both failed.', { cause: primary });
 }
 
+function existingSQLiteCompanion(databasePath: string): string | undefined {
+    return SQLITE_COMPANION_SUFFIXES.map((suffix) => `${databasePath}${suffix}`).find(
+        (companionPath) => lstatSync(companionPath, { throwIfNoEntry: false }) !== undefined,
+    );
+}
+
+function installSQLiteCompanionCleanup(db: Database.Database, databasePath: string): void {
+    const close = db.close.bind(db);
+    let nativeClosed = false;
+    let cleanupComplete = false;
+    db.close = () => {
+        if (cleanupComplete) {
+            return db;
+        }
+        if (!nativeClosed) {
+            close();
+            nativeClosed = true;
+        }
+        const failures: unknown[] = [];
+        for (const suffix of SQLITE_COMPANION_SUFFIXES) {
+            const companionPath = `${databasePath}${suffix}`;
+            let failure: unknown;
+            try {
+                const observed = lstatSync(companionPath, { bigint: true, throwIfNoEntry: false });
+                const confirmed = observed === undefined ? undefined : lstatSync(companionPath, { bigint: true });
+                const same =
+                    observed !== undefined &&
+                    confirmed !== undefined &&
+                    observed.dev === confirmed.dev &&
+                    observed.ino === confirmed.ino &&
+                    observed.ctimeNs === confirmed.ctimeNs;
+                const admitted =
+                    same &&
+                    confirmed.isFile() &&
+                    !confirmed.isSymbolicLink() &&
+                    ((suffix === '-wal' && confirmed.size === 0n) || (suffix === '-shm' && confirmed.size === 32_768n));
+                if (admitted) {
+                    unlinkSync(companionPath);
+                } else if (observed !== undefined) {
+                    failure = new Error(`Readonly SQLite verification left an unrecognized companion: ${companionPath}`);
+                }
+                if (admitted && lstatSync(companionPath, { throwIfNoEntry: false }) !== undefined) {
+                    failure = new Error(`Readonly SQLite verification companion cleanup failed: ${companionPath}`);
+                }
+            } catch (error) {
+                failure = error;
+            }
+            if (failure !== undefined) {
+                failures.push(failure);
+            }
+        }
+        if (failures.length > 0) {
+            throw new AggregateError(failures, `Readonly SQLite verification companion cleanup failed for ${databasePath}.`);
+        }
+        cleanupComplete = true;
+        return db;
+    };
+}
+
 function openVerifiedPlaintextDatabase(
     databasePath: string,
     expectedSha256?: string,
     integrityLabel = 'Managed backup',
     errorPrefix = 'Managed backup is unrecognized or unverifiable',
+    readonly = true,
 ): Database.Database {
     let stats: BigIntStats;
     let plaintext: boolean;
@@ -570,6 +632,11 @@ function openVerifiedPlaintextDatabase(
             throw plaintextDatabaseVerificationError(databasePath, errorPrefix, cause);
         }
     }
+    const existingCompanion = existingSQLiteCompanion(databasePath);
+    if (existingCompanion !== undefined) {
+        const cause = new Error(`unexpected SQLite companion exists: ${existingCompanion}`);
+        throw plaintextDatabaseVerificationError(databasePath, errorPrefix, cause);
+    }
     let seal: ReturnType<typeof pinSQLitePathForOpen>;
     try {
         seal = pinSQLitePathForOpen(databasePath, {
@@ -583,7 +650,8 @@ function openVerifiedPlaintextDatabase(
     }
     let db: Database.Database;
     try {
-        db = new Database(seal.sqlitePath, { fileMustExist: true, timeout: 0 });
+        db = new Database(seal.sqlitePath, { readonly, fileMustExist: true, timeout: 0 });
+        installSQLiteCompanionCleanup(db, databasePath);
     } catch (error) {
         throw plaintextDatabaseVerificationError(databasePath, errorPrefix, managedBackupOpenCleanupCause(error, undefined, seal));
     }
@@ -771,7 +839,29 @@ function verifyEncryptedManagedBackup(databasePath: string, encryptedSha256: str
 
 function buildEncryptedManagedBackup(backup: ManagedBackupMigration, key: Buffer): string {
     removeFile(backup.encryptedPath);
-    const source = openVerifiedPlaintextDatabase(backup.sourcePath, backup.originalSha256);
+    const plaintextCopy = `${backup.encryptedPath}.plaintext`;
+    removeFile(plaintextCopy);
+    let source: Database.Database;
+    let copyPrepared = false;
+    try {
+        copyFileSync(backup.sourcePath, plaintextCopy, fsConstants.COPYFILE_EXCL);
+        chmodSync(plaintextCopy, PRIVATE_FILE_MODE);
+        if (hashFile(plaintextCopy) !== backup.originalSha256) {
+            throw new Error('Managed backup changed while creating its private migration copy.');
+        }
+        source = openVerifiedPlaintextDatabase(
+            plaintextCopy,
+            backup.originalSha256,
+            'Managed backup migration copy',
+            'Managed backup migration copy is unrecognized or unverifiable',
+            false,
+        );
+        copyPrepared = true;
+    } finally {
+        if (!copyPrepared) {
+            removeFile(plaintextCopy);
+        }
+    }
     let descriptor: number | undefined;
     try {
         descriptor = createPrivateEmptyDatabaseDescriptor(backup.encryptedPath);
@@ -786,7 +876,11 @@ function buildEncryptedManagedBackup(backup: ManagedBackupMigration, key: Buffer
         removeFile(backup.encryptedPath);
         throw error;
     } finally {
-        source.close();
+        try {
+            source.close();
+        } finally {
+            removeFile(plaintextCopy);
+        }
     }
     syncFile(backup.encryptedPath);
     fsyncDirectory(path.dirname(backup.encryptedPath));
