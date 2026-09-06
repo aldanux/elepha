@@ -2,6 +2,10 @@
 
 ## 0.4.0
 
+Elepha 0.4.0 introduces opt-in durable capture and encrypted local storage. Approved sessions can retain a bounded, searchable filtered copy after the original transcript disappears. This release also adds encrypted backup and restore, purge and incognito deletion, optional paranoid locking, automatic migration of existing plaintext databases, and moved-project recovery. Node.js 22.12.0 or newer is required.
+
+### Changes
+
 - Purge and incognito remove the stored conversation copy, including its search index by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
 - Add opt-in durable capture: persist the filtered turns of a session locally by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
 - Backfill durable-capture copies for sessions ingested before it was enabled by [@aldanux](https://github.com/aldanux) in [#50](https://github.com/aldanux/elepha/pull/50)
