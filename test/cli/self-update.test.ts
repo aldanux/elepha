@@ -5,8 +5,10 @@ const mocks = vi.hoisted(() => ({
     selfUpdate: vi.fn(),
     countApproved: vi.fn(() => 1),
     openDb: vi.fn(async () => ({})),
+    spinner: vi.fn(),
 }));
 
+vi.mock('@clack/prompts', () => ({ spinner: mocks.spinner }));
 vi.mock('../../src/install/self-update.js', () => ({ selfUpdate: mocks.selfUpdate }));
 vi.mock('../../src/storage/consent-store.js', () => ({
     ConsentStore: class {
@@ -21,6 +23,11 @@ vi.mock('../../src/storage/db.js', () => ({ openDb: mocks.openDb }));
 const { formatSelfUpdateCurrentMessage, formatSelfUpdateUpdatedMessage, registerSelfUpdate } = await import(
     '../../src/cli/commands/self-update.js'
 );
+const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+
+function setTty(value: boolean): void {
+    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value });
+}
 
 async function runSelfUpdate(): Promise<{ stdout: string[]; stderr: string[] }> {
     const stdout: string[] = [];
@@ -43,6 +50,11 @@ describe('elepha self-update', () => {
     afterEach(() => {
         vi.restoreAllMocks();
         process.exitCode = undefined;
+        if (stdoutTty) {
+            Object.defineProperty(process.stdout, 'isTTY', stdoutTty);
+        } else {
+            Reflect.deleteProperty(process.stdout, 'isTTY');
+        }
     });
 
     it('says the install is already on the latest version when nothing changed', async () => {
@@ -65,5 +77,29 @@ describe('elepha self-update', () => {
         expect(stderr).toEqual([]);
         expect(mocks.selfUpdate).toHaveBeenCalledWith({ readApprovedRoots: expect.any(Function) });
         expect(process.exitCode).toBeUndefined();
+    });
+
+    it('shows progress while a TTY update is pending and prints the installed version after it completes', async () => {
+        setTty(true);
+        const spinner = { start: vi.fn(), stop: vi.fn(), error: vi.fn() };
+        mocks.spinner.mockReturnValue(spinner);
+        let finish: ((result: { status: 'updated'; previousVersion: string; version: string }) => void) | undefined;
+        mocks.selfUpdate.mockReturnValue(
+            new Promise((resolve) => {
+                finish = resolve;
+            }),
+        );
+
+        const running = runSelfUpdate();
+        await vi.waitFor(() => expect(spinner.start).toHaveBeenCalledWith('Updating elepha…'));
+        expect(spinner.stop).not.toHaveBeenCalled();
+
+        finish?.({ status: 'updated', previousVersion: '0.3.2', version: '0.4.1' });
+        const { stdout, stderr } = await running;
+
+        expect(spinner.stop).toHaveBeenCalledWith('Update complete ✔');
+        expect(spinner.error).not.toHaveBeenCalled();
+        expect(stdout).toEqual(['elepha updated: 0.3.2 → 0.4.1']);
+        expect(stderr).toEqual([]);
     });
 });

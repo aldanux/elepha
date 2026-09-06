@@ -12,11 +12,21 @@ export interface DaemonHealthCheckRuntime {
     sleep(milliseconds: number): void;
 }
 
+export interface AsyncDaemonHealthCheckRuntime {
+    now(): number;
+    sleep(milliseconds: number): void | Promise<void>;
+}
+
 export const defaultDaemonHealthCheckRuntime: DaemonHealthCheckRuntime = {
     now: () => Date.now(),
     sleep(milliseconds) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
     },
+};
+
+export const defaultAsyncDaemonHealthCheckRuntime: AsyncDaemonHealthCheckRuntime = {
+    now: () => Date.now(),
+    sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
 };
 
 export function boundedDaemonOutput(output: string): string {
@@ -43,6 +53,23 @@ export function waitForHealthyHeartbeat(isHealthy: () => boolean, runtime: Daemo
             return false;
         }
         runtime.sleep(Math.min(DAEMON_HEALTH_CHECK_POLL_MS, remaining));
+    }
+}
+
+export async function waitForHealthyHeartbeatAsync(
+    isHealthy: () => boolean,
+    runtime: AsyncDaemonHealthCheckRuntime = defaultAsyncDaemonHealthCheckRuntime,
+): Promise<boolean> {
+    const deadline = runtime.now() + DAEMON_HEALTH_CHECK_DEADLINE_MS;
+    while (true) {
+        if (isHealthy()) {
+            return true;
+        }
+        const remaining = deadline - runtime.now();
+        if (remaining <= 0) {
+            return false;
+        }
+        await runtime.sleep(Math.min(DAEMON_HEALTH_CHECK_POLL_MS, remaining));
     }
 }
 

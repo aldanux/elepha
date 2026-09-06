@@ -27,14 +27,15 @@ function runtime(overrides: Partial<DoctorRuntime> = {}): DoctorRuntime {
         inspectIntegrations: () => activeIntegrations,
         inspectDatabase: () => ({ approvedRoots: 1 }),
         inspectLauncher: () => ({ healthy: true, detail: 'managed launcher is valid' }),
+        waitForHealthy: (service) => service.waitForHealthy(),
         ...overrides,
         approvedRoots: overrides.approvedRoots ?? 1,
     };
 }
 
 describe('elepha doctor', () => {
-    it('reports every healthy check and exits zero', () => {
-        const result = runDoctor(runtime());
+    it('reports every healthy check and exits zero', async () => {
+        const result = await runDoctor(runtime());
 
         expect(result.exitCode).toBe(0);
         expect(result.lines).toEqual(
@@ -52,12 +53,12 @@ describe('elepha doctor', () => {
         expect(result.nextSteps).toEqual([]);
     });
 
-    it('restarts a down daemon with the live approved-root count and exits zero after a healthy recheck', () => {
+    it('restarts a down daemon with the live approved-root count and exits zero after a healthy recheck', async () => {
         const service = { stop: vi.fn(), waitForHealthy: vi.fn(() => true) };
         const reconcile = vi.fn(() => 'active' as const);
         let checks = 0;
 
-        const result = runDoctor(
+        const result = await runDoctor(
             runtime({
                 service: service as never,
                 inspectDaemon: () => daemon(checks++ > 0),
@@ -74,10 +75,10 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(0);
     });
 
-    it('reports a failed daemon restart and exits non-zero', () => {
+    it('reports a failed daemon restart and exits non-zero', async () => {
         const service = { stop: vi.fn(), waitForHealthy: vi.fn(() => false) };
 
-        const result = runDoctor(
+        const result = await runDoctor(
             runtime({
                 service: service as never,
                 inspectDaemon: () => daemon(false),
@@ -90,10 +91,10 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(1);
     });
 
-    it('hands off to elepha install when the managed daemon service is not installed', () => {
+    it('hands off to elepha install when the managed daemon service is not installed', async () => {
         const service = { stop: vi.fn(), waitForHealthy: vi.fn(() => true) };
 
-        const result = runDoctor(
+        const result = await runDoctor(
             runtime({
                 service: service as never,
                 inspectDaemon: () => daemon(false),
@@ -106,7 +107,7 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(1);
     });
 
-    it('hands off to elepha install when the daemon repair throws', () => {
+    it('hands off to elepha install when the daemon repair throws', async () => {
         const service = {
             stop: vi.fn(() => {
                 throw new Error('launchctl bootout failed');
@@ -114,15 +115,17 @@ describe('elepha doctor', () => {
             waitForHealthy: vi.fn(() => true),
         };
 
-        const result = runDoctor(runtime({ service: service as never, inspectDaemon: () => daemon(false), reconcile: () => 'active' }));
+        const result = await runDoctor(
+            runtime({ service: service as never, inspectDaemon: () => daemon(false), reconcile: () => 'active' }),
+        );
 
         expect(result.lines).toContain('✗ Daemon repair: launchctl bootout failed');
         expect(result.nextSteps).toEqual([terminalHandoff('install')]);
         expect(result.exitCode).toBe(1);
     });
 
-    it('hands off to elepha install when the launcher check itself fails', () => {
-        const result = runDoctor(
+    it('hands off to elepha install when the launcher check itself fails', async () => {
+        const result = await runDoctor(
             runtime({
                 inspectLauncher: () => {
                     throw new Error('launcher manifest is unreadable');
@@ -135,8 +138,8 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(1);
     });
 
-    it('hands off missing hooks and consent without installing or modifying consent', () => {
-        const result = runDoctor(
+    it('hands off missing hooks and consent without installing or modifying consent', async () => {
+        const result = await runDoctor(
             runtime({
                 inspectIntegrations: () => ({
                     ...activeIntegrations,
@@ -151,8 +154,8 @@ describe('elepha doctor', () => {
         expect(result.nextSteps).toEqual([terminalHandoff('install'), terminalHandoff('consent grant <path>')]);
     });
 
-    it('hands off Codex hook approval without trying to change its trust state', () => {
-        const result = runDoctor(
+    it('hands off Codex hook approval without trying to change its trust state', async () => {
+        const result = await runDoctor(
             runtime({
                 inspectIntegrations: () => ({
                     ...activeIntegrations,
@@ -165,8 +168,8 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(1);
     });
 
-    it('reports database and launcher failures without attempting a repair beyond the daemon', () => {
-        const result = runDoctor(
+    it('reports database and launcher failures without attempting a repair beyond the daemon', async () => {
+        const result = await runDoctor(
             runtime({
                 inspectDatabase: () => {
                     throw new Error('database is unreadable');
@@ -186,8 +189,8 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(1);
     });
 
-    it('surfaces an interrupted install transaction as a recoverable install hand-off', () => {
-        const result = runDoctor(runtime({ inspectInstallRecovery: () => true }));
+    it('surfaces an interrupted install transaction as a recoverable install hand-off', async () => {
+        const result = await runDoctor(runtime({ inspectInstallRecovery: () => true }));
 
         expect(result.lines).toContain(
             '✗ Install recovery: interrupted install transaction detected; elepha install will restore the previous state before retrying',

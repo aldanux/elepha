@@ -14,7 +14,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { SYSTEMD_SERVICE_NAME } from '../config/constants.js';
+import { NPM_INSTALL_TIMEOUT_MS, NPM_REGISTRY_LOOKUP_TIMEOUT_MS, SYSTEMD_SERVICE_NAME } from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
 import type { LauncherBackend } from '../install/launcher.js';
 
@@ -398,7 +398,7 @@ function runNpm(invocation: NpmInvocation, args: readonly string[]): string {
         return execFileSync(invocation.executable, [...invocation.argsPrefix, ...args], {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'pipe'],
-            timeout: 60_000,
+            timeout: NPM_INSTALL_TIMEOUT_MS,
             maxBuffer: 128 * 1024,
             env: invocation.environment,
             cwd: invocation.cwd,
@@ -408,7 +408,7 @@ function runNpm(invocation: NpmInvocation, args: readonly string[]): string {
     }
 }
 
-function runNpmAsync(invocation: NpmInvocation, args: readonly string[]): Promise<string> {
+function runNpmAsync(invocation: NpmInvocation, args: readonly string[], timeout = NPM_REGISTRY_LOOKUP_TIMEOUT_MS): Promise<string> {
     if (!path.isAbsolute(invocation.executable)) {
         return Promise.reject(new Error('npm invocation is outside elepha allowlist'));
     }
@@ -418,10 +418,11 @@ function runNpmAsync(invocation: NpmInvocation, args: readonly string[]): Promis
             [...invocation.argsPrefix, ...args],
             {
                 encoding: 'utf8',
-                timeout: 10_000,
+                timeout,
                 maxBuffer: 128 * 1024,
                 env: invocation.environment,
                 cwd: invocation.cwd,
+                shell: false,
             },
             (error, stdout, stderr) => {
                 if (error) {
@@ -463,4 +464,12 @@ export function npmInstallGlobalElepha(invocation: NpmInvocation, version: strin
         throw new Error('npm installation version is outside elepha allowlist');
     }
     runNpm(invocation, ['install', '-g', `elepha@${version}`]);
+}
+
+// Install without blocking terminal progress rendering.
+export async function npmInstallGlobalElephaAsync(invocation: NpmInvocation, version: string | 'latest'): Promise<void> {
+    if (version !== 'latest' && !validPackageVersion(version)) {
+        throw new Error('npm installation version is outside elepha allowlist');
+    }
+    await runNpmAsync(invocation, ['install', '-g', `elepha@${version}`], NPM_INSTALL_TIMEOUT_MS);
 }

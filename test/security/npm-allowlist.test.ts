@@ -5,6 +5,7 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     npmInstallGlobalElepha,
+    npmInstallGlobalElephaAsync,
     npmInvocationForBackend,
     npmViewElephaLatest,
     npmViewElephaLatestAsync,
@@ -106,7 +107,24 @@ describe('npm subprocess allowlist', () => {
         expect(mockedExecFile).toHaveBeenCalledWith(
             path.join(backend.npmBin, 'npm'),
             ['view', 'elepha@latest', 'version', '--json'],
-            expect.objectContaining({ cwd: homedir(), encoding: 'utf8', timeout: 10_000 }),
+            expect.objectContaining({ cwd: homedir(), encoding: 'utf8', timeout: 10_000, shell: false }),
+            expect.any(Function),
+        );
+    });
+
+    it('installs through the fixed async argv without blocking terminal progress', async () => {
+        mockedExecFile.mockImplementationOnce(((_executable, _args, _options, callback) => {
+            (callback as (error: Error | null, stdout: string, stderr: string) => void)(null, '', '');
+            return {} as ReturnType<typeof execFile>;
+        }) as typeof execFile);
+        const backend = standaloneBackend();
+
+        await expect(npmInstallGlobalElephaAsync(npmInvocationForBackend(backend), 'latest')).resolves.toBeUndefined();
+        expect(mockedExecFileSync).not.toHaveBeenCalled();
+        expect(mockedExecFile).toHaveBeenCalledWith(
+            path.join(backend.npmBin, 'npm'),
+            ['install', '-g', 'elepha@latest'],
+            expect.objectContaining({ cwd: homedir(), encoding: 'utf8', timeout: 60_000, shell: false }),
             expect.any(Function),
         );
     });

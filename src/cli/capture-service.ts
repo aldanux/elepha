@@ -1,12 +1,16 @@
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS } from '../config/constants.js';
 import type { Heartbeat } from '../daemon/heartbeat.js';
-import { type DaemonHealthCheckRuntime, defaultDaemonHealthCheckRuntime, waitForHealthyHeartbeat } from '../install/daemon-health.js';
+import {
+    type AsyncDaemonHealthCheckRuntime,
+    defaultAsyncDaemonHealthCheckRuntime,
+    waitForHealthyHeartbeatAsync,
+} from '../install/daemon-health.js';
 import { type DaemonHealth, daemonHealth } from '../install/health-checks.js';
 import { isSupportedPlatform } from '../install/platform.js';
 import { type ServiceBackend, serviceBackend } from '../install/service-backend.js';
 import { errorMessage } from '../util/error.js';
 
-export interface DaemonControlRuntime extends DaemonHealthCheckRuntime {
+export interface DaemonControlRuntime extends AsyncDaemonHealthCheckRuntime {
     platform: NodeJS.Platform;
     createService(): ServiceBackend;
     hasServiceArtifacts(service: ServiceBackend): boolean;
@@ -23,7 +27,7 @@ interface ResumeCaptureServiceTransition extends CaptureServiceTransition {
 }
 
 export const defaultDaemonControlRuntime: DaemonControlRuntime = {
-    ...defaultDaemonHealthCheckRuntime,
+    ...defaultAsyncDaemonHealthCheckRuntime,
     platform: process.platform,
     createService: serviceBackend,
     hasServiceArtifacts: (service) => service.isInstalled(),
@@ -76,10 +80,10 @@ function isFreshHeartbeat(heartbeat: Heartbeat | undefined, previous: Heartbeat 
 }
 
 // Enables capture before starting the managed service.
-export function resumeCaptureService(
+export async function resumeCaptureService(
     service: ServiceBackend,
     runtime: Pick<DaemonControlRuntime, 'daemonHealth' | 'now' | 'sleep'> = defaultDaemonControlRuntime,
-): ResumeCaptureServiceTransition {
+): Promise<ResumeCaptureServiceTransition> {
     const before = service.status();
     const initialHealth = runtime.daemonHealth();
     if (before.loaded && !before.disabled && !before.unknown && initialHealth.healthy) {
@@ -99,7 +103,7 @@ export function resumeCaptureService(
     service.start();
 
     let health = initialHealth;
-    const healthy = waitForHealthyHeartbeat(() => {
+    const healthy = await waitForHealthyHeartbeatAsync(() => {
         health = runtime.daemonHealth();
         return health.healthy && isFreshHeartbeat(health.heartbeat, initialHealth.heartbeat);
     }, runtime);

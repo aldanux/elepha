@@ -45,6 +45,10 @@ describe('launcher probe', () => {
             const original = JSON.parse(readFileSync(packageJson, 'utf8')) as { name: string; version: string; engines: { node: string } };
 
             expect(runProbe(bin, MINIMUM_NODE_VERSION).status).toBe(0);
+            const legacyLauncher = runProbe(bin, MINIMUM_NODE_VERSION.split('.')[0]!);
+            expect(legacyLauncher).toMatchObject({ status: 0, stdout: '', stderr: '' });
+            expect(runProbe(bin, '21').stderr).toContain('launcher probe failed: engines.node');
+            expect(runProbe(bin, '22.0.0').stderr).toContain('launcher probe failed: engines.node');
             expect(runVersion(bin)).toMatchObject({ status: 0, stdout: `${original.version}\n` });
 
             writeFileSync(packageJson, JSON.stringify({ ...original, name: 'not-elepha' }));
