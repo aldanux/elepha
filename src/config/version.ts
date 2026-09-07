@@ -1,13 +1,23 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
+const packageJsonPath = path.join(path.resolve(import.meta.dirname, '..', '..'), 'package.json');
+
+export function readInstalledPackageVersion(): string | undefined {
+    try {
+        const manifest = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { version?: unknown };
+        return typeof manifest.version === 'string' ? manifest.version : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 function readPackageVersion(): string {
-    const packageRoot = path.resolve(import.meta.dirname, '..', '..');
-    const manifest = JSON.parse(readFileSync(path.join(packageRoot, 'package.json'), 'utf8')) as { version?: unknown };
-    if (typeof manifest.version !== 'string') {
+    const version = readInstalledPackageVersion();
+    if (version === undefined) {
         throw new Error('elepha package.json has an invalid version');
     }
-    return manifest.version;
+    return version;
 }
 
 export const PACKAGE_VERSION = readPackageVersion();
