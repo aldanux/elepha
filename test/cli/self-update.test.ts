@@ -1,12 +1,17 @@
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DATABASE_MIGRATION_CONNECTIONS_ACTIVE } from '../../src/storage/database-migration.js';
 
-const mocks = vi.hoisted(() => ({
-    selfUpdate: vi.fn(),
-    countApproved: vi.fn(() => 1),
-    openDb: vi.fn(async () => ({})),
-    spinner: vi.fn(),
-}));
+const mocks = vi.hoisted(() => {
+    const closeDb = vi.fn();
+    return {
+        selfUpdate: vi.fn(),
+        countApproved: vi.fn(() => 1),
+        closeDb,
+        openDb: vi.fn(async () => ({ close: closeDb })),
+        spinner: vi.fn(),
+    };
+});
 
 vi.mock('@clack/prompts', () => ({ spinner: mocks.spinner }));
 vi.mock('../../src/install/self-update.js', () => ({ selfUpdate: mocks.selfUpdate }));
@@ -20,9 +25,8 @@ vi.mock('../../src/storage/consent-store.js', () => ({
 }));
 vi.mock('../../src/storage/db.js', () => ({ openDb: mocks.openDb }));
 
-const { formatSelfUpdateCurrentMessage, formatSelfUpdateUpdatedMessage, registerSelfUpdate } = await import(
-    '../../src/cli/commands/self-update.js'
-);
+const { formatSelfUpdateCurrentMessage, formatSelfUpdateRolledBackMessage, formatSelfUpdateUpdatedMessage, registerSelfUpdate } =
+    await import('../../src/cli/commands/self-update.js');
 const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
 
 function setTty(value: boolean): void {
@@ -77,6 +81,53 @@ describe('elepha self-update', () => {
         expect(stderr).toEqual([]);
         expect(mocks.selfUpdate).toHaveBeenCalledWith({ readApprovedRoots: expect.any(Function) });
         expect(process.exitCode).toBeUndefined();
+    });
+
+    it('closes the temporary consent reader before continuing the update', async () => {
+        mocks.selfUpdate.mockImplementation(async (runtime: { readApprovedRoots(): Promise<number> }) => {
+            expect(await runtime.readApprovedRoots()).toBe(1);
+            expect(mocks.closeDb).toHaveBeenCalledOnce();
+            return { status: 'updated', previousVersion: '1.2.3', version: '1.2.4' };
+        });
+
+        await runSelfUpdate();
+
+        expect(mocks.openDb).toHaveBeenCalledOnce();
+        expect(mocks.countApproved).toHaveBeenCalledOnce();
+        expect(mocks.closeDb).toHaveBeenCalledOnce();
+    });
+
+    it('closes the temporary consent reader when counting approved roots fails', async () => {
+        mocks.countApproved.mockImplementationOnce(() => {
+            throw new Error('consent read failed');
+        });
+        mocks.selfUpdate.mockImplementation(async (runtime: { readApprovedRoots(): Promise<number> }) => {
+            await runtime.readApprovedRoots();
+            return { status: 'updated', previousVersion: '1.2.3', version: '1.2.4' };
+        });
+
+        const { stdout, stderr } = await runSelfUpdate();
+
+        expect(mocks.closeDb).toHaveBeenCalledOnce();
+        expect(stdout).toEqual([]);
+        expect(stderr).toEqual(['consent read failed']);
+        expect(process.exitCode).toBe(1);
+    });
+
+    it('prints a concise rollback reason for database migration contention', async () => {
+        mocks.selfUpdate.mockReturnValue({
+            status: 'rolled-back',
+            previousVersion: '0.3.0',
+            attemptedVersion: '0.4.4',
+            failure: `capture service did not produce a healthy heartbeat; launchctl diagnostics; ${DATABASE_MIGRATION_CONNECTIONS_ACTIVE}`,
+        });
+
+        const { stdout, stderr } = await runSelfUpdate();
+
+        expect(stdout).toEqual([]);
+        expect(stderr).toEqual([formatSelfUpdateRolledBackMessage('0.3.0', '0.4.4', DATABASE_MIGRATION_CONNECTIONS_ACTIVE)]);
+        expect(stderr[0]).not.toContain('launchctl diagnostics');
+        expect(process.exitCode).toBe(1);
     });
 
     it('shows progress while a TTY update is pending and prints the installed version after it completes', async () => {
