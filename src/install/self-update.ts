@@ -3,11 +3,11 @@ import path from 'node:path';
 import { MINIMUM_NODE_VERSION } from '../config/constants.js';
 import { updateAvailablePath } from '../config/paths.js';
 import { npmInstallGlobalElephaAsync, npmInvocationForBackend, npmViewElephaLatestAsync } from '../security/subprocess-allowlist.js';
-import { migratePrimaryDatabaseToEncrypted } from '../storage/database-migration.js';
 import { defaultDbPath } from '../storage/db.js';
 import { errorMessage } from '../util/error.js';
 import { removeFileIfExists } from '../util/fs.js';
 import { type ResolvedElephaBin, resolveInstalledElephaBin } from './binary.js';
+import { migrateDatabaseForInstall } from './database-migration.js';
 import { detectLauncherBackend, type LauncherBackend } from './launcher.js';
 import { isSupportedPlatform } from './platform.js';
 import { reconcileCaptureServiceAsync, type ServiceBackend, serviceBackend } from './service-backend.js';
@@ -121,7 +121,8 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
     const npm = runtime.npm ?? defaultNpm(backend);
     const service = runtime.service ?? serviceBackend({ platform });
     const reconcile: Reconcile = runtime.reconcile ?? reconcileCaptureServiceAsync;
-    const migrateDatabase = runtime.migrateDatabase ?? (() => migratePrimaryDatabaseToEncrypted(defaultDbPath()));
+    const migrateDatabase =
+        runtime.migrateDatabase ?? (() => migrateDatabaseForInstall(defaultDbPath(), { resolveInstalledBin: () => resolved }));
     const readApprovedRoots =
         runtime.readApprovedRoots ??
         (async () => {

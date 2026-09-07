@@ -1,4 +1,5 @@
-// Security Rule 2: only the fixed git and elepha npm calls below are
+// Security Rule 2: only fixed git, service-manager, Elepha npm calls, and
+// bounded read-only macOS process inspection for legacy MCP retirement are
 // permitted. This test is the allowlist half of "both required" - the
 // Biome GritQL plugin (.biome-plugins/no-raw-subprocess.grit) is the other
 // half, structurally banning child_process calls anywhere else in src/. This
@@ -41,6 +42,12 @@ describe('subprocess allowlist', () => {
         expect(source).not.toMatch(/shell\s*:\s*true/);
         expect(source).not.toMatch(/\.\.\.\s*process\.env/);
         expect(source).toMatch(/execFileSync\(/);
+        expect(source).toMatch(/function runMacosProcessInspection\(executable: '\/usr\/sbin\/lsof' \| '\/bin\/ps'/);
+        expect([...source.matchAll(/runMacosProcessInspection\('([^']+)'/g)].map((match) => match[1])).toEqual([
+            '/usr/sbin/lsof',
+            '/usr/sbin/lsof',
+            '/bin/ps',
+        ]);
 
         const gitCalls = [...source.matchAll(/runGit\(\[([^\]]+)]/g)].map((m) =>
             m[1]!

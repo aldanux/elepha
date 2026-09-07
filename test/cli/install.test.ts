@@ -6,14 +6,12 @@ const mocks = vi.hoisted(() => ({
     migrateDatabase: vi.fn(async () => undefined),
     openDb: vi.fn(async () => ({})),
     printInstallation: vi.fn(),
-    spinner: vi.fn(),
     service: {
         status: vi.fn(() => ({ loaded: false, disabled: false, unknown: false })),
         stop: vi.fn(),
     },
 }));
 
-vi.mock('@clack/prompts', () => ({ spinner: mocks.spinner }));
 vi.mock('../../src/install/installer.js', () => ({ installElepha: mocks.installElepha }));
 vi.mock('../../src/install/service-backend.js', () => ({ serviceBackend: () => mocks.service }));
 vi.mock('../../src/storage/consent-store.js', () => ({
@@ -24,7 +22,7 @@ vi.mock('../../src/storage/consent-store.js', () => ({
         }
     },
 }));
-vi.mock('../../src/storage/database-migration.js', () => ({ migratePrimaryDatabaseToEncrypted: mocks.migrateDatabase }));
+vi.mock('../../src/install/database-migration.js', () => ({ migrateDatabaseForInstall: mocks.migrateDatabase }));
 vi.mock('../../src/storage/db.js', () => ({ defaultDbPath: () => '/state/elepha.db', openDb: mocks.openDb }));
 vi.mock('../../src/cli/shared.js', () => ({ printInstallation: mocks.printInstallation }));
 
@@ -72,14 +70,13 @@ afterEach(() => {
 });
 
 describe('elepha install progress', () => {
-    it('renders one TTY spinner per phase and prints the installation summary last', async () => {
+    it('renders each TTY phase and prints the installation summary last', async () => {
         setTty(true);
         const events: string[] = [];
-        mocks.spinner.mockImplementation(() => ({
-            start: (message: string) => events.push(`start:${message}`),
-            stop: (message: string) => events.push(`stop:${message}`),
-            error: (message: string) => events.push(`error:${message}`),
-        }));
+        vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+            events.push(String(chunk));
+            return true;
+        });
         mocks.installElepha.mockImplementation((_paths, runtime) => {
             runtime.onPhase('Preparing hooks & MCP', 'start');
             runtime.onPhase('Preparing hooks & MCP', 'done');
@@ -93,19 +90,14 @@ describe('elepha install progress', () => {
 
         await installProgram().parseAsync(['node', 'elepha', 'install']);
 
-        expect(mocks.spinner).toHaveBeenCalledTimes(3);
-        expect(events).toEqual([
-            'start:Preparing hooks & MCP…',
-            'stop:Preparing hooks & MCP ✔',
-            'start:Registering integrations…',
-            'stop:Registering integrations ✔',
-            'start:Starting the capture daemon…',
-            'stop:Starting the capture daemon ✔',
-            'summary',
-        ]);
+        expect(events.at(-1)).toBe('summary');
+        const rendered = events.slice(0, -1).join('');
+        expect(rendered).toContain('Preparing hooks & MCP ✔\n');
+        expect(rendered).toContain('Registering integrations ✔\n');
+        expect(rendered).toContain('Starting the capture daemon ✔\n');
     });
 
-    it('passes no reporter and emits no spinner controls when stdout is not a TTY', async () => {
+    it('passes no reporter and emits no loader controls when stdout is not a TTY', async () => {
         setTty(false);
         mocks.installElepha.mockReturnValue(installationResult());
 
@@ -116,21 +108,19 @@ describe('elepha install progress', () => {
         expect(mocks.installElepha).toHaveBeenCalledWith(undefined, { approvedRoots: 2, service: mocks.service });
         expect(mocks.service.stop.mock.invocationCallOrder[0]).toBeLessThan(mocks.migrateDatabase.mock.invocationCallOrder[0]);
         expect(mocks.migrateDatabase.mock.invocationCallOrder[0]).toBeLessThan(mocks.openDb.mock.invocationCallOrder[0]);
-        expect(mocks.spinner).not.toHaveBeenCalled();
         expect(mocks.printInstallation).toHaveBeenCalledOnce();
     });
 
-    it('resolves an active spinner in a failure state', () => {
+    it('resolves an active loader in a failure state', () => {
         setTty(true);
-        const spinner = { start: vi.fn(), stop: vi.fn(), error: vi.fn() };
-        mocks.spinner.mockReturnValue(spinner);
+        const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
         const reporter = createInstallProgressReporter();
 
         reporter?.('Starting the capture daemon', 'start');
         reporter?.('Starting the capture daemon', 'fail');
 
-        expect(spinner.start).toHaveBeenCalledWith('Starting the capture daemon…');
-        expect(spinner.error).toHaveBeenCalledWith('Starting the capture daemon ✖');
-        expect(spinner.stop).not.toHaveBeenCalled();
+        const rendered = terminal.mock.calls.map(([chunk]) => String(chunk)).join('');
+        expect(rendered).toContain('Starting the capture daemon');
+        expect(rendered).toContain('Starting the capture daemon ✖\n');
     });
 });
