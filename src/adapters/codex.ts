@@ -121,6 +121,7 @@ interface CodexLine {
 interface CodexSessionIndexLine {
     id?: string;
     thread_name?: string;
+    updated_at?: string;
 }
 
 function hasToolCall(payloadType: string | undefined): boolean {
@@ -268,6 +269,9 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // is still writing, so leave the prompt-derived fallback in place.
     protected override async readSessionAiTitle(filePath: string): Promise<string | undefined> {
         const sessionId = this.nativeSessionId(filePath);
+        let latestTitle: string | undefined;
+        let latestUpdatedAt: number | undefined;
+        let lastTitleWithoutUsableTimestamp: string | undefined;
         try {
             for await (const { text } of readBoundedLines(path.join(codexHome(), 'session_index.jsonl'))) {
                 let line: CodexSessionIndexLine;
@@ -276,15 +280,25 @@ export class CodexAdapter extends JsonlTurnAdapter {
                 } catch {
                     continue;
                 }
-                if (line.id === sessionId && typeof line.thread_name === 'string') {
-                    return line.thread_name;
+                if (line.id !== sessionId || typeof line.thread_name !== 'string') {
+                    continue;
+                }
+
+                const updatedAt = Date.parse(line.updated_at ?? '');
+                if (!Number.isFinite(updatedAt)) {
+                    lastTitleWithoutUsableTimestamp = line.thread_name;
+                    continue;
+                }
+                if (latestUpdatedAt === undefined || updatedAt >= latestUpdatedAt) {
+                    latestTitle = line.thread_name;
+                    latestUpdatedAt = updatedAt;
                 }
             }
         } catch {
             // The daemon's transcript readability report must not turn a
             // missing or temporarily malformed title index into ingest noise.
         }
-        return undefined;
+        return latestTitle ?? lastTitleWithoutUsableTimestamp;
     }
 
     // Codex has emitted both user-turn envelopes. When an event_msg is present

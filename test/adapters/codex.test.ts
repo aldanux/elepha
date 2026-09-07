@@ -148,13 +148,33 @@ describe('CodexAdapter session index titles', () => {
 
     afterEach(() => vi.unstubAllEnvs());
 
-    it('seeds the matching thread_name without changing its text', async () => {
+    it('seeds the latest matching thread_name without changing its text', async () => {
+        const turns = await parsedTurns(
+            `{"id":"${sessionId}","thread_name":"## Objective Make elepha's stored/se…","updated_at":"2026-09-07T12:11:11Z"}\n` +
+                `{"id":"${sessionId}","thread_name":"  Wire Codex AI session titles D111  ","updated_at":"2026-09-07T12:11:16Z"}\n`,
+        );
+
+        expect(turns[0]?.aiTitle).toBe('  Wire Codex AI session titles D111  ');
+        expect(titleForSegment(turns, true)).toBe('Wire Codex AI session titles D111');
+    });
+
+    it('preserves shell-like text for the shared title pipeline to render', async () => {
         const turns = await parsedTurns(
             `{"id":"${sessionId}","thread_name":"  Keep $(this)  title  ","updated_at":"2026-09-07T00:00:00Z"}\n`,
         );
 
         expect(turns[0]?.aiTitle).toBe('  Keep $(this)  title  ');
         expect(titleForSegment(turns, true)).toBe('Keep $(this) title');
+    });
+
+    it.each([
+        ['missing timestamps', `{"id":"${sessionId}","thread_name":"Initial name"}\n{"id":"${sessionId}","thread_name":"Final name"}\n`],
+        [
+            'unparseable timestamps',
+            `{"id":"${sessionId}","thread_name":"Initial name","updated_at":"not-a-date"}\n{"id":"${sessionId}","thread_name":"Final name","updated_at":"still-not-a-date"}\n`,
+        ],
+    ])('uses the last matching row when index timestamps are %s', async (_case, index) => {
+        await expect(parsedTitle(index)).resolves.toBe('Final name');
     });
 
     it.each([
