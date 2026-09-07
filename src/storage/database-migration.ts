@@ -59,6 +59,8 @@ import {
 } from './encrypted-database-export.js';
 
 export const DATABASE_MIGRATION_IN_PROGRESS = 'migration_in_progress';
+export const DATABASE_MIGRATION_CONNECTIONS_ACTIVE =
+    'Database migration is blocked by another process using the database. Close Claude Code and Codex completely, then retry the command from a standalone terminal.';
 export const DATABASE_KEY_COMMITMENT_INDETERMINATE =
     'Database key commitment is indeterminate; migration remains blocked with the plaintext canonical.';
 
@@ -759,7 +761,7 @@ function switchPlaintextToDeleteJournalMode(db: Database.Database): unknown {
             }
             const remaining = deadline - Date.now();
             if (remaining <= 0) {
-                throw error;
+                throw new Error(DATABASE_MIGRATION_CONNECTIONS_ACTIVE, { cause: error });
             }
             Atomics.wait(wait, 0, 0, Math.min(DATABASE_MIGRATION_QUIESCE_POLL_MS, remaining));
         }

@@ -9,7 +9,7 @@ import { PACKAGE_VERSION } from '../config/constants.js';
 import { SERVER_INSTRUCTIONS } from '../serving/instructions.js';
 import type { DatabaseEncryptionRuntime } from '../storage/database-encryption.js';
 import { defaultDbPath, openManagedDatabase } from '../storage/db.js';
-import { ElephaMcpService, mcpToolDefinitions } from './tools.js';
+import { ElephaMcpService, type McpToolHandlers, mcpToolDefinitions } from './tools.js';
 
 export { SERVER_INSTRUCTIONS } from '../serving/instructions.js';
 export { ElephaMcpService };
@@ -68,7 +68,7 @@ function schemaRefusal(readiness: SchemaReadiness): McpToolResult {
     };
 }
 
-export function createMcpServer(service: ElephaMcpService): McpServer {
+export function createMcpServer(service: McpToolHandlers): McpServer {
     const server = new McpServer({ name: 'elepha', version: PACKAGE_VERSION }, { instructions: SERVER_INSTRUCTIONS });
     registerTools(server, mcpToolDefinitions(service));
     return server;
@@ -100,10 +100,33 @@ function registerTools(server: McpServer, tools: ReturnType<typeof mcpToolDefini
     server.registerTool(tools.getSession.name, tools.getSession.configuration, tools.getSession.handler);
 }
 
+function requestScopedHandlers(dbPath: string): McpToolHandlers {
+    const invoke = async (operation: (service: ElephaMcpService) => McpToolResult | Promise<McpToolResult>) => {
+        const db = await openMcpReadOnlyDatabase(dbPath);
+        try {
+            const readiness = schemaReadiness(db);
+            if (!readiness.ready) {
+                return schemaRefusal(readiness);
+            }
+            return await operation(new ElephaMcpService(db, mcpResponseShaper));
+        } finally {
+            db.close();
+        }
+    };
+
+    return {
+        listProjects: () => invoke((service) => service.listProjects()),
+        listSessions: (input) => invoke((service) => service.listSessions(input)),
+        getSession: (input) => invoke((service) => service.getSession(input)),
+    };
+}
+
 // Starts the only network-facing transport. stdout remains reserved for JSON-RPC.
 export async function serveMcp(dbPath: string = defaultDbPath()): Promise<void> {
-    const db = await openMcpReadOnlyDatabase(dbPath);
-    const server = createMcpServerForDatabase(db);
+    // Coding clients keep their stdio MCP process alive for the whole chat.
+    // Scope SQLite ownership to one tool call so an idle client cannot block
+    // database migration, replacement, or restore.
+    const server = createMcpServer(requestScopedHandlers(dbPath));
     await server.connect(new StdioServerTransport());
 }
 

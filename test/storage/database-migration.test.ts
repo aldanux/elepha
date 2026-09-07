@@ -5,6 +5,8 @@ import { copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSyn
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DATABASE_KEYRING_TIMEOUT_MS } from '../../src/config/constants.js';
@@ -18,6 +20,7 @@ import {
 } from '../../src/storage/database-lifecycle.js';
 import {
     DATABASE_KEY_COMMITMENT_INDETERMINATE,
+    DATABASE_MIGRATION_CONNECTIONS_ACTIVE,
     type DatabaseMigrationRuntime,
     migratePrimaryDatabaseToEncrypted,
 } from '../../src/storage/database-migration.js';
@@ -37,6 +40,55 @@ async function killChild(child: ChildProcess): Promise<void> {
     }
     child.kill('SIGKILL');
     await once(child, 'exit');
+}
+
+async function spawnRetiringUnmanagedReader(dbPath: string, directory: string, retireAfterMs: number): Promise<ChildProcess> {
+    const source = `
+import Database from 'better-sqlite3-multiple-ciphers';
+const database = new Database(${JSON.stringify(dbPath)}, { readonly: true, fileMustExist: true });
+database.exec('BEGIN');
+database.prepare('SELECT COUNT(*) FROM sessions').get();
+process.send?.({ ready: true });
+setTimeout(() => {
+    database.exec('ROLLBACK');
+    database.close();
+}, ${retireAfterMs});
+`;
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+        cwd: repositoryRoot,
+        env: { ...process.env, ELEPHA_HOME: directory },
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+    });
+    let stderr = '';
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+        stderr += chunk;
+    });
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => reject(new Error(`Timed out waiting for unmanaged reader: ${stderr}`)), 5_000);
+            child.once('message', (message) => {
+                clearTimeout(timeout);
+                if ((message as { ready?: unknown }).ready === true) {
+                    resolve();
+                } else {
+                    reject(new Error(`Unexpected unmanaged reader message: ${JSON.stringify(message)}`));
+                }
+            });
+            child.once('exit', (code, signal) => {
+                clearTimeout(timeout);
+                reject(new Error(`Unmanaged reader exited before acquisition (${String(code)}/${String(signal)}): ${stderr}`));
+            });
+            child.once('error', (error) => {
+                clearTimeout(timeout);
+                reject(error);
+            });
+        });
+    } catch (error) {
+        await killChild(child);
+        throw error;
+    }
+    return child;
 }
 
 function fixture(prefix: string): { directory: string; dbPath: string } {
@@ -1331,52 +1383,69 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
     it('waits for a retiring unmanaged WAL reader before changing journal mode', async () => {
         const { directory, dbPath } = fixture('elepha-database-migration-retiring-reader-');
         const migrationRuntime = runtime(directory);
-        const source = `
-import Database from 'better-sqlite3-multiple-ciphers';
-const database = new Database(${JSON.stringify(dbPath)}, { readonly: true, fileMustExist: true });
-database.exec('BEGIN');
-database.prepare('SELECT COUNT(*) FROM sessions').get();
-process.send?.({ ready: true });
-setTimeout(() => {
-    database.exec('ROLLBACK');
-    database.close();
-}, 250);
-`;
-        const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
-            cwd: repositoryRoot,
-            env: { ...process.env, ELEPHA_HOME: directory },
-            stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-        });
-        let stderr = '';
-        child.stderr?.setEncoding('utf8');
-        child.stderr?.on('data', (chunk: string) => {
-            stderr += chunk;
-        });
+        const child = await spawnRetiringUnmanagedReader(dbPath, directory, 250);
         try {
-            await new Promise<void>((resolve, reject) => {
-                const timeout = setTimeout(() => reject(new Error(`Timed out waiting for retiring reader: ${stderr}`)), 5_000);
-                child.once('message', (message) => {
-                    clearTimeout(timeout);
-                    if ((message as { ready?: unknown }).ready === true) {
-                        resolve();
-                    } else {
-                        reject(new Error(`Unexpected retiring reader message: ${JSON.stringify(message)}`));
-                    }
-                });
-                child.once('exit', (code, signal) => {
-                    clearTimeout(timeout);
-                    reject(new Error(`Retiring reader exited before acquisition (${String(code)}/${String(signal)}): ${stderr}`));
-                });
-                child.once('error', (error) => {
-                    clearTimeout(timeout);
-                    reject(error);
-                });
-            });
-
             await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).resolves.toEqual({ status: 'migrated' });
             await assertEncryptedOpenable(dbPath, migrationRuntime);
         } finally {
             await killChild(child);
+        }
+    }, 15_000);
+
+    it('explains how to retire a connection after persistent journal-mode contention', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-persistent-reader-');
+        const originalPragma = Database.prototype.pragma;
+        let deleteModeAttempts = 0;
+        const pragmaSpy = vi.spyOn(Database.prototype, 'pragma').mockImplementation(function (
+            this: Database.Database,
+            source: string,
+            ...args: unknown[]
+        ) {
+            if (source === 'journal_mode = DELETE') {
+                deleteModeAttempts += 1;
+                throw new Database.SqliteError('database is locked', 'SQLITE_BUSY');
+            }
+            return (originalPragma as (...pragmaArgs: unknown[]) => unknown).call(this, source, ...args);
+        } as typeof Database.prototype.pragma);
+        try {
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).rejects.toThrow(
+                DATABASE_MIGRATION_CONNECTIONS_ACTIVE,
+            );
+        } finally {
+            pragmaSpy.mockRestore();
+        }
+        expect(deleteModeAttempts).toBeGreaterThan(1);
+        assertPlaintextOpenable(dbPath);
+    }, 15_000);
+
+    it('migrates while an idle MCP server remains connected after serving a request', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-idle-mcp-');
+        const transport = new StdioClientTransport({
+            command: process.execPath,
+            args: [path.resolve('bin/elepha.js'), 'mcp', 'serve'],
+            cwd: repositoryRoot,
+            env: {
+                HOME: directory,
+                ELEPHA_DB_PATH: dbPath,
+                ELEPHA_ENV_FILE: path.join(directory, 'missing.env'),
+            },
+            stderr: 'pipe',
+        });
+        const client = new Client({ name: 'migration-idle-mcp-test', version: '1.0.0' });
+        try {
+            await client.connect(transport);
+            await expect(client.callTool({ name: 'list_projects', arguments: {} })).resolves.toMatchObject({
+                structuredContent: { empty: true, reason: 'no_projects' },
+            });
+            expect(transport.pid).not.toBeNull();
+
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).resolves.toEqual({ status: 'migrated' });
+            await expect(client.listTools()).resolves.toMatchObject({
+                tools: expect.arrayContaining([expect.objectContaining({ name: 'list_projects' })]),
+            });
+            await assertEncryptedOpenable(dbPath, runtime(directory));
+        } finally {
+            await client.close();
         }
     }, 15_000);
 

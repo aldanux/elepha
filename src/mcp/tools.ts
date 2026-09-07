@@ -41,8 +41,8 @@ type ListSessionsInput = { project?: string; limit?: number; include_all?: boole
 type GetSessionInput = { id: string; last_n?: number };
 
 export interface McpToolHandlers {
-    listProjects(): McpToolResult;
-    listSessions(input: ListSessionsInput): McpToolResult;
+    listProjects(): McpToolResult | Promise<McpToolResult>;
+    listSessions(input: ListSessionsInput): McpToolResult | Promise<McpToolResult>;
     getSession(input: GetSessionInput): Promise<McpToolResult>;
 }
 
