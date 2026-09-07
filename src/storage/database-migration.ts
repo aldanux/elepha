@@ -28,6 +28,8 @@ import {
     DATABASE_MIGRATION_COPY_SPACE_DENOMINATOR,
     DATABASE_MIGRATION_COPY_SPACE_NUMERATOR,
     DATABASE_MIGRATION_HASH_CHUNK_BYTES,
+    DATABASE_MIGRATION_QUIESCE_POLL_MS,
+    DATABASE_MIGRATION_QUIESCE_TIMEOUT_MS,
     MINIMUM_NODE_VERSION,
     PRIVATE_DIR_MODE,
     PRIVATE_FILE_MODE,
@@ -743,14 +745,34 @@ function assertPlaintextDeleteJournalMode(journalMode: unknown): void {
     }
 }
 
+function switchPlaintextToDeleteJournalMode(db: Database.Database): unknown {
+    // A pre-lifecycle daemon can retain its WAL reader briefly after the
+    // service manager reports it stopped. Persistent readers still fail closed.
+    const deadline = Date.now() + DATABASE_MIGRATION_QUIESCE_TIMEOUT_MS;
+    const wait = new Int32Array(new SharedArrayBuffer(4));
+    while (true) {
+        try {
+            return db.pragma('journal_mode = DELETE', { simple: true });
+        } catch (error) {
+            if (!(error instanceof Database.SqliteError) || error.code !== 'SQLITE_BUSY') {
+                throw error;
+            }
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) {
+                throw error;
+            }
+            Atomics.wait(wait, 0, 0, Math.min(DATABASE_MIGRATION_QUIESCE_POLL_MS, remaining));
+        }
+    }
+}
+
 function quiescePlaintextDatabase(databasePath: string, runtime: DatabaseMigrationRuntime): Database.Database {
     const db = new Database(databasePath, { fileMustExist: true, timeout: 0 });
     try {
-        db.pragma('busy_timeout = 0');
         db.exec('BEGIN EXCLUSIVE');
         db.exec('ROLLBACK');
         assertPlaintextCheckpointReady(checkpointResult(db));
-        const journalMode = db.pragma('journal_mode = DELETE', { simple: true });
+        const journalMode = switchPlaintextToDeleteJournalMode(db);
         assertPlaintextDeleteJournalMode(journalMode);
         assertNoHotJournal(databasePath);
         db.exec('BEGIN EXCLUSIVE');
