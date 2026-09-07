@@ -1,5 +1,9 @@
 # elepha
 
+## 0.4.3
+
+- Allow database encryption migration to wait briefly for a retiring pre-update WAL reader before changing journal mode by [@aldanux](https://github.com/aldanux) in [#57](https://github.com/aldanux/elepha/pull/57)
+
 ## 0.4.2
 
 - Show the supported Node.js version in the README badge by [@aldanux](https://github.com/aldanux) in [#54](https://github.com/aldanux/elepha/pull/54)
