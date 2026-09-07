@@ -12,10 +12,6 @@ import { defaultLaunchdServicePaths, type LaunchctlExecutor, LaunchdBackend } fr
 import type { ServiceBackend } from '../../src/install/service-backend.js';
 import { defaultSystemdServicePaths, type SystemctlExecutor, SystemdBackend } from '../../src/install/systemd-backend.js';
 
-const progressMocks = vi.hoisted(() => ({ spinner: vi.fn() }));
-
-vi.mock('@clack/prompts', () => ({ spinner: progressMocks.spinner }));
-
 const STARTED_AT = '2026-08-28T00:00:00.000Z';
 const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
 
@@ -511,8 +507,7 @@ describe('elepha pause and resume', () => {
 
     it('restarts capture by pausing then resuming and reports the running state', async () => {
         setTty(true);
-        const spinner = { start: vi.fn(), stop: vi.fn(), error: vi.fn() };
-        progressMocks.spinner.mockReturnValue(spinner);
+        const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
         const executor = new FakeLaunchctl(true, false);
         const runtime = runtimeFor(executor, {
             daemonHealth: () =>
@@ -525,9 +520,9 @@ describe('elepha pause and resume', () => {
 
         expect(result.exitCode).toBeUndefined();
         expect(result.stdout).toBe('Capture daemon restarted (RUNNING (pid 43, heartbeat 0s ago)).\n');
-        expect(spinner.start).toHaveBeenCalledWith('Restarting capture daemon…');
-        expect(spinner.stop).toHaveBeenCalledWith('Capture daemon restarted ✔');
-        expect(spinner.error).not.toHaveBeenCalled();
+        const rendered = terminal.mock.calls.map(([chunk]) => String(chunk)).join('');
+        expect(rendered).toContain('Restarting capture daemon');
+        expect(rendered).toContain('Capture daemon restarted ✔\n');
         expect(
             executor.calls.filter(([verb]) => ['bootout', 'disable', 'enable', 'bootstrap'].includes(verb)).map(([verb]) => verb),
         ).toEqual(['bootout', 'disable', 'enable', 'bootstrap']);

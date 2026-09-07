@@ -1,11 +1,11 @@
-import * as clack from '@clack/prompts';
 import type { Command } from 'commander';
+import { migrateDatabaseForInstall } from '../../install/database-migration.js';
 import { type InstallPhaseReporter, installElepha } from '../../install/installer.js';
 import { type ServiceBackend, serviceBackend } from '../../install/service-backend.js';
 import { ConsentStore } from '../../storage/consent-store.js';
-import { migratePrimaryDatabaseToEncrypted } from '../../storage/database-migration.js';
 import { defaultDbPath, openDb } from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
+import { type CliProgress, startCliProgress } from '../progress.js';
 import { printInstallation } from '../shared.js';
 
 export function createInstallProgressReporter(): InstallPhaseReporter | undefined {
@@ -13,17 +13,16 @@ export function createInstallProgressReporter(): InstallPhaseReporter | undefine
         return undefined;
     }
 
-    let active: ReturnType<typeof clack.spinner> | undefined;
+    let active: CliProgress | undefined;
     return (phase, event) => {
         if (event === 'start') {
-            active = clack.spinner({ output: process.stdout });
-            active.start(`${phase}…`);
+            active = startCliProgress(phase);
             return;
         }
         if (event === 'done') {
-            active?.stop(`${phase} ✔`);
+            active?.done(phase);
         } else {
-            active?.error(`${phase} ✖`);
+            active?.fail(phase);
         }
         active = undefined;
     };
@@ -46,7 +45,7 @@ async function runInstall(): Promise<void> {
         service = serviceBackend();
         priorService = service.status();
         service.stop();
-        await migratePrimaryDatabaseToEncrypted(defaultDbPath());
+        await migrateDatabaseForInstall(defaultDbPath());
         const onPhase = createInstallProgressReporter();
         const runtime = {
             approvedRoots: new ConsentStore(await openDb()).countApproved(),

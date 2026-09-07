@@ -4,10 +4,12 @@
 
 ### Updating from 0.3.x
 
-Close Claude Code and Codex, then perform this one-time upgrade from a standalone terminal:
+The 0.4.5 instructions below did not handle an MCP process left running from the
+previous package. This is corrected in 0.4.6. Once 0.4.6 or later is available,
+perform the one-time upgrade from any terminal; Claude Code and Codex may remain open:
 
 ```console
-npm install -g elepha@0.4.5
+npm install -g elepha@latest
 elepha install
 elepha doctor
 ```

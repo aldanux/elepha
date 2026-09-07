@@ -43,6 +43,7 @@
         "access": "public"
     },
     "scripts": {
+        "postinstall": "node ./bin/postinstall.js",
         "prepublishOnly": "npm run build",
         "build": "tsc -p tsconfig.json",
         "dev": "tsx watch src/cli/index.ts",

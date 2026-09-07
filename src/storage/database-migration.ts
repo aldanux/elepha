@@ -60,7 +60,7 @@ import {
 
 export const DATABASE_MIGRATION_IN_PROGRESS = 'migration_in_progress';
 export const DATABASE_MIGRATION_CONNECTIONS_ACTIVE =
-    'Database migration is blocked by another process using the database. Close Claude Code and Codex completely, then retry the command from a standalone terminal.';
+    'Database migration is blocked by another process using the database. Run elepha install to retire verified stale elepha MCP readers; other database connections must close before retrying.';
 export const DATABASE_KEY_COMMITMENT_INDETERMINATE =
     'Database key commitment is indeterminate; migration remains blocked with the plaintext canonical.';
 

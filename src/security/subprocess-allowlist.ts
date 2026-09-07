@@ -3,18 +3,26 @@
 // (.biome-plugins/no-raw-subprocess.grit) bans exec/execSync/spawn/spawnSync
 // calls and the shell option everywhere else, and
 // test/security/subprocess-allowlist.test.ts asserts this file's actual call
-// sites match the five documented here.
+// sites match the fixed git, service, npm, and macOS inspection wrappers here.
 //
-// Both commands take a fixed, hardcoded argv - the only variable is `cwd`,
-// which every caller must source from a canonicalized, consent-checked
-// project record. Never pass a value read out of a transcript as `cwd`:
-// a Codex rollout's own `cwd` field IS transcript content.
+// Git uses fixed subcommands and a canonicalized, consent-checked project
+// cwd. Service and npm wrappers use fixed lifecycle/package-management verbs
+// and validated installation selectors. Bounded macOS inspection accepts
+// only an absolute configured database path or a validated OS process ID.
+// No selector or cwd may come from transcripts: a Codex rollout's own cwd
+// field IS transcript content.
 
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawnSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { NPM_INSTALL_TIMEOUT_MS, NPM_REGISTRY_LOOKUP_TIMEOUT_MS, SYSTEMD_SERVICE_NAME } from '../config/constants.js';
+import {
+    LEGACY_MCP_INSPECTION_MAX_BYTES,
+    LEGACY_MCP_INSPECTION_TIMEOUT_MS,
+    NPM_INSTALL_TIMEOUT_MS,
+    NPM_REGISTRY_LOOKUP_TIMEOUT_MS,
+    SYSTEMD_SERVICE_NAME,
+} from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
 import type { LauncherBackend } from '../install/launcher.js';
 
@@ -71,6 +79,54 @@ function copySubprocessEnv(keys: readonly string[]): NodeJS.ProcessEnv {
 // Local-only subprocesses receive no network proxy or CA credentials.
 function localSubprocessEnv(): NodeJS.ProcessEnv {
     return copySubprocessEnv(LOCAL_SUBPROCESS_ENV_KEYS);
+}
+
+// Legacy MCPs predate lifecycle leases. These macOS-only, read-only probes
+// identify an installed package's actual database readers before retirement.
+// Database paths come from local configuration; PIDs come from the OS probe.
+function runMacosProcessInspection(executable: '/usr/sbin/lsof' | '/bin/ps', args: string[]): string {
+    const result = spawnSync(executable, args, {
+        encoding: 'utf8',
+        shell: false,
+        timeout: LEGACY_MCP_INSPECTION_TIMEOUT_MS,
+        maxBuffer: LEGACY_MCP_INSPECTION_MAX_BYTES,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...localSubprocessEnv(), LC_ALL: 'C' },
+    });
+    if (result.error !== undefined) {
+        throw result.error;
+    }
+    // Both tools return 1 with no output when the requested process/file
+    // has disappeared. Permission errors and incomplete output are errors.
+    if (result.status === 1 && result.stdout === '' && result.stderr === '') {
+        return '';
+    }
+    if (result.status !== 0 || result.stderr !== '') {
+        throw new Error(`Legacy MCP process inspection failed (${executable}): ${result.stderr.trim() || String(result.status)}`);
+    }
+    return result.stdout;
+}
+
+function inspectedPid(pid: number): string {
+    if (!Number.isSafeInteger(pid) || pid <= 1) {
+        throw new Error('Legacy MCP inspection requires a positive process ID.');
+    }
+    return String(pid);
+}
+
+export function macosDatabaseOpenFiles(databasePath: string): string {
+    if (!path.isAbsolute(databasePath) || databasePath.includes('\0')) {
+        throw new Error('Legacy MCP inspection requires an absolute database path.');
+    }
+    return runMacosProcessInspection('/usr/sbin/lsof', ['-nP', '-F0pRcuftanDi', '--', databasePath]);
+}
+
+export function macosProcessOpenFiles(pid: number): string {
+    return runMacosProcessInspection('/usr/sbin/lsof', ['-nP', '-F0pRcuftanDi', '-a', '-p', inspectedPid(pid)]);
+}
+
+export function macosProcessCommand(pid: number): string {
+    return runMacosProcessInspection('/bin/ps', ['-ww', '-p', inspectedPid(pid), '-o', 'pid=,uid=,lstart=,command=']);
 }
 
 // npm never inherits the complete CLI environment: it can contain credentials

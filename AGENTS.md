@@ -41,8 +41,11 @@ anything, a transcript path structurally cannot reach a shell.
 **Rule 2 — Subprocess allowlist; no transcript-derived arguments.** The only permitted
 subprocesses live in `src/security/subprocess-allowlist.ts`: a fixed set of read-only
 `git` subcommands, the platform service manager (`launchctl` / `systemctl --user`) with
-fixed lifecycle verbs, and the resolved npm backend with fixed package-management argv
-for self-update. Every subprocess uses an argv array with `shell: false`. **No
+fixed lifecycle verbs, the resolved npm backend with fixed package-management argv
+for self-update, and fixed read-only macOS `/bin/ps` and `/usr/sbin/lsof` probes for
+installer-owned legacy MCP retirement. Those probes accept only a configured database
+path or a validated OS process ID; Linux uses `/proc` without subprocesses. Every
+subprocess uses an argv array with `shell: false`. **No
 argument — including `cwd` — may derive from transcript content or a transcript path;**
 a git call's `cwd` comes from the canonicalized, consent-checked project record only.
 (Note: a `cwd` value read out of a transcript *is* transcript content.)

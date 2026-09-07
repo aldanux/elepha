@@ -9,11 +9,9 @@ const mocks = vi.hoisted(() => {
         countApproved: vi.fn(() => 1),
         closeDb,
         openDb: vi.fn(async () => ({ close: closeDb })),
-        spinner: vi.fn(),
     };
 });
 
-vi.mock('@clack/prompts', () => ({ spinner: mocks.spinner }));
 vi.mock('../../src/install/self-update.js', () => ({ selfUpdate: mocks.selfUpdate }));
 vi.mock('../../src/storage/consent-store.js', () => ({
     ConsentStore: class {
@@ -132,8 +130,7 @@ describe('elepha self-update', () => {
 
     it('shows progress while a TTY update is pending and prints the installed version after it completes', async () => {
         setTty(true);
-        const spinner = { start: vi.fn(), stop: vi.fn(), error: vi.fn() };
-        mocks.spinner.mockReturnValue(spinner);
+        const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
         let finish: ((result: { status: 'updated'; previousVersion: string; version: string }) => void) | undefined;
         mocks.selfUpdate.mockReturnValue(
             new Promise((resolve) => {
@@ -142,14 +139,14 @@ describe('elepha self-update', () => {
         );
 
         const running = runSelfUpdate();
-        await vi.waitFor(() => expect(spinner.start).toHaveBeenCalledWith('Updating elepha…'));
-        expect(spinner.stop).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(terminal).toHaveBeenCalled());
+        const pending = terminal.mock.calls.map(([chunk]) => String(chunk)).join('');
+        expect(pending).toContain('Updating elepha');
 
         finish?.({ status: 'updated', previousVersion: '0.3.2', version: '0.4.1' });
         const { stdout, stderr } = await running;
 
-        expect(spinner.stop).toHaveBeenCalledWith('Update complete ✔');
-        expect(spinner.error).not.toHaveBeenCalled();
+        expect(terminal.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain('Update complete ✔\n');
         expect(stdout).toEqual(['elepha updated: 0.3.2 → 0.4.1']);
         expect(stderr).toEqual([]);
     });
