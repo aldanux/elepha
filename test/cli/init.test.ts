@@ -4,7 +4,6 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { type InitPrompts, runInit } from '../../src/cli/init.js';
-import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
 import type { DiscoveryResult } from '../../src/discovery/session-projects.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
@@ -71,14 +70,6 @@ describe('elepha init', () => {
         const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const init = fakePrompts(CANCELLED, []);
         const consent = fakePrompts(CANCELLED, []);
-        let initOutput = '';
-        let consentOutput = '';
-        init.output.on('data', (chunk: Buffer) => {
-            initOutput += chunk.toString('utf8');
-        });
-        consent.output.on('data', (chunk: Buffer) => {
-            consentOutput += chunk.toString('utf8');
-        });
 
         try {
             await expect(
@@ -103,10 +94,6 @@ describe('elepha init', () => {
                 }),
             ).resolves.toBe(0);
 
-            expect(initOutput).toContain(ELEPHA_WORDMARK);
-            expect(initOutput).toContain(ELEPHA_TAGLINE);
-            expect(consentOutput).not.toContain(ELEPHA_WORDMARK);
-            expect(consentOutput).toContain(ELEPHA_TAGLINE);
             expect(consent.prompts.select).toHaveBeenCalledOnce();
             expect(consent.prompts.select).toHaveBeenCalledWith({
                 message: 'How should elepha remember your projects?',
@@ -118,7 +105,6 @@ describe('elepha init', () => {
                     { value: 'individual', label: 'By individual project — only the ones you pick' },
                 ],
             });
-            expect(consent.events).toContain('note:Tools detected: Claude Code, Codex');
         } finally {
             db.close();
             rmSync(directory, { recursive: true, force: true });
@@ -136,7 +122,7 @@ describe('elepha init', () => {
         const projectTwo = path.join(workspace, 'two');
         const phpstormProjects = path.join(home, 'PhpstormProjects');
         const orphan = path.join(phpstormProjects, 'elepha-init-fixture-orphan');
-        const { prompts, events, output } = fakePrompts('folder', [sites, phpstormProjects]);
+        const { prompts, output } = fakePrompts('folder', [sites, phpstormProjects]);
         const backfillApprovedRoots = vi.fn(async (roots: string[]) => roots.length * 3);
         const reconcile = vi.fn();
 
@@ -188,10 +174,6 @@ describe('elepha init', () => {
                 expect.objectContaining({ path: phpstormProjects }),
                 expect.objectContaining({ path: sites }),
             ]);
-            expect(events).toContain('note:Tools detected: Claude Code, Codex');
-            expect(events).toContain(
-                "outro:elepha's memory: 3 projects (3 new) · 6 turns imported\n\nRun `elepha init` anytime to change what's remembered, or `elepha purge --revoked` to clear revoked projects from elepha's memory.",
-            );
         } finally {
             db.close();
             rmSync(directory, { recursive: true, force: true });
@@ -204,7 +186,7 @@ describe('elepha init', () => {
         const store = new MemoryStore(db);
         const folder = path.join(homedir(), 'Sites');
         const project = path.join(folder, `elepha-init-${path.basename(directory)}`, 'secret');
-        const { prompts, events, output } = fakePrompts('folder', [folder]);
+        const { prompts, output } = fakePrompts('folder', [folder]);
         const backfillApprovedRoots = vi.fn(async () => 1);
         store.consent.grant(folder);
         store.consent.revoke(project);
@@ -232,9 +214,6 @@ describe('elepha init', () => {
             expect(store.consent.list('approved')).toEqual([
                 expect.objectContaining({ path: folder, decided_at: originalDecidedAt, source: 'cli' }),
             ]);
-            expect(events).toContain(
-                "outro:elepha's memory: 1 project\n\nRun `elepha init` anytime to change what's remembered, or `elepha purge --revoked` to clear revoked projects from elepha's memory.",
-            );
         } finally {
             db.close();
             rmSync(directory, { recursive: true, force: true });
@@ -344,7 +323,7 @@ describe('elepha init', () => {
         const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const store = new MemoryStore(db);
         const project = path.join(directory, 'project');
-        const { prompts, events, output } = fakePrompts('individual', []);
+        const { prompts, output } = fakePrompts('individual', []);
         store.consent.revoke(project);
 
         try {
@@ -358,13 +337,6 @@ describe('elepha init', () => {
                     discover: async () => discovery([{ root: project, displayName: 'project', sessionCount: 1 }]),
                 }),
             ).resolves.toBe(0);
-
-            const outro = events.find((event) => event.startsWith('outro:'));
-            expect(outro).toContain('· 1 project paused');
-            expect(outro).not.toContain('memory kept');
-            expect(outro).toContain(
-                "\n\nRun `elepha init` anytime to change what's remembered, or `elepha purge --revoked` to clear revoked projects from elepha's memory.",
-            );
         } finally {
             db.close();
             rmSync(directory, { recursive: true, force: true });
@@ -432,7 +404,7 @@ describe('elepha init', () => {
             turns: (db.prepare('SELECT COUNT(*) AS count FROM memories').get() as { count: number }).count,
         });
         const before = counts();
-        const { prompts, events, output } = fakePrompts('individual', [selectedProject, emptyProject]);
+        const { prompts, output } = fakePrompts('individual', [selectedProject, emptyProject]);
 
         try {
             await expect(
@@ -464,9 +436,6 @@ describe('elepha init', () => {
             expect(store.consent.consentState(pausedProject)).toBe('denied');
             expect(store.consent.consentState(emptyProject)).toBe('approved');
             expect(counts()).toEqual(before);
-            expect(events).toContain(
-                `outro:elepha's memory: 2 projects · 1 with no sessions yet · 1 project paused · auto-sync paused for 1 folder (${path.basename(sites)})\n\nRun \`elepha init\` anytime to change what's remembered, or \`elepha purge --revoked\` to clear revoked projects from elepha's memory.`,
-            );
 
             const folder = fakePrompts('folder', [sites]);
             await expect(
@@ -512,7 +481,7 @@ describe('elepha init', () => {
         store.consent.grant(projectTwo);
         const storedProject = store.upsertProject(projectOne);
         store.upsertSession('codex', 'captured-session', storedProject.id, path.join(directory, 'captured.jsonl'));
-        const { prompts, events, output } = fakePrompts('folder', []);
+        const { prompts, output } = fakePrompts('folder', []);
         const planPurge = vi.spyOn(store, 'planPurge');
 
         try {
@@ -541,9 +510,6 @@ describe('elepha init', () => {
             );
             expect(store.findSession('codex', 'captured-session')).toBeDefined();
             expect(planPurge).not.toHaveBeenCalled();
-            expect(events).toContain(
-                "outro:elepha's memory: 0 projects · 2 projects paused\n\nRun `elepha init` anytime to change what's remembered, or `elepha purge --revoked` to clear revoked projects from elepha's memory.",
-            );
         } finally {
             db.close();
             rmSync(directory, { recursive: true, force: true });

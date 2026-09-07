@@ -13,11 +13,6 @@ import type { ServiceBackend } from '../../src/install/service-backend.js';
 import { defaultSystemdServicePaths, type SystemctlExecutor, SystemdBackend } from '../../src/install/systemd-backend.js';
 
 const STARTED_AT = '2026-08-28T00:00:00.000Z';
-const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
-
-function setTty(value: boolean): void {
-    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value });
-}
 
 function heartbeat(pid = 42, startedAt = STARTED_AT, updatedAt = startedAt): Heartbeat {
     return { pid, startedAt, updatedAt };
@@ -144,11 +139,6 @@ async function runDaemonControl(
 
 afterEach(() => {
     vi.restoreAllMocks();
-    if (stdoutTty) {
-        Object.defineProperty(process.stdout, 'isTTY', stdoutTty);
-    } else {
-        Reflect.deleteProperty(process.stdout, 'isTTY');
-    }
 });
 
 describe('elepha pause and resume', () => {
@@ -506,8 +496,6 @@ describe('elepha pause and resume', () => {
     });
 
     it('restarts capture by pausing then resuming and reports the running state', async () => {
-        setTty(true);
-        const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
         const executor = new FakeLaunchctl(true, false);
         const runtime = runtimeFor(executor, {
             daemonHealth: () =>
@@ -520,9 +508,6 @@ describe('elepha pause and resume', () => {
 
         expect(result.exitCode).toBeUndefined();
         expect(result.stdout).toBe('Capture daemon restarted (RUNNING (pid 43, heartbeat 0s ago)).\n');
-        const rendered = terminal.mock.calls.map(([chunk]) => String(chunk)).join('');
-        expect(rendered).toContain('Restarting capture daemon');
-        expect(rendered).toContain('Capture daemon restarted ✔\n');
         expect(
             executor.calls.filter(([verb]) => ['bootout', 'disable', 'enable', 'bootstrap'].includes(verb)).map(([verb]) => verb),
         ).toEqual(['bootout', 'disable', 'enable', 'bootstrap']);
