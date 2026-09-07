@@ -116,7 +116,8 @@ function aiTitle(value: string | undefined): string | undefined {
     if (value === undefined) {
         return undefined;
     }
-    const title = cleanTitle(value);
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    const title = normalized.length <= MAX_TITLE_CHARS ? normalized : `${normalized.slice(0, MAX_TITLE_CHARS - 1)}…`;
     return title === '' ? undefined : title;
 }
 

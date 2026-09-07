@@ -29,7 +29,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
-import { codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
+import { codexHome, codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
 import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionClassification, ToolName } from '../types/index.js';
 import {
     classifyEmptyJsonlSession,
@@ -116,6 +116,12 @@ interface CodexLine {
     timestamp?: string;
     type: string; // "session_meta" | "event_msg" | "response_item" | "turn_context" | ...
     payload?: CodexPayload;
+}
+
+interface CodexSessionIndexLine {
+    id?: string;
+    thread_name?: string;
+    updated_at?: string;
 }
 
 function hasToolCall(payloadType: string | undefined): boolean {
@@ -256,6 +262,43 @@ export class CodexAdapter extends JsonlTurnAdapter {
     nativeSessionId(filePath: string): string {
         const m = ROLLOUT_ID_RE.exec(path.basename(filePath));
         return m ? m[1] : path.basename(filePath, '.jsonl');
+    }
+
+    // Codex keeps the AI-generated thread name in its session index, separate
+    // from the rollout. A missing or incomplete index is normal while Codex
+    // is still writing, so leave the prompt-derived fallback in place.
+    protected override async readSessionAiTitle(filePath: string): Promise<string | undefined> {
+        const sessionId = this.nativeSessionId(filePath);
+        let latestTitle: string | undefined;
+        let latestUpdatedAt: number | undefined;
+        let lastTitleWithoutUsableTimestamp: string | undefined;
+        try {
+            for await (const { text } of readBoundedLines(path.join(codexHome(), 'session_index.jsonl'))) {
+                let line: CodexSessionIndexLine;
+                try {
+                    line = JSON.parse(text) as CodexSessionIndexLine;
+                } catch {
+                    continue;
+                }
+                if (line.id !== sessionId || typeof line.thread_name !== 'string') {
+                    continue;
+                }
+
+                const updatedAt = Date.parse(line.updated_at ?? '');
+                if (!Number.isFinite(updatedAt)) {
+                    lastTitleWithoutUsableTimestamp = line.thread_name;
+                    continue;
+                }
+                if (latestUpdatedAt === undefined || updatedAt >= latestUpdatedAt) {
+                    latestTitle = line.thread_name;
+                    latestUpdatedAt = updatedAt;
+                }
+            }
+        } catch {
+            // The daemon's transcript readability report must not turn a
+            // missing or temporarily malformed title index into ingest noise.
+        }
+        return latestTitle ?? lastTitleWithoutUsableTimestamp;
     }
 
     // Codex has emitted both user-turn envelopes. When an event_msg is present

@@ -1,10 +1,11 @@
-import { unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
+import { titleForSegment } from '../../src/storage/session-title.js';
 import type { ParsedTurn } from '../../src/types/index.js';
-import { withTempDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 // Both fixtures below are trimmed real samples (content genericized, structure
 // and field names untouched) pulled from real ~/.codex/sessions transcripts
@@ -109,6 +110,79 @@ describe('CodexAdapter.matches', () => {
                 expect(adapter.matches(caseVariant)).toBe(false);
             }
         });
+    });
+});
+
+describe('CodexAdapter session index titles', () => {
+    const sessionId = '019fa000-0000-7000-8000-000000000099';
+
+    function fixture(home: string): string {
+        const sessions = path.join(home, 'sessions', '2026', '09', '07');
+        mkdirSync(sessions, { recursive: true });
+        const filePath = path.join(sessions, `rollout-2026-09-07T00-00-00-${sessionId}.jsonl`);
+        writeFileSync(
+            filePath,
+            `${JSON.stringify({ type: 'session_meta', payload: { id: sessionId, cwd: '/repo' } })}\n${JSON.stringify({
+                type: 'event_msg',
+                payload: { type: 'user_message', message: 'Fallback title from the first substantive prompt' },
+            })}\n${JSON.stringify({
+                type: 'response_item',
+                payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] },
+            })}\n`,
+        );
+        return filePath;
+    }
+
+    async function parsedTurns(index: string | undefined): Promise<ParsedTurn[]> {
+        const home = withGrantableTestDir('elepha-codex-session-index-');
+        vi.stubEnv('CODEX_HOME', home);
+        if (index !== undefined) {
+            writeFileSync(path.join(home, 'session_index.jsonl'), index);
+        }
+        return collect(new CodexAdapter().parseTurns(fixture(home), undefined, { closeTrailingOnIdle: true }));
+    }
+
+    async function parsedTitle(index: string | undefined): Promise<string | undefined> {
+        return (await parsedTurns(index))[0]?.aiTitle;
+    }
+
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('seeds the latest matching thread_name without changing its text', async () => {
+        const turns = await parsedTurns(
+            `{"id":"${sessionId}","thread_name":"## Objective Make elepha's stored/se…","updated_at":"2026-09-07T12:11:11Z"}\n` +
+                `{"id":"${sessionId}","thread_name":"  Wire Codex AI session titles D111  ","updated_at":"2026-09-07T12:11:16Z"}\n`,
+        );
+
+        expect(turns[0]?.aiTitle).toBe('  Wire Codex AI session titles D111  ');
+        expect(titleForSegment(turns, true)).toBe('Wire Codex AI session titles D111');
+    });
+
+    it('preserves shell-like text for the shared title pipeline to render', async () => {
+        const turns = await parsedTurns(
+            `{"id":"${sessionId}","thread_name":"  Keep $(this)  title  ","updated_at":"2026-09-07T00:00:00Z"}\n`,
+        );
+
+        expect(turns[0]?.aiTitle).toBe('  Keep $(this)  title  ');
+        expect(titleForSegment(turns, true)).toBe('Keep $(this) title');
+    });
+
+    it.each([
+        ['missing timestamps', `{"id":"${sessionId}","thread_name":"Initial name"}\n{"id":"${sessionId}","thread_name":"Final name"}\n`],
+        [
+            'unparseable timestamps',
+            `{"id":"${sessionId}","thread_name":"Initial name","updated_at":"not-a-date"}\n{"id":"${sessionId}","thread_name":"Final name","updated_at":"still-not-a-date"}\n`,
+        ],
+    ])('uses the last matching row when index timestamps are %s', async (_case, index) => {
+        await expect(parsedTitle(index)).resolves.toBe('Final name');
+    });
+
+    it.each([
+        ['row absent', `{"id":"other-session","thread_name":"Other title"}\n`],
+        ['index missing', undefined],
+        ['malformed index', '{not json}\n'],
+    ])('falls back when the session index is %s', async (_case, index) => {
+        await expect(parsedTitle(index)).resolves.toBeUndefined();
     });
 });
 

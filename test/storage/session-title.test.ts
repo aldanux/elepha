@@ -13,6 +13,11 @@ describe('session titles', () => {
         expect(titleForSegment([{ userMessage: 'Fallback prompt', aiTitle: 'Generated title' }], true)).toBe('Generated title');
     });
 
+    it('uses AI titles 1:1 apart from whitespace collapse and the safety cap', () => {
+        expect(titleForSegment([{ userMessage: 'Fallback prompt', aiTitle: '  Keep $(this)\n title  ' }], true)).toBe('Keep $(this) title');
+        expect(titleForSegment([{ userMessage: 'Fallback prompt', aiTitle: 'x'.repeat(80) }], true)).toBe(`${'x'.repeat(71)}…`);
+    });
+
     it('uses the first non-empty line of a multi-line prompt', () => {
         const prompt = 'Sesión de construcción sobre market-scout.\n\n0 (comprobación previa, luego implementación).';
 

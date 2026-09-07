@@ -481,6 +481,13 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
         return undefined;
     }
 
+    // Some providers record one AI-generated title outside the turn transcript.
+    // Read it once per parse and seed every assembled turn so the shared title
+    // pipeline remains responsible for choosing it over the prompt fallback.
+    protected async readSessionAiTitle(_filePath: string): Promise<string | undefined> {
+        return undefined;
+    }
+
     // Updates transient assembly bookkeeping without making a skipped plumbing line part of the turn payload.
     protected observeToolCallState(_state: TurnBuilderState, _line: unknown): void {}
 
@@ -541,6 +548,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
             }
 
             const sessionId = this.nativeSessionId(filePath);
+            const sessionAiTitle = await this.readSessionAiTitle(filePath);
             let currentCwd: string | undefined;
             let currentSurface: string | undefined;
             let currentBranch: string | undefined;
@@ -678,6 +686,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                     if (cls === 'boundary') {
                         const closed = currentTurn;
                         currentTurn = freshState();
+                        currentTurn.aiTitle = sessionAiTitle;
                         currentTurn.resumeMarkerBefore = pendingResumeMarker;
                         pendingResumeMarker = false;
                         if (closed && !isEmptyTurn(closed)) {
