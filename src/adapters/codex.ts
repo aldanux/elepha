@@ -50,7 +50,15 @@ const EXTERNAL_IMPORT_TURN_PREFIX = 'external-import-turn-';
 
 // Top-level line types this adapter has observed and deliberately ignores
 // (none carry turn content; session_meta/turn_context are mined for cwd only).
-const KNOWN_TOP_LEVEL_SKIP = new Set(['session_meta', 'turn_context', 'world_state', 'compacted', 'inter_agent_communication_metadata']);
+const KNOWN_TOP_LEVEL_SKIP = new Set([
+    'session_meta',
+    'turn_context',
+    'world_state',
+    'compacted',
+    'inter_agent_communication_metadata',
+    // Codex token accounting: identifiers and usage counters only, with no user or assistant turn content.
+    'token_usage_record',
+]);
 
 // event_msg.payload.type subtypes other than "user_message". agent_message is
 // a higher-volume duplicate of the response_item assistant text we already
