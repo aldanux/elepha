@@ -74,7 +74,7 @@ export function createMcpServer(service: McpToolHandlers): McpServer {
     return server;
 }
 
-// Builds either the normal read surface or the same three-tool surface whose
+// Builds either the normal read surface or the same four-tool surface whose
 // calls refuse with a named schema reason. The check itself is read-only.
 export function createMcpServerForDatabase(db: Database.Database): McpServer {
     const readiness = schemaReadiness(db);
@@ -89,6 +89,7 @@ export function createMcpServerForDatabase(db: Database.Database): McpServer {
             listProjects: () => schemaRefusal(readiness),
             listSessions: () => schemaRefusal(readiness),
             getSession: async () => schemaRefusal(readiness),
+            recall: async () => schemaRefusal(readiness),
         }),
     );
     return server;
@@ -98,6 +99,7 @@ function registerTools(server: McpServer, tools: ReturnType<typeof mcpToolDefini
     server.registerTool(tools.listProjects.name, tools.listProjects.configuration, tools.listProjects.handler);
     server.registerTool(tools.listSessions.name, tools.listSessions.configuration, tools.listSessions.handler);
     server.registerTool(tools.getSession.name, tools.getSession.configuration, tools.getSession.handler);
+    server.registerTool(tools.recall.name, tools.recall.configuration, tools.recall.handler);
 }
 
 function requestScopedHandlers(dbPath: string): McpToolHandlers {
@@ -118,6 +120,7 @@ function requestScopedHandlers(dbPath: string): McpToolHandlers {
         listProjects: () => invoke((service) => service.listProjects()),
         listSessions: (input) => invoke((service) => service.listSessions(input)),
         getSession: (input) => invoke((service) => service.getSession(input)),
+        recall: (input) => invoke((service) => service.recall(input)),
     };
 }
 
