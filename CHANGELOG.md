@@ -1,5 +1,10 @@
 # elepha
 
+## 0.4.4
+
+- Prevent encrypted database migration from rejecting historical managed backups when read-only verification is required by [@aldanux](https://github.com/aldanux) in [#58](https://github.com/aldanux/elepha/pull/58)
+- Release SQLite after each MCP tool call so connected coding clients do not block database migration or self-update, and explain how to retire readers left by an older installation by [@aldanux](https://github.com/aldanux) in [#60](https://github.com/aldanux/elepha/pull/60)
+
 ## 0.4.3
 
 - Allow database encryption migration to wait briefly for a retiring pre-update WAL reader before changing journal mode by [@aldanux](https://github.com/aldanux) in [#57](https://github.com/aldanux/elepha/pull/57)
