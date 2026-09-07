@@ -361,14 +361,27 @@ function reconstructFullDatabase(
 }
 
 function cloneFullDatabase(source: Database.Database, targetSchema: string): void {
-    source.transaction(() =>
-        reconstructFullDatabase(
-            source,
-            (entry) => source.exec(qualifyCreateSql(entry, targetSchema)),
-            (table, clear) => copyWholeTable(source, targetSchema, table, clear),
-            (enabled) => source.unsafeMode(enabled),
-        ),
-    )();
+    const foreignKeys = source.pragma('foreign_keys', { simple: true });
+    if (foreignKeys !== 0 && foreignKeys !== 1) {
+        throw new Error('Backup source returned an invalid foreign_keys setting.');
+    }
+    source.pragma('foreign_keys = OFF');
+    try {
+        source.transaction(() => {
+            reconstructFullDatabase(
+                source,
+                (entry) => source.exec(qualifyCreateSql(entry, targetSchema)),
+                (table, clear) => copyWholeTable(source, targetSchema, table, clear),
+                (enabled) => source.unsafeMode(enabled),
+            );
+            const violations = source.pragma(`${targetSchema}.foreign_key_check`) as unknown[];
+            if (violations.length !== 0) {
+                throw new Error('Backup target failed foreign_key_check.');
+            }
+        })();
+    } finally {
+        source.pragma(`foreign_keys = ${foreignKeys === 1 ? 'ON' : 'OFF'}`);
+    }
 }
 
 function copyWholeTableBetween(source: Database.Database, target: Database.Database, table: TableListRow, clear = false): void {

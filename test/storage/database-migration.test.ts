@@ -191,6 +191,63 @@ describe('plaintext primary database encryption migration', () => {
         }
     });
 
+    it('opens retained plaintext backups read-only throughout migration', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-readonly-backup-');
+        const backupPath = `${dbPath}.bak-2026-09-01`;
+        copyFileSync(dbPath, backupPath);
+        const backup = new Database(backupPath);
+        backup.prepare('UPDATE sessions SET native_id = ?').run('readonly-backup');
+        backup.close();
+
+        const originalClose = Database.prototype.close;
+        const observedModes: boolean[] = [];
+        Database.prototype.close = function recordManagedBackupMode() {
+            try {
+                const session = this.prepare('SELECT native_id FROM sessions').get() as { native_id?: unknown } | undefined;
+                if (session?.native_id === 'readonly-backup' && path.basename(this.name) === path.basename(backupPath)) {
+                    observedModes.push(this.readonly);
+                }
+            } catch {
+                // Encrypted verification handles cannot be queried without their key.
+            }
+            return originalClose.call(this);
+        };
+
+        try {
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).resolves.toEqual({ status: 'migrated' });
+        } finally {
+            Database.prototype.close = originalClose;
+        }
+
+        expect(observedModes.length).toBeGreaterThan(0);
+        expect(observedModes).toEqual(observedModes.map(() => true));
+    });
+
+    it('encrypts a valid legacy backup whose child table predates its parent', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-legacy-foreign-key-order-');
+        const backupPath = `${dbPath}.bak-2026-09-01`;
+        copyFileSync(dbPath, backupPath);
+        const backup = new Database(backupPath);
+        backup.exec(`
+            CREATE TABLE legacy_child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES legacy_parent(id)
+            );
+            CREATE TABLE legacy_parent (id INTEGER PRIMARY KEY);
+            INSERT INTO legacy_parent (id) VALUES (1);
+            INSERT INTO legacy_child (id, parent_id) VALUES (1, 1);
+        `);
+        expect(backup.pragma('foreign_key_check')).toEqual([]);
+        backup.close();
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, runtime(directory))).resolves.toEqual({ status: 'migrated' });
+
+        const encrypted = openKeyedDatabase(backupPath, FIXED_KEY, { readonly: true, fileMustExist: true });
+        expect(encrypted.prepare('SELECT id, parent_id FROM legacy_child').all()).toEqual([{ id: 1, parent_id: 1 }]);
+        expect(encrypted.pragma('foreign_key_check')).toEqual([]);
+        encrypted.close();
+    });
+
     it('rejects an unrecognized managed backup before creating migration state or changing the plaintext canonical', async () => {
         const { directory, dbPath } = fixture('elepha-database-migration-invalid-backup-');
         const invalidBackup = `${dbPath}.bak-2026-09-01`;
