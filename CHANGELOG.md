@@ -1,5 +1,9 @@
 # elepha
 
+## 0.4.2
+
+- Show the supported Node.js version in the README badge by [@aldanux](https://github.com/aldanux) in [#54](https://github.com/aldanux/elepha/pull/54)
+
 ## 0.4.1
 
 - Keep self-update compatible with 0.3.x launchers and show terminal progress while update and daemon health commands run by [@aldanux](https://github.com/aldanux) in [#52](https://github.com/aldanux/elepha/pull/52)
