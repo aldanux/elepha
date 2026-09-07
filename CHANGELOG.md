@@ -2,6 +2,18 @@
 
 ## 0.4.5
 
+### Updating from 0.3.x
+
+Close Claude Code and Codex, then perform this one-time upgrade from a standalone terminal:
+
+```console
+npm install -g elepha@0.4.5
+elepha install
+elepha doctor
+```
+
+Existing memory and consent remain unchanged. Future updates can use `elepha self-update`.
+
 - Close the temporary consent reader during self-update and present concise rollback diagnostics by [@aldanux](https://github.com/aldanux) in [#63](https://github.com/aldanux/elepha/pull/63)
 
 ## 0.4.4
