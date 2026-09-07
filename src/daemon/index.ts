@@ -21,6 +21,8 @@ import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import {
+    DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
+    DAEMON_PACKAGE_REPLACED_EXIT_CODE,
     DEFAULT_IDLE_DEBOUNCE_MS,
     DEFAULT_MAX_CONCURRENT,
     DURABLE_CAPTURE_BACKFILL_BATCH_SIZE,
@@ -28,6 +30,8 @@ import {
     FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
+    PACKAGE_VERSION,
+    readInstalledPackageVersion,
     SWEEP_INTERVAL_MS,
     UPDATE_CHECK_LOOP_INTERVAL_MS,
 } from '../config/constants.js';
@@ -164,6 +168,9 @@ export interface DaemonOptions {
     updateCheck?: () => Promise<unknown> | unknown;
     // How often to revisit the persisted 24-hour update-check cache.
     updateCheckIntervalMs?: number;
+    // Test seams for retirement when npm removes or replaces the running package.
+    readInstalledPackageVersion?: () => string | undefined;
+    exit?: (code: number) => void;
     // Forces chokidar to poll instead of using native OS watch descriptors
     // (fsevents on macOS, inotify on Linux). Off by default - native watching
     // is cheaper and this changes real filesystem-event behavior, so it's not
@@ -206,6 +213,8 @@ export class IngestionDaemon {
     private readonly sweepIntervalMs: number;
     private readonly updateCheck: () => Promise<unknown> | unknown;
     private readonly updateCheckIntervalMs: number;
+    private readonly readInstalledPackageVersion: () => string | undefined;
+    private readonly exit: (code: number) => void;
     private readonly watcherUsePolling: boolean;
     private readonly watcherPollIntervalMs: number;
     private readonly captureClaudeCode: boolean;
@@ -224,6 +233,7 @@ export class IngestionDaemon {
     private startupSweepPromise: Promise<void> | undefined;
     private durableCaptureBackfillTimer: NodeJS.Timeout | undefined;
     private durableCaptureBackfillPromise: Promise<void> | undefined;
+    private missingPackageChecks = 0;
     private stopping = false;
     private readonly startedAt = new Date().toISOString();
 
@@ -288,6 +298,8 @@ export class IngestionDaemon {
                     warn: this.logError,
                 }));
         this.updateCheckIntervalMs = options.updateCheckIntervalMs ?? UPDATE_CHECK_LOOP_INTERVAL_MS;
+        this.readInstalledPackageVersion = options.readInstalledPackageVersion ?? readInstalledPackageVersion;
+        this.exit = options.exit ?? ((code) => process.exit(code));
         this.watcherUsePolling = options.watcherUsePolling ?? false;
         this.watcherPollIntervalMs = options.watcherPollIntervalMs ?? 50;
         this.readCorpus = options.readCorpus ?? ((watchRoot) => readdir(watchRoot, { recursive: true }));
@@ -358,7 +370,7 @@ export class IngestionDaemon {
         this.firstPromptSearchBackfillTimer.unref();
 
         writeHeartbeat(this.heartbeatPath, this.startedAt);
-        this.heartbeatTimer = setInterval(() => writeHeartbeat(this.heartbeatPath, this.startedAt), HEARTBEAT_INTERVAL_MS);
+        this.heartbeatTimer = setInterval(() => this.refreshInstallationHeartbeat(), HEARTBEAT_INTERVAL_MS);
         this.heartbeatTimer.unref();
 
         // The registry request belongs to the background daemon, never the
@@ -399,6 +411,44 @@ export class IngestionDaemon {
         }
         this.stopPromise = this.stopInternal();
         return this.stopPromise;
+    }
+
+    private refreshInstallationHeartbeat(): void {
+        let installedVersion: string | undefined;
+        try {
+            installedVersion = this.readInstalledPackageVersion();
+        } catch {
+            installedVersion = undefined;
+        }
+
+        if (installedVersion === PACKAGE_VERSION) {
+            this.missingPackageChecks = 0;
+            writeHeartbeat(this.heartbeatPath, this.startedAt);
+            return;
+        }
+        if (installedVersion === undefined) {
+            this.missingPackageChecks++;
+            if (this.missingPackageChecks < DAEMON_MISSING_PACKAGE_CHECK_LIMIT) {
+                writeHeartbeat(this.heartbeatPath, this.startedAt);
+                return;
+            }
+            this.retireInstallation(0);
+            return;
+        }
+        this.retireInstallation(DAEMON_PACKAGE_REPLACED_EXIT_CODE);
+    }
+
+    private retireInstallation(exitCode: number): void {
+        if (this.stopping) {
+            return;
+        }
+        void this.stop().then(
+            () => this.exit(exitCode),
+            (error: unknown) => {
+                this.logError(`[elepha] installation retirement failed: ${(error as Error).message}`);
+                this.exit(DAEMON_PACKAGE_REPLACED_EXIT_CODE);
+            },
+        );
     }
 
     private installSignalHandlers(): void {

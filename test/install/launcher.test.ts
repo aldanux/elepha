@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -156,6 +157,25 @@ describe('stable launcher backend', () => {
         expect(launcher).toContain(path.join(fixture.root, 'nvm-exec'));
         expect(launcher).not.toContain('/versions/node/v22.2.1');
         expect(launcher).toContain('"$@"');
+    });
+
+    it('lets a managed service stop cleanly when the package disappears', () => {
+        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-launcher-retirement-'));
+        const command = path.join(fixture, 'elepha');
+        const launcherPath = path.join(fixture, 'launcher');
+        writeFileSync(command, '#!/bin/sh\nexit 66\n');
+        chmodSync(command, 0o755);
+        writeFileSync(
+            launcherPath,
+            renderLauncher({ kind: 'standalone', command, node: process.execPath, npmBin: fixture }, MINIMUM_NODE_VERSION),
+        );
+        chmodSync(launcherPath, 0o755);
+
+        expect(spawnSync(launcherPath, ['start'], { env: { ...process.env, ELEPHA_SERVICE: '1' } }).status).toBe(0);
+        expect(spawnSync(launcherPath, ['start'], { env: { ...process.env, ELEPHA_SERVICE: '' } })).toMatchObject({
+            status: 66,
+            stderr: Buffer.from('elepha launcher failed: package-invalid\n'),
+        });
     });
 
     it('refuses a non-default active runtime before any installer write', () => {

@@ -261,7 +261,7 @@ export function renderLauncher(backend: LauncherBackend, minimumNodeVersion: str
         `if [ "\${ELEPHA_MANAGED_LAUNCHER:-}" = "1" ]; then printf "%s\\n" "elepha launcher failed: recursion" >&2; exit 126; fi`,
         'export ELEPHA_MANAGED_LAUNCHER=1',
         `if ! ${probe(backend, 'node', versionProbe)} >/dev/null 2>&1; then printf "%s\\n" "elepha launcher failed: default-missing" >&2; exit 69; fi`,
-        `if ! ${probe(backend, 'elepha', packageProbe)} >/dev/null 2>&1; then printf "%s\\n" "elepha launcher failed: package-invalid" >&2; exit 66; fi`,
+        `if ! ${probe(backend, 'elepha', packageProbe)} >/dev/null 2>&1; then if [ "\${ELEPHA_SERVICE:-}" = "1" ]; then exit 0; fi; printf "%s\\n" "elepha launcher failed: package-invalid" >&2; exit 66; fi`,
         launch,
         '',
     );

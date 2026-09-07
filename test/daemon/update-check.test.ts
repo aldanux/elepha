@@ -2,7 +2,12 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { UPDATE_CHECK_INTERVAL_MS } from '../../src/config/constants.js';
+import {
+    DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
+    DAEMON_PACKAGE_REPLACED_EXIT_CODE,
+    PACKAGE_VERSION,
+    UPDATE_CHECK_INTERVAL_MS,
+} from '../../src/config/constants.js';
 import { setSetting, unsetSetting } from '../../src/config/settings.js';
 import { HEARTBEAT_INTERVAL_MS, readHeartbeat } from '../../src/daemon/heartbeat.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
@@ -276,6 +281,87 @@ describe('daemon update check', () => {
             expect(readHeartbeat(path.join(root, 'daemon.heartbeat.json'))?.updatedAt).not.toBe(firstHeartbeat?.updatedAt);
         } finally {
             releaseQuery?.();
+            await daemon.stop();
+            vi.useRealTimers();
+        }
+    });
+
+    it('stops cleanly after the installed package remains absent', async () => {
+        vi.useFakeTimers();
+        const root = mkdtempSync(path.join(tmpdir(), 'elepha-missing-installation-'));
+        const heartbeatPath = path.join(root, 'daemon.heartbeat.json');
+        const exit = vi.fn();
+        const daemon = new IngestionDaemon({
+            store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
+            watchRoots: [root],
+            heartbeatPath,
+            watcherUsePolling: true,
+            updateCheck: () => undefined,
+            readInstalledPackageVersion: () => undefined,
+            exit,
+        });
+
+        try {
+            daemon.start();
+            await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS * DAEMON_MISSING_PACKAGE_CHECK_LIMIT);
+            await daemon.stop();
+
+            expect(exit).toHaveBeenCalledExactlyOnceWith(0);
+            expect(readHeartbeat(heartbeatPath)).toBeUndefined();
+        } finally {
+            await daemon.stop();
+            vi.useRealTimers();
+        }
+    });
+
+    it('keeps running when a transient package replacement recovers', async () => {
+        vi.useFakeTimers();
+        const root = mkdtempSync(path.join(tmpdir(), 'elepha-transient-installation-'));
+        let checks = 0;
+        const exit = vi.fn();
+        const daemon = new IngestionDaemon({
+            store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
+            watchRoots: [root],
+            heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
+            watcherUsePolling: true,
+            updateCheck: () => undefined,
+            readInstalledPackageVersion: () => (++checks < DAEMON_MISSING_PACKAGE_CHECK_LIMIT ? undefined : PACKAGE_VERSION),
+            exit,
+        });
+
+        try {
+            daemon.start();
+            await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS * DAEMON_MISSING_PACKAGE_CHECK_LIMIT);
+
+            expect(exit).not.toHaveBeenCalled();
+            expect(readHeartbeat(path.join(root, 'daemon.heartbeat.json'))).toBeDefined();
+        } finally {
+            await daemon.stop();
+            vi.useRealTimers();
+        }
+    });
+
+    it('restarts through the service manager when the installed version changes', async () => {
+        vi.useFakeTimers();
+        const root = mkdtempSync(path.join(tmpdir(), 'elepha-replaced-installation-'));
+        const exit = vi.fn();
+        const daemon = new IngestionDaemon({
+            store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
+            watchRoots: [root],
+            heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
+            watcherUsePolling: true,
+            updateCheck: () => undefined,
+            readInstalledPackageVersion: () => '99.0.0',
+            exit,
+        });
+
+        try {
+            daemon.start();
+            await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+            await daemon.stop();
+
+            expect(exit).toHaveBeenCalledExactlyOnceWith(DAEMON_PACKAGE_REPLACED_EXIT_CODE);
+        } finally {
             await daemon.stop();
             vi.useRealTimers();
         }
