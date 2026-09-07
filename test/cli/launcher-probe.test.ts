@@ -27,7 +27,6 @@ describe('launcher probe', () => {
         const prefix = path.join(root, 'prefix');
         try {
             mkdirSync(packDirectory);
-            npm(['run', 'build']);
             const [{ filename }] = JSON.parse(npm(['pack', '--json', '--pack-destination', packDirectory])) as Array<{ filename: string }>;
             npm([
                 'install',
