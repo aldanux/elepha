@@ -1192,6 +1192,7 @@ describe('elepha backup exports', () => {
         const output = path.join(fixture.directory, 'concurrent-snapshot.db');
         const heartbeat = path.join(fixture.directory, 'concurrent-writer.heartbeat');
         const resumeWriter = path.join(fixture.directory, 'concurrent-writer.resume');
+        const writerAdvanced = path.join(fixture.directory, 'concurrent-writer.advanced');
         const stop = path.join(fixture.directory, 'concurrent-writer.stop');
         const targetReady = path.join(fixture.directory, 'concurrent-export-target.ready');
         const beginVacuum = path.join(fixture.directory, 'concurrent-export.begin');
@@ -1199,7 +1200,7 @@ describe('elepha backup exports', () => {
         const writerSource = `
             import { existsSync, writeFileSync } from 'node:fs';
 
-            const [sourcePath, heartbeatPath, resumePath, stopPath, keyHex, rows] = process.argv.slice(1);
+            const [sourcePath, heartbeatPath, resumePath, advancedPath, stopPath, keyHex, rows] = process.argv.slice(1);
             const { openKeyedDatabase } = await import(${JSON.stringify(new URL('../../src/storage/db.ts', import.meta.url).href)});
             const writer = openKeyedDatabase(sourcePath, Buffer.from(keyHex, 'hex'), { fileMustExist: true });
             writer.pragma('journal_mode = WAL');
@@ -1216,6 +1217,7 @@ describe('elepha backup exports', () => {
                 updateAll.run(label);
                 writer.pragma('wal_checkpoint(TRUNCATE)');
                 writeFileSync(heartbeatPath, String(generation), { mode: 0o600 });
+                if (generation === 2) writeFileSync(advancedPath, 'ready', { mode: 0o600 });
                 Atomics.wait(sleeper, 0, 0, 5);
             }
             writer.close();
@@ -1231,6 +1233,7 @@ describe('elepha backup exports', () => {
                 fixture.dbPath,
                 heartbeat,
                 resumeWriter,
+                writerAdvanced,
                 stop,
                 FIXED_KEY.toString('hex'),
                 String(rowCount),
@@ -1295,9 +1298,9 @@ describe('elepha backup exports', () => {
         });
         const exit = waitForExit(child);
         await waitForFile(targetReady, child);
-        writeFileSync(beginVacuum, 'begin', { mode: 0o600 });
-        await new Promise((resolve) => setTimeout(resolve, 10));
         writeFileSync(resumeWriter, 'resume', { mode: 0o600 });
+        await waitForFile(writerAdvanced, writer);
+        writeFileSync(beginVacuum, 'begin', { mode: 0o600 });
         const exportExit = await exit;
         writeFileSync(stop, 'stop', { mode: 0o600 });
         await expect(writerExit).resolves.toEqual({ code: 0, signal: null });

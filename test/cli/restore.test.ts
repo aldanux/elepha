@@ -437,7 +437,10 @@ describe('elepha restore', () => {
         const fixture = createTestDb(`elepha-native-import-${encrypted ? 'encrypted' : 'plaintext'}-`);
         fixture.close();
         const sourcePath = path.join(fixture.directory, 'clean-wal-source.db');
-        const destinationPath = path.join(fixture.directory, 'encrypted-stage.db');
+        const destinationRoot = withGrantableTestDir('elepha-native-import-stage-');
+        const destinationDirectory = path.join(destinationRoot, 'stage');
+        mkdirSync(destinationDirectory);
+        const destinationPath = path.join(destinationDirectory, 'encrypted-stage.db');
         if (encrypted) closeSync(createPrivateEmptyDatabaseDescriptor(sourcePath));
         const source = encrypted ? openKeyedDatabase(sourcePath, FIXED_KEY, { fileMustExist: true }) : new Database(sourcePath);
         source.exec(`
