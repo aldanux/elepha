@@ -83,6 +83,8 @@ export const PARANOID_STATE_FILE_NAME = 'paranoid.json';
 export const DATABASE_MIGRATION_COPY_SPACE_NUMERATOR = 21;
 export const DATABASE_MIGRATION_COPY_SPACE_DENOMINATOR = 10;
 export const DATABASE_MIGRATION_HASH_CHUNK_BYTES = 1024 * 1024;
+export const DATABASE_MIGRATION_QUIESCE_POLL_MS = 25;
+export const DATABASE_MIGRATION_QUIESCE_TIMEOUT_MS = 5_000;
 export const DATABASE_EXPORT_VERIFY_CHUNK_BYTES = 1024 * 1024;
 // Restore/import metadata caps leave at least 8x row and 100x text headroom over the canonical schema.
 export const DATABASE_SCHEMA_METADATA_MAX_ROWS = 256;

@@ -1328,6 +1328,58 @@ await migratePrimaryDatabaseToEncrypted(${JSON.stringify(dbPath)}, {
         await assertEncryptedOpenable(dbPath, migrationRuntime);
     });
 
+    it('waits for a retiring unmanaged WAL reader before changing journal mode', async () => {
+        const { directory, dbPath } = fixture('elepha-database-migration-retiring-reader-');
+        const migrationRuntime = runtime(directory);
+        const source = `
+import Database from 'better-sqlite3-multiple-ciphers';
+const database = new Database(${JSON.stringify(dbPath)}, { readonly: true, fileMustExist: true });
+database.exec('BEGIN');
+database.prepare('SELECT COUNT(*) FROM sessions').get();
+process.send?.({ ready: true });
+setTimeout(() => {
+    database.exec('ROLLBACK');
+    database.close();
+}, 250);
+`;
+        const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+            cwd: repositoryRoot,
+            env: { ...process.env, ELEPHA_HOME: directory },
+            stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+        });
+        let stderr = '';
+        child.stderr?.setEncoding('utf8');
+        child.stderr?.on('data', (chunk: string) => {
+            stderr += chunk;
+        });
+        try {
+            await new Promise<void>((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error(`Timed out waiting for retiring reader: ${stderr}`)), 5_000);
+                child.once('message', (message) => {
+                    clearTimeout(timeout);
+                    if ((message as { ready?: unknown }).ready === true) {
+                        resolve();
+                    } else {
+                        reject(new Error(`Unexpected retiring reader message: ${JSON.stringify(message)}`));
+                    }
+                });
+                child.once('exit', (code, signal) => {
+                    clearTimeout(timeout);
+                    reject(new Error(`Retiring reader exited before acquisition (${String(code)}/${String(signal)}): ${stderr}`));
+                });
+                child.once('error', (error) => {
+                    clearTimeout(timeout);
+                    reject(error);
+                });
+            });
+
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).resolves.toEqual({ status: 'migrated' });
+            await assertEncryptedOpenable(dbPath, migrationRuntime);
+        } finally {
+            await killChild(child);
+        }
+    }, 15_000);
+
     it('preserves acknowledged alias WAL data when a reader prevents the native close checkpoint', async () => {
         const { directory, dbPath } = fixture('elepha-database-migration-closed-alias-wal-');
         const aliasPath = path.join(directory, 'alias.db');
