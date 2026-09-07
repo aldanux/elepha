@@ -1,5 +1,10 @@
 # elepha
 
+## 0.4.5
+
+- Close the temporary consent reader during self-update and present concise rollback diagnostics by [@aldanux](https://github.com/aldanux) in [#63](https://github.com/aldanux/elepha/pull/63)
+- Stop the managed daemon when the global package is removed, and restart it when the installed version changes by [@aldanux](https://github.com/aldanux) in [#66](https://github.com/aldanux/elepha/pull/66)
+
 ## 0.4.4
 
 - Prevent encrypted database migration from rejecting historical managed backups when read-only verification is required by [@aldanux](https://github.com/aldanux) in [#58](https://github.com/aldanux/elepha/pull/58)
