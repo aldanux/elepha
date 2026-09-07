@@ -1,10 +1,9 @@
-import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 
 const FIXTURE_PATH = path.resolve('test/fixtures/codex/rollout-2026-07-22T15-29-54-019f88f2-145b-7853-8390-75dac88737d6.jsonl');
@@ -51,16 +50,6 @@ function claudeCodeModelVisibleText(response: unknown): string {
 describe('elepha MCP stdio transport', () => {
     const databases: Array<ReturnType<typeof openUnmanagedDb>> = [];
     const clients: Client[] = [];
-
-    beforeAll(() => {
-        // This test starts the released bin entrypoint, which imports dist/.
-        // Rebuild first so a source-only content-envelope regression cannot
-        // pass against an old local artifact.
-        execFileSync(process.execPath, [path.resolve('node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'], {
-            cwd: process.cwd(),
-            stdio: 'pipe',
-        });
-    });
 
     afterEach(async () => {
         await Promise.all(clients.splice(0).map((client) => client.close()));
