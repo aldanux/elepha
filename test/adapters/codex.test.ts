@@ -60,6 +60,7 @@ const V0_147_RESPONSE_ITEM_ONLY = path.join(
 // Trimmed real v0.149.0 shape: the synthetic resume marker is its own
 // response_item and must never become a human turn.
 const V0_149_RESUME_MARKER = path.join(__dirname, '..', 'fixtures', 'codex', 'rollout-codex-v0.149.0-resume-marker.jsonl');
+const V0_153_TOKEN_USAGE_RECORD = path.join(__dirname, '..', 'fixtures', 'codex', 'rollout-codex-v0.153.4-token-usage-record.jsonl');
 
 async function collect(iter: AsyncIterable<ParsedTurn>): Promise<ParsedTurn[]> {
     const out: ParsedTurn[] = [];
@@ -238,6 +239,17 @@ describe('CodexAdapter.parseTurns against a real (v0.145.0) multi-file-patch sam
         expect(turn!.toolCalls[1]!.filePaths).toHaveLength(2);
 
         expect(warn).not.toHaveBeenCalled();
+    });
+});
+
+describe('CodexAdapter.parseTurns against a real (v0.153.4) token-usage sample', () => {
+    it('ignores token accounting without warning or producing a turn', async () => {
+        const warn = vi.fn();
+        const adapter = new CodexAdapter(warn);
+        const turns = await collect(adapter.parseTurns(V0_153_TOKEN_USAGE_RECORD, undefined, { closeTrailingOnIdle: true }));
+
+        expect(warn).not.toHaveBeenCalled();
+        expect(turns).toEqual([]);
     });
 });
 
