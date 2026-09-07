@@ -6,7 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { GET_SESSION_DEADLINE_MS, MAX_GET_SESSION_LAST_N } from '../../src/config/constants.js';
+import { DURABLE_CAPTURE_FILTER_VERSION, GET_SESSION_DEADLINE_MS, MAX_GET_SESSION_LAST_N } from '../../src/config/constants.js';
 import { PACKAGE_VERSION } from '../../src/config/version.js';
 import { createMcpServer, createMcpServerForDatabase, mcpResponseShaper, openMcpReadOnlyDatabase } from '../../src/mcp/server.js';
 import { ElephaMcpService, mcpToolDefinitions } from '../../src/mcp/tools.js';
@@ -18,7 +18,7 @@ import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
-import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 class FixtureAdapter implements SessionAdapter {
     readonly tool: ToolName;
@@ -300,11 +300,135 @@ describe('elepha MCP server surface', () => {
             listProjects: () => ({ content: [{ type: 'text', text: '' }] }),
             listSessions: () => ({ content: [{ type: 'text', text: '' }] }),
             getSession: async () => ({ content: [{ type: 'text', text: '' }] }),
+            recall: async () => ({ content: [{ type: 'text', text: '' }] }),
         });
         const schema = definitions.getSession.configuration.inputSchema.last_n;
 
         expect(schema.safeParse(MAX_GET_SESSION_LAST_N).success).toBe(true);
         expect(schema.safeParse(MAX_GET_SESSION_LAST_N + 1).success).toBe(false);
+    });
+
+    it('returns rollup material, durable snippets, and provenance from the existing consented recall index', async () => {
+        const fixture = createTestDb('elepha-mcp-recall-material-');
+        const projectPath = path.join(fixture.directory, 'project');
+        mkdirSync(projectPath);
+        const project = seedProject(fixture, { path: projectPath });
+        seedConsentRoot(fixture, { path: projectPath });
+
+        const rollup = seedSession(fixture, {
+            project,
+            nativeId: 'rollup-material',
+            title: 'Receipt storage choice',
+            surface: 'desktop',
+            lastIngestedAt: '2026-09-07T12:00:00.000Z',
+        });
+        seedMemory(fixture, { project, session: rollup });
+        seedRollup(fixture, {
+            project,
+            session: rollup,
+            decisions: [{ what: 'Use durable receipts', why: 'Restarts support recovery' }],
+        });
+        fixture.db
+            .prepare('UPDATE session_rollups SET pending_items = ? WHERE session_id = ?')
+            .run(JSON.stringify(['Verify recovery']), rollup.id);
+
+        const partial = seedSession(fixture, {
+            project,
+            nativeId: 'partial-material',
+            title: 'Partial recall material',
+            surface: 'cli',
+            lastIngestedAt: '2026-09-07T11:30:00.000Z',
+        });
+        seedMemory(fixture, { project, session: partial });
+        seedRollup(fixture, {
+            project,
+            session: partial,
+            decisions: [{ what: 'Use durable recovery', why: 'Relevant to the same work' }],
+        });
+
+        const durable = seedSession(fixture, {
+            project,
+            nativeId: 'durable-material',
+            title: 'Routine follow-up',
+            surface: 'cli',
+            lastIngestedAt: '2026-09-07T11:00:00.000Z',
+        });
+        const memory = seedMemory(fixture, { project, session: durable });
+        fixture.db
+            .prepare(
+                `INSERT INTO filtered_turns
+                 (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
+                  dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+                 VALUES (?, 1, ?, '', '[]', 0, 0, 0, ?, '2026-09-07T11:00:00.000Z')`,
+            )
+            .run(memory.id, 'The buried marker is orchid beacon.', DURABLE_CAPTURE_FILTER_VERSION);
+        fixture.db
+            .prepare(
+                `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+                 VALUES (?, 'complete', ?, '2026-09-07T11:00:00.000Z')`,
+            )
+            .run(durable.id, DURABLE_CAPTURE_FILTER_VERSION);
+
+        const service = new ElephaMcpService(fixture.db);
+        const rollupResult = text(await service.recall({ query: 'durable receipts' }));
+        expect(rollupResult).toContain('Tool/surface: Codex Desktop');
+        expect(rollupResult).toContain('Session:');
+        expect(rollupResult).toContain('Title: Receipt storage choice');
+        expect(rollupResult).toContain('- What: Use durable receipts');
+        expect(rollupResult).toContain('Why: Restarts support recovery');
+        expect(rollupResult).toContain('- Verify recovery');
+
+        const naturalLanguageResult = text(await service.recall({ query: 'durable receipts recovery' }));
+        expect(naturalLanguageResult).toContain('Title: Receipt storage choice');
+        expect(naturalLanguageResult).toContain('Title: Partial recall material');
+
+        const durableResult = text(await service.recall({ query: 'orchid beacon' }));
+        expect(durableResult).toContain('Durable filtered-turn snippet:');
+        expect(durableResult).toContain('The buried marker is orchid beacon.');
+    });
+
+    it('scopes recall to its resolved project, excludes unconsented sessions, reports misses, and states truncation', async () => {
+        const fixture = createTestDb('elepha-mcp-recall-scope-');
+        const allowedPath = path.join(fixture.directory, 'allowed');
+        const otherPath = path.join(fixture.directory, 'other');
+        const deniedPath = path.join(fixture.directory, 'denied');
+        [allowedPath, otherPath, deniedPath].forEach((directory) => {
+            mkdirSync(directory);
+        });
+        const allowed = seedProject(fixture, { path: allowedPath });
+        const other = seedProject(fixture, { path: otherPath });
+        const denied = seedProject(fixture, { path: deniedPath });
+        seedConsentRoot(fixture, { path: allowedPath });
+        seedConsentRoot(fixture, { path: otherPath });
+
+        const addRollup = (project: typeof allowed, nativeId: string, title: string, what: string): void => {
+            const session = seedSession(fixture, { project, nativeId, title });
+            seedMemory(fixture, { project, session });
+            seedRollup(fixture, { project, session, decisions: [{ what, why: 'A recorded reason' }] });
+        };
+        addRollup(allowed, 'allowed-recall', 'Allowed recall', 'Use shared ledger');
+        addRollup(other, 'other-recall', 'Other recall', 'Use shared ledger');
+        addRollup(denied, 'denied-recall', 'Denied recall', 'Use shared ledger');
+
+        const service = new ElephaMcpService(fixture.db);
+        const scoped = text(await service.recall({ query: 'shared ledger', project: allowedPath }));
+        expect(scoped).toContain('Title: Allowed recall');
+        expect(scoped).not.toContain('Title: Other recall');
+        const global = text(await service.recall({ query: 'shared ledger' }));
+        expect(global).toContain('Title: Allowed recall');
+        expect(global).toContain('Title: Other recall');
+        expect(global).not.toContain('Title: Denied recall');
+        expect(text(await service.recall({ query: 'absent marker' }))).toContain('No recall matches found for “absent marker”.');
+
+        const oversized = seedSession(fixture, { project: allowed, nativeId: 'oversized-recall', title: 'Oversized recall' });
+        seedMemory(fixture, { project: allowed, session: oversized });
+        seedRollup(fixture, {
+            project: allowed,
+            session: oversized,
+            decisions: [{ what: 'overflow marker', why: 'x'.repeat(20_000) }],
+        });
+        const truncated = text(await service.recall({ query: 'overflow marker', project: allowedPath }));
+        expect(truncated).toContain('Recall material was truncated to fit the 4k-token response budget.');
     });
 
     it('keeps every empty and failure state distinct while serving a raw episode without internal IDs', async () => {
@@ -439,6 +563,7 @@ describe('elepha MCP server surface', () => {
         await client.connect(clientTransport);
         expect(client.getServerVersion()).toMatchObject({ name: 'elepha', version: PACKAGE_VERSION });
         const mcpEpisode = await client.callTool({ name: 'get_session', arguments: { id: servedId } });
+        const mcpRecall = await client.callTool({ name: 'recall', arguments: { query: 'resume implementation' } });
         const rejectedLastN = await client.callTool({
             name: 'get_session',
             arguments: { id: servedId, last_n: MAX_GET_SESSION_LAST_N + 1 },
@@ -456,6 +581,7 @@ describe('elepha MCP server surface', () => {
             ]),
         );
         const mcpText = text(mcpEpisode);
+        expect(text(mcpRecall)).toContain('Title: Resume the implementation');
         expect(mcpText).toContain('I will inspect src/example.ts.');
         expect(mcpText).toContain('src/example.ts');
         const nonce = mcpText.match(/\[\[elepha-data ([0-9a-f-]{36})]]/)?.[1];

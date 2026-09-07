@@ -216,6 +216,7 @@ async function expectRepresentativeReadsLocked(seeded: Awaited<ReturnType<typeof
         mcp.listProjects(),
         mcp.listSessions({ project: seeded.projectPath }),
         await mcp.getSession({ id: publicId }),
+        await mcp.recall({ query: 'before lock' }),
     ]) {
         expect(response.content).toEqual([{ type: 'text', text: LOCKED_MEMORY_MESSAGE }]);
         expect(response.structuredContent).toEqual(LOCKED_MCP_RESULT);
