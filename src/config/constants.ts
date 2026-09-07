@@ -9,7 +9,7 @@ export const ELEPHA_WORDMARK = `███████╗ ██╗      ██�
 ╚══════╝ ╚══════╝ ╚══════╝ ╚═╝      ╚═╝  ╚═╝ ╚═╝  ╚═╝`;
 export const ELEPHA_TAGLINE = ` · 🐘 elepha · switch tools, keep the context · `;
 export const DOCS_URL = 'https://github.com/aldanux/elepha#readme';
-export { PACKAGE_VERSION } from './version.js';
+export { PACKAGE_VERSION, readInstalledPackageVersion } from './version.js';
 export const BACKUP_KEEP = 5;
 export const USER_BACKUPS_DIR_NAME = 'backups';
 export const SQLITE_MINIMUM_DATABASE_BYTES = 512;
@@ -100,6 +100,8 @@ export const SEGMENT_FILE_CONTINUITY_THRESHOLD = 0.5;
 export const IDLE_CLOSE_MS = 30 * 60 * 1000;
 export const HEARTBEAT_INTERVAL_MS = 20_000;
 export const HEARTBEAT_STALE_MS = HEARTBEAT_INTERVAL_MS * 3;
+export const DAEMON_MISSING_PACKAGE_CHECK_LIMIT = 3;
+export const DAEMON_PACKAGE_REPLACED_EXIT_CODE = 75;
 export const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 export const FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE = 25;
 export const DURABLE_CAPTURE_BACKFILL_BATCH_SIZE = 25;
