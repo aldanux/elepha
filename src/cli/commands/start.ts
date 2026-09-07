@@ -3,11 +3,12 @@ import type { Command } from 'commander';
 import { elephaLaunchFailurePath } from '../../config/paths.js';
 import { IngestionDaemon } from '../../daemon/index.js';
 import { RollupService } from '../../daemon/rollup-service.js';
-import { migratePrimaryDatabaseToEncrypted } from '../../storage/database-migration.js';
+import { DATABASE_MIGRATION_CONNECTIONS_ACTIVE, migratePrimaryDatabaseToEncrypted } from '../../storage/database-migration.js';
 import { defaultDbPath, openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { RollupStore } from '../../storage/rollup-store.js';
 import { createConfiguredSynthesisProviders } from '../../summarizer/provider-config.js';
+import { errorMessage } from '../../util/error.js';
 
 export interface StartCommandRuntime {
     migrateDatabase(databasePath: string): Promise<unknown>;
@@ -24,7 +25,17 @@ export function registerStart(program: Command, runtime: StartCommandRuntime = d
         .action(async () => {
             const log = (msg: string) => console.log(msg);
             const logError = (msg: string) => console.error(msg);
-            await runtime.migrateDatabase(defaultDbPath());
+            try {
+                await runtime.migrateDatabase(defaultDbPath());
+            } catch (error) {
+                const message = errorMessage(error);
+                if (message === DATABASE_MIGRATION_CONNECTIONS_ACTIVE || message.startsWith('database_lifecycle_busy:')) {
+                    console.error(DATABASE_MIGRATION_CONNECTIONS_ACTIVE);
+                    process.exitCode = 1;
+                    return;
+                }
+                throw error;
+            }
             const db = await openDb();
             const store = new MemoryStore(db);
             if (store.consent.list('approved').length === 0) {
