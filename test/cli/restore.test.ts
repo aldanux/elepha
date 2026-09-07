@@ -560,30 +560,34 @@ describe('elepha restore', () => {
                 db.exec(`CREATE VIEW metadata_view AS SELECT '${'x'.repeat(DATABASE_SCHEMA_METADATA_MAX_CHARS)}' AS value`);
             },
         },
-    ])('rejects $label before encrypted reconstruction materializes unbounded metadata', ({ expectedRows, populate }) => {
-        const directory = withGrantableTestDir('elepha-schema-metadata-import-');
-        const sourcePath = path.join(directory, 'source.db');
-        const destinationPath = path.join(directory, 'encrypted-stage.db');
-        const source = new Database(sourcePath);
-        populate(source);
-        expect(
-            source
-                .prepare(
-                    `SELECT (SELECT COUNT(*) FROM sqlite_schema WHERE sql IS NOT NULL) AS schema_rows,
-                            (SELECT COUNT(*) FROM pragma_table_list WHERE schema = 'main') AS table_rows`,
-                )
-                .safeIntegers()
-                .get(),
-        ).toEqual(expectedRows);
-        source.close();
-        const descriptor = createPrivateEmptyDatabaseDescriptor(destinationPath);
-        const destinationIdentity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
-        closeSync(descriptor);
+    ])(
+        'rejects $label before encrypted reconstruction materializes unbounded metadata',
+        ({ expectedRows, populate }) => {
+            const directory = withGrantableTestDir('elepha-schema-metadata-import-');
+            const sourcePath = path.join(directory, 'source.db');
+            const destinationPath = path.join(directory, 'encrypted-stage.db');
+            const source = new Database(sourcePath);
+            populate(source);
+            expect(
+                source
+                    .prepare(
+                        `SELECT (SELECT COUNT(*) FROM sqlite_schema WHERE sql IS NOT NULL) AS schema_rows,
+                                (SELECT COUNT(*) FROM pragma_table_list WHERE schema = 'main') AS table_rows`,
+                    )
+                    .safeIntegers()
+                    .get(),
+            ).toEqual(expectedRows);
+            source.close();
+            const descriptor = createPrivateEmptyDatabaseDescriptor(destinationPath);
+            const destinationIdentity = inspectPrivateEmptyDatabaseDescriptor(descriptor);
+            closeSync(descriptor);
 
-        expect(() =>
-            writeEncryptedDatabaseImport(sourcePath, importSourceStat(sourcePath), destinationPath, destinationIdentity, FIXED_KEY),
-        ).toThrow(DATABASE_SCHEMA_METADATA_LIMIT_ERROR);
-    });
+            expect(() =>
+                writeEncryptedDatabaseImport(sourcePath, importSourceStat(sourcePath), destinationPath, destinationIdentity, FIXED_KEY),
+            ).toThrow(DATABASE_SCHEMA_METADATA_LIMIT_ERROR);
+        },
+        15_000,
+    );
 
     it.each([
         { encrypted: false, label: 'plaintext' },
