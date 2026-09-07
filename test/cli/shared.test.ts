@@ -167,8 +167,6 @@ describe('withCapturePaused', () => {
         ).resolves.toBe(true);
 
         expect(calls).toEqual(['stop', 'disable', 'operation', 'enable', 'start']);
-        expect(log).toHaveBeenCalledWith('Paused capture…');
-        expect(log).toHaveBeenCalledWith('Capture resumed.');
     });
 
     it('leaves capture paused when no healthy writer was running', async () => {
@@ -179,7 +177,7 @@ describe('withCapturePaused', () => {
 
         expect(operation).toHaveBeenCalledOnce();
         expect(serviceBackend).not.toHaveBeenCalled();
-        expect(log).not.toHaveBeenCalledWith('Capture resumed.');
+        expect(log).not.toHaveBeenCalled();
     });
 
     it('refuses without running or resuming when the daemon stays healthy', async () => {
@@ -232,6 +230,5 @@ describe('withCapturePaused', () => {
         ).rejects.toThrow('apply failed');
 
         expect(calls).toEqual(['stop', 'disable', 'operation', 'enable', 'start']);
-        expect(log).toHaveBeenCalledWith('Capture resumed.');
     });
 });

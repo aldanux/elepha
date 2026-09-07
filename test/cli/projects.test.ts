@@ -76,7 +76,10 @@ describe('elepha projects', () => {
             const allProgram = new Command();
             registerProjects(allProgram);
             await allProgram.parseAsync(['node', 'elepha', 'projects', '--all']);
-            expect(output).toEqual([`${temporaryRoot}  (temp) (1 session)`]);
+            expect(output).toHaveLength(1);
+            expect(output[0]).toContain(temporaryRoot);
+            expect(output[0]).toContain('(temp)');
+            expect(output[0]).toContain('(1 session)');
         } finally {
             log.mockRestore();
             vi.unstubAllEnvs();

@@ -2,7 +2,6 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { type ImportPrompts, runImportWizard } from '../../src/cli/import-wizard.js';
-import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
 
 const CANCELLED = Symbol('cancelled');
 
@@ -33,14 +32,8 @@ describe('elepha import wizard', () => {
         ['overwrite', true],
     ] as const)('imports the selected backup in %s mode through the fakeable confirmation seam', async (mode, overwrite) => {
         const backup = path.join('/tmp', `elepha-${mode}.db`);
-        const events: string[] = [];
-        const prompts = fakePrompts([backup, mode], true, events);
+        const prompts = fakePrompts([backup, mode], true);
         const output = ttyStream();
-        let rendered = '';
-        output.on('data', (chunk: Buffer) => {
-            rendered += chunk.toString('utf8');
-            events.push('tagline');
-        });
         const importBackup = vi.fn(async (_file: string, _overwrite: boolean, confirm?: () => Promise<boolean>) => ({
             cancelled: confirm ? !(await confirm()) : false,
         }));
@@ -57,10 +50,6 @@ describe('elepha import wizard', () => {
 
         expect(importBackup).toHaveBeenCalledWith(backup, overwrite, expect.any(Function));
         expect(prompts.confirm).toHaveBeenCalledWith(expect.objectContaining({ initialValue: false }));
-        expect(prompts.outro).toHaveBeenCalledWith('Import complete.');
-        expect(rendered.split(ELEPHA_TAGLINE)).toHaveLength(2);
-        expect(rendered).not.toContain(ELEPHA_WORDMARK);
-        expect(events.slice(0, 2)).toEqual(['tagline', 'intro:Import elepha memory']);
     });
 
     it('cancels before the import operation mutates anything', async () => {

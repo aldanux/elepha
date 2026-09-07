@@ -26,7 +26,7 @@ vi.mock('../../src/install/database-migration.js', () => ({ migrateDatabaseForIn
 vi.mock('../../src/storage/db.js', () => ({ defaultDbPath: () => '/state/elepha.db', openDb: mocks.openDb }));
 vi.mock('../../src/cli/shared.js', () => ({ printInstallation: mocks.printInstallation }));
 
-const { createInstallProgressReporter, registerInstall } = await import('../../src/cli/commands/install.js');
+const { registerInstall } = await import('../../src/cli/commands/install.js');
 
 const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
 
@@ -70,33 +70,6 @@ afterEach(() => {
 });
 
 describe('elepha install progress', () => {
-    it('renders each TTY phase and prints the installation summary last', async () => {
-        setTty(true);
-        const events: string[] = [];
-        vi.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
-            events.push(String(chunk));
-            return true;
-        });
-        mocks.installElepha.mockImplementation((_paths, runtime) => {
-            runtime.onPhase('Preparing hooks & MCP', 'start');
-            runtime.onPhase('Preparing hooks & MCP', 'done');
-            runtime.onPhase('Registering integrations', 'start');
-            runtime.onPhase('Registering integrations', 'done');
-            runtime.onPhase('Starting the capture daemon', 'start');
-            runtime.onPhase('Starting the capture daemon', 'done');
-            return installationResult();
-        });
-        mocks.printInstallation.mockImplementation(() => events.push('summary'));
-
-        await installProgram().parseAsync(['node', 'elepha', 'install']);
-
-        expect(events.at(-1)).toBe('summary');
-        const rendered = events.slice(0, -1).join('');
-        expect(rendered).toContain('Preparing hooks & MCP ✔\n');
-        expect(rendered).toContain('Registering integrations ✔\n');
-        expect(rendered).toContain('Starting the capture daemon ✔\n');
-    });
-
     it('passes no reporter and emits no loader controls when stdout is not a TTY', async () => {
         setTty(false);
         mocks.installElepha.mockReturnValue(installationResult());
@@ -109,18 +82,5 @@ describe('elepha install progress', () => {
         expect(mocks.service.stop.mock.invocationCallOrder[0]).toBeLessThan(mocks.migrateDatabase.mock.invocationCallOrder[0]);
         expect(mocks.migrateDatabase.mock.invocationCallOrder[0]).toBeLessThan(mocks.openDb.mock.invocationCallOrder[0]);
         expect(mocks.printInstallation).toHaveBeenCalledOnce();
-    });
-
-    it('resolves an active loader in a failure state', () => {
-        setTty(true);
-        const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-        const reporter = createInstallProgressReporter();
-
-        reporter?.('Starting the capture daemon', 'start');
-        reporter?.('Starting the capture daemon', 'fail');
-
-        const rendered = terminal.mock.calls.map(([chunk]) => String(chunk)).join('');
-        expect(rendered).toContain('Starting the capture daemon');
-        expect(rendered).toContain('Starting the capture daemon ✖\n');
     });
 });

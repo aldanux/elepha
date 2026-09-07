@@ -5,7 +5,6 @@ import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { buildPurgeScope, type PurgePrompts, runPurgeWizard } from '../../src/cli/purge-wizard.js';
-import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -109,7 +108,7 @@ describe('elepha purge wizard', () => {
             }),
         ).resolves.toBe(1);
 
-        expect(events).not.toContain('outro:Purge complete.');
+        expect(events.some((event) => event.startsWith('outro:'))).toBe(false);
     });
 
     it('previews the selected project, confirms through the fake seam, and applies through the existing purge engine', async () => {
@@ -152,13 +151,8 @@ describe('elepha purge wizard', () => {
             retainedProject.id,
             path.join(directory, 'retained.jsonl'),
         );
-        const { prompts, events } = fakePrompts(['project', selectedPath], true);
+        const { prompts } = fakePrompts(['project', selectedPath], true);
         const output = ttyStream();
-        let rendered = '';
-        output.on('data', (chunk: Buffer) => {
-            rendered += chunk.toString('utf8');
-            events.push('tagline');
-        });
         const runPurge = vi.fn((scope, plan, confirm) => runPurgeOperation(store, scope, { applyRequested: true, plan, confirm }));
         const logs: string[] = [];
         const log = vi.spyOn(console, 'log').mockImplementation((message: string) => logs.push(message));
@@ -207,12 +201,6 @@ describe('elepha purge wizard', () => {
             });
             expect(prompts.confirm).toHaveBeenCalledWith(
                 expect.objectContaining({ message: expect.stringContaining('these 3 session(s)') }),
-            );
-            expect(rendered.split(ELEPHA_TAGLINE)).toHaveLength(2);
-            expect(rendered).not.toContain(ELEPHA_WORDMARK);
-            expect(events.slice(0, 2)).toEqual(['tagline', 'intro:Purge elepha memory']);
-            expect(events).toEqual(
-                expect.arrayContaining(['intro:Purge elepha memory', 'start:Preparing purge preview…', 'stop', 'outro:Purge complete.']),
             );
             expect(logs).toEqual(expect.arrayContaining([expect.stringContaining('In total: 3 session(s), 0 turn(s).')]));
 

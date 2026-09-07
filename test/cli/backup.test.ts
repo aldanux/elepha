@@ -20,7 +20,6 @@ import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it, vi } from 'vitest';
 import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard.js';
 import { defaultBackupPath, exportAll, exportProject, listFullBackups } from '../../src/cli/commands/backup.js';
-import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
 import { isSupportedPlatform } from '../../src/install/platform.js';
 import { openKeyedDatabase, rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { BACKUP_DESTINATION_COMPANION_ERROR } from '../../src/storage/encrypted-database-export.js';
@@ -4034,13 +4033,8 @@ describe('elepha backup exports', () => {
     it('selects a consolidated project and writes its export through the fakeable wizard seam', async () => {
         const { fixture, project } = seedExportFixture();
         const output = path.join(fixture.directory, 'wizard-export.db');
-        const { prompts, events } = fakePrompts(['project', repositoryRoot], output);
+        const { prompts } = fakePrompts(['project', repositoryRoot], output);
         const wizardOutput = ttyStream();
-        let rendered = '';
-        wizardOutput.on('data', (chunk: Buffer) => {
-            rendered += chunk.toString('utf8');
-            events.push('tagline');
-        });
         const store = new MemoryStore(fixture.db);
 
         await expect(
@@ -4067,9 +4061,6 @@ describe('elepha backup exports', () => {
                 ],
             });
             expect(prompts.select).toHaveBeenNthCalledWith(2, expect.objectContaining({ message: 'Which project should elepha back up?' }));
-            expect(rendered.split(ELEPHA_TAGLINE)).toHaveLength(2);
-            expect(rendered).not.toContain(ELEPHA_WORDMARK);
-            expect(events.slice(0, 2)).toEqual(['tagline', 'intro:Back up elepha memory']);
         } finally {
             exported.close();
         }

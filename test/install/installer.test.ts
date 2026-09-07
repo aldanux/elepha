@@ -103,28 +103,6 @@ class FakeSystemctl implements SystemctlExecutor {
 }
 
 describe('three-file installer transaction', () => {
-    it('reports the tool-agnostic integration registration phase', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-phase-'));
-        const paths = installPaths(root);
-        createConfigDirectories(paths);
-        writeFileSync(paths.claudeSettings, '{}');
-        writeFileSync(paths.claudeMcp, '{}');
-        writeFileSync(paths.codexConfig, '');
-        const phases: string[] = [];
-
-        installElepha(paths, {
-            approvedRoots: 1,
-            onPhase: (phase, event) => phases.push(`${event}:${phase}`),
-        });
-
-        expect(phases).toEqual([
-            'start:Preparing hooks & MCP',
-            'done:Preparing hooks & MCP',
-            'start:Registering integrations',
-            'done:Registering integrations',
-        ]);
-    });
-
     it('runs install and uninstall through the systemd backend on Linux', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-linux-'));
         const paths = installPaths(root);

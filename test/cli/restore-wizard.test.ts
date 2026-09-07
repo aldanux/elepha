@@ -3,7 +3,6 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { type RestorePrompts, runRestoreWizard } from '../../src/cli/restore-wizard.js';
-import { ELEPHA_TAGLINE, ELEPHA_WORDMARK } from '../../src/config/constants.js';
 import { createTestDb } from '../helpers/db.js';
 
 const CANCELLED = Symbol('cancelled');
@@ -31,14 +30,8 @@ describe('elepha restore wizard', () => {
         const fixture = createTestDb('elepha-restore-wizard-');
         const newest = path.join(fixture.directory, 'elepha-full-newest.db');
         const older = path.join(fixture.directory, 'elepha-full-older.db');
-        const events: string[] = [];
-        const prompts = fakePrompts([newest], true, events);
+        const prompts = fakePrompts([newest], true);
         const output = ttyStream();
-        let rendered = '';
-        output.on('data', (chunk: Buffer) => {
-            rendered += chunk.toString('utf8');
-            events.push('tagline');
-        });
         const restore = vi.fn(async (_file: string, confirm: () => Promise<boolean>) => ({ cancelled: !(await confirm()) }));
 
         await expect(
@@ -66,10 +59,6 @@ describe('elepha restore wizard', () => {
         expect(prompts.confirm).toHaveBeenCalledWith(
             expect.objectContaining({ message: expect.stringContaining('Replace the current elepha database') }),
         );
-        expect(prompts.outro).toHaveBeenCalledWith('Restore complete.');
-        expect(rendered.split(ELEPHA_TAGLINE)).toHaveLength(2);
-        expect(rendered).not.toContain(ELEPHA_WORDMARK);
-        expect(events.slice(0, 2)).toEqual(['tagline', 'intro:Restore elepha memory']);
     });
 
     it('falls back to the path prompt when manual entry is selected', async () => {

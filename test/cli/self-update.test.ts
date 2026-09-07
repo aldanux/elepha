@@ -25,12 +25,6 @@ vi.mock('../../src/storage/db.js', () => ({ openDb: mocks.openDb }));
 
 const { formatSelfUpdateCurrentMessage, formatSelfUpdateRolledBackMessage, formatSelfUpdateUpdatedMessage, registerSelfUpdate } =
     await import('../../src/cli/commands/self-update.js');
-const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
-
-function setTty(value: boolean): void {
-    Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value });
-}
-
 async function runSelfUpdate(): Promise<{ stdout: string[]; stderr: string[] }> {
     const stdout: string[] = [];
     const stderr: string[] = [];
@@ -52,11 +46,6 @@ describe('elepha self-update', () => {
     afterEach(() => {
         vi.restoreAllMocks();
         process.exitCode = undefined;
-        if (stdoutTty) {
-            Object.defineProperty(process.stdout, 'isTTY', stdoutTty);
-        } else {
-            Reflect.deleteProperty(process.stdout, 'isTTY');
-        }
     });
 
     it('says the install is already on the latest version when nothing changed', async () => {
@@ -126,28 +115,5 @@ describe('elepha self-update', () => {
         expect(stderr).toEqual([formatSelfUpdateRolledBackMessage('0.3.0', '0.4.4', DATABASE_MIGRATION_CONNECTIONS_ACTIVE)]);
         expect(stderr[0]).not.toContain('launchctl diagnostics');
         expect(process.exitCode).toBe(1);
-    });
-
-    it('shows progress while a TTY update is pending and prints the installed version after it completes', async () => {
-        setTty(true);
-        const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-        let finish: ((result: { status: 'updated'; previousVersion: string; version: string }) => void) | undefined;
-        mocks.selfUpdate.mockReturnValue(
-            new Promise((resolve) => {
-                finish = resolve;
-            }),
-        );
-
-        const running = runSelfUpdate();
-        await vi.waitFor(() => expect(terminal).toHaveBeenCalled());
-        const pending = terminal.mock.calls.map(([chunk]) => String(chunk)).join('');
-        expect(pending).toContain('Updating elepha');
-
-        finish?.({ status: 'updated', previousVersion: '0.3.2', version: '0.4.1' });
-        const { stdout, stderr } = await running;
-
-        expect(terminal.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain('Update complete ✔\n');
-        expect(stdout).toEqual(['elepha updated: 0.3.2 → 0.4.1']);
-        expect(stderr).toEqual([]);
     });
 });

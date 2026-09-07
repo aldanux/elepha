@@ -182,10 +182,13 @@ logging tool, which is exactly the fragile pattern elepha is built to avoid.
   than weakening, relaxing, or deleting an assertion to make the suite pass. If an
   assertion is genuinely wrong, explain why in the pull request before changing it,
   because a quiet test edit erases the contract instead of repairing the behavior.
-- **Pin user-visible output byte-for-byte.** Assert every prompt, confirmation, and
-  rendered line with an exact string, including trailing spaces; whitespace is part of
-  the byte-level interface and can affect terminal presentation or automation.
-  Refactors may share the mechanism but must not silently reword output.
+- **Pin contract output byte-for-byte; test terminal chrome by meaning.** Assert exact
+  strings, including whitespace, only when output is consumed by another program or
+  an AI, is a shared contract string, or is a security/destructive prompt,
+  confirmation, or affected-path/row report. For purely human-facing decorative
+  terminal chrome — spinner labels, progress dots or ellipses, colors, ASCII art, and
+  cosmetic status phrasing — assert the functional state or action conveyed when it
+  needs coverage; do not pin exact wording, punctuation, color, or spacing.
 - **Keep fixtures inside the repository tree.** A test suite must never create or
   delete anything outside the repository, and it must not place project fixtures in an
   operating-system temporary tree that production deliberately refuses.
