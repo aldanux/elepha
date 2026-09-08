@@ -2,6 +2,15 @@
 
 ## 0.5.0
 
+### Highlights
+
+- **Ask your past work in plain language.** The new `recall` MCP tool answers a natural-language question like "do you remember why we moved the purchase button" with the decisions, the reasoning, and open items, each tagged with its project and session, and it works with no AI key of your own.
+- **Cross-tool resume with `elepha:resume`.** `elepha:select` becomes `elepha:resume:<n>` and loads the whole session so you can continue it in another tool, with the model presenting a recap instead of pasting the turns back.
+- **Nothing is injected unless you ask.** The automatic session-start brief is gone; type `elepha:info` for status on demand (sessions here and total, capture state, last session, and update notices).
+- **Steadier memory.** A transferred or renamed repository consolidates instead of splitting in two, capture-paused operations no longer throw a spurious 60s error, and session counts now match across `elepha projects`, `elepha:info`, `elepha:list`, and `elepha:query`.
+
+### Changes
+
 - Add the consent-scoped MCP `recall` tool for provenance-backed historical memory material by [@aldanux](https://github.com/aldanux) in [#73](https://github.com/aldanux/elepha/pull/73)
 - Rename `elepha:select:<n>` to `elepha:resume:<n>` (no alias) and serve the whole filtered session for cross-tool resume, with a recap instruction so the model presents where the work left off, the decisions and why, and open items, instead of pasting turns by [@aldanux](https://github.com/aldanux) in [#76](https://github.com/aldanux/elepha/pull/76)
 - Remove the SessionStart auto-brief and its startup-mode config; add `elepha:info` for on-demand status (sessions here/total, capture state, last session with its project). Operational daemon-health and update notices still surface at session start by [@aldanux](https://github.com/aldanux) in [#77](https://github.com/aldanux/elepha/pull/77)
