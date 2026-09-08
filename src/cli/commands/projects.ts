@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import type { Command } from 'commander';
 import { isWithin, samePath } from '../../config/paths.js';
 import { discoverFolderRepos } from '../../discovery/session-projects.js';
+import { SessionReader } from '../../serving/session-reader.js';
 import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver } from '../../storage/project-resolver.js';
@@ -23,7 +24,7 @@ export function registerProjects(program: Command): void {
                 const approvedDiscovered = discovered
                     .filter((project) => store.consent.consentState(project.root) === 'approved')
                     .sort((a, b) => a.root.localeCompare(b.root));
-                const sessionCounts = store.sessionCountsByProject();
+                const sessionCounts = new SessionReader(store.database).sessionCountsByProject();
                 const projects = new ProjectResolver(store.database).list();
                 const countSessions = (projectIds: readonly number[]): number =>
                     projectIds.reduce((total, projectId) => total + (sessionCounts.get(projectId) ?? 0), 0);

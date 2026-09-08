@@ -142,14 +142,6 @@ export class MemoryStore {
         return this.projects.listProjects();
     }
 
-    sessionCountsByProject(): Map<number, number> {
-        const rows = this.db.prepare('SELECT project_id, COUNT(*) AS c FROM sessions GROUP BY project_id').all() as Array<{
-            project_id: number;
-            c: number;
-        }>;
-        return new Map(rows.map((row) => [row.project_id, row.c]));
-    }
-
     upsertSession(
         tool: ToolName,
         nativeId: string,
