@@ -279,7 +279,7 @@ describe('D40 UserPromptSubmit command hook', () => {
         });
 
         expect(injectedBody(result)).toBe(
-            `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture ON · 6 sessions here / 8 total · last session 1h ago in Claude Code Desktop · Claude workspace · type elepha:last to resume`,
+            `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture: ON · sessions: 6 here / 8 total · last session in project: Claude workspace - 1h ago in Claude Code Desktop · type elepha:last to resume`,
         );
     });
 
@@ -297,7 +297,7 @@ describe('D40 UserPromptSubmit command hook', () => {
             readUpdateAvailable: () => undefined,
         });
 
-        expect(injectedBody(result)).toBe(`${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture ON · 0 sessions here / 0 total`);
+        expect(injectedBody(result)).toBe(`${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture: ON · sessions: 0 here / 0 total`);
     });
 
     it('byte-pins elepha:info with capture off and the grantable-root hint', async () => {
@@ -328,7 +328,7 @@ describe('D40 UserPromptSubmit command hook', () => {
         });
 
         expect(injectedBody(result)).toBe(
-            `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture OFF · 0 sessions here / 1 total · type elepha:list to recall · run 'elepha consent grant ${canonicalPendingCwd}' to capture here`,
+            `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture: OFF · sessions: 0 here / 1 total · type elepha:list to recall · run 'elepha consent grant ${canonicalPendingCwd}' to capture here`,
         );
     });
 
@@ -346,7 +346,7 @@ describe('D40 UserPromptSubmit command hook', () => {
                 DISPLAY_VERBATIM_INSTRUCTIONS,
                 '⬆ elepha 99.0.0 available — → Run (Terminal): elepha self-update',
                 '⚠ elepha: capture is paused — daemon not running. → Run (Terminal): elepha doctor',
-                '🐘 elepha · capture ON · 6 sessions here / 6 total · last session 2h ago in Codex CLI · elepha · type elepha:last to resume',
+                '🐘 elepha · capture: ON · sessions: 6 here / 6 total · last session in project: elepha - 2h ago in Codex CLI · type elepha:last to resume',
             ].join('\n'),
         );
     });

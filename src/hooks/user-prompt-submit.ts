@@ -161,14 +161,14 @@ async function commandBody(
                 infoContext.captureOffRoot !== 'refused' && infoContext.captureOffRoot.state === 'pending'
                     ? ` · run 'elepha consent grant ${infoContext.captureOffRoot.path}' to capture here`
                     : '';
-            status = `🐘 elepha · capture OFF · ${here} sessions here / ${total} total · type elepha:list to recall${grantHint}`;
+            status = `🐘 elepha · capture: OFF · sessions: ${here} here / ${total} total · type elepha:list to recall${grantHint}`;
         } else {
             const session = newestActivity(reader.recentConsentedSessions(consentedProjects), {
                 excludeNativeId: infoContext.excludeNativeId,
             });
-            status = `🐘 elepha · capture ON · ${here} sessions here / ${total} total`;
+            status = `🐘 elepha · capture: ON · sessions: ${here} here / ${total} total`;
             if (session !== undefined) {
-                status += ` · last session ${relativeTime(endedAt(session), now)} in ${surfaceLabel(session.tool, session.surface)} · ${projectNames.get(session.project_id) ?? '(unknown project)'} · type elepha:last to resume`;
+                status += ` · last session in project: ${projectNames.get(session.project_id) ?? '(unknown project)'} - ${relativeTime(endedAt(session), now)} in ${surfaceLabel(session.tool, session.surface)} · type elepha:last to resume`;
             }
         }
         status = withDaemonHealthWarning(status, now, infoContext.daemonHealth);
