@@ -5,11 +5,14 @@ export interface ToolConfigPaths {
     claudeSettings: string;
     claudeMcp: string;
     codexConfig: string;
+    opencodeConfig: string;
+    opencodeStore?: string;
 }
 
 export interface PresentTools {
     claude: boolean;
     codex: boolean;
+    opencode: boolean;
 }
 
 function isDirectory(file: string): boolean {
@@ -22,5 +25,7 @@ export function detectPresentTools(paths: ToolConfigPaths): PresentTools {
     return {
         claude: isDirectory(path.dirname(paths.claudeSettings)) || existsSync(paths.claudeMcp),
         codex: isDirectory(path.dirname(paths.codexConfig)),
+        opencode:
+            isDirectory(path.dirname(paths.opencodeConfig)) || (paths.opencodeStore !== undefined && isDirectory(paths.opencodeStore)),
     };
 }

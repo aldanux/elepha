@@ -1,4 +1,15 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+    existsSync,
+    lstatSync,
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    rmSync,
+    statSync,
+    symlinkSync,
+    writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parse } from 'smol-toml';
@@ -12,6 +23,7 @@ import {
 } from '../../src/install/launchd-backend.js';
 import type { LauncherBackend } from '../../src/install/launcher.js';
 import { defaultSystemdServicePaths, type SystemctlExecutor, SystemdBackend } from '../../src/install/systemd-backend.js';
+import { ELEPHA_MCP_ARGS, ELEPHA_MCP_SERVER_NAME } from '../../src/mcp/installer.js';
 
 const bin = '/opt/npm/bin/elepha';
 const launcherMock = vi.hoisted(() => ({
@@ -64,6 +76,8 @@ function installPaths(root: string) {
         claudeSettings: path.join(root, '.claude', 'settings.json'),
         claudeMcp: path.join(root, '.claude.json'),
         codexConfig: path.join(root, '.codex', 'config.toml'),
+        opencodeConfig: path.join(root, '.config', 'opencode', 'opencode.json'),
+        opencodeStore: path.join(root, '.local', 'share', 'opencode'),
     };
 }
 
@@ -102,7 +116,7 @@ class FakeSystemctl implements SystemctlExecutor {
     }
 }
 
-describe('three-file installer transaction', () => {
+describe('installer transaction', () => {
     it('runs install and uninstall through the systemd backend on Linux', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-linux-'));
         const paths = installPaths(root);
@@ -1047,14 +1061,63 @@ describe('three-file installer transaction', () => {
         expect(existsSync(paths.claudeMcp)).toBe(false);
     });
 
+    it('registers OpenCode MCP only when OpenCode is present and removes it on uninstall', () => {
+        const scratch = path.resolve(import.meta.dirname, '..', '..', '.test-scratch');
+        mkdirSync(scratch, { recursive: true });
+        const root = mkdtempSync(path.join(scratch, 'opencode-mcp-installer-'));
+        const paths = installPaths(root);
+        mkdirSync(paths.opencodeStore, { recursive: true });
+
+        try {
+            const installed = installElepha(paths, { home: root, approvedRoots: 1 });
+
+            expect(installed.status.opencodeMcp).toBe('registered');
+            expect(installed.status.ready).toBe(true);
+            expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
+                mcp: {
+                    [ELEPHA_MCP_SERVER_NAME]: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true },
+                },
+            });
+            expect(existsSync(paths.claudeSettings)).toBe(false);
+            expect(existsSync(paths.codexConfig)).toBe(false);
+
+            const removed = uninstallElepha(paths, { home: root, approvedRoots: 1 });
+
+            expect(removed.status.opencodeMcp).toBe('not installed');
+            expect(existsSync(paths.opencodeConfig)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('does not create opencode.json when another supported tool is present but OpenCode is absent', () => {
+        const scratch = path.resolve(import.meta.dirname, '..', '..', '.test-scratch');
+        mkdirSync(scratch, { recursive: true });
+        const root = mkdtempSync(path.join(scratch, 'opencode-mcp-absent-'));
+        const paths = installPaths(root);
+        mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
+
+        try {
+            const installed = installElepha(paths, { home: root, approvedRoots: 1 });
+
+            expect(installed.status.opencodeMcp).toBe('not present');
+            expect(existsSync(paths.opencodeConfig)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it('refuses when neither supported tool is present without writing a config', () => {
         const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
         const paths = installPaths(root);
 
-        expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow('no supported tool found; install Claude Code or Codex first');
+        expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow(
+            'no supported tool found; install Claude Code or Codex or OpenCode first',
+        );
         expect(existsSync(paths.claudeSettings)).toBe(false);
         expect(existsSync(paths.claudeMcp)).toBe(false);
         expect(existsSync(paths.codexConfig)).toBe(false);
+        expect(existsSync(paths.opencodeConfig)).toBe(false);
     });
 
     it.each([

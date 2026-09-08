@@ -2,10 +2,10 @@ import { existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { parse } from 'smol-toml';
 import { MINIMUM_NODE_VERSION, PRIVATE_FILE_MODE } from '../config/constants.js';
-import { claudeMcpPath, claudeSettingsPath, codexConfigPath, elephaHome } from '../config/paths.js';
+import { claudeMcpPath, claudeSettingsPath, codexConfigPath, elephaHome, opencodeConfigPath, opencodeStoreRoot } from '../config/paths.js';
 import { transformClaudeHook, transformCodexHook } from '../hooks/installer.js';
-import { transformClaudeMcp, transformCodexMcp } from '../mcp/installer.js';
-import { SESSION_ADAPTER_TOOLS, TOOL_METADATA } from '../types/index.js';
+import { transformClaudeMcp, transformCodexMcp, transformOpencodeMcp } from '../mcp/installer.js';
+import { SUPPORTED_TOOLS, TOOL_METADATA } from '../types/index.js';
 import { atomicWrite } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
 import {
@@ -48,7 +48,13 @@ function missingApprovedRoots(entryPoint: string): never {
 }
 
 function paths(): InstallPaths {
-    return { claudeSettings: claudeSettingsPath(), claudeMcp: claudeMcpPath(), codexConfig: codexConfigPath() };
+    return {
+        claudeSettings: claudeSettingsPath(),
+        claudeMcp: claudeMcpPath(),
+        codexConfig: codexConfigPath(),
+        opencodeConfig: opencodeConfigPath(),
+        opencodeStore: opencodeStoreRoot(),
+    };
 }
 
 function text(file: string): string {
@@ -166,7 +172,9 @@ function isDefaultPaths(input: InstallPaths): boolean {
     return (
         input.claudeSettings === current.claudeSettings &&
         input.claudeMcp === current.claudeMcp &&
-        input.codexConfig === current.codexConfig
+        input.codexConfig === current.codexConfig &&
+        input.opencodeConfig === current.opencodeConfig &&
+        input.opencodeStore === current.opencodeStore
     );
 }
 
@@ -252,8 +260,8 @@ export function installElepha(
     const recoveryService = runtime.service ?? serviceBackend({ platform, home: runtime.home });
     replayRollbackJournal(recoveryService);
     const present = detectPresentTools(inputPaths);
-    if (!present.claude && !present.codex) {
-        const choices = SESSION_ADAPTER_TOOLS.map((tool) => TOOL_METADATA[tool].displayName).join(' or ');
+    if (!present.claude && !present.codex && !present.opencode) {
+        const choices = SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName).join(' or ');
         throw new Error(`no supported tool found; install ${choices} first`);
     }
     const resolved = resolveInstalledElephaBin();
@@ -282,6 +290,7 @@ export function installElepha(
         claudeSettings: text(inputPaths.claudeSettings),
         claudeMcp: text(inputPaths.claudeMcp),
         codex: text(inputPaths.codexConfig),
+        opencode: text(inputPaths.opencodeConfig),
     };
     const preparingPhase = 'Preparing hooks & MCP';
     runtime.onPhase?.(preparingPhase, 'start');
@@ -312,6 +321,18 @@ export function installElepha(
                           file: inputPaths.codexConfig,
                           text: transformCodexMcp(transformCodexHook(before.codex, launcher), launcher),
                           validate: validateToml,
+                      },
+                  ]
+                : []),
+            // OpenCode has no hook config to prove presence, so never fabricate
+            // opencode.json unless its config directory or data store already exists.
+            ...(present.opencode
+                ? [
+                      {
+                          kind: 'write' as const,
+                          file: inputPaths.opencodeConfig,
+                          text: transformOpencodeMcp(before.opencode, launcher),
+                          validate: validateJson('OpenCode opencode.json'),
                       },
                   ]
                 : []),
@@ -396,6 +417,7 @@ export function installElepha(
         text(inputPaths.claudeMcp),
         text(inputPaths.codexConfig),
         inputPaths.codexConfig,
+        text(inputPaths.opencodeConfig),
         launcher,
         present,
     );
@@ -426,6 +448,7 @@ export function uninstallElepha(
         claudeSettings: text(inputPaths.claudeSettings),
         claudeMcp: text(inputPaths.claudeMcp),
         codex: text(inputPaths.codexConfig),
+        opencode: text(inputPaths.opencodeConfig),
     };
     const snapshots = installSnapshotsDirectory(runtime);
     const uninstallConfigs = [
@@ -447,6 +470,12 @@ export function uninstallElepha(
             validate: validateToml,
             remove: (current: string) =>
                 transformCodexMcp(transformCodexHook(current, launcher, true, inputPaths.codexConfig), launcher, true),
+        },
+        {
+            file: inputPaths.opencodeConfig,
+            current: before.opencode,
+            validate: validateJson('OpenCode opencode.json'),
+            remove: (current: string) => transformOpencodeMcp(current, launcher, true),
         },
     ];
     const changes = uninstallConfigs.flatMap<ConfigChange>(({ file, current, validate, remove }) => {
@@ -486,6 +515,7 @@ export function uninstallElepha(
         text(inputPaths.claudeMcp),
         text(inputPaths.codexConfig),
         inputPaths.codexConfig,
+        text(inputPaths.opencodeConfig),
         launcher,
         detectPresentTools(inputPaths),
     );

@@ -40,7 +40,9 @@ sessions for you to open with `elepha:resume`. To *answer* a natural-language qu
 past work, the model calls elepha's `recall` MCP tool, which returns the relevant material
 (decisions, the reasoning, and open items) with its provenance (project, tool, session,
 date) so the model can answer in place. `recall` needs elepha's MCP tools connected; it is
-not typed as an `elepha:` command.
+not typed as an `elepha:` command. `elepha install` connects those MCP tools automatically
+for detected Claude Code, Codex, and OpenCode installations. OpenCode does not yet support
+the separate in-chat `elepha:` command interception described on this page.
 
 ## Maintenance
 

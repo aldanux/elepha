@@ -1,6 +1,14 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { PRIVATE_DIR_MODE } from '../config/constants.js';
-import { claudeMcpPath, claudeSettingsPath, codexConfigPath, daemonHeartbeatPath, elephaLauncherPath } from '../config/paths.js';
+import {
+    claudeMcpPath,
+    claudeSettingsPath,
+    codexConfigPath,
+    daemonHeartbeatPath,
+    elephaLauncherPath,
+    opencodeConfigPath,
+    opencodeStoreRoot,
+} from '../config/paths.js';
 import { HEARTBEAT_STALE_MS, type Heartbeat, isPidAlive, readHeartbeat } from '../daemon/heartbeat.js';
 import { errorMessage } from '../util/error.js';
 import { readJson } from '../util/fs.js';
@@ -73,6 +81,8 @@ export function integrationHealth(
         claudeSettings: claudeSettingsPath(),
         claudeMcp: claudeMcpPath(),
         codexConfig: codexConfigPath(),
+        opencodeConfig: opencodeConfigPath(),
+        opencodeStore: opencodeStoreRoot(),
     },
 ): IntegrationHealth {
     const bin = existsSync(elephaLauncherPath()) ? elephaLauncherPath() : resolveInstalledElephaBin().bin;
@@ -85,6 +95,7 @@ export function integrationHealth(
             text(paths.claudeMcp, '{}'),
             text(paths.codexConfig, ''),
             paths.codexConfig,
+            text(paths.opencodeConfig, ''),
             bin,
             present,
         ),

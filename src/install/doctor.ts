@@ -139,7 +139,10 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
         const { present, status } = integrations;
         const claudeReady = status.claudeHook === 'active' && status.claudeUserPromptSubmitHook === 'active';
         const codexReady = status.codexHook === 'active' && status.codexUserPromptSubmitHook === 'active';
-        const mcpReady = (!present.claude || status.claudeMcp === 'registered') && (!present.codex || status.codexMcp === 'registered');
+        const mcpReady =
+            (!present.claude || status.claudeMcp === 'registered') &&
+            (!present.codex || status.codexMcp === 'registered') &&
+            (!present.opencode || status.opencodeMcp === 'registered');
         const claudeDisplayName = TOOL_METADATA['claude-code'].displayName;
         const codexDisplayName = TOOL_METADATA.codex.displayName;
         lines.push(
@@ -158,10 +161,15 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
                     ? `✗ ${codexDisplayName} hooks: approval is required`
                     : `✗ ${codexDisplayName} hooks: SessionStart + UserPromptSubmit must be installed and approved`,
         );
-        lines.push(mcpReady ? '✓ MCP: Claude and Codex registered' : '✗ MCP: Claude and Codex must be registered');
+        lines.push(
+            mcpReady
+                ? '✓ MCP: Claude, Codex, and OpenCode registered where detected'
+                : '✗ MCP: Claude, Codex, and OpenCode must be registered where detected',
+        );
         const needsInstall =
             (present.claude && (!claudeReady || status.claudeMcp !== 'registered')) ||
-            (present.codex && ((!codexReady && !hasCodexApprovalIssue(status)) || status.codexMcp !== 'registered'));
+            (present.codex && ((!codexReady && !hasCodexApprovalIssue(status)) || status.codexMcp !== 'registered')) ||
+            (present.opencode && status.opencodeMcp !== 'registered');
         if (needsInstall) {
             addNextStep(nextSteps, terminalHandoff('install'));
         }
@@ -207,7 +215,8 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
         (!integrations.present.codex ||
             (integrations.status.codexHook === 'active' &&
                 integrations.status.codexUserPromptSubmitHook === 'active' &&
-                integrations.status.codexMcp === 'registered'));
+                integrations.status.codexMcp === 'registered')) &&
+        (!integrations.present.opencode || integrations.status.opencodeMcp === 'registered');
     const healthy = daemonOk && approvedRoots !== undefined && approvedRoots > 0 && integrationsOk && launcherOk && installRecoveryOk;
     if (nextSteps.length > 0) {
         lines.push('Next steps:');
