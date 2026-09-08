@@ -395,7 +395,7 @@ function renderBody(
             usedLaxFallback ? '' : undefined,
             `Recall hits for “${query.display}” (${shown.length} shown of ${hits.length}):`,
             ...shown.map(
-                (hit, index) => `${index + 1}. [${relativeTime(hit.endedAt, now)} | ${hit.tool}] · ${hit.project} · ${hit.sessionTitle}`,
+                (hit, index) => `${index + 1}. [${relativeTime(hit.endedAt, now)} | ${hit.tool} | ${hit.project}] · ${hit.sessionTitle}`,
             ),
             resultCapOmitted > 0 ? `+${resultCapOmitted} more matches — refine your query.` : undefined,
             budgetOmitted > 0

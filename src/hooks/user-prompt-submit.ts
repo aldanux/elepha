@@ -134,6 +134,9 @@ async function commandBody(
         if (rows.length === 0) {
             return { body: 'No sessions found in consented projects.', shownSessionIds: [] };
         }
+        const projectNames = new Map(
+            consentedProjects.flatMap((candidate) => candidate.projectIds.map((projectId) => [projectId, candidate.displayName] as const)),
+        );
         const shown = rows.slice(0, command.count);
         return {
             body: [
@@ -141,7 +144,7 @@ async function commandBody(
                 `Recent sessions (${shown.length}):`,
                 ...shown.map(
                     (session, index) =>
-                        `${index + 1}. [${relativeTime(endedAt(session), now)} | ${surfaceLabel(session.tool, session.surface)}] · ${titleOf(session)}`,
+                        `${index + 1}. [${relativeTime(endedAt(session), now)} | ${surfaceLabel(session.tool, session.surface)} | ${projectNames.get(session.project_id) ?? '(unknown project)'}] · ${titleOf(session)}`,
                 ),
                 '',
                 SELECT_HINT,
