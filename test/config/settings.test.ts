@@ -22,6 +22,7 @@ describe('settings', () => {
             { key: 'update-check', value: false, source: 'config' },
             { key: 'capture-claude-code', value: true, source: 'default' },
             { key: 'capture-codex', value: true, source: 'default' },
+            { key: 'capture-opencode', value: false, source: 'default' },
             { key: 'durable-capture', value: false, source: 'default' },
             { key: 'query-matching', value: 'strict', source: 'default' },
         ]);
@@ -65,6 +66,7 @@ describe('settings', () => {
             expect(listSettings({ ELEPHA_NO_UPDATE_CHECK: '1' }, configPath())).toEqual([
                 { key: 'query-matching', value: 'strict', source: 'default' },
                 { key: 'durable-capture', value: false, source: 'default' },
+                { key: 'capture-opencode', value: false, source: 'default' },
                 { key: 'capture-codex', value: true, source: 'default' },
                 { key: 'capture-claude-code', value: true, source: 'default' },
                 { key: 'update-check', value: false, source: 'env' },
@@ -77,6 +79,7 @@ describe('settings', () => {
     it.each([
         ['capture-claude-code', false],
         ['capture-codex', true],
+        ['capture-opencode', true],
     ] as const)('does not apply the update-check environment override to %s', (key, configuredValue) => {
         const file = configPath();
         writeFileSync(file, `${JSON.stringify({ [key]: configuredValue })}\n`);
@@ -88,18 +91,19 @@ describe('settings', () => {
         });
     });
 
-    it.each(['capture-claude-code', 'capture-codex'] as const)(
-        'preserves the default for %s when the update-check environment override is set',
-        (key) => {
-            const file = configPath();
+    it.each([
+        ['capture-claude-code', true],
+        ['capture-codex', true],
+        ['capture-opencode', false],
+    ] as const)('preserves the default for %s when the update-check environment override is set', (key, defaultValue) => {
+        const file = configPath();
 
-            expect(getSetting(key, { ELEPHA_NO_UPDATE_CHECK: '1' }, file)).toEqual({
-                key,
-                value: true,
-                source: 'default',
-            });
-        },
-    );
+        expect(getSetting(key, { ELEPHA_NO_UPDATE_CHECK: '1' }, file)).toEqual({
+            key,
+            value: defaultValue,
+            source: 'default',
+        });
+    });
 
     it('removes only update-check and returns to the default', () => {
         const file = configPath();
@@ -127,21 +131,23 @@ describe('settings', () => {
         ['0', false],
         ['off', false],
     ])('accepts %s as %s for each boolean setting', (input, expected) => {
-        for (const key of ['update-check', 'capture-claude-code', 'capture-codex', 'durable-capture'] as const) {
+        for (const key of ['update-check', 'capture-claude-code', 'capture-codex', 'capture-opencode', 'durable-capture'] as const) {
             const file = configPath();
             setSetting(key, input, file);
             expect(getSetting(key, {}, file).value).toBe(expected);
         }
     });
 
-    it('defaults both capture tools to enabled and durable capture to disabled in settings and daemon memory config', () => {
+    it('defaults JSONL capture on, OpenCode capture off, and durable capture off in settings and daemon memory config', () => {
         const file = configPath();
 
         expect(getSetting('capture-claude-code', {}, file).value).toBe(true);
         expect(getSetting('capture-codex', {}, file).value).toBe(true);
+        expect(getSetting('capture-opencode', {}, file).value).toBe(false);
         expect(getSetting('durable-capture', {}, file).value).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.captureClaudeCode).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.captureCodex).toBe(true);
+        expect(DEFAULT_MEMORY_CONFIG.captureOpencode).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.durableCapture).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.durableCaptureMaxBytes).toBe(DURABLE_CAPTURE_MAX_BYTES);
         expect(readMemoryConfig(file)).toEqual({ config: DEFAULT_MEMORY_CONFIG });
@@ -152,6 +158,13 @@ describe('settings', () => {
         writeFileSync(file, '{"durable-capture":true}\n');
 
         expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, durableCapture: true } });
+    });
+
+    it('loads the OpenCode capture setting into daemon memory config', () => {
+        const file = configPath();
+        writeFileSync(file, '{"capture-opencode":true}\n');
+
+        expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, captureOpencode: true } });
     });
 
     it('loads a positive integer durable capture byte cap into daemon memory config', () => {
@@ -170,11 +183,19 @@ describe('settings', () => {
         expect(readFileSync(file, 'utf8')).toBe(before);
     });
 
+    it('allows the two default capture tools to be disabled when OpenCode capture is enabled', () => {
+        const file = configPath();
+        setSetting('capture-opencode', 'on', file);
+        setSetting('capture-claude-code', 'off', file);
+
+        expect(() => setSetting('capture-codex', 'off', file)).not.toThrow();
+    });
+
     it('rejects unknown keys and invalid values without writing a typo', () => {
         const file = configPath();
 
         expect(() => setSetting('auto-update', 'true', file)).toThrow(
-            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, durable-capture, query-matching',
+            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, durable-capture, query-matching',
         );
         expect(() => setSetting('update-check', 'yes', file)).toThrow('update-check must be true, false, 1, 0, on, or off');
         expect(() => setSetting('query-matching', 'loose', file)).toThrow('query-matching must be strict or lax');

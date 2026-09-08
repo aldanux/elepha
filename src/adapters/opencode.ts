@@ -1,6 +1,8 @@
 import { realpathSync } from 'node:fs';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { isWithinProviderStore } from '../config/paths.js';
+import { turnText } from '../security/self-ingestion.js';
+import { containsSentinel } from '../security/sentinel.js';
 import type {
     OpenedSessionRow,
     ParsedToolCall,
@@ -175,6 +177,14 @@ export class OpencodeAdapter implements SqliteSourceAdapter {
 
     constructor(private readonly warnUnknownLine: (message: string) => void = (message) => console.warn(message)) {}
 
+    private withSentinelDrop(turn: ParsedTurn): ParsedTurn {
+        if (!containsSentinel(turnText(turn))) {
+            return turn;
+        }
+        this.warnUnknownLine(`[elepha] dropped turn ${turn.turnIndex} of ${turn.sessionId}: self-injected content (sentinel)`);
+        return { ...turn, droppedReason: 'sentinel' };
+    }
+
     dirtySessions(db: Database.Database, sinceWatermark?: number): OpenedSessionRow[] {
         const rows = (
             sinceWatermark === undefined
@@ -284,7 +294,7 @@ export class OpencodeAdapter implements SqliteSourceAdapter {
             if (message.role === 'user') {
                 if (openTurn) {
                     if (hasContent(openTurn)) {
-                        yield parsedTurn(db.name, session, openTurn);
+                        yield this.withSentinelDrop(parsedTurn(db.name, session, openTurn));
                     }
                     turnIndex++;
                 }
@@ -337,7 +347,7 @@ export class OpencodeAdapter implements SqliteSourceAdapter {
         }
 
         if (openTurn && options?.closeTrailingOnIdle && hasAssistantContribution(openTurn)) {
-            yield parsedTurn(db.name, session, openTurn);
+            yield this.withSentinelDrop(parsedTurn(db.name, session, openTurn));
         }
     }
 

@@ -8,6 +8,7 @@ import { elephaConfigPath } from './paths.js';
 export interface MemoryConfig {
     captureClaudeCode?: boolean;
     captureCodex?: boolean;
+    captureOpencode?: boolean;
     durableCapture?: boolean;
     durableCaptureMaxBytes?: number;
 }
@@ -15,6 +16,7 @@ export interface MemoryConfig {
 export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
     captureClaudeCode: true,
     captureCodex: true,
+    captureOpencode: false,
     durableCapture: false,
     durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };
@@ -45,6 +47,9 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
     }
     if (typeof settings['capture-codex'] === 'boolean') {
         output.captureCodex = settings['capture-codex'];
+    }
+    if (typeof settings['capture-opencode'] === 'boolean') {
+        output.captureOpencode = settings['capture-opencode'];
     }
     if (typeof settings['durable-capture'] === 'boolean') {
         output.durableCapture = settings['durable-capture'];

@@ -7,4 +7,9 @@ describe('OpenCode adapter subprocess boundary', () => {
         const source = readFileSync(path.resolve(import.meta.dirname, '..', '..', 'src', 'adapters', 'opencode.ts'), 'utf8');
         expect(source).not.toMatch(/node:child_process/);
     });
+
+    it('keeps the daemon free of the child-process module', () => {
+        const source = readFileSync(path.resolve(import.meta.dirname, '..', '..', 'src', 'daemon', 'index.ts'), 'utf8');
+        expect(source).not.toMatch(/node:child_process/);
+    });
 });

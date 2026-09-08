@@ -4,6 +4,7 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { defaultAdapters, sessionAdapterFor } from '../adapters/index.js';
+import { OpencodeAdapter, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
     DURABLE_CAPTURE_FILTER_VERSION,
     MAX_GET_SESSION_LAST_N,
@@ -130,6 +131,11 @@ interface SourceTurnCollection extends TurnCollection {
     sourceUnavailable?: boolean;
 }
 
+interface OpenedSourceTurns {
+    turns: AsyncIterable<ParsedTurn> | Iterable<ParsedTurn>;
+    close(): Promise<void> | void;
+}
+
 function leafStrings(value: unknown): string[] {
     if (typeof value === 'string') {
         return [value];
@@ -215,6 +221,7 @@ export function newestActivity(
 
 export class SessionReader {
     private readonly adapters: SessionAdapterMap;
+    private readonly opencodeAdapter = new OpencodeAdapter();
     private readonly sessionsMemo = new Map<string, ServedSession[]>();
     private readonly consentedSessionsMemo = new Map<string, ServedSession[]>();
 
@@ -658,16 +665,46 @@ export class SessionReader {
         storedIndexes?: ReadonlySet<number>,
         bounds?: TurnCollectionBounds,
     ): Promise<SourceTurnCollection> {
-        const opened = await this.openTranscript(session.tool, session.source_path);
-        if ('reason' in opened) {
-            return { reason: opened.reason, sourceUnavailable: true };
-        }
-        const { handle } = opened;
+        let opened: OpenedSourceTurns | undefined;
         try {
-            const adapter = sessionAdapterFor(this.adapters, session.tool);
-            if (!adapter) {
+            if (session.tool === 'opencode') {
+                const sourceDb = openOpencodeDbReadonly(session.source_path);
+                const sourceSession = this.opencodeAdapter
+                    .dirtySessions(sourceDb)
+                    .find((candidate) => candidate.sessionId === session.native_id);
+                if (!sourceSession) {
+                    sourceDb.close();
+                    return { reason: 'transcript_unreadable', sourceUnavailable: true };
+                }
+                opened = {
+                    turns: this.opencodeAdapter.parseSessionTurns(sourceDb, sourceSession, undefined, { closeTrailingOnIdle: true }),
+                    close: () => {
+                        sourceDb.close();
+                    },
+                };
+            } else {
+                const transcript = await this.openTranscript(session.tool, session.source_path);
+                if ('reason' in transcript) {
+                    return { reason: transcript.reason, sourceUnavailable: true };
+                }
+                const adapter = sessionAdapterFor(this.adapters, session.tool);
+                if (!adapter) {
+                    await transcript.handle.close();
+                    return { reason: 'transcript_unreadable', sourceUnavailable: true };
+                }
+                opened = {
+                    turns: adapter.parseTurns(session.source_path, undefined, {
+                        closeTrailingOnIdle: true,
+                        handle: transcript.handle,
+                        signal,
+                    }),
+                    close: () => transcript.handle.close(),
+                };
+            }
+            if (!opened) {
                 return { reason: 'transcript_unreadable', sourceUnavailable: true };
             }
+
             const indexes = storedIndexes ?? new Set(this.storedTurnRecallFields(session).keys());
             if (indexes.size === 0) {
                 return { reason: 'no_stored_turn_indexes' };
@@ -680,11 +717,7 @@ export class SessionReader {
             let retainedRenderedChars = 0;
             let highWaterTurns = 0;
             let highWaterRenderedChars = 0;
-            for await (const turn of adapter.parseTurns(session.source_path, undefined, {
-                closeTrailingOnIdle: true,
-                handle,
-                signal,
-            })) {
+            for await (const turn of opened.turns) {
                 if (isMemoryLocked(this.db)) {
                     return { reason: 'locked' };
                 }
@@ -744,7 +777,7 @@ export class SessionReader {
         } catch {
             return { reason: 'transcript_unreadable' };
         } finally {
-            await handle.close();
+            await opened?.close();
         }
     }
 

@@ -12,6 +12,7 @@ import { type InjectionRow, InjectionStore, type RecordInjectionInput } from './
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
+import { SqliteSourceWatermarkStore } from './sqlite-source-watermark-store.js';
 import { minMedianMax, type ProjectCount, type Stats, type StatusCount, type ToolCount, type ToolZeroPaths } from './stats.js';
 import { type MemoryRow, TurnStore } from './turn-store.js';
 
@@ -94,6 +95,7 @@ export class MemoryStore {
     private readonly sessions: SessionStore;
     private readonly turns: TurnStore;
     private readonly injections: InjectionStore;
+    private readonly sqliteSourceWatermarks: SqliteSourceWatermarkStore;
     readonly shownSessionLists: ShownSessionListStore;
 
     constructor(db: Database, options: MemoryStoreOptions = {}) {
@@ -103,6 +105,7 @@ export class MemoryStore {
         this.sessions = new SessionStore(db, (id) => this.projects.getProjectById(id), options.resolveGitCommitCount);
         this.turns = new TurnStore(db, this.sessions);
         this.injections = new InjectionStore(db);
+        this.sqliteSourceWatermarks = new SqliteSourceWatermarkStore(db);
         this.shownSessionLists = new ShownSessionListStore(db);
     }
 
@@ -215,6 +218,14 @@ export class MemoryStore {
 
     getSessionCursor(tool: ToolName, nativeId: string): string | undefined {
         return this.sessions.getSessionCursor(tool, nativeId);
+    }
+
+    getSqliteSourceWatermark(tool: ToolName, sourcePath: string): number | undefined {
+        return this.sqliteSourceWatermarks.get(tool, sourcePath);
+    }
+
+    setSqliteSourceWatermark(tool: ToolName, sourcePath: string, watermark: number): void {
+        this.sqliteSourceWatermarks.set(tool, sourcePath, watermark);
     }
 
     advanceExistingSessionCursor(tool: ToolName, nativeId: string, cursor: string): boolean {
