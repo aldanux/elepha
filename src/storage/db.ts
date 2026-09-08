@@ -25,6 +25,13 @@ export function defaultDbPath(): string {
     return override ? path.resolve(override) : path.join(elephaHome(), 'elepha.db');
 }
 
+export const SQLITE_SOURCE_WATERMARK_SCHEMA = {
+    table: 'source_watermarks',
+    tool: 'tool',
+    sourcePath: 'source_path',
+    watermark: 'watermark',
+} as const;
+
 const PARANOID_AUTHORITY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS paranoid_authority (
   id             INTEGER PRIMARY KEY CHECK (id = 1),
@@ -50,7 +57,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS sessions (
   id               INTEGER PRIMARY KEY,
-  tool             TEXT NOT NULL CHECK (tool IN ('claude-code','codex')),
+  tool             TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
   native_id        TEXT NOT NULL,
   segment_index    INTEGER NOT NULL DEFAULT 0,
   project_id       INTEGER NOT NULL REFERENCES projects(id),
@@ -218,6 +225,13 @@ CREATE TABLE IF NOT EXISTS incognito_transcripts (
   tombstoned_at TEXT NOT NULL,
   PRIMARY KEY (tool, native_id)
 );
+
+CREATE TABLE IF NOT EXISTS ${SQLITE_SOURCE_WATERMARK_SCHEMA.table} (
+  ${SQLITE_SOURCE_WATERMARK_SCHEMA.tool}        TEXT NOT NULL,
+  ${SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath}  TEXT NOT NULL,
+  ${SQLITE_SOURCE_WATERMARK_SCHEMA.watermark}   INTEGER NOT NULL,
+  PRIMARY KEY (${SQLITE_SOURCE_WATERMARK_SCHEMA.tool}, ${SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath})
+);
 `;
 
 // No migration framework exists yet (single-table-additive product, pre-1.0).
@@ -279,6 +293,7 @@ function migrate(db: Database.Database): void {
     if (!sessionColumns.includes('git_commit_count')) {
         db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
     }
+    migrateSessionsToolConstraint(db);
 
     const columns = (db.pragma('table_info(memories)') as Array<{ name: string }>).map((c) => c.name);
     if (!columns.includes('summarizer_status')) {
@@ -458,7 +473,7 @@ function migrateSessionsTable(db: Database.Database): void {
         db.exec(`
       CREATE TABLE sessions_new (
         id               INTEGER PRIMARY KEY,
-        tool             TEXT NOT NULL CHECK (tool IN ('claude-code','codex')),
+        tool             TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
         native_id        TEXT NOT NULL,
         segment_index    INTEGER NOT NULL DEFAULT 0,
         project_id       INTEGER NOT NULL REFERENCES projects(id),
@@ -494,6 +509,63 @@ function migrateSessionsTable(db: Database.Database): void {
     // Preserve rebuilt rows and add the nullable historical baseline only
     // after the constraint migration is done.
     db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
+}
+
+function migrateSessionsToolConstraint(db: Database.Database): void {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get() as
+        | { sql: string }
+        | undefined;
+    if (schema?.sql.includes("'opencode'")) {
+        return;
+    }
+
+    db.pragma('foreign_keys = OFF');
+    const rebuild = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE sessions_new (
+            id                  INTEGER PRIMARY KEY,
+            tool                TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
+            native_id           TEXT NOT NULL,
+            segment_index       INTEGER NOT NULL DEFAULT 0,
+            project_id          INTEGER NOT NULL REFERENCES projects(id),
+            source_path         TEXT NOT NULL,
+            cursor              TEXT,
+            started_at          TEXT NOT NULL,
+            last_ingested_at    TEXT NOT NULL,
+            surface             TEXT CHECK (surface IN ('cli','desktop')),
+            git_branch          TEXT,
+            kind                TEXT CHECK (kind IN ('main','subagent','fork','adjudicator')),
+            last_turn_at        TEXT,
+            trailing_branch     TEXT,
+            trailing_files      TEXT NOT NULL DEFAULT '[]',
+            rendered_chars      INTEGER DEFAULT 0,
+            rendered_turns      INTEGER DEFAULT 0,
+            title               TEXT,
+            custom_title        TEXT,
+            first_prompt_search TEXT,
+            git_commit_count    INTEGER,
+            UNIQUE (tool, native_id, segment_index)
+          );
+          INSERT INTO sessions_new
+            (id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
+             surface, git_branch, kind, last_turn_at, trailing_branch, trailing_files, rendered_chars,
+             rendered_turns, title, custom_title, first_prompt_search, git_commit_count)
+          SELECT id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
+                 surface, git_branch, kind, last_turn_at, trailing_branch, trailing_files, rendered_chars,
+                 rendered_turns, title, custom_title, first_prompt_search, git_commit_count
+          FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_new RENAME TO sessions;
+          CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
+        `);
+    });
+    rebuild();
+
+    const violations = db.pragma('foreign_key_check');
+    if (Array.isArray(violations) && violations.length > 0) {
+        throw new Error(`sessions tool migration left ${violations.length} foreign-key violation(s): ${JSON.stringify(violations)}`);
+    }
+    db.pragma('foreign_keys = ON');
 }
 
 const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');

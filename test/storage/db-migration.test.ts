@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
-import { openUnmanagedDb } from '../../src/storage/db.js';
+import { openUnmanagedDb, SQLITE_SOURCE_WATERMARK_SCHEMA } from '../../src/storage/db.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
 describe('sessions table migration', () => {
@@ -89,7 +89,38 @@ describe('sessions table migration', () => {
             'id',
             'total_bytes',
         ]);
+        expect(
+            (db.pragma(`table_info(${SQLITE_SOURCE_WATERMARK_SCHEMA.table})`) as Array<{ name: string }>).map((column) => column.name),
+        ).toEqual([
+            SQLITE_SOURCE_WATERMARK_SCHEMA.tool,
+            SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath,
+            SQLITE_SOURCE_WATERMARK_SCHEMA.watermark,
+        ]);
         db.close();
+    });
+
+    it('adds the SQLite source watermark table to a legacy DB and leaves it unchanged on reopen', () => {
+        const directory = withGrantableTestDir('elepha-sqlite-watermark-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const legacy = openUnmanagedDb(dbPath);
+        legacy.exec(`DROP TABLE ${SQLITE_SOURCE_WATERMARK_SCHEMA.table}`);
+        legacy.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        migrated
+            .prepare(
+                `INSERT INTO ${SQLITE_SOURCE_WATERMARK_SCHEMA.table}
+                 (${SQLITE_SOURCE_WATERMARK_SCHEMA.tool}, ${SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath}, ${SQLITE_SOURCE_WATERMARK_SCHEMA.watermark})
+                 VALUES (?, ?, ?)`,
+            )
+            .run('opencode', '/provider/opencode.db', 123);
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare(`SELECT * FROM ${SQLITE_SOURCE_WATERMARK_SCHEMA.table}`).all()).toEqual([
+            { tool: 'opencode', source_path: '/provider/opencode.db', watermark: 123 },
+        ]);
+        reopened.close();
     });
 
     it('rebuilds the pre-evicted durable capture status constraint and preserves existing coverage', () => {
@@ -481,6 +512,14 @@ describe('migration idempotency and reversibility', () => {
         expect(row.surface).toBeNull();
         expect(row.trailing_files).toBe('[]');
         expect(row.custom_title).toBeNull();
+        expect(() =>
+            migrated
+                .prepare(
+                    `INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
+                     VALUES ('opencode', 'legacy-opencode', 1, '/provider/opencode.db', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')`,
+                )
+                .run(),
+        ).not.toThrow();
 
         const memRow = migrated.prepare('SELECT * FROM memories WHERE session_id = ?').get(1) as Record<string, unknown>;
         expect(memRow.has_external_content).toBe(0);

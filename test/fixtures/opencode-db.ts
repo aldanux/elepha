@@ -2,10 +2,102 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 
+export interface OpencodeSessionFixture {
+    sessionId: string;
+    directory: string;
+    title: string;
+    timeUpdated: number;
+    parentId?: string;
+}
+
+export interface OpencodeTurnFixture {
+    sessionId: string;
+    turnIndex: number;
+    timeCreated: number;
+    timeUpdated: number;
+    userMessage: string;
+    assistantText: string;
+}
+
+function insertSession(db: Database.Database, session: OpencodeSessionFixture): void {
+    db.prepare(
+        `INSERT INTO session
+         (id, parent_id, directory, title, version, time_created, time_updated)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+        session.sessionId,
+        session.parentId ?? null,
+        session.directory,
+        session.title,
+        '1.18.29',
+        session.timeUpdated,
+        session.timeUpdated,
+    );
+}
+
+function insertTurn(db: Database.Database, turn: OpencodeTurnFixture): void {
+    const userMessageId = `${turn.sessionId}_msg_${turn.turnIndex}_user`;
+    const assistantMessageId = `${turn.sessionId}_msg_${turn.turnIndex}_assistant`;
+    const insertMessage = db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)');
+    insertMessage.run(
+        userMessageId,
+        turn.sessionId,
+        turn.timeCreated,
+        turn.timeCreated,
+        JSON.stringify({ role: 'user', time: { created: turn.timeCreated } }),
+    );
+    insertMessage.run(
+        assistantMessageId,
+        turn.sessionId,
+        turn.timeCreated + 100,
+        turn.timeCreated + 100,
+        JSON.stringify({ role: 'assistant', time: { created: turn.timeCreated + 100 } }),
+    );
+    const insertPart = db.prepare(
+        'INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)',
+    );
+    insertPart.run(
+        `${userMessageId}_part`,
+        userMessageId,
+        turn.sessionId,
+        turn.timeCreated + 1,
+        turn.timeCreated + 1,
+        JSON.stringify({ type: 'text', text: turn.userMessage }),
+    );
+    insertPart.run(
+        `${assistantMessageId}_part`,
+        assistantMessageId,
+        turn.sessionId,
+        turn.timeCreated + 101,
+        turn.timeCreated + 101,
+        JSON.stringify({ type: 'text', text: turn.assistantText }),
+    );
+    db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(turn.timeUpdated, turn.sessionId);
+}
+
+export function addOpencodeSession(dbPath: string, session: OpencodeSessionFixture): void {
+    const db = new Database(dbPath);
+    try {
+        insertSession(db, session);
+    } finally {
+        db.close();
+    }
+}
+
+export function appendOpencodeTurn(dbPath: string, turn: OpencodeTurnFixture): void {
+    const db = new Database(dbPath);
+    try {
+        insertTurn(db, turn);
+    } finally {
+        db.close();
+    }
+}
+
 export function createOpencodeFixture(dbPath: string, projectPath: string): void {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     const db = new Database(dbPath);
     try {
+        db.pragma('journal_mode = WAL');
         db.exec(`
             CREATE TABLE session (
                 id TEXT PRIMARY KEY,
@@ -41,13 +133,19 @@ export function createOpencodeFixture(dbPath: string, projectPath: string): void
             );
         `);
 
-        const insertSession = db.prepare(
-            `INSERT INTO session
-             (id, parent_id, directory, title, version, time_created, time_updated)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        );
-        insertSession.run('ses_sub', 'ses_primary', projectPath, 'Sub-session', '1.18.29', 50, 100);
-        insertSession.run('ses_primary', null, projectPath, 'Primary title', '1.18.29', 90, 200);
+        insertSession(db, {
+            sessionId: 'ses_sub',
+            parentId: 'ses_primary',
+            directory: projectPath,
+            title: 'Sub-session',
+            timeUpdated: 100,
+        });
+        insertSession(db, {
+            sessionId: 'ses_primary',
+            directory: projectPath,
+            title: 'Primary title',
+            timeUpdated: 200,
+        });
 
         const insertMessage = db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)');
         insertMessage.run('msg_1', 'ses_primary', 1_000, 1_000, JSON.stringify({ role: 'user', time: { created: 1_000 } }));

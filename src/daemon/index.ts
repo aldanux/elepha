@@ -13,6 +13,7 @@
 // per-file mutex a second scan could re-read a cursor the first is still
 // advancing.
 
+import { existsSync } from 'node:fs';
 import { stat as fsStat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import chokidar, { type FSWatcher } from 'chokidar';
@@ -21,6 +22,7 @@ import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { sessionAdapterFor } from '../adapters/index.js';
+import { OpencodeAdapter, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
     DAEMON_PACKAGE_REPLACED_EXIT_CODE,
@@ -46,6 +48,9 @@ import {
     isReadableProviderSource,
     isRefusedProjectRoot,
     isWithin,
+    opencodeDbPath,
+    opencodeStoreRoot,
+    samePath,
     updateAvailablePath,
     updateCheckStatePath,
 } from '../config/paths.js';
@@ -68,6 +73,7 @@ import type {
     SessionAdapter,
     SessionAdapterMap,
     SessionClassification,
+    SqliteSourceAdapter,
     SummarizationProvider,
     SummarizerStatus,
 } from '../types/index.js';
@@ -141,7 +147,12 @@ export function deduplicateDaemonUnknownLineWarnings(
 // (CLAUDE_CONFIG_DIR / CODEX_HOME), and a module-level constant would bake in
 // whatever the environment looked like at import time.
 export function watchRoots(): string[] {
-    return [claudeProjectsRoot(), codexSessionsRoot()];
+    const roots = [claudeProjectsRoot(), codexSessionsRoot()];
+    const opencodeRoot = opencodeStoreRoot();
+    if (existsSync(opencodeRoot)) {
+        roots.push(opencodeRoot);
+    }
+    return roots;
 }
 
 export interface DaemonOptions {
@@ -220,6 +231,7 @@ export class IngestionDaemon {
     private readonly watcherPollIntervalMs: number;
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
+    private readonly captureOpencode: boolean;
     private readonly durableCapture: boolean;
     private readonly durableCaptureMaxBytes: number;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
@@ -243,6 +255,7 @@ export class IngestionDaemon {
     private readonly idleTimers = new Map<string, NodeJS.Timeout>();
     private readonly processing = new Set<string>();
     private readonly workQueue: WorkQueue;
+    private readonly opencodeAdapter: SqliteSourceAdapter;
     private stopPromise: Promise<void> | undefined;
     private signalHandlersInstalled = false;
     private readonly shutdownOnSignal = () => {
@@ -271,6 +284,7 @@ export class IngestionDaemon {
         }
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
+        this.captureOpencode = configResult.config.captureOpencode ?? false;
         this.durableCapture = configResult.config.durableCapture ?? false;
         this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
         this.store = options.store;
@@ -279,6 +293,7 @@ export class IngestionDaemon {
         const warnUnknownLine = deduplicateDaemonUnknownLineWarnings(this.log);
         this.warnDeduplicated = warnUnknownLine;
         this.adapters = options.adapters ?? [new ClaudeCodeAdapter(warnUnknownLine), new CodexAdapter(warnUnknownLine)];
+        this.opencodeAdapter = new OpencodeAdapter(warnUnknownLine);
         this.idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
         this.workQueue = new WorkQueue(options.maxConcurrentSummaries ?? DEFAULT_MAX_CONCURRENT, this.log, this.logError);
         this.failureWindow = new FailureWindow(this.log, this.logError);
@@ -740,6 +755,11 @@ export class IngestionDaemon {
     }
 
     private onFileEvent(filePath: string): void {
+        const opencodeDatabase = this.opencodeDatabaseForEvent(filePath);
+        if (opencodeDatabase) {
+            this.scheduleOpencodeScan(opencodeDatabase);
+            return;
+        }
         const adapter = this.adapterFor(filePath);
         if (!adapter) {
             return;
@@ -770,6 +790,36 @@ export class IngestionDaemon {
         });
     }
 
+    private opencodeDatabaseForEvent(filePath: string): string | undefined {
+        const databasePath = opencodeDbPath();
+        const watchedPaths = [databasePath, `${databasePath}-wal`, `${databasePath}-shm`];
+        if (!isWithin(opencodeStoreRoot(), filePath) || !watchedPaths.some((candidate) => samePath(candidate, filePath))) {
+            return undefined;
+        }
+        return canonicalizeExisting(databasePath);
+    }
+
+    private scheduleOpencodeScan(databasePath: string): void {
+        const canonicalPath = canonicalizeExisting(databasePath);
+        const existing = this.idleTimers.get(canonicalPath);
+        if (existing) {
+            clearTimeout(existing);
+        }
+        this.idleTimers.set(
+            canonicalPath,
+            setTimeout(() => {
+                this.idleTimers.delete(canonicalPath);
+                this.enqueueOpencodeScan(canonicalPath);
+            }, this.idleDebounceMs),
+        );
+    }
+
+    private enqueueOpencodeScan(databasePath: string): void {
+        this.workQueue.enqueue(async () => {
+            await this.scanOpencodeDb(databasePath);
+        });
+    }
+
     // Replays local transcripts for one newly-approved root without enabling a
     // synthesis provider. Approval must make the already-written transcript
     // useful, but it must not turn a CLI acknowledgement into unbounded API
@@ -785,10 +835,17 @@ export class IngestionDaemon {
             return 0;
         }
         let ingested = 0;
+        const scannedOpencodeDatabases = new Set<string>();
         for (const watchRoot of this.watchRoots) {
             const files = await this.readCorpus(watchRoot).catch(() => [] as string[]);
             for (const relativePath of files.sort()) {
                 const filePath = path.join(watchRoot, relativePath);
+                const opencodeDatabase = this.opencodeDatabaseForEvent(filePath);
+                if (opencodeDatabase && !scannedOpencodeDatabases.has(opencodeDatabase)) {
+                    scannedOpencodeDatabases.add(opencodeDatabase);
+                    ingested += (await this.scanOpencodeDb(opencodeDatabase, canonicalRoots)).ingested;
+                    continue;
+                }
                 const adapter = this.adapterFor(filePath);
                 if (adapter) {
                     ingested += (await this.scanFile(adapter, filePath, true, canonicalRoots)).ingested;
@@ -804,6 +861,7 @@ export class IngestionDaemon {
     // read.
     private async sweepStartupFiles(): Promise<void> {
         const summary: SweepSummary = { files: 0, ingested: 0, skipped: new Map(), emptySessions: new Map() };
+        const scannedOpencodeDatabases = new Set<string>();
         for (const watchRoot of this.watchRoots) {
             const files = await this.readCorpus(watchRoot).catch((err: unknown) => {
                 this.logError(`[elepha] startup sweep could not list ${watchRoot}: ${(err as Error).message}`);
@@ -811,6 +869,21 @@ export class IngestionDaemon {
             });
             for (const relativePath of files.sort()) {
                 const filePath = path.join(watchRoot, relativePath);
+                const opencodeDatabase = this.opencodeDatabaseForEvent(filePath);
+                if (opencodeDatabase) {
+                    if (scannedOpencodeDatabases.has(opencodeDatabase)) {
+                        continue;
+                    }
+                    scannedOpencodeDatabases.add(opencodeDatabase);
+                    summary.files++;
+                    const result = await this.scanOpencodeDb(opencodeDatabase);
+                    summary.ingested += result.ingested;
+                    if (result.skipped) {
+                        summary.skipped.set(result.skipped.category, (summary.skipped.get(result.skipped.category) ?? 0) + 1);
+                    }
+                    this.scheduleOpencodeScan(opencodeDatabase);
+                    continue;
+                }
                 let adapterSkip: FileSkip | undefined;
                 const adapter = this.adapterFor(filePath, (skipped) => {
                     adapterSkip = skipped;
@@ -888,6 +961,203 @@ export class IngestionDaemon {
             });
         }
         return skipped;
+    }
+
+    private async scanOpencodeDb(databasePath: string, onlyProjectRoots?: string | readonly string[]): Promise<ScanResult> {
+        const canonicalPath = canonicalizeExisting(databasePath);
+        if (!this.captureOpencode) {
+            return {
+                ingested: 0,
+                skipped: this.recordSkippedFile(
+                    canonicalPath,
+                    { category: 'capture disabled', reason: 'capture is disabled for opencode' },
+                    { tool: 'opencode' },
+                ),
+            };
+        }
+
+        if (this.processing.has(canonicalPath)) {
+            this.scheduleOpencodeScan(canonicalPath);
+            return { ingested: 0 };
+        }
+        this.processing.add(canonicalPath);
+
+        try {
+            const db = openOpencodeDbReadonly(canonicalPath);
+            try {
+                const watermark =
+                    onlyProjectRoots === undefined
+                        ? this.store.getSqliteSourceWatermark(this.opencodeAdapter.tool, canonicalPath)
+                        : undefined;
+                const sessions = this.opencodeAdapter.dirtySessions(db, watermark);
+                const selectedRoots =
+                    onlyProjectRoots === undefined
+                        ? undefined
+                        : (typeof onlyProjectRoots === 'string' ? [onlyProjectRoots] : onlyProjectRoots).map((root) =>
+                              canonicalizeExisting(root),
+                          );
+                let ingested = 0;
+                let consumedWatermark: number | undefined;
+
+                for (const session of sessions) {
+                    const logContext = { tool: this.opencodeAdapter.tool, sessionId: session.sessionId };
+                    const canonicalDirectory = canonicalizeExisting(session.directory);
+                    if (selectedRoots !== undefined) {
+                        const coveringRoot = selectedRoots.find((root) => isWithin(root, canonicalDirectory));
+                        if (coveringRoot === undefined || this.store.consent.consentState(canonicalDirectory) !== 'approved') {
+                            this.recordSkippedFile(
+                                canonicalPath,
+                                {
+                                    category: 'unapproved root',
+                                    reason: `${session.directory} is outside/unapproved for the selected backfill roots; skipped before parsing transcript content`,
+                                },
+                                logContext,
+                            );
+                            consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                            continue;
+                        }
+                    } else {
+                        if (isRefusedProjectRoot(session.directory)) {
+                            this.recordSkippedFile(
+                                canonicalPath,
+                                {
+                                    category: 'refused root',
+                                    reason: `refusing to ingest from "${session.directory}" - not a permitted project root`,
+                                },
+                                logContext,
+                            );
+                            consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                            continue;
+                        }
+                        const consentState = this.store.consent.consentState(canonicalDirectory);
+                        if (consentState !== 'approved') {
+                            if (consentState === 'denied') {
+                                this.store.recordIncognitoTranscript(this.opencodeAdapter.tool, session.sessionId);
+                            }
+                            const physicalDirectory = await realpath(session.directory).catch(() => undefined);
+                            const directoryStat =
+                                physicalDirectory === undefined ? undefined : await fsStat(physicalDirectory).catch(() => undefined);
+                            if (physicalDirectory === undefined || !directoryStat?.isDirectory()) {
+                                this.recordSkippedFile(
+                                    canonicalPath,
+                                    {
+                                        category: 'unapproved root',
+                                        reason: `${session.directory} is not an existing project directory; skipped before parsing transcript content`,
+                                    },
+                                    logContext,
+                                );
+                                consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                                continue;
+                            }
+                            const root = this.store.consent.recordPending(physicalDirectory);
+                            this.recordSkippedFile(
+                                canonicalPath,
+                                {
+                                    category: 'unapproved root',
+                                    reason: `${root.path} is not an approved memory root; skipped before parsing transcript content. Grant it with \`elepha consent grant ${root.path}\`.`,
+                                },
+                                logContext,
+                            );
+                            consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                            continue;
+                        }
+                    }
+
+                    if (this.store.isTranscriptPurged(this.opencodeAdapter.tool, session.sessionId)) {
+                        this.recordSkippedFile(
+                            canonicalPath,
+                            {
+                                category: 'purged',
+                                reason: `transcript ${session.sessionId} was purged and is permanently excluded from ingestion`,
+                            },
+                            logContext,
+                        );
+                        consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                        continue;
+                    }
+                    if (this.store.isTranscriptIncognito(this.opencodeAdapter.tool, session.sessionId)) {
+                        this.recordSkippedFile(
+                            canonicalPath,
+                            {
+                                category: 'incognito',
+                                reason: `transcript ${session.sessionId} was observed while capture was denied and is permanently excluded from ingestion`,
+                            },
+                            logContext,
+                        );
+                        consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                        continue;
+                    }
+
+                    const classification = this.opencodeAdapter.classifySession(session);
+                    const skipLabel =
+                        classification.exclusion ??
+                        (classification.kind === 'fork-copy' || classification.kind === 'adjudicator' ? classification.kind : undefined);
+                    if (skipLabel) {
+                        this.recordSkippedFile(
+                            canonicalPath,
+                            {
+                                category: 'excluded session',
+                                reason: `skipping ${skipLabel} session ${session.sessionId}: ${classification.reason ?? ''}`,
+                            },
+                            logContext,
+                        );
+                        consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                        continue;
+                    }
+
+                    const cursor = this.store.getSessionCursor(this.opencodeAdapter.tool, session.sessionId);
+                    let sessionIngested = 0;
+                    for await (const turn of this.opencodeAdapter.parseSessionTurns(db, session, cursor, {
+                        closeTrailingOnIdle: true,
+                    })) {
+                        const consentState = this.consentStateForTurn(turn);
+                        if (consentState === 'denied') {
+                            this.store.recordIncognitoTranscript(turn.tool, turn.sessionId);
+                            break;
+                        }
+                        if (turn.droppedReason === 'sentinel') {
+                            await this.advanceDroppedTurn(turn, undefined, classification);
+                            if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
+                                break;
+                            }
+                            continue;
+                        }
+                        if (await this.persistTurn(this.opencodeAdapter, turn, undefined, classification)) {
+                            ingested++;
+                            sessionIngested++;
+                        }
+                        if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
+                            break;
+                        }
+                    }
+                    if (sessionIngested > 0) {
+                        await this.refreshRollup(this.opencodeAdapter, canonicalPath, session.sessionId, 'live', classification);
+                    }
+                    consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                }
+
+                if (onlyProjectRoots === undefined && consumedWatermark !== undefined) {
+                    this.store.setSqliteSourceWatermark(this.opencodeAdapter.tool, canonicalPath, consumedWatermark);
+                }
+                if (ingested > 0) {
+                    this.skippedFiles.delete(canonicalPath);
+                }
+                return { ingested, skipped: ingested === 0 ? this.skippedFiles.get(canonicalPath) : undefined };
+            } finally {
+                db.close();
+            }
+        } catch (error) {
+            return {
+                ingested: 0,
+                skipped: this.recordSkippedFile(
+                    canonicalPath,
+                    { category: 'unexpected error', reason: `unexpected error: ${(error as Error).message}` },
+                    { tool: this.opencodeAdapter.tool },
+                ),
+            };
+        } finally {
+            this.processing.delete(canonicalPath);
+        }
     }
 
     private async scanFile(
@@ -1187,7 +1457,12 @@ export class IngestionDaemon {
         return customTitle;
     }
 
-    private async persistTurn(adapter: SessionAdapter, turn: ParsedTurn, customTitle?: string): Promise<boolean> {
+    private async persistTurn(
+        adapter: SessionAdapter | SqliteSourceAdapter,
+        turn: ParsedTurn,
+        customTitle?: string,
+        explicitClassification?: SessionClassification,
+    ): Promise<boolean> {
         // Refused roots ($HOME itself, document dumps) never become projects.
         // Enforced here rather than downstream because a project row created
         // from a bad cwd is self-healing in the wrong direction: purge it and
@@ -1226,7 +1501,9 @@ export class IngestionDaemon {
 
         const surface = sessionSurface(turn.tool, turn.surface);
         const classification =
-            this.kindCache.get(turn.sourcePath) ?? (await this.adapterFor(turn.sourcePath)?.classifySession(turn.sourcePath));
+            explicitClassification ??
+            this.kindCache.get(turn.sourcePath) ??
+            (await this.adapterFor(turn.sourcePath)?.classifySession(turn.sourcePath));
         const meta = {
             surface,
             gitBranch: turn.gitBranch ?? null,
@@ -1336,7 +1613,11 @@ export class IngestionDaemon {
     // not emit a persistable turn. We still create/locate its ordinary session
     // so its cursor can move past the complete source range without recording
     // memory, rendered stats, boundary state, or a summarizer call.
-    private async advanceDroppedTurn(turn: ParsedTurn, customTitle?: string): Promise<void> {
+    private async advanceDroppedTurn(
+        turn: ParsedTurn,
+        customTitle?: string,
+        explicitClassification?: SessionClassification,
+    ): Promise<void> {
         if (isRefusedProjectRoot(turn.projectPath)) {
             this.recordSkippedFile(
                 turn.sourcePath,
@@ -1357,7 +1638,9 @@ export class IngestionDaemon {
         }
 
         const classification =
-            this.kindCache.get(turn.sourcePath) ?? (await this.adapterFor(turn.sourcePath)?.classifySession(turn.sourcePath));
+            explicitClassification ??
+            this.kindCache.get(turn.sourcePath) ??
+            (await this.adapterFor(turn.sourcePath)?.classifySession(turn.sourcePath));
         const meta = {
             surface: sessionSurface(turn.tool, turn.surface),
             gitBranch: turn.gitBranch ?? null,
@@ -1390,7 +1673,13 @@ export class IngestionDaemon {
     // Recomputes a session's rollup. `state` is 'live' for a mid-session batch
     // and 'final' once the transcript has gone idle - but 'final' is only ever
     // a heuristic, and any later turn returns the session to 'live'.
-    private async refreshRollup(adapter: SessionAdapter, filePath: string, nativeId: string, state: 'live' | 'final'): Promise<void> {
+    private async refreshRollup(
+        adapter: SessionAdapter | SqliteSourceAdapter,
+        filePath: string,
+        nativeId: string,
+        state: 'live' | 'final',
+        explicitClassification?: SessionClassification,
+    ): Promise<void> {
         if (!this.rollupService || isMemoryLocked(this.store.database)) {
             return;
         }
@@ -1400,12 +1689,13 @@ export class IngestionDaemon {
             return;
         }
 
-        const classification = this.kindCache.get(filePath) ?? (await adapter.classifySession(filePath));
+        const classification =
+            explicitClassification ?? this.kindCache.get(filePath) ?? (await (adapter as SessionAdapter).classifySession(filePath));
         await this.refreshStoredSessionRollup(adapter, filePath, session, classification, state);
     }
 
     private async refreshStoredSessionRollup(
-        adapter: SessionAdapter,
+        adapter: SessionAdapter | SqliteSourceAdapter,
         filePath: string,
         session: NonNullable<ReturnType<MemoryStore['findSession']>>,
         classification: SessionClassification | undefined,
@@ -1415,7 +1705,8 @@ export class IngestionDaemon {
             return;
         }
 
-        const resolvedClassification = classification ?? this.kindCache.get(filePath) ?? (await adapter.classifySession(filePath));
+        const resolvedClassification =
+            classification ?? this.kindCache.get(filePath) ?? (await (adapter as SessionAdapter).classifySession(filePath));
         const kind = resolvedClassification.kind;
         // Sub-agent work is attached to the parent session rather than listed
         // as a peer; an un-ingested parent leaves it standalone rather than

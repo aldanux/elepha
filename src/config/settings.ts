@@ -6,7 +6,14 @@ import { elephaConfigPath } from './paths.js';
 const UPDATE_CHECK_KEY = 'update-check';
 const BOOLEAN_SETTING_VALUES = ['true', 'false', '1', '0', 'on', 'off'] as const;
 
-export const SETTING_KEYS = [UPDATE_CHECK_KEY, 'capture-claude-code', 'capture-codex', 'durable-capture', 'query-matching'] as const;
+export const SETTING_KEYS = [
+    UPDATE_CHECK_KEY,
+    'capture-claude-code',
+    'capture-codex',
+    'capture-opencode',
+    'durable-capture',
+    'query-matching',
+] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
 export type SettingSource = 'config' | 'env' | 'default';
 export type QueryMatchingMode = 'strict' | 'lax';
@@ -29,6 +36,7 @@ export const SETTING_SCHEMA = {
     'update-check': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-claude-code': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-codex': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
+    'capture-opencode': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
     'durable-capture': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
     'query-matching': { kind: 'enum', values: ['strict', 'lax'], default: 'strict' },
 } as const satisfies Record<SettingKey, SettingSchema>;
@@ -124,7 +132,10 @@ function configuredSetting<K extends SettingKey>(key: K, value: unknown): Settin
         | undefined;
 }
 
-function captureEnabled(config: ConfigObject, key: 'capture-claude-code' | 'capture-codex'): boolean {
+const CAPTURE_SETTING_KEYS = ['capture-claude-code', 'capture-codex', 'capture-opencode'] as const;
+type CaptureSettingKey = (typeof CAPTURE_SETTING_KEYS)[number];
+
+function captureEnabled(config: ConfigObject, key: CaptureSettingKey): boolean {
     return configuredSetting(key, config[key]) ?? SETTING_SCHEMA[key].default;
 }
 
@@ -166,10 +177,11 @@ export function setSetting(key: string, value: string, filePath: string = elepha
     }
     const config = readConfigForMutation(filePath).config;
     const parsedValue = parseSetting(key, value);
-    if (!parsedValue && key === 'capture-claude-code' && !captureEnabled(config, 'capture-codex')) {
-        throw new Error('at least one capture tool must remain enabled');
-    }
-    if (!parsedValue && key === 'capture-codex' && !captureEnabled(config, 'capture-claude-code')) {
+    if (
+        !parsedValue &&
+        CAPTURE_SETTING_KEYS.includes(key as CaptureSettingKey) &&
+        CAPTURE_SETTING_KEYS.filter((captureKey) => captureKey !== key).every((captureKey) => !captureEnabled(config, captureKey))
+    ) {
         throw new Error('at least one capture tool must remain enabled');
     }
     config[key] = parsedValue;
