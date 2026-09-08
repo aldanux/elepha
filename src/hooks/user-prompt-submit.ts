@@ -1,10 +1,12 @@
 // Fail-open UserPromptSubmit hook. Historical turns are rendered exclusively
 // by SessionReader; this hook never reads a transcript itself.
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { ELEPHA_LIST_DEFAULT_LIMIT, ELEPHA_LIST_MAX_LIMIT, RESUME_CHAR_BUDGET } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
+import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
+import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
@@ -16,8 +18,8 @@ import {
     servedContextInstructions,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
-import { endedAt, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
-import { ConsentStore } from '../storage/consent-store.js';
+import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
+import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
 import { LOCKED_MEMORY_MESSAGE, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
@@ -27,9 +29,11 @@ import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookTool, parsePayload, readStdin, type UserPromptSubmitPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
 import { recordHookOutput } from './output.js';
+import { withDaemonHealthWarning, withUpdateNotice } from './session-start.js';
 
 export type UserPromptCommand =
     | { kind: 'help' }
+    | { kind: 'info' }
     | { kind: 'last' }
     | { kind: 'list'; count: number; tool?: ToolName }
     | { kind: 'resume'; index: number }
@@ -43,6 +47,8 @@ export interface UserPromptSubmitDependencies {
     now?: () => number;
     log?: (line: string) => void;
     projectResolver?: (db: Database.Database) => ProjectResolver;
+    daemonHealth?: typeof classifyDaemonHealth;
+    readUpdateAvailable?: (markerPath: string) => UpdateAvailable | undefined;
     writeInjection?: (store: MemoryStore, input: Parameters<MemoryStore['recordInjection']>[0]) => boolean;
 }
 
@@ -56,6 +62,13 @@ interface CommandBodyResult {
 interface StoredResumeTarget {
     hasStoredList: boolean;
     session?: ServedSession;
+}
+
+interface InfoCommandContext {
+    captureOffRoot: ConsentRoot | 'refused' | undefined;
+    excludeNativeId: string;
+    daemonHealth: typeof classifyDaemonHealth;
+    readUpdateAvailable: (markerPath: string) => UpdateAvailable | undefined;
 }
 
 const ACTIONS: Record<string, Extract<UserPromptCommand, { kind: 'action' }>> = {
@@ -84,6 +97,9 @@ export function parseUserPromptCommand(prompt: string): UserPromptCommand | unde
     const command = prompt.trim();
     if (command === 'elepha:help') {
         return { kind: 'help' };
+    }
+    if (command === 'elepha:info') {
+        return { kind: 'info' };
     }
     if (command === 'elepha:last') {
         return { kind: 'last' };
@@ -122,6 +138,7 @@ async function commandBody(
     consentedProjects: readonly ProjectSet[],
     storedResumeTarget: StoredResumeTarget = { hasStoredList: false },
     now: number = Date.now(),
+    infoContext?: InfoCommandContext,
 ): Promise<CommandBodyResult> {
     if (!command || command.kind === 'help') {
         return { body: `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${HELP}` };
@@ -129,15 +146,41 @@ async function commandBody(
     if (command.kind === 'action') {
         return { body: terminalHandoff('self-update') };
     }
+    const projectNames = new Map(
+        consentedProjects.flatMap((candidate) => candidate.projectIds.map((projectId) => [projectId, candidate.displayName] as const)),
+    );
+    if (command.kind === 'info') {
+        if (!infoContext) {
+            throw new Error('info context unavailable');
+        }
+        const total = reader.consentedTotal(consentedProjects);
+        const here = infoContext.captureOffRoot || project === undefined ? 0 : reader.consentedTotal([project]);
+        let status: string;
+        if (infoContext.captureOffRoot) {
+            const grantHint =
+                infoContext.captureOffRoot !== 'refused' && infoContext.captureOffRoot.state === 'pending'
+                    ? ` · run 'elepha consent grant ${infoContext.captureOffRoot.path}' to capture here`
+                    : '';
+            status = `🐘 elepha · capture OFF · ${here} sessions here / ${total} total · type elepha:list to recall${grantHint}`;
+        } else {
+            const session = newestActivity(reader.recentConsentedSessions(consentedProjects), {
+                excludeNativeId: infoContext.excludeNativeId,
+            });
+            status = `🐘 elepha · capture ON · ${here} sessions here / ${total} total`;
+            if (session !== undefined) {
+                status += ` · last session ${relativeTime(endedAt(session), now)} in ${surfaceLabel(session.tool, session.surface)} · ${projectNames.get(session.project_id) ?? '(unknown project)'} · type elepha:last to resume`;
+            }
+        }
+        status = withDaemonHealthWarning(status, now, infoContext.daemonHealth);
+        status = withUpdateNotice(status, infoContext.readUpdateAvailable);
+        return { body: `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${status}` };
+    }
     if (command.kind === 'list') {
         const sessions = reader.recentConsentedSessions(consentedProjects);
         const rows = command.tool === undefined ? sessions : sessions.filter((session) => session.tool === command.tool);
         if (rows.length === 0) {
             return { body: 'No sessions found in consented projects.', shownSessionIds: [] };
         }
-        const projectNames = new Map(
-            consentedProjects.flatMap((candidate) => candidate.projectIds.map((projectId) => [projectId, candidate.displayName] as const)),
-        );
         const shown = rows.slice(0, command.count);
         return {
             body: [
@@ -268,6 +311,21 @@ export async function runUserPromptSubmit(
                 }
             } else {
                 const project = consentedProject(db, payload.cwd);
+                let infoContext: InfoCommandContext | undefined;
+                if (command?.kind === 'info') {
+                    let canonicalCwd: string;
+                    try {
+                        canonicalCwd = realpathSync(payload.cwd);
+                    } catch {
+                        return { reason: 'project_unavailable_or_unconsented' };
+                    }
+                    infoContext = {
+                        captureOffRoot: store.consent.captureOffNudge(canonicalCwd),
+                        excludeNativeId: payload.session_id,
+                        daemonHealth: dependencies.daemonHealth ?? classifyDaemonHealth,
+                        readUpdateAvailable: dependencies.readUpdateAvailable ?? readUpdateAvailable,
+                    };
+                }
                 let storedResumeTarget: StoredResumeTarget = { hasStoredList: false };
                 if (command?.kind === 'resume') {
                     const storedSessionIds = store.shownSessionLists.forChat(tool, payload.session_id);
@@ -285,8 +343,8 @@ export async function runUserPromptSubmit(
                     }
                 }
                 const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
-                const commandNow = command?.kind === 'list' ? clock() : undefined;
-                const result = await commandBody(command, reader, project, consentedProjects, storedResumeTarget, commandNow);
+                const commandNow = command?.kind === 'list' || command?.kind === 'info' ? clock() : undefined;
+                const result = await commandBody(command, reader, project, consentedProjects, storedResumeTarget, commandNow, infoContext);
                 if (result.shownSessionIds !== undefined && !contributingSessionsStillConsented(db, reader, result.shownSessionIds)) {
                     log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
                     return { reason: 'project_unavailable_or_unconsented' };

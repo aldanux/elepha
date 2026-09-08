@@ -103,11 +103,11 @@ describe('settings', () => {
 
     it('removes only update-check and returns to the default', () => {
         const file = configPath();
-        writeFileSync(file, '{"memory":{"on_startup":"auto"},"update-check":false}\n');
+        writeFileSync(file, '{"capture-codex":true,"update-check":false}\n');
 
         unsetSetting('update-check', file);
 
-        expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ memory: { on_startup: 'auto' } });
+        expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ 'capture-codex': true });
         expect(getSetting('update-check', {}, file)).toEqual({ key: 'update-check', value: true, source: 'default' });
     });
 
