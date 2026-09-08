@@ -25,9 +25,11 @@ user's behalf. Transcript content and derived text are treated as inert data, ne
 code, commands, or paths to execute. Capture, local search, and recall do not require
 an AI provider key.
 
-[Demo Video](https://github.com/user-attachments/assets/478a14aa-acb8-4a51-99d6-e809d0473280)
+<!-- Demo video pending re-record. When the new clip is uploaded, uncomment and set the URL:
+[Demo Video](PASTE_GITHUB_ATTACHMENT_URL_HERE)
 
 _Video description: Recall a Codex session from Claude Code._
+-->
 
 ## Get started
 
@@ -38,7 +40,7 @@ elepha init
 ```
 
 Codex requires manual approval of **elepha's** hooks through `/hooks` and may ask
-again after a hook changes. Then open a supported tool and type `elepha:last`.
+again after a hook changes.
 
 Full walkthrough: [getting-started guide](docs/getting-started.md).
 
@@ -49,47 +51,62 @@ and Codex desktop. All four surfaces use the same local memory database.
 
 It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 
-Durable capture is opt-in and off by default. When enabled, it stores sanitized user
-prompts, assistant responses, and path-bearing tool-call metadata in the encrypted
-database. Raw JSONL, thinking, tool output, fetched content, and raw tool arguments
-are excluded. See [protecting and recovering memory](docs/storage.md).
-
-## Documentation
-
-- [Getting started](docs/getting-started.md)
-- [In-AI-chat command index](docs/commands-in-ai-chat.md)
-- [CLI command index](docs/commands-cli.md)
-- [Choosing what elepha may remember](docs/consent.md)
-- [Controlling capture](docs/capture.md)
-- [Configuration](docs/configuration.md)
-- [Protecting and recovering memory](docs/storage.md)
-- [Deleting memory](docs/purge.md)
-- [Updating and maintenance](docs/maintenance.md)
-- [Troubleshooting](docs/troubleshooting.md)
-
 ## How it works
 
-1. **Capture.** A background service reads supported session files under approved project roots.
-2. **Index.** Session metadata, summaries, and optional filtered durable copies are stored in the local database.
-3. **Recall.** MCP exposes read-only project, session, and content lookup. `elepha:query`, `elepha:resume:<n>`, and `elepha:last` provide the same context inside supported chats.
+1. **Capture:** A background service reads supported session files under approved project roots.
+2. **Index:** Session metadata, summaries, and optional filtered durable copies are stored in the encrypted local database.
+3. **Recall:** A read-only MCP server and `elepha:` commands surface past context in chat. Ask in plain language, or find and reopen
+   sessions with `elepha:query` / `elepha:resume` / `elepha:last`.
 
 Search uses stored titles, first prompts, rollups, and the filtered local full-text
 index where durable capture is available. Session recall renders filtered content
 from a complete durable copy or the source transcript. Results are bounded and
 report when older turns were omitted.
 
-Full list: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
+## Recall in chat: ask in plain language
 
-## In-AI-chat commands
+No keywords needed. When elepha's MCP tools are connected, ask in natural language and it
+answers with the reasoning: what was decided, why, and what is still open, naming the
+project and session it came from.
 
-| Command                            | What it does                                                     |
-|------------------------------------|------------------------------------------------------------------|
-| `elepha:last`                      | Inject the newest available turns from the most recent session.  |
-| `elepha:list`                      | List the five most recent sessions, numbered.                    |
-| `elepha:list:<n>`                  | List the last `n`, up to 100.                                    |
-| `elepha:query <search terms>`      | Search every approved project.                                   |
-| `elepha:query:here <search terms>` | Search the current project only.                                 |
-| `elepha:resume:<n>`                | Load the nth session to continue it; the model presents a recap. |
+> do you remember why we moved the purchase button into a modal?
+
+To find and reopen a session, the `elepha:` commands work in any supported chat. Full
+guide: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
+
+| Command                    | What it does                                                                       |
+|----------------------------|------------------------------------------------------------------------------------|
+| `elepha:query <text>`      | Find sessions from plain text across all approved projects.                        |
+| `elepha:query:here <text>` | Same, current project only.                                                        |
+| `elepha:last`              | Inject the newest turns from the most recent session.                              |
+| `elepha:list[:<n>]`        | List recent sessions, numbered (up to 100).                                        |
+| `elepha:resume:<n>`        | Load a session to continue it; the model presents a recap.                         |
+| `elepha:info`              | Show status: sessions, capture, last session, and when a new version is available. |
+
+## Storage
+
+By default elepha stores derived memory only: session metadata and summaries. The full
+conversation is read back from the original transcript on demand, so recall of an older
+session depends on that file still being on disk.
+
+Durable capture is opt-in and off by default. When on, elepha keeps its own filtered copy
+of each turn inside the encrypted database: sanitized user prompts, assistant responses,
+and path-bearing tool-call metadata. Raw JSONL, thinking, tool output, fetched content,
+and raw tool arguments are excluded. That copy:
+
+- survives the original transcript being deleted, so it can remain the only record;
+- enables local full-text search of past content with no AI provider key;
+- travels inside encrypted backups and project exports.
+
+Durable capture is capped at 1 GiB in total; when full, the oldest sessions are evicted
+first. Turn it on or off with:
+
+```console
+elepha config set durable-capture true
+elepha config set durable-capture false
+```
+
+See [protecting and recovering memory](docs/storage.md).
 
 ## Privacy and consent
 
@@ -107,6 +124,19 @@ The encrypted database, search index, and recall service are local.
   being re-ingested.
 - Memory lives at `$ELEPHA_HOME/elepha.db`, or `~/.elepha/elepha.db` by default.
   Current encrypted backups require the same installation key.
+
+## Documentation
+
+- [Getting started](docs/getting-started.md)
+- [In-AI-chat command index](docs/commands-in-ai-chat.md)
+- [CLI command index](docs/commands-cli.md)
+- [Choosing what elepha may remember](docs/consent.md)
+- [Controlling capture](docs/capture.md)
+- [Configuration](docs/configuration.md)
+- [Protecting and recovering memory](docs/storage.md)
+- [Deleting memory](docs/purge.md)
+- [Updating and maintenance](docs/maintenance.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
 ## License and links
 
