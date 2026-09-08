@@ -99,7 +99,12 @@ async function waitForCaptureToStop(): Promise<boolean> {
 }
 
 // Runs a destructive operation only after confirming that the capture writer is stopped.
-export async function withCapturePaused(operation: string, fn: () => Promise<void>, output: CliOutputSink = console): Promise<boolean> {
+export async function withCapturePaused(
+    operation: string,
+    fn: () => Promise<void>,
+    output: CliOutputSink = console,
+    releaseBeforeResume?: () => void | Promise<void>,
+): Promise<boolean> {
     const health = daemonHealth();
     if (!health.healthy) {
         if (health.state.startsWith('STUCK')) {
@@ -135,7 +140,8 @@ export async function withCapturePaused(operation: string, fn: () => Promise<voi
         await fn();
         return true;
     } finally {
-        resumeCaptureService(service);
+        await releaseBeforeResume?.();
+        await resumeCaptureService(service);
         output.log('Capture resumed.');
     }
 }

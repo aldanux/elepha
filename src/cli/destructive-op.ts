@@ -20,6 +20,12 @@ export interface DestructiveOpOptions<Plan> {
     confirm?: (plan: Plan) => MaybePromise<boolean>;
     backupLog?: (message: string) => void;
     output?: CliOutputSink;
+    // Default: the operation's db is closed before the daemon is resumed, so the
+    // resumed daemon can migrate and open without a competing connection (D117).
+    // Set true only when the caller keeps using this handle after runDestructiveOp
+    // returns (sanitize's paranoid-generation gate does); such a caller owns
+    // releasing it and accepts that resume still contends until it does.
+    retainDbAfter?: boolean;
     messages: {
         dryRun: string;
     };
@@ -58,5 +64,10 @@ export async function runDestructiveOp<Plan>(opts: DestructiveOpOptions<Plan>): 
             await opts.verify(plan);
         },
         output,
+        opts.retainDbAfter
+            ? undefined
+            : () => {
+                  opts.db.close();
+              },
     );
 }

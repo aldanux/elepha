@@ -92,6 +92,10 @@ async function runSanitize(
         // it deletes nothing.
         applyRequested,
         db,
+        // The paranoid-generation gate replays buffered output under this same
+        // handle and token after runDestructiveOp returns, so it must not be
+        // closed before resume. See D117 follow-up (data-to-observe §12).
+        retainDbAfter: true,
         operationLabel: 'sanitize',
         output: output.sink,
         plan: () => planSanitize(db),
