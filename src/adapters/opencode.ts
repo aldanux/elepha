@@ -58,6 +58,12 @@ interface OpenTurn {
 
 const FILE_PATH_INPUT_KEYS = ['filePath', 'file_path', 'path'] as const;
 const EXTERNAL_FETCH_TOOLS = new Set(['webfetch', 'websearch', 'web_fetch', 'web_search', 'web-fetch', 'web-search']);
+// OpenCode creates sessions with this placeholder, then replaces it asynchronously with an AI title.
+const OPENCODE_PLACEHOLDER_TITLE_PATTERN = /^New session - \d{4}-\d{2}-\d{2}T/;
+
+export function opencodeSessionAiTitle(title: string | undefined): string | undefined {
+    return title === undefined || OPENCODE_PLACEHOLDER_TITLE_PATTERN.test(title) ? undefined : title;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -137,7 +143,7 @@ function parsedTurn(dbPath: string, session: OpenedSessionRow, turn: OpenTurn): 
         endedAt: turn.endedAt,
         userMessage: turn.userMessageParts.join('\n').trim(),
         assistantText: turn.assistantTextParts.join('\n').trim(),
-        aiTitle: session.title,
+        aiTitle: opencodeSessionAiTitle(session.title),
         toolCalls: turn.toolCalls,
         surface: undefined,
         gitBranch: undefined,

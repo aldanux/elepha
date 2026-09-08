@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { OpencodeAdapter, openOpencodeDbReadonly } from '../../src/adapters/opencode.js';
+import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../../src/adapters/opencode.js';
 import { opencodeDbPath } from '../../src/config/paths.js';
 import { createOpencodeFixture } from '../fixtures/opencode-db.js';
 
@@ -22,6 +22,11 @@ afterEach(() => {
 });
 
 describe('OpencodeAdapter', () => {
+    it('treats OpenCode placeholder titles as absent', () => {
+        expect(opencodeSessionAiTitle('New session - 2026-09-08T16:24:27.510Z')).toBeUndefined();
+        expect(opencodeSessionAiTitle('Qué es Git')).toBe('Qué es Git');
+    });
+
     it('enumerates dirty sessions after a strict watermark in update order', () => {
         const db = openOpencodeDbReadonly(opencodeDbPath());
         try {

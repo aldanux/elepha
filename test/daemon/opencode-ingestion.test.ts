@@ -8,7 +8,7 @@ import { SessionReader } from '../../src/serving/session-reader.js';
 import { SQLITE_SOURCE_WATERMARK_SCHEMA } from '../../src/storage/db.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { RollupProvider } from '../../src/summarizer/rollup-provider.js';
-import { addOpencodeSession, appendOpencodeTurn, createOpencodeFixture } from '../fixtures/opencode-db.js';
+import { addOpencodeSession, appendOpencodeTurn, createOpencodeFixture, updateOpencodeSessionTitle } from '../fixtures/opencode-db.js';
 import { createTestDb } from '../helpers/db.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -70,6 +70,38 @@ afterEach(() => {
 });
 
 describe('OpenCode daemon ingestion', () => {
+    it('falls back from placeholder titles and refreshes a later AI title without new turns', async () => {
+        const sourceRoot = withGrantableTestDir('elepha-opencode-title-source-');
+        const projectPath = withGrantableTestDir('elepha-opencode-title-project-');
+        vi.stubEnv('XDG_DATA_HOME', sourceRoot);
+        createOpencodeFixture(opencodeDbPath(), projectPath);
+        updateOpencodeSessionTitle(opencodeDbPath(), 'ses_primary', 'New session - 2026-09-08T16:24:27.510Z', 300);
+        appendOpencodeTurn(opencodeDbPath(), {
+            sessionId: 'ses_sub',
+            turnIndex: 0,
+            timeCreated: 500,
+            timeUpdated: 100,
+            userMessage: 'Subagent prompt',
+            assistantText: 'Subagent answer',
+        });
+
+        const fixture = createTestDb('elepha-opencode-title-store-');
+        fixture.store.consent.grant(projectPath);
+        const daemon = new IngestionDaemon({ store: fixture.store, readConfig: enabledConfig });
+        const scan = daemonSeam(daemon);
+
+        await expect(scan.scanOpencodeDb(opencodeDbPath())).resolves.toMatchObject({ ingested: 3 });
+        const primary = fixture.store.findSession('opencode', 'ses_primary');
+        expect(primary).toMatchObject({ title: 'First prompt' });
+        expect(fixture.store.findSession('opencode', 'ses_sub')).toMatchObject({ title: 'Sub-session' });
+        expect(fixture.store.listMemoriesForSession(primary!.id)).toHaveLength(2);
+
+        updateOpencodeSessionTitle(opencodeDbPath(), 'ses_primary', 'Qué es Git', 400);
+        await expect(scan.scanOpencodeDb(opencodeDbPath())).resolves.toMatchObject({ ingested: 0 });
+        expect(fixture.store.findSession('opencode', 'ses_primary')).toMatchObject({ title: 'Qué es Git' });
+        expect(fixture.store.listMemoriesForSession(primary!.id)).toHaveLength(2);
+    });
+
     it('captures OpenCode sessions by default', async () => {
         const sourceRoot = withGrantableTestDir('elepha-opencode-disabled-source-');
         const projectPath = withGrantableTestDir('elepha-opencode-disabled-project-');
