@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
-import { runSessionStart } from '../../src/hooks/session-start.js';
+import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
@@ -138,12 +138,12 @@ describe('capture consent', () => {
         expect(store.listProjects().map((project) => project.path)).toEqual([approved]);
 
         store.database.close();
-        const result = await runSessionStart(
+        const result = await runUserPromptSubmit(
             JSON.stringify({
                 session_id: 'identity-consent-session',
                 cwd: moved,
-                hook_event_name: 'SessionStart',
-                source: 'startup',
+                hook_event_name: 'UserPromptSubmit',
+                prompt: 'elepha:info',
                 model: 'gpt-5.6',
                 permission_mode: 'default',
             }),
@@ -151,7 +151,8 @@ describe('capture consent', () => {
             {
                 dbPath,
                 now: () => Date.parse('2026-08-24T00:00:00.000Z'),
-                readConfig: () => ({ config: { on_startup: 'notify', on_clear: 'off', on_resume: 'off', on_compact: 'off' } }),
+                daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
+                readUpdateAvailable: () => undefined,
             },
         );
         expect(result).toMatchObject({

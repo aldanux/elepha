@@ -1,17 +1,11 @@
-// Hook configuration is deliberately narrow: malformed explicit config is an
-// error, whereas an absent config keeps the documented fail-open defaults.
+// Daemon capture configuration is deliberately narrow: malformed explicit
+// config is an error, whereas an absent config keeps the capture defaults.
 
 import { readFileSync } from 'node:fs';
 import { DURABLE_CAPTURE_MAX_BYTES } from './constants.js';
 import { elephaConfigPath } from './paths.js';
 
-export type StartupMode = 'notify' | 'auto' | 'off' | 'ask';
-
 export interface MemoryConfig {
-    on_startup: StartupMode;
-    on_clear: StartupMode;
-    on_resume: StartupMode;
-    on_compact: StartupMode;
     captureClaudeCode?: boolean;
     captureCodex?: boolean;
     durableCapture?: boolean;
@@ -19,18 +13,11 @@ export interface MemoryConfig {
 }
 
 export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
-    on_startup: 'notify',
-    on_clear: 'notify',
-    on_resume: 'auto',
-    on_compact: 'off',
     captureClaudeCode: true,
     captureCodex: true,
     durableCapture: false,
     durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };
-
-const KEYS = ['on_startup', 'on_clear', 'on_resume', 'on_compact'] as const;
-const MODES = new Set<StartupMode>(['notify', 'auto', 'off', 'ask']);
 
 export function readMemoryConfig(filePath: string = elephaConfigPath()): { config: MemoryConfig } | { error: string } {
     let raw: string;
@@ -65,23 +52,6 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
     const durableCaptureMaxBytes = settings['durable-capture-max-bytes'];
     if (typeof durableCaptureMaxBytes === 'number' && Number.isSafeInteger(durableCaptureMaxBytes) && durableCaptureMaxBytes > 0) {
         output.durableCaptureMaxBytes = durableCaptureMaxBytes;
-    }
-    const memory = (parsed as { memory?: unknown }).memory;
-    if (memory === undefined) {
-        return { config: output };
-    }
-    if (!memory || typeof memory !== 'object' || Array.isArray(memory)) {
-        return { error: 'memory config.memory must be an object' };
-    }
-    for (const key of KEYS) {
-        const value = (memory as Record<string, unknown>)[key];
-        if (value === undefined) {
-            continue;
-        }
-        if (typeof value !== 'string' || !MODES.has(value as StartupMode)) {
-            return { error: `memory config ${key} is unsupported` };
-        }
-        output[key] = value as StartupMode;
     }
     return { config: output };
 }

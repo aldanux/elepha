@@ -9,6 +9,7 @@ export const RESUME_RECAP_INSTRUCTIONS =
 export const REMEMBER_QUERY_REQUIRED = 'Recall query must contain at least one non-filler search term.';
 export const REMEMBER_HERE_UNCONSENTED =
     'This directory is not a consented project. Run elepha:query <terms> to search all consented memory, or elepha consent grant <path> to start capturing here.';
+export const INFO_HELP = 'elepha:info — Show elepha status: sessions here/total, capture state, last session.';
 export const HELP = [
     'In-chat commands:',
     'elepha:query <query> — Search all consented projects.',
@@ -16,6 +17,7 @@ export const HELP = [
     "elepha:last — Inject the most recent session's turns.",
     'elepha:list[:<n>][:codex|:claude] — List 1–100 recent sessions, optionally filtered by tool.',
     'elepha:resume:<n> — Load the nth session to continue it; the model presents a recap.',
+    INFO_HELP,
     'elepha:update — Show the terminal command for updating elepha.',
     'elepha:help — Show this in-chat command list.',
 ].join('\n');

@@ -72,11 +72,10 @@ describe('no shell reachable from transcript-reading code', () => {
         expect(hook).not.toMatch(/git(?:Rev|Remote)[^(]*\(payload\./);
     });
 
-    it('never derives a git subprocess argv or cwd from any transcript field', () => {
+    it('never reaches a git subprocess from SessionStart or any transcript field', () => {
         const hook = readFileSync(path.join(SRC_ROOT, 'hooks', 'session-start.ts'), 'utf8');
-        // `cwd` and `transcript_path` are both untrusted stdin/transcript data.
-        // The only git call-site must bind cwd from the consented ProjectSet.
-        expect(hook).toMatch(/const cwd = project\.gitRoot \?\? project\.paths\[0]/);
+        expect(hook).not.toMatch(/subprocess-allowlist/);
+        expect(hook).not.toMatch(/\bgit(?:Rev|Remote)[^(]*\(/);
         expect(hook).not.toMatch(/git(?:Rev|Remote)[^(]*\(\s*(?:payload\.|payload\[[^\]]+]|session\.source_path)/);
     });
 

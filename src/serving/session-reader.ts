@@ -5,8 +5,6 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { defaultAdapters } from '../adapters/index.js';
 import {
-    AUTO_BRIEF_AGGREGATE_FILE_LIMIT,
-    AUTO_BRIEF_AGGREGATE_SESSION_LIMIT,
     DURABLE_CAPTURE_FILTER_VERSION,
     MAX_GET_SESSION_LAST_N,
     RECENT_SESSION_WINDOW_MS,
@@ -33,7 +31,6 @@ import {
 } from '../storage/paranoid-gate.js';
 import type { ProjectSet } from '../storage/project-resolver.js';
 import {
-    isSubstantive,
     type ProjectSessionAggregate,
     readProjectSessionAggregates,
     readProjectSessions,
@@ -471,13 +468,6 @@ export class SessionReader {
         );
     }
 
-    newestSubstantive(project: ProjectSet): ServedSession | undefined {
-        return this.withReadGeneration(
-            () => undefined,
-            () => this.sessionsFor(project).find(isSubstantive),
-        );
-    }
-
     counts(project: ProjectSet, now: number = Date.now()): { recent: number; total: number } {
         return this.withReadGeneration(
             () => ({ recent: 0, total: 0 }),
@@ -766,44 +756,6 @@ export class SessionReader {
             return parsed.turns === undefined
                 ? { reason: parsed.sourceUnavailable && durable.present ? 'durable_capture_incomplete' : parsed.reason }
                 : { episode: boundedRender(parsed.turns, boundedLastN, charBudget, nonce, parsed.omittedBefore) };
-        });
-    }
-
-    aggregate(project: ProjectSet): { files: string[]; surfaces: string[]; lastActivity: string | null } {
-        const locked = () => ({ files: [], surfaces: [], lastActivity: null });
-        return this.withReadGeneration(locked, () => {
-            const rows = this.sessionsFor(project).filter(isSubstantive).slice(0, AUTO_BRIEF_AGGREGATE_SESSION_LIMIT);
-            const ids = rows.map((row) => row.id);
-            if (ids.length === 0) {
-                return locked();
-            }
-            const memories = this.db
-                .prepare(`SELECT files_touched FROM memories WHERE session_id IN (${ids.map(() => '?').join(',')})`)
-                .all(...ids) as Array<{ files_touched: string }>;
-            const count = new Map<string, number>();
-            for (const memory of memories) {
-                try {
-                    const files: unknown = JSON.parse(memory.files_touched);
-                    if (Array.isArray(files)) {
-                        for (const file of files) {
-                            if (typeof file === 'string') {
-                                count.set(file, (count.get(file) ?? 0) + 1);
-                            }
-                        }
-                    }
-                } catch {
-                    // Stored malformed JSON is not a valid zero; omit it from an aggregate only.
-                }
-            }
-            const files = [...count.entries()]
-                .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-                .slice(0, AUTO_BRIEF_AGGREGATE_FILE_LIMIT)
-                .map(([file]) => file.split('/').filter(Boolean).at(-1) ?? file);
-            return {
-                files,
-                surfaces: [...new Set(rows.map((row) => surfaceLabel(row.tool, row.surface)))],
-                lastActivity: endedAt(rows[0]),
-            };
         });
     }
 }

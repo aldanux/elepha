@@ -5,12 +5,9 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { refuseLockedCliRead } from '../../src/cli/read-gate.js';
-import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { RollupService } from '../../src/daemon/rollup-service.js';
-import { runSessionStart } from '../../src/hooks/session-start.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
-import { wrap } from '../../src/security/sentinel.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import type { DatabaseEncryptionRuntime } from '../../src/storage/database-encryption.js';
@@ -221,33 +218,6 @@ async function expectRepresentativeReadsLocked(seeded: Awaited<ReturnType<typeof
         expect(response.content).toEqual([{ type: 'text', text: LOCKED_MEMORY_MESSAGE }]);
         expect(response.structuredContent).toEqual(LOCKED_MCP_RESULT);
     }
-
-    const startup = await runSessionStart(
-        JSON.stringify({
-            session_id: 'current',
-            cwd: seeded.projectPath,
-            hook_event_name: 'SessionStart',
-            source: 'startup',
-            model: 'gpt-5.6',
-            permission_mode: 'default',
-        }),
-        'codex',
-        {
-            dbPath: seeded.dbPath,
-            openDatabase: ((dbPath: string) => openDb(dbPath, { encryption: seeded.runtime })) as typeof openDb,
-            readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG } }),
-            projectResolver: () => {
-                throw new Error('locked output must not resolve or read protected projects');
-            },
-        },
-    );
-    const startupInjection = seeded.db
-        .prepare('SELECT injection_id, body FROM injections WHERE tool = ? AND native_session_id = ? ORDER BY id')
-        .get('codex', 'current') as { injection_id: string; body: string } | undefined;
-    expect(startupInjection?.body).toBe(LOCKED_MEMORY_MESSAGE);
-    expect(codexHookText(startup)).toBe(
-        startupInjection === undefined ? undefined : wrap('notify', startupInjection.injection_id, LOCKED_MEMORY_MESSAGE),
-    );
 
     const prompt = await runUserPromptSubmit(
         JSON.stringify({
