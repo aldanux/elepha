@@ -241,7 +241,7 @@ describe('MemoryStore', () => {
             ]);
         });
 
-        it('merges a dead checkout into the live row sharing its remote and moves every project foreign key', () => {
+        it('merges a renamed checkout into the live row sharing its remote and moves every project foreign key', () => {
             const now = '2026-08-22T00:00:00.000Z';
             const insertProject = store.database.prepare(
                 `INSERT INTO projects (path, display_name, git_root, git_remote, git_root_commit, first_seen_at, last_seen_at)
@@ -272,7 +272,9 @@ describe('MemoryStore', () => {
                 )
                 .run(deadSession.id, dead, now, now, now);
 
-            const plans = store.rekeyProjectsByIdentity(fakeResolver({ '/work/current-name': '/work/current-name' }));
+            const plans = store.rekeyProjectsByIdentity(
+                fakeResolver({ '/work/old-name': '/work/current-name', '/work/current-name': '/work/current-name' }),
+            );
 
             expect(plans).toEqual([
                 expect.objectContaining({ canonical: expect.objectContaining({ id: live }), gitRoot: '/work/current-name' }),
@@ -289,6 +291,114 @@ describe('MemoryStore', () => {
             expect(store.database.prepare('SELECT project_id FROM memories').all()).toEqual([{ project_id: live }]);
             expect(store.database.prepare('SELECT project_id FROM sessions').all()).toEqual([{ project_id: live }]);
             expect(store.database.prepare('SELECT project_id FROM session_rollups').all()).toEqual([{ project_id: live }]);
+        });
+
+        it('merges a transferred repository by live git root and moves every project foreign key', () => {
+            const now = '2026-09-08T00:00:00.000Z';
+            const insertProject = store.database.prepare(
+                `INSERT INTO projects (path, display_name, git_root, git_remote, git_root_commit, first_seen_at, last_seen_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            );
+            const canonical = Number(
+                insertProject.run(
+                    '/work/current-name',
+                    'current-name',
+                    '/work/current-name',
+                    'git@example.test:new-owner/repo.git',
+                    'root-commit',
+                    now,
+                    now,
+                ).lastInsertRowid,
+            );
+            const transferred = Number(
+                insertProject.run(
+                    '/work/current-name/packages/app',
+                    'app',
+                    '/work/current-name',
+                    'git@example.test:old-owner/repo.git',
+                    'root-commit',
+                    now,
+                    now,
+                ).lastInsertRowid,
+            );
+            const transferredSession = store.upsertSession('codex', 'transferred-session', transferred, '/tmp/transferred.jsonl');
+            store.recordTurn(makeTurn({ tool: 'codex', sessionId: 'transferred-session' }), transferredSession.id, transferred, {
+                decisions: [],
+                pending_items: [],
+                status: 'ok',
+            });
+            store.database
+                .prepare(
+                    `INSERT INTO session_rollups
+                     (session_id, project_id, tool, title, summary, decisions, pending_items, files_touched, turn_count, started_at, ended_at, kind, parent_session_id, summarizer_status, rollup_state, rolled_up_through_turn_index, computed_at, rollup_version)
+                     VALUES (?, ?, 'codex', 'transferred', '', '[]', '[]', '[]', 0, ?, ?, 'primary', NULL, 'ok', 'final', -1, ?, 1)`,
+                )
+                .run(transferredSession.id, transferred, now, now, now);
+            const resolver = fakeResolver({
+                '/work/current-name': '/work/current-name',
+                '/work/current-name/packages/app': '/work/current-name',
+            });
+
+            expect(store.planRekeyProjectsByIdentity(resolver)).toEqual([
+                expect.objectContaining({
+                    canonical: expect.objectContaining({ id: canonical }),
+                    gitRoot: '/work/current-name',
+                    merged: [expect.objectContaining({ id: transferred })],
+                }),
+            ]);
+
+            const plans = store.rekeyProjectsByIdentity(resolver);
+
+            expect(plans).toEqual([
+                expect.objectContaining({
+                    canonical: expect.objectContaining({ id: canonical }),
+                    gitRoot: '/work/current-name',
+                    merged: [expect.objectContaining({ id: transferred })],
+                }),
+            ]);
+            expect(store.listProjects()).toEqual([expect.objectContaining({ id: canonical, path: '/work/current-name' })]);
+            expect(store.database.prepare('SELECT project_id FROM memories').all()).toEqual([{ project_id: canonical }]);
+            expect(store.database.prepare('SELECT project_id FROM sessions').all()).toEqual([{ project_id: canonical }]);
+            expect(store.database.prepare('SELECT project_id FROM session_rollups').all()).toEqual([{ project_id: canonical }]);
+        });
+
+        it('does not merge forks that share a root commit but resolve to different git roots', () => {
+            const now = '2026-09-08T00:00:00.000Z';
+            const insertProject = store.database.prepare(
+                `INSERT INTO projects (path, display_name, git_root, git_remote, git_root_commit, first_seen_at, last_seen_at)
+                 VALUES (?, ?, ?, NULL, ?, ?, ?)`,
+            );
+            insertProject.run('/work/fork-one', 'fork-one', '/work/fork-one', 'shared-root-commit', now, now);
+            insertProject.run('/work/fork-two', 'fork-two', '/work/fork-two', 'shared-root-commit', now, now);
+
+            expect(
+                store.planRekeyProjectsByIdentity(fakeResolver({ '/work/fork-one': '/work/fork-one', '/work/fork-two': '/work/fork-two' })),
+            ).toEqual([]);
+            expect(store.listProjects()).toHaveLength(2);
+        });
+
+        it('groups unresolvable rows by their stored identity', () => {
+            const now = '2026-09-08T00:00:00.000Z';
+            const insertProject = store.database.prepare(
+                `INSERT INTO projects (path, display_name, git_root, git_remote, git_root_commit, first_seen_at, last_seen_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            );
+            const canonical = Number(
+                insertProject.run('/gone/repo', 'repo', '/stale/repo', 'git@example.test:team/repo.git', 'commit-one', now, now)
+                    .lastInsertRowid,
+            );
+            const victim = Number(
+                insertProject.run('/gone/repo/nested', 'nested', '/stale/repo', 'git@example.test:team/repo.git', 'commit-two', now, now)
+                    .lastInsertRowid,
+            );
+
+            expect(store.planRekeyProjectsByIdentity(fakeResolver({}))).toEqual([
+                expect.objectContaining({
+                    canonical: expect.objectContaining({ id: canonical }),
+                    gitRoot: null,
+                    merged: [expect.objectContaining({ id: victim })],
+                }),
+            ]);
         });
 
         it('merges matching root commits without a remote and keeps a no-longer-live canonical path unchanged', () => {

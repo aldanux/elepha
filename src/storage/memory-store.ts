@@ -359,9 +359,9 @@ export class MemoryStore {
     }
 
     // Consolidates project rows that identify the same repository even when a
-    // checkout was renamed or moved. A stored remote is the durable identity,
-    // followed by the root commit; a live git root is the fallback for legacy
-    // rows without either value.
+    // checkout was renamed or moved. The live git root identifies the working
+    // copy; stored remote and root-commit identity are fallbacks only for rows
+    // whose paths no longer resolve.
     //
     // When a group has a live checkout, its canonical row is chosen from those
     // live members, preferring the repository root and then the shallowest
@@ -371,11 +371,10 @@ export class MemoryStore {
         const groups = new Map<string, Array<{ project: ProjectRow; gitRoot: string | null }>>();
         for (const project of this.listProjects()) {
             const gitRoot = project.path ? resolveGitRoot(project.path) : null;
-            const identity = project.git_remote || project.git_root_commit || gitRoot;
-            if (!identity) {
+            const key = gitRoot !== null ? normalizeForCompare(gitRoot) : project.git_remote || project.git_root_commit;
+            if (!key) {
                 continue;
             }
-            const key = gitRoot === identity ? normalizeForCompare(identity) : identity;
             const members = groups.get(key);
             if (members) {
                 members.push({ project, gitRoot });
