@@ -1,5 +1,29 @@
 # elepha
 
+## 0.5.0
+
+### Highlights
+
+- **Ask your past work in plain language.** The new `recall` MCP tool answers a natural-language question like "do you remember why we moved the purchase button" with the decisions, the reasoning, and open items, each tagged with its project and session, and it works with no AI key of your own.
+- **Cross-tool resume with `elepha:resume`.** `elepha:select` becomes `elepha:resume:<n>` and loads the whole session so you can continue it in another tool, with the model presenting a recap instead of pasting the turns back.
+- **Nothing is injected unless you ask.** The automatic session-start brief is gone; type `elepha:info` for status on demand (sessions here and total, capture state, last session, and update notices).
+- **Steadier memory.** A transferred or renamed repository consolidates instead of splitting in two, capture-paused operations no longer throw a spurious 60s error, and session counts now match across `elepha projects`, `elepha:info`, `elepha:list`, and `elepha:query`.
+
+### Changes
+
+- Add the consent-scoped MCP `recall` tool for provenance-backed historical memory material by [@aldanux](https://github.com/aldanux) in [#73](https://github.com/aldanux/elepha/pull/73)
+- Rename `elepha:select:<n>` to `elepha:resume:<n>` (no alias) and serve the whole filtered session for cross-tool resume, with a recap instruction so the model presents where the work left off, the decisions and why, and open items, instead of pasting turns by [@aldanux](https://github.com/aldanux) in [#76](https://github.com/aldanux/elepha/pull/76)
+- Remove the SessionStart auto-brief and its startup-mode config; add `elepha:info` for on-demand status (sessions here/total, capture state, last session with its project). Operational daemon-health and update notices still surface at session start by [@aldanux](https://github.com/aldanux) in [#77](https://github.com/aldanux/elepha/pull/77)
+
+- Show the project in `elepha:list` and `elepha:query` result-row tags by [@aldanux](https://github.com/aldanux) in [#75](https://github.com/aldanux/elepha/pull/75)
+- Refine the `elepha:info` status line for readability: labelled `capture:` and `sessions:` segments, a constant `X here / Y total` count, and `last session in project: <name> - <age> ago in <tool surface>` by [@aldanux](https://github.com/aldanux) in [#79](https://github.com/aldanux/elepha/pull/79)
+- Fix `rekey-projects` so a transferred or renamed repository (changed git remote) consolidates: group project rows by their live-resolved git root before the mutable git remote, keeping fork-safety by [@aldanux](https://github.com/aldanux) in [#78](https://github.com/aldanux/elepha/pull/78)
+- Recognize Codex token usage records without emitting unknown-type warnings by [@aldanux](https://github.com/aldanux) in [#74](https://github.com/aldanux/elepha/pull/74)
+- Use Codex's AI-generated thread names for stored session titles by [@aldanux](https://github.com/aldanux) in [#72](https://github.com/aldanux/elepha/pull/72)
+- Docs: lead the README with natural-language recall, document that `elepha:query` takes free text with configurable strict/lax matching, distinguish finding sessions from the `recall` MCP tool that answers questions, document `elepha:info`, and comment out the demo video pending a re-record by [@aldanux](https://github.com/aldanux) in [#81](https://github.com/aldanux/elepha/pull/81)
+- Fix a spurious "Capture daemon did not become healthy within 60s" error after capture-paused operations (backfill, purge, backup, rekey, self-update): release the CLI's database and await the daemon resume so the restarted daemon can migrate, open, and heartbeat without a competing connection by [@aldanux](https://github.com/aldanux) in [#82](https://github.com/aldanux/elepha/pull/82)
+- Count sessions consistently: `elepha projects` now reports the same substantive (searchable and listable) session count as `elepha:info`, `elepha:list`, and `elepha:query`, instead of a raw row count by [@aldanux](https://github.com/aldanux) in [#83](https://github.com/aldanux/elepha/pull/83)
+
 ## 0.4.6
 
 - Automatically retire verified stale MCP readers from npm-replaced Elepha packages during global upgrades and blocked install migrations. This lets 0.4.5 self-update complete and makes the one-time 0.3.x npm install path work without closing coding clients, while preserving database locking and leaving unrelated processes untouched by [@aldanux](https://github.com/aldanux) in [#68](https://github.com/aldanux/elepha/pull/68)
