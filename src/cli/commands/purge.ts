@@ -236,24 +236,31 @@ async function runExternalAgentImportPurge(db: Database.Database, options: Exter
         return false;
     }
     let verificationFailed = false;
-    const proceeded = await withCapturePaused('external-agent import purge', async () => {
-        const dbPath = defaultDbPath();
-        if (existsSync(dbPath)) {
-            backupDatabaseAndReport(db, dbPath);
-        }
-        applyExternalAgentImportPurge(db, plan);
-        const verification = await verifyExternalAgentImportPurge(db, adapter, plan);
-        if (!verification.ok) {
-            verificationFailed = true;
-            console.error(`\nVERIFICATION FAILED:\n${verification.errors.map((error) => `  - ${error}`).join('\n')}`);
-            process.exitCode = 1;
-            return;
-        }
-        console.log(
-            `\nDeleted ${plan.sessions.length} session row(s), ${plan.memoryRowsAffected} memory row(s), and ${plan.rollupsAffected} rollup(s). ` +
-                'Verified resulting counts, foreign keys, and remaining Codex source rollouts.',
-        );
-    });
+    const proceeded = await withCapturePaused(
+        'external-agent import purge',
+        async () => {
+            const dbPath = defaultDbPath();
+            if (existsSync(dbPath)) {
+                backupDatabaseAndReport(db, dbPath);
+            }
+            applyExternalAgentImportPurge(db, plan);
+            const verification = await verifyExternalAgentImportPurge(db, adapter, plan);
+            if (!verification.ok) {
+                verificationFailed = true;
+                console.error(`\nVERIFICATION FAILED:\n${verification.errors.map((error) => `  - ${error}`).join('\n')}`);
+                process.exitCode = 1;
+                return;
+            }
+            console.log(
+                `\nDeleted ${plan.sessions.length} session row(s), ${plan.memoryRowsAffected} memory row(s), and ${plan.rollupsAffected} rollup(s). ` +
+                    'Verified resulting counts, foreign keys, and remaining Codex source rollouts.',
+            );
+        },
+        console,
+        () => {
+            db.close();
+        },
+    );
     return proceeded && !verificationFailed;
 }
 

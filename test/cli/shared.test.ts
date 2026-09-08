@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CAPTURE_PAUSE_DEADLINE_MS } from '../../src/config/constants.js';
+import { CAPTURE_PAUSE_DEADLINE_MS, DAEMON_HEALTH_CHECK_POLL_MS } from '../../src/config/constants.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
 import type { openUnmanagedDb } from '../../src/storage/db.js';
 
@@ -161,12 +161,66 @@ describe('withCapturePaused', () => {
             });
 
         await expect(
-            withCapturePaused('purge', async () => {
-                calls.push('operation');
-            }),
+            withCapturePaused(
+                'purge',
+                async () => {
+                    calls.push('operation');
+                },
+                console,
+                () => {
+                    calls.push('release');
+                },
+            ),
         ).resolves.toBe(true);
 
+        expect(calls).toEqual(['stop', 'disable', 'operation', 'release', 'enable', 'start']);
+    });
+
+    it('does not resolve until capture resume completes', async () => {
+        vi.useFakeTimers();
+        const calls: string[] = [];
+        serviceBackend.mockReturnValue(fakeService(calls));
+        daemonHealth
+            .mockReturnValueOnce({
+                state: 'RUNNING (pid 42, heartbeat 1s ago)',
+                healthy: true,
+                heartbeat: { pid: 42, startedAt: '2026-08-28T00:00:00.000Z', updatedAt: '2026-08-28T00:00:01.000Z' },
+            })
+            .mockReturnValueOnce({
+                state: 'NOT RUNNING (pid 42 from last heartbeat is gone - crashed?)',
+                healthy: false,
+                heartbeat: { pid: 42, startedAt: '2026-08-28T00:00:00.000Z', updatedAt: '2026-08-28T00:00:01.000Z' },
+            })
+            .mockReturnValueOnce({
+                state: 'NOT RUNNING (pid 42 from last heartbeat is gone - crashed?)',
+                healthy: false,
+                heartbeat: { pid: 42, startedAt: '2026-08-28T00:00:00.000Z', updatedAt: '2026-08-28T00:00:01.000Z' },
+            })
+            .mockReturnValueOnce({
+                state: 'NOT RUNNING (no heartbeat file)',
+                healthy: false,
+            })
+            .mockReturnValueOnce({
+                state: 'RUNNING (pid 43, heartbeat 0s ago)',
+                healthy: true,
+                heartbeat: { pid: 43, startedAt: '2026-08-28T00:01:00.000Z', updatedAt: '2026-08-28T00:01:00.000Z' },
+            });
+
+        let settled = false;
+        const result = withCapturePaused('purge', async () => {
+            calls.push('operation');
+        });
+        void result.then(() => {
+            settled = true;
+        });
+
+        await vi.advanceTimersByTimeAsync(0);
+        expect(settled).toBe(false);
         expect(calls).toEqual(['stop', 'disable', 'operation', 'enable', 'start']);
+
+        await vi.advanceTimersByTimeAsync(DAEMON_HEALTH_CHECK_POLL_MS);
+        await expect(result).resolves.toBe(true);
+        expect(settled).toBe(true);
     });
 
     it('leaves capture paused when no healthy writer was running', async () => {
