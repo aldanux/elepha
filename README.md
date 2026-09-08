@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>Local memory for Claude Code and Codex, across CLI and desktop.</b></p>
+<p align="center"><b>Local memory for Claude Code, Codex, and OpenCode.</b></p>
 <p align="center">Reads existing transcripts and serves context via MCP.</p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 ## Overview
 
-elepha reads eligible Claude Code and Codex session files already stored on disk,
+elepha reads eligible Claude Code and Codex session files, plus the local OpenCode session database,
 indexes sessions from approved projects in one encrypted SQLite database, and exposes
 past context through a read-only MCP server and `elepha:` commands in AI chat.
 
@@ -46,14 +46,18 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 
 ## Supported tools and platforms
 
-**elepha** supports Claude Code CLI and the Claude desktop Code tab, plus Codex CLI
-and Codex desktop. All four surfaces use the same local memory database.
+**elepha** supports Claude Code CLI and the Claude desktop Code tab, Codex CLI and
+Codex desktop, and OpenCode. All supported tools use the same local memory database.
+
+OpenCode capture is passive, automatic, on by default, and consent-gated per project.
+Past OpenCode work is available through elepha's MCP server. In-chat `elepha:` command
+interception is supported in Claude Code and Codex; it is not currently claimed for OpenCode.
 
 It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 
 ## How it works
 
-1. **Capture:** A background service reads supported session files under approved project roots.
+1. **Capture:** A background service reads supported local session sources under approved project roots.
 2. **Index:** Session metadata, summaries, and optional filtered durable copies are stored in the encrypted local database.
 3. **Recall:** A read-only MCP server and `elepha:` commands surface past context in chat. Ask in plain language, or find and reopen
    sessions with `elepha:query` / `elepha:resume` / `elepha:last`.
@@ -71,7 +75,7 @@ project and session it came from.
 
 > do you remember why we moved the purchase button into a modal?
 
-To find and reopen a session, the `elepha:` commands work in any supported chat. Full
+To find and reopen a session, the `elepha:` commands work in Claude Code and Codex chat. Full
 guide: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
 
 | Command                    | What it does                                                                       |

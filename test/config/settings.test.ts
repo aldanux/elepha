@@ -22,7 +22,7 @@ describe('settings', () => {
             { key: 'update-check', value: false, source: 'config' },
             { key: 'capture-claude-code', value: true, source: 'default' },
             { key: 'capture-codex', value: true, source: 'default' },
-            { key: 'capture-opencode', value: false, source: 'default' },
+            { key: 'capture-opencode', value: true, source: 'default' },
             { key: 'durable-capture', value: false, source: 'default' },
             { key: 'query-matching', value: 'strict', source: 'default' },
         ]);
@@ -66,7 +66,7 @@ describe('settings', () => {
             expect(listSettings({ ELEPHA_NO_UPDATE_CHECK: '1' }, configPath())).toEqual([
                 { key: 'query-matching', value: 'strict', source: 'default' },
                 { key: 'durable-capture', value: false, source: 'default' },
-                { key: 'capture-opencode', value: false, source: 'default' },
+                { key: 'capture-opencode', value: true, source: 'default' },
                 { key: 'capture-codex', value: true, source: 'default' },
                 { key: 'capture-claude-code', value: true, source: 'default' },
                 { key: 'update-check', value: false, source: 'env' },
@@ -94,7 +94,7 @@ describe('settings', () => {
     it.each([
         ['capture-claude-code', true],
         ['capture-codex', true],
-        ['capture-opencode', false],
+        ['capture-opencode', true],
     ] as const)('preserves the default for %s when the update-check environment override is set', (key, defaultValue) => {
         const file = configPath();
 
@@ -138,16 +138,16 @@ describe('settings', () => {
         }
     });
 
-    it('defaults JSONL capture on, OpenCode capture off, and durable capture off in settings and daemon memory config', () => {
+    it('defaults all capture tools on and durable capture off in settings and daemon memory config', () => {
         const file = configPath();
 
         expect(getSetting('capture-claude-code', {}, file).value).toBe(true);
         expect(getSetting('capture-codex', {}, file).value).toBe(true);
-        expect(getSetting('capture-opencode', {}, file).value).toBe(false);
+        expect(getSetting('capture-opencode', {}, file).value).toBe(true);
         expect(getSetting('durable-capture', {}, file).value).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.captureClaudeCode).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.captureCodex).toBe(true);
-        expect(DEFAULT_MEMORY_CONFIG.captureOpencode).toBe(false);
+        expect(DEFAULT_MEMORY_CONFIG.captureOpencode).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.durableCapture).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.durableCaptureMaxBytes).toBe(DURABLE_CAPTURE_MAX_BYTES);
         expect(readMemoryConfig(file)).toEqual({ config: DEFAULT_MEMORY_CONFIG });
@@ -162,9 +162,9 @@ describe('settings', () => {
 
     it('loads the OpenCode capture setting into daemon memory config', () => {
         const file = configPath();
-        writeFileSync(file, '{"capture-opencode":true}\n');
+        writeFileSync(file, '{"capture-opencode":false}\n');
 
-        expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, captureOpencode: true } });
+        expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, captureOpencode: false } });
     });
 
     it('loads a positive integer durable capture byte cap into daemon memory config', () => {
@@ -174,12 +174,13 @@ describe('settings', () => {
         expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, durableCaptureMaxBytes: 4096 } });
     });
 
-    it('rejects disabling both capture tools without changing the config', () => {
+    it('rejects disabling all three capture tools without changing the final config write', () => {
         const file = configPath();
         setSetting('capture-claude-code', 'off', file);
+        setSetting('capture-codex', 'off', file);
         const before = readFileSync(file, 'utf8');
 
-        expect(() => setSetting('capture-codex', 'off', file)).toThrow('at least one capture tool must remain enabled');
+        expect(() => setSetting('capture-opencode', 'off', file)).toThrow('at least one capture tool must remain enabled');
         expect(readFileSync(file, 'utf8')).toBe(before);
     });
 

@@ -4,8 +4,9 @@
 
 import { lstat, open, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { openOpencodeDbReadonly } from '../adapters/opencode.js';
 import { MAX_METADATA_SCAN_BYTES, MAX_METADATA_SCAN_LINES, READABILITY_READ_CHUNK_BYTES } from '../config/constants.js';
-import { claudeProjectsRoot, codexSessionsRoot, isRefusedProjectRoot, normalizeForCompare } from '../config/paths.js';
+import { claudeProjectsRoot, codexSessionsRoot, isRefusedProjectRoot, normalizeForCompare, opencodeDbPath } from '../config/paths.js';
 import type { ToolName } from '../types/index.js';
 
 export interface DiscoveredProject {
@@ -25,6 +26,7 @@ export interface DiscoveryResult {
 export interface DiscoveryPaths {
     claudeProjects?: string;
     codexSessions?: string;
+    opencodeDatabase?: string;
     isRefusedRoot?: (root: string) => boolean;
 }
 
@@ -61,6 +63,10 @@ function isCodexSession(relativePath: string): boolean {
 
 async function directoryExists(directory: string): Promise<boolean> {
     return (await stat(directory).catch(() => undefined))?.isDirectory() ?? false;
+}
+
+async function regularFileExists(filePath: string): Promise<boolean> {
+    return (await stat(filePath).catch(() => undefined))?.isFile() ?? false;
 }
 
 // Reads only enough JSONL metadata to find the session cwd and its timestamp.
@@ -166,7 +172,7 @@ async function gitRootFor(cwd: string): Promise<string | undefined> {
     }
 }
 
-function safeTimestamp(value: string): string {
+function safeTimestamp(value: string | number): string {
     return Number.isNaN(new Date(value).getTime()) ? '' : new Date(value).toISOString();
 }
 
@@ -177,6 +183,10 @@ export async function detectSessionTools(paths: DiscoveryPaths = {}): Promise<To
         if (await directoryExists(store.root)) {
             detected.push(store.tool);
         }
+    }
+    const opencodeDatabase = paths.opencodeDatabase ?? opencodeDbPath();
+    if ((await directoryExists(path.dirname(opencodeDatabase))) && (await regularFileExists(opencodeDatabase))) {
+        detected.push('opencode');
     }
     return detected;
 }
@@ -280,6 +290,41 @@ export async function discoverSessionProjects(paths: DiscoveryPaths = {}): Promi
                 continue;
             }
             accumulate(candidates, root, store.tool, safeTimestamp(metadata.timestamp));
+        }
+    }
+
+    if (detectedTools.includes('opencode')) {
+        const databasePath = paths.opencodeDatabase ?? opencodeDbPath();
+        const db = openOpencodeDbReadonly(databasePath);
+        try {
+            const rows = db.prepare('SELECT directory, time_created, time_updated FROM session').all() as Array<{
+                directory: unknown;
+                time_created: unknown;
+                time_updated: unknown;
+            }>;
+            for (const row of rows) {
+                if (typeof row.directory !== 'string') {
+                    continue;
+                }
+                const directory = path.resolve(row.directory);
+                const gitRoot = await gitRootFor(directory);
+                const root = gitRoot ?? directory;
+                if ((paths.isRefusedRoot ?? isRefusedProjectRoot)(root)) {
+                    continue;
+                }
+                if (!(await directoryExists(root))) {
+                    continue;
+                }
+                const timestamp =
+                    typeof row.time_updated === 'string' || typeof row.time_updated === 'number'
+                        ? row.time_updated
+                        : typeof row.time_created === 'string' || typeof row.time_created === 'number'
+                          ? row.time_created
+                          : '';
+                accumulate(candidates, root, 'opencode', safeTimestamp(timestamp));
+            }
+        } finally {
+            db.close();
         }
     }
 
