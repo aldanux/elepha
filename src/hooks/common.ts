@@ -10,7 +10,7 @@ import { ConsentStore } from '../storage/consent-store.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import type { SessionAdapterTool } from '../types/index.js';
 
-export type HookTool = SessionAdapterTool;
+export type HookTool = SessionAdapterTool | 'opencode';
 export type HookSource = 'startup' | 'clear' | 'resume' | 'compact';
 
 interface CommonHookPayload {
@@ -32,6 +32,10 @@ export interface UserPromptSubmitPayload extends CommonHookPayload {
 }
 
 export type HookPayload = SessionStartPayload | UserPromptSubmitPayload;
+
+export function isHookTool(value: unknown): value is HookTool {
+    return value === 'claude-code' || value === 'codex' || value === 'opencode';
+}
 
 export function parsePayload(raw: string, tool: HookTool, event: 'SessionStart'): SessionStartPayload | undefined;
 export function parsePayload(raw: string, tool: HookTool, event: 'UserPromptSubmit'): UserPromptSubmitPayload | undefined;
@@ -60,7 +64,7 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
     ) {
         return undefined;
     }
-    // Codex explicitly allows a null transcript path. Neither tool's path is
+    // Codex explicitly allows a null transcript path. No hook tool's path is
     // used beyond validation; it cannot become a reader or subprocess input.
     if (payload.transcript_path !== undefined && payload.transcript_path !== null && typeof payload.transcript_path !== 'string') {
         return undefined;

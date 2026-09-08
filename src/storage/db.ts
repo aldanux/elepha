@@ -201,7 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_injections_session ON injections(tool, native_ses
 -- The ordered session ids behind elepha:resume:<n>. One row is the complete
 -- last list shown to one native chat, including an intentionally empty list.
 CREATE TABLE IF NOT EXISTS shown_session_lists (
-  tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex')),
+  tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
   native_session_id TEXT NOT NULL,
   session_ids       TEXT NOT NULL,
   PRIMARY KEY (tool, native_session_id)
@@ -294,6 +294,7 @@ function migrate(db: Database.Database): void {
         db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
     }
     migrateSessionsToolConstraint(db);
+    migrateShownSessionListsToolConstraint(db);
 
     const columns = (db.pragma('table_info(memories)') as Array<{ name: string }>).map((c) => c.name);
     if (!columns.includes('summarizer_status')) {
@@ -566,6 +567,32 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
         throw new Error(`sessions tool migration left ${violations.length} foreign-key violation(s): ${JSON.stringify(violations)}`);
     }
     db.pragma('foreign_keys = ON');
+}
+
+function migrateShownSessionListsToolConstraint(db: Database.Database): void {
+    const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shown_session_lists'").get() as
+        | { sql: string }
+        | undefined;
+    if (schema?.sql.includes("'opencode'")) {
+        return;
+    }
+
+    const rebuild = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE shown_session_lists_new (
+            tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
+            native_session_id TEXT NOT NULL,
+            session_ids       TEXT NOT NULL,
+            PRIMARY KEY (tool, native_session_id)
+          );
+          INSERT INTO shown_session_lists_new (tool, native_session_id, session_ids)
+          SELECT tool, native_session_id, session_ids
+          FROM shown_session_lists;
+          DROP TABLE shown_session_lists;
+          ALTER TABLE shown_session_lists_new RENAME TO shown_session_lists;
+        `);
+    });
+    rebuild();
 }
 
 const SQLITE_PLAINTEXT_HEADER = Buffer.from('SQLite format 3\0', 'binary');

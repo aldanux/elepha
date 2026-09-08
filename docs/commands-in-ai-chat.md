@@ -8,18 +8,18 @@ Recall commands are read-only: elepha injects the result into the same turn. Act
 
 This page is the full guide for in-chat recall commands.
 
-| Command                                            | Description                                                                      |
-|----------------------------------------------------|----------------------------------------------------------------------------------|
-| `elepha:last`                                      | Inject the newest available turns from the most recent session.                  |
+| Command                                            | Description                                                                                                                               |
+|----------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `elepha:last`                                      | Inject the newest available turns from the most recent session.                                                                           |
 | `elepha:query <q>`                                 | Search all consented projects and return a numbered list of matching sessions. `<q>` is free text: plain phrases work, not just keywords. |
-| `elepha:query:here <q>`                            | Same as `elepha:query`, but only the current project.                            |
-| `elepha:list`                                      | List the five most recent session titles, numbered for selection.                |
-| `elepha:list:<n>`                                  | List the last `n` session titles, where `n` is from 1 to 100.                    |
-| `elepha:list:codex` / `elepha:list:claude`         | List recent sessions from only Codex or Claude Code.                             |
-| `elepha:list:<n>:codex` / `elepha:list:<n>:claude` | Apply both a 1–100 count and a tool filter, with the count before the tool.      |
-| `elepha:resume:<n>`                                | Load the nth session to continue it; the model presents a recap.                 |
-| `elepha:info`                                      | Show elepha status: sessions here and total, capture state, the last session with its project, and any capture or new-version alert. |
-| `elepha:help`                                      | Show the in-chat command list.                                                   |
+| `elepha:query:here <q>`                            | Same as `elepha:query`, but only the current project.                                                                                     |
+| `elepha:list`                                      | List the five most recent session titles, numbered for selection.                                                                         |
+| `elepha:list:<n>`                                  | List the last `n` session titles, where `n` is from 1 to 100.                                                                             |
+| `elepha:list:codex` / `elepha:list:claude`         | List recent sessions from only Codex or Claude Code.                                                                                      |
+| `elepha:list:<n>:codex` / `elepha:list:<n>:claude` | Apply both a 1–100 count and a tool filter, with the count before the tool.                                                               |
+| `elepha:resume:<n>`                                | Load the nth session to continue it; the model presents a recap.                                                                          |
+| `elepha:info`                                      | Show elepha status: sessions here and total, capture state, the last session with its project, and any capture or new-version alert.      |
+| `elepha:help`                                      | Show the in-chat command list.                                                                                                            |
 
 **What a search looks at.** Search looks at session titles and how you opened each session; at what a session concluded
 where it has a rollup; and, for sessions recorded with durable capture, at the stored filtered
