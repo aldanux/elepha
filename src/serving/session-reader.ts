@@ -461,6 +461,22 @@ export class SessionReader {
         );
     }
 
+    sessionCountsByProject(): Map<number, number> {
+        return this.withReadGeneration(
+            () => new Map(),
+            () => {
+                const rows = this.db.prepare('SELECT project_id, title, custom_title FROM sessions').all() as Array<
+                    Pick<ServedSession, 'project_id' | 'title' | 'custom_title'>
+                >;
+                const counts = new Map<number, number>();
+                for (const session of rows.filter(hasRealContent)) {
+                    counts.set(session.project_id, (counts.get(session.project_id) ?? 0) + 1);
+                }
+                return counts;
+            },
+        );
+    }
+
     sessionById(id: number): ServedSession | undefined {
         return this.withReadGeneration(
             () => undefined,

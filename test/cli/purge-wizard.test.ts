@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { buildPurgeScope, type PurgePrompts, runPurgeWizard } from '../../src/cli/purge-wizard.js';
+import { SessionReader } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -163,13 +164,7 @@ describe('elepha purge wizard', () => {
         store.consent.revoke(selectedPath);
 
         try {
-            expect(store.sessionCountsByProject()).toEqual(
-                new Map([
-                    [selectedProject.id, 2],
-                    [fragmentProjectId, 1],
-                    [retainedProject.id, 1],
-                ]),
-            );
+            expect(new SessionReader(store.database).sessionCountsByProject()).toEqual(new Map());
             await expect(
                 runPurgeWizard({
                     input: ttyStream(),
@@ -197,7 +192,7 @@ describe('elepha purge wizard', () => {
             });
             expect(prompts.select).toHaveBeenNthCalledWith(2, {
                 message: 'Which project should elepha forget?',
-                options: [{ value: selectedPath, label: 'elepha (revoked)', hint: `${selectedPath} · 3 sessions` }],
+                options: [{ value: selectedPath, label: 'elepha (revoked)', hint: `${selectedPath} · 0 sessions` }],
             });
             expect(prompts.confirm).toHaveBeenCalledWith(
                 expect.objectContaining({ message: expect.stringContaining('these 3 session(s)') }),

@@ -1,6 +1,7 @@
 import type { Readable, Writable } from 'node:stream';
 import * as clack from '@clack/prompts';
 import { consentedProject } from '../hooks/common.js';
+import { SessionReader } from '../serving/session-reader.js';
 import type { MemoryStore, PurgePlan, PurgeScope } from '../storage/memory-store.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { parseSince } from '../storage/stats.js';
@@ -139,7 +140,7 @@ function dateOrDuration(value: string | undefined): string | undefined {
 }
 
 function projectOptions(store: MemoryStore): { options: PromptOption[]; projectsByValue: Map<string, ProjectSet> } {
-    const sessionCounts = store.sessionCountsByProject();
+    const sessionCounts = new SessionReader(store.database).sessionCountsByProject();
     const projectsByValue = new Map<string, ProjectSet>();
     const options = new ProjectResolver(store.database)
         .list()
