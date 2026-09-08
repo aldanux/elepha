@@ -90,7 +90,7 @@ describe('session titles', () => {
     it('uses the first non-command prompt after elepha control turns', () => {
         const turns = [
             { userMessage: ' elepha:list ' },
-            { userMessage: 'ELEPHA:select:2' },
+            { userMessage: 'ELEPHA:resume:2' },
             { userMessage: 'Implement filtered recent sessions' },
         ];
 

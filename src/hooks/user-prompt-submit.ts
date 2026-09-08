@@ -3,7 +3,7 @@
 
 import { existsSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { ELEPHA_LIST_DEFAULT_LIMIT, ELEPHA_LIST_MAX_LIMIT } from '../config/constants.js';
+import { ELEPHA_LIST_DEFAULT_LIMIT, ELEPHA_LIST_MAX_LIMIT, RESUME_CHAR_BUDGET } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { terminalHandoff } from '../markers.js';
 import {
@@ -11,6 +11,7 @@ import {
     HELP,
     REMEMBER_HERE_UNCONSENTED,
     REMEMBER_QUERY_REQUIRED,
+    RESUME_RECAP_INSTRUCTIONS,
     SELECT_HINT,
     servedContextInstructions,
 } from '../serving/instructions.js';
@@ -31,7 +32,7 @@ export type UserPromptCommand =
     | { kind: 'help' }
     | { kind: 'last' }
     | { kind: 'list'; count: number; tool?: ToolName }
-    | { kind: 'select'; index: number }
+    | { kind: 'resume'; index: number }
     | { kind: 'query'; query: string; scope: 'global' | 'here' }
     | { kind: 'action'; command: 'self-update' };
 
@@ -52,7 +53,7 @@ interface CommandBodyResult {
     shownSessionIds?: number[];
 }
 
-interface StoredSelectTarget {
+interface StoredResumeTarget {
     hasStoredList: boolean;
     session?: ServedSession;
 }
@@ -95,9 +96,9 @@ export function parseUserPromptCommand(prompt: string): UserPromptCommand | unde
     if (queryGlobal) {
         return { kind: 'query', query: queryGlobal[1] ?? '', scope: 'global' };
     }
-    const select = /^elepha:select:([1-9]\d*)$/.exec(command);
-    if (select?.[1]) {
-        return { kind: 'select', index: Number(select[1]) };
+    const resume = /^elepha:resume:([1-9]\d*)$/.exec(command);
+    if (resume?.[1]) {
+        return { kind: 'resume', index: Number(resume[1]) };
     }
     const list = /^elepha:list(?::([1-9]\d*))?(?::(codex|claude))?$/.exec(command);
     if (list) {
@@ -119,7 +120,7 @@ async function commandBody(
     reader: SessionReader,
     project: ProjectSet | undefined,
     consentedProjects: readonly ProjectSet[],
-    storedSelectTarget: StoredSelectTarget = { hasStoredList: false },
+    storedResumeTarget: StoredResumeTarget = { hasStoredList: false },
     now: number = Date.now(),
 ): Promise<CommandBodyResult> {
     if (!command || command.kind === 'help') {
@@ -153,8 +154,8 @@ async function commandBody(
         };
     }
     const session =
-        command.kind === 'select' && storedSelectTarget.hasStoredList
-            ? storedSelectTarget.session
+        command.kind === 'resume' && storedResumeTarget.hasStoredList
+            ? storedResumeTarget.session
             : command.kind === 'last'
               ? reader.recentConsentedSessions(consentedProjects)[0]
               : project === undefined
@@ -163,12 +164,14 @@ async function commandBody(
     if (!session) {
         return { body: 'No session found at that position.' };
     }
-    const rendered = await reader.render(session);
+    const rendered =
+        command.kind === 'resume' ? await reader.render(session, undefined, undefined, RESUME_CHAR_BUDGET) : await reader.render(session);
     if (!rendered.episode) {
         return { body: `Unable to render ${titleOf(session)}: ${rendered.reason ?? 'unknown error'}.`, shownSessionIds: [session.id] };
     }
+    const framing = servedContextInstructions(rendered.episode.nonce);
     return {
-        body: `${servedContextInstructions(rendered.episode.nonce)}\n\n# ${titleOf(session)}\n\n${rendered.episode.text.trimEnd()}`,
+        body: `${command.kind === 'resume' ? `${RESUME_RECAP_INSTRUCTIONS}\n` : ''}${framing}\n\n# ${titleOf(session)}\n\n${rendered.episode.text.trimEnd()}`,
         shownSessionIds: [session.id],
     };
 }
@@ -265,8 +268,8 @@ export async function runUserPromptSubmit(
                 }
             } else {
                 const project = consentedProject(db, payload.cwd);
-                let storedSelectTarget: StoredSelectTarget = { hasStoredList: false };
-                if (command?.kind === 'select') {
+                let storedResumeTarget: StoredResumeTarget = { hasStoredList: false };
+                if (command?.kind === 'resume') {
                     const storedSessionIds = store.shownSessionLists.forChat(tool, payload.session_id);
                     if (storedSessionIds !== undefined) {
                         const sessionId = storedSessionIds[command.index - 1];
@@ -278,12 +281,12 @@ export async function runUserPromptSubmit(
                                 return { reason: 'project_unavailable_or_unconsented' };
                             }
                         }
-                        storedSelectTarget = { hasStoredList: true, session };
+                        storedResumeTarget = { hasStoredList: true, session };
                     }
                 }
                 const consentedProjects = projectResolver(db).listConsentedStored(store.consent);
                 const commandNow = command?.kind === 'list' ? clock() : undefined;
-                const result = await commandBody(command, reader, project, consentedProjects, storedSelectTarget, commandNow);
+                const result = await commandBody(command, reader, project, consentedProjects, storedResumeTarget, commandNow);
                 if (result.shownSessionIds !== undefined && !contributingSessionsStillConsented(db, reader, result.shownSessionIds)) {
                     log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
                     return { reason: 'project_unavailable_or_unconsented' };
