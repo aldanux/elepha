@@ -234,7 +234,7 @@ export class SessionStore {
         return true;
     }
 
-    // Writes a sanitized title in the same transaction as the turn that establishes it.
+    // Applies the shared sanitized title rules to a persisted session.
     updateSessionTitle(sessionDbId: number, turn: Pick<ParsedTurn, 'aiTitle' | 'userMessage'>): void {
         const row = this.db.prepare('SELECT title, segment_index FROM sessions WHERE id = ?').get(sessionDbId) as
             | { title: string | null; segment_index: number }

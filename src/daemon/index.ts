@@ -22,7 +22,7 @@ import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { sessionAdapterFor } from '../adapters/index.js';
-import { OpencodeAdapter, openOpencodeDbReadonly } from '../adapters/opencode.js';
+import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
     DAEMON_PACKAGE_REPLACED_EXIT_CODE,
@@ -1129,6 +1129,13 @@ export class IngestionDaemon {
                         if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
                             break;
                         }
+                    }
+                    const storedSession = this.store.findSession(this.opencodeAdapter.tool, session.sessionId);
+                    if (storedSession !== undefined) {
+                        this.store.updateSessionTitle(storedSession.id, {
+                            aiTitle: opencodeSessionAiTitle(session.title),
+                            userMessage: '',
+                        });
                     }
                     if (sessionIngested > 0) {
                         await this.refreshRollup(this.opencodeAdapter, canonicalPath, session.sessionId, 'live', classification);

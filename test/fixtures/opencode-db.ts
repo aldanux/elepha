@@ -93,6 +93,15 @@ export function appendOpencodeTurn(dbPath: string, turn: OpencodeTurnFixture): v
     }
 }
 
+export function updateOpencodeSessionTitle(dbPath: string, sessionId: string, title: string, timeUpdated: number): void {
+    const db = new Database(dbPath);
+    try {
+        db.prepare('UPDATE session SET title = ?, time_updated = ? WHERE id = ?').run(title, timeUpdated, sessionId);
+    } finally {
+        db.close();
+    }
+}
+
 export function createOpencodeFixture(dbPath: string, projectPath: string): void {
     mkdirSync(path.dirname(dbPath), { recursive: true });
     const db = new Database(dbPath);

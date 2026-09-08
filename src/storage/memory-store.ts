@@ -159,6 +159,10 @@ export class MemoryStore {
         return this.sessions.findSession(tool, nativeId);
     }
 
+    updateSessionTitle(sessionDbId: number, turn: Pick<ParsedTurn, 'aiTitle' | 'userMessage'>): void {
+        this.sessions.updateSessionTitle(sessionDbId, turn);
+    }
+
     // A purge freezes the whole native transcript, across all its segments.
     isTranscriptPurged(tool: ToolName, nativeId: string): boolean {
         return this.db.prepare('SELECT 1 FROM purged_transcripts WHERE tool = ? AND native_id = ?').get(tool, nativeId) !== undefined;
