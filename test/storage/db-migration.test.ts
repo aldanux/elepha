@@ -241,6 +241,54 @@ describe('sessions table migration', () => {
     });
 });
 
+describe('shown-session-list tool migration', () => {
+    it('accepts opencode in a fresh database', () => {
+        const db = openUnmanagedDb(':memory:');
+
+        expect(() =>
+            db
+                .prepare('INSERT INTO shown_session_lists (tool, native_session_id, session_ids) VALUES (?, ?, ?)')
+                .run('opencode', 'fresh-chat', '[1]'),
+        ).not.toThrow();
+        db.close();
+    });
+
+    it('widens a legacy constraint, preserves rows, and is unchanged on reopen', () => {
+        const directory = withGrantableTestDir('elepha-shown-list-tool-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const legacy = openUnmanagedDb(dbPath);
+        legacy.exec(`
+            DROP TABLE shown_session_lists;
+            CREATE TABLE shown_session_lists (
+              tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex')),
+              native_session_id TEXT NOT NULL,
+              session_ids       TEXT NOT NULL,
+              PRIMARY KEY (tool, native_session_id)
+            );
+            INSERT INTO shown_session_lists (tool, native_session_id, session_ids)
+            VALUES ('claude-code', 'legacy-chat', '[7]');
+        `);
+        legacy.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        migrated
+            .prepare('INSERT INTO shown_session_lists (tool, native_session_id, session_ids) VALUES (?, ?, ?)')
+            .run('opencode', 'new-chat', '[9]');
+        expect(migrated.prepare('SELECT * FROM shown_session_lists ORDER BY native_session_id').all()).toEqual([
+            { tool: 'claude-code', native_session_id: 'legacy-chat', session_ids: '[7]' },
+            { tool: 'opencode', native_session_id: 'new-chat', session_ids: '[9]' },
+        ]);
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT * FROM shown_session_lists ORDER BY native_session_id').all()).toEqual([
+            { tool: 'claude-code', native_session_id: 'legacy-chat', session_ids: '[7]' },
+            { tool: 'opencode', native_session_id: 'new-chat', session_ids: '[9]' },
+        ]);
+        reopened.close();
+    });
+});
+
 describe('migration idempotency and reversibility', () => {
     it('adds first_prompt_search to an existing sessions table and leaves historical rows NULL on reopen', () => {
         const dir = mkdtempSync(path.join(tmpdir(), 'elepha-first-prompt-search-column-'));
