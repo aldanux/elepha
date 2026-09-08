@@ -3,7 +3,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { defaultAdapters } from '../adapters/index.js';
+import { defaultAdapters, sessionAdapterFor } from '../adapters/index.js';
 import {
     DURABLE_CAPTURE_FILTER_VERSION,
     MAX_GET_SESSION_LAST_N,
@@ -38,7 +38,7 @@ import {
     type ServedSession,
 } from '../storage/session-read-model.js';
 import { UNTITLED_EPISODE } from '../storage/session-title.js';
-import { type ParsedTurn, type SessionAdapter, TOOL_METADATA, type ToolName } from '../types/index.js';
+import { type ParsedTurn, type SessionAdapterMap, TOOL_METADATA, type ToolName } from '../types/index.js';
 import { dataBlockClose, dataBlockOpen } from './instructions.js';
 
 export type { ServedSession } from '../storage/session-read-model.js';
@@ -214,13 +214,13 @@ export function newestActivity(
 }
 
 export class SessionReader {
-    private readonly adapters: Record<ToolName, SessionAdapter>;
+    private readonly adapters: SessionAdapterMap;
     private readonly sessionsMemo = new Map<string, ServedSession[]>();
     private readonly consentedSessionsMemo = new Map<string, ServedSession[]>();
 
     constructor(
         private readonly db: Database.Database,
-        adapters: Record<ToolName, SessionAdapter> = defaultAdapters(),
+        adapters: SessionAdapterMap = defaultAdapters(),
         private readonly openTranscript: ProviderTranscriptOpener = openProviderTranscript,
     ) {
         this.adapters = adapters;
@@ -664,6 +664,10 @@ export class SessionReader {
         }
         const { handle } = opened;
         try {
+            const adapter = sessionAdapterFor(this.adapters, session.tool);
+            if (!adapter) {
+                return { reason: 'transcript_unreadable', sourceUnavailable: true };
+            }
             const indexes = storedIndexes ?? new Set(this.storedTurnRecallFields(session).keys());
             if (indexes.size === 0) {
                 return { reason: 'no_stored_turn_indexes' };
@@ -676,7 +680,7 @@ export class SessionReader {
             let retainedRenderedChars = 0;
             let highWaterTurns = 0;
             let highWaterRenderedChars = 0;
-            for await (const turn of this.adapters[session.tool].parseTurns(session.source_path, undefined, {
+            for await (const turn of adapter.parseTurns(session.source_path, undefined, {
                 closeTrailingOnIdle: true,
                 handle,
                 signal,

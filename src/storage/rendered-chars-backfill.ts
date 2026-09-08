@@ -3,9 +3,10 @@
 // call and no retained text.
 
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { sessionAdapterFor } from '../adapters/index.js';
 import { isReadableProviderSource } from '../config/paths.js';
 import { renderedChars, renderedTurns } from '../rendering/raw-turn-renderer.js';
-import type { ParsedTurn, SessionAdapter, ToolName } from '../types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 
 export interface RenderedCharsChange {
@@ -83,7 +84,8 @@ const deriver: BackfillDeriver<SessionSeed, RenderedCharsChange, Map<number, Set
         return { sessions, state: indexesBySession };
     },
     async derive({ adapters, session, state }) {
-        const counted = await countSession(session, adapters[session.tool], state.get(session.id) ?? new Set());
+        const adapter = sessionAdapterFor(adapters, session.tool);
+        const counted = adapter ? await countSession(session, adapter, state.get(session.id) ?? new Set()) : null;
         const transcriptMissing = counted === null;
         if (!transcriptMissing && session.rendered_chars === counted.renderedChars && session.rendered_turns === counted.renderedTurns) {
             return undefined;
@@ -118,12 +120,12 @@ const deriver: BackfillDeriver<SessionSeed, RenderedCharsChange, Map<number, Set
     },
 };
 
-export async function planRenderedCharsBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<RenderedCharsPlan> {
+export async function planRenderedCharsBackfill(db: Database, adapters: SessionAdapterMap): Promise<RenderedCharsPlan> {
     const plan = await planBackfill(db, adapters, deriver);
     return { ...plan, sessionsSkippedConcurrent: 0 };
 }
 
-export async function applyRenderedCharsBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<RenderedCharsPlan> {
+export async function applyRenderedCharsBackfill(db: Database, adapters: SessionAdapterMap): Promise<RenderedCharsPlan> {
     const plan = await applyBackfill(db, adapters, deriver);
     return { ...plan, sessionsSkippedConcurrent: (plan as Partial<RenderedCharsPlan>).sessionsSkippedConcurrent ?? 0 };
 }

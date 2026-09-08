@@ -3,8 +3,9 @@
 // memories, rollups, rendered statistics, or custom-title metadata.
 
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { sessionAdapterFor } from '../adapters/index.js';
 import { isReadableProviderSource } from '../config/paths.js';
-import type { ParsedTurn, SessionAdapter, ToolName } from '../types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 import { distinctSessionTitles, titleCandidatesForSegment, UNTITLED_EPISODE } from './session-title.js';
 
@@ -71,7 +72,8 @@ const deriver: BackfillDeriver<SessionSeed, SessionTitleChange, SessionTitleStat
         };
     },
     async derive({ db, adapters, session, state }) {
-        const turns = await turnsForSession(db, session, adapters[session.tool]);
+        const adapter = sessionAdapterFor(adapters, session.tool);
+        const turns = adapter ? await turnsForSession(db, session, adapter) : undefined;
         if (turns === undefined) {
             return {
                 sessionId: session.id,
@@ -117,11 +119,11 @@ const deriver: BackfillDeriver<SessionSeed, SessionTitleChange, SessionTitleStat
     },
 };
 
-export async function planSessionTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionTitlePlan> {
+export async function planSessionTitleBackfill(db: Database, adapters: SessionAdapterMap): Promise<SessionTitlePlan> {
     return planBackfill(db, adapters, deriver);
 }
 
 // Applies only readable sessions' derived titles in one transaction.
-export async function applySessionTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionTitlePlan> {
+export async function applySessionTitleBackfill(db: Database, adapters: SessionAdapterMap): Promise<SessionTitlePlan> {
     return applyBackfill(db, adapters, deriver);
 }

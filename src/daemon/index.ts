@@ -19,7 +19,8 @@ import chokidar, { type FSWatcher } from 'chokidar';
 import { OversizedTranscriptRecordError } from '../adapters/base.js';
 import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
-import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
+import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
+import { sessionAdapterFor } from '../adapters/index.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
     DAEMON_PACKAGE_REPLACED_EXIT_CODE,
@@ -65,10 +66,10 @@ import type {
     EmptySessionKind,
     ParsedTurn,
     SessionAdapter,
+    SessionAdapterMap,
     SessionClassification,
     SummarizationProvider,
     SummarizerStatus,
-    ToolName,
 } from '../types/index.js';
 import { FailureWindow } from './failure-window.js';
 import { clearHeartbeat, defaultHeartbeatPath, writeHeartbeat } from './heartbeat.js';
@@ -501,7 +502,7 @@ export class IngestionDaemon {
     }
 
     private async backfillDurableCapture(): Promise<void> {
-        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as Record<ToolName, SessionAdapter>;
+        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as SessionAdapterMap;
         const backfill = new DurableCaptureBackfillStore(this.store.database, this.store.consent, this.durableCaptureMaxBytes);
         while (!this.stopping) {
             const consentedProjectIds = new ProjectResolver(this.store.database)
@@ -526,6 +527,13 @@ export class IngestionDaemon {
                     continue;
                 }
 
+                const adapter = sessionAdapterFor(adapters, session.tool);
+                if (!adapter) {
+                    backfill.finish(session, affectedSessionIds, 'source_unavailable', new Date().toISOString());
+                    this.log(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} source type has no JSONL adapter`);
+                    continue;
+                }
+
                 const opened = await this.openTranscript(session.tool, session.sourcePath);
                 if ('reason' in opened) {
                     backfill.finish(session, affectedSessionIds, 'source_unavailable', new Date().toISOString());
@@ -537,7 +545,6 @@ export class IngestionDaemon {
                 let writeUnauthorized = false;
                 let writeEvicted = false;
                 try {
-                    const adapter = adapters[session.tool];
                     for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
                         closeTrailingOnIdle: true,
                         handle: opened.handle,
@@ -616,7 +623,7 @@ export class IngestionDaemon {
     }
 
     private async backfillFirstPromptSearch(): Promise<void> {
-        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as Record<ToolName, SessionAdapter>;
+        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as SessionAdapterMap;
         while (!this.stopping) {
             const consentedProjectIds = new ProjectResolver(this.store.database)
                 .listConsentedStored(this.store.consent)
@@ -1217,7 +1224,7 @@ export class IngestionDaemon {
             return false;
         }
 
-        const surface = turn.tool === 'claude-code' ? claudeCodeSurface(turn.surface) : codexSurface(turn.surface);
+        const surface = sessionSurface(turn.tool, turn.surface);
         const classification =
             this.kindCache.get(turn.sourcePath) ?? (await this.adapterFor(turn.sourcePath)?.classifySession(turn.sourcePath));
         const meta = {
@@ -1352,7 +1359,7 @@ export class IngestionDaemon {
         const classification =
             this.kindCache.get(turn.sourcePath) ?? (await this.adapterFor(turn.sourcePath)?.classifySession(turn.sourcePath));
         const meta = {
-            surface: turn.tool === 'claude-code' ? claudeCodeSurface(turn.surface) : codexSurface(turn.surface),
+            surface: sessionSurface(turn.tool, turn.surface),
             gitBranch: turn.gitBranch ?? null,
             kind: classification ? toSessionRowKind(classification.kind) : null,
             customTitle,

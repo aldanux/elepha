@@ -6,10 +6,10 @@ import { mcpResponseShaper } from '../../src/mcp/server.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { detectShellSyntax, escapeShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
 
 class FixtureAdapter implements SessionAdapter {
-    readonly tool: ToolName = 'codex';
+    readonly tool: SessionAdapterTool = 'codex';
     readonly watchGlobs = ['*.jsonl'];
 
     matches(): boolean {
@@ -185,7 +185,7 @@ describe('MCP response shell-syntax net', () => {
         db.prepare(`INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES ('root', ?, 'approved', 'x', 'cli')`).run(
             realpathSync(projectPath),
         );
-        const adapters: Record<ToolName, SessionAdapter> = {
+        const adapters: SessionAdapterMap = {
             codex: new FixtureAdapter(),
             'claude-code': new FixtureAdapter(),
         };

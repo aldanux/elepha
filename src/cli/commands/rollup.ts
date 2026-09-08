@@ -2,6 +2,7 @@ import { stat as statFile } from 'node:fs/promises';
 import type { Command } from 'commander';
 import { ClaudeCodeAdapter } from '../../adapters/claude-code.js';
 import { CodexAdapter } from '../../adapters/codex.js';
+import { sessionAdapterFor } from '../../adapters/index.js';
 import { CHARS_PER_TOKEN } from '../../config/constants.js';
 import { isReadableProviderSource } from '../../config/paths.js';
 import { RollupService } from '../../daemon/rollup-service.js';
@@ -12,7 +13,7 @@ import { ROLLUP_VERSION, RollupStore } from '../../storage/rollup-store.js';
 import { SummarizerCallLog } from '../../summarizer/call-log.js';
 import { estimateCostUsd } from '../../summarizer/pricing.js';
 import { createConfiguredSynthesisProviders } from '../../summarizer/provider-config.js';
-import type { SessionAdapter, ToolName } from '../../types/index.js';
+import type { SessionAdapterMap } from '../../types/index.js';
 import { withCliReadGeneration } from '../read-gate.js';
 
 const REBUILD_PREVIEW_OUTPUT_TOKENS_PER_SESSION = 512;
@@ -92,7 +93,7 @@ export function registerRollup(program: Command): void {
                         provider: providers.rollupMerge,
                         log: output.log,
                     });
-                    const adapters: Record<ToolName, SessionAdapter> = {
+                    const adapters: SessionAdapterMap = {
                         'claude-code': new ClaudeCodeAdapter(),
                         codex: new CodexAdapter(),
                     };
@@ -115,7 +116,11 @@ export function registerRollup(program: Command): void {
                         if (limit && completed + aborted >= limit) {
                             break;
                         }
-                        const adapter = adapters[session.tool];
+                        const adapter = sessionAdapterFor(adapters, session.tool);
+                        if (!adapter) {
+                            skipped++;
+                            continue;
+                        }
                         if (!isReadableProviderSource(session.tool, session.source_path)) {
                             continue;
                         }

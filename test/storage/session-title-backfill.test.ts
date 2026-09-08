@@ -8,14 +8,14 @@ import { applyCustomTitleBackfill, planCustomTitleBackfill } from '../../src/sto
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import { applySessionTitleBackfill, planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
-import type { ParsedTurn, ParseTurnsOptions, SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { ParsedTurn, ParseTurnsOptions, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
 
 const SOURCE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'sample-session.jsonl');
 const CUSTOM_TITLE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.229-custom-title.jsonl');
 const FRAME_LINK = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.232-frame-link.jsonl');
 
 class TitleFixtureAdapter implements SessionAdapter {
-    readonly tool: ToolName = 'claude-code';
+    readonly tool: SessionAdapterTool = 'claude-code';
     readonly watchGlobs = ['*.jsonl'];
 
     matches(): boolean {
@@ -59,7 +59,7 @@ class TitleFixtureAdapter implements SessionAdapter {
 }
 
 class CodexFixtureAdapter extends TitleFixtureAdapter {
-    override readonly tool: ToolName = 'codex';
+    override readonly tool: SessionAdapterTool = 'codex';
 
     override nativeSessionId(): string {
         return 'codex-title-backfill';
@@ -143,7 +143,7 @@ describe('session-title backfill', () => {
         insertMemory.run(7, 8, 'claude-code');
         insertMemory.run(8, 9, 'claude-code');
 
-        const adapters: Record<ToolName, SessionAdapter> = {
+        const adapters: SessionAdapterMap = {
             'claude-code': new TitleFixtureAdapter(),
             codex: new CodexFixtureAdapter(),
         };
@@ -188,7 +188,7 @@ describe('session-title backfill', () => {
             )
             .run(customTitleSource, frameLinkSource);
         const beforeRendered = customDb.prepare('SELECT id, rendered_chars FROM sessions ORDER BY id').all();
-        const customTitleAdapters: Record<ToolName, SessionAdapter> = {
+        const customTitleAdapters: SessionAdapterMap = {
             'claude-code': new ClaudeCodeAdapter(),
             codex: new CodexAdapter(),
         };

@@ -75,7 +75,7 @@ import {
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
 import { applyManualSplit, planManualSplit } from '../../src/storage/resegmentation.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
-import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
@@ -3523,7 +3523,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         await expect(capDaemon.persistTurn(capAdapter, capTurns[1]!)).resolves.toBe(true);
         const capSession = restoredStore.findSession('codex', 'cap-session');
         if (!capSession) throw new Error('Cap session was not recorded');
-        const adapters = { codex: capAdapter, 'claude-code': capAdapter } as Record<ToolName, SessionAdapter>;
+        const adapters = { codex: capAdapter, 'claude-code': capAdapter } as SessionAdapterMap;
         const split = await planManualSplit(restored, adapters, capSession.id, 1);
         applyManualSplit(restored, split);
         await capDaemon.backfillDurableCapture();

@@ -10,6 +10,8 @@ import {
     isRefusedProjectRoot,
     isWithin,
     isWithinProviderStore,
+    opencodeDbPath,
+    opencodeStoreRoot,
     providerStoreRoot,
     samePath,
 } from '../../src/config/paths.js';
@@ -112,10 +114,18 @@ describe('provider transcript stores', () => {
 
         expect(providerStoreRoot('claude-code')).toBe('/Users/test/.claude-custom/projects');
         expect(providerStoreRoot('codex')).toBe('/Users/test/.codex-custom/sessions');
+        expect(providerStoreRoot('opencode')).toBe(path.join(homedir(), '.local', 'share', 'opencode'));
         expect(isRefusedProjectRoot('/Users/test/.claude-custom/memories')).toBe(true);
         expect(isRefusedProjectRoot('/Users/test/.codex-custom/memories')).toBe(true);
         expect(isWithinProviderStore('codex', '/Users/test/.codex-custom/sessions/rollout.jsonl')).toBe(true);
         expect(isWithinProviderStore('codex', '/tmp/evil.jsonl')).toBe(false);
         expect(isWithinProviderStore('future-tool' as ToolName, '/Users/test/.codex-custom/sessions/rollout.jsonl')).toBe(false);
+    });
+
+    it('honors XDG_DATA_HOME for the OpenCode database', () => {
+        process.env.XDG_DATA_HOME = '/Users/test/.xdg-data';
+
+        expect(opencodeStoreRoot()).toBe('/Users/test/.xdg-data/opencode');
+        expect(opencodeDbPath()).toBe('/Users/test/.xdg-data/opencode/opencode.db');
     });
 });

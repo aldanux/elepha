@@ -17,8 +17,9 @@ import type {
     ParsedTurn,
     ParseTurnsOptions,
     SessionAdapter,
+    SessionAdapterMap,
+    SessionAdapterTool,
     SessionClassification,
-    ToolName,
 } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession, type TestDatabase } from '../helpers/db.js';
 
@@ -68,7 +69,7 @@ class DerivedDataAdapter implements SessionAdapter {
     );
 
     constructor(
-        readonly tool: ToolName,
+        readonly tool: SessionAdapterTool,
         private readonly sourcePath: string,
     ) {}
 
@@ -109,11 +110,11 @@ interface SeededOutsideSource {
     fixture: TestDatabase;
     sourcePath: string;
     adapter: DerivedDataAdapter;
-    adapters: Record<ToolName, SessionAdapter>;
+    adapters: SessionAdapterMap;
     sessionId: number;
 }
 
-function seedOutsideSource(tool: ToolName = 'claude-code'): SeededOutsideSource {
+function seedOutsideSource(tool: SessionAdapterTool = 'claude-code'): SeededOutsideSource {
     const fixture = createTestDb('elepha-provider-source-boundary-');
     vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(fixture.directory, 'claude-home'));
     vi.stubEnv('CODEX_HOME', path.join(fixture.directory, 'codex-home'));
@@ -147,9 +148,9 @@ function seedOutsideSource(tool: ToolName = 'claude-code'): SeededOutsideSource 
     });
     fixture.db.prepare('UPDATE sessions SET first_prompt_search = NULL WHERE id = ?').run(session.id);
     const adapter = new DerivedDataAdapter(tool, sourcePath);
-    const otherTool: ToolName = tool === 'codex' ? 'claude-code' : 'codex';
+    const otherTool: SessionAdapterTool = tool === 'codex' ? 'claude-code' : 'codex';
     const otherAdapter = new DerivedDataAdapter(otherTool, sourcePath);
-    const adapters: Record<ToolName, SessionAdapter> =
+    const adapters: SessionAdapterMap =
         tool === 'codex' ? { 'claude-code': otherAdapter, codex: adapter } : { 'claude-code': adapter, codex: otherAdapter };
     return { fixture, sourcePath, adapter, adapters, sessionId: session.id };
 }

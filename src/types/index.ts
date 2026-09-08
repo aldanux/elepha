@@ -1,13 +1,17 @@
 import type { FileHandle } from 'node:fs/promises';
+import type Database from 'better-sqlite3-multiple-ciphers';
 
 export const TOOL_METADATA = {
     'claude-code': { displayName: 'Claude Code' },
     codex: { displayName: 'Codex' },
+    opencode: { displayName: 'OpenCode' },
 } as const;
 
 export type ToolName = keyof typeof TOOL_METADATA;
+export type SessionAdapterTool = Exclude<ToolName, 'opencode'>;
 
 export const SUPPORTED_TOOLS = Object.keys(TOOL_METADATA) as ToolName[];
+export const SESSION_ADAPTER_TOOLS = ['claude-code', 'codex'] as const satisfies readonly SessionAdapterTool[];
 
 export function isToolName(value: unknown): value is ToolName {
     return SUPPORTED_TOOLS.includes(value as ToolName);
@@ -29,9 +33,9 @@ export interface ParsedToolCall {
 export interface ParsedTurn {
     tool: ToolName;
     sessionId: string;
-    // Absolute path to the source JSONL file this turn came from.
+    // Absolute path to the provider transcript source this turn came from.
     sourcePath: string;
-    // Absolute, canonical cwd at turn time. Keys `projects`.
+    // Provider-owned project binding for the turn. Keys `projects`.
     projectPath: string;
     // 0-based position of this turn within the session, used for dedupe.
     turnIndex: number;
@@ -134,7 +138,7 @@ export interface EmptySessionAnalysis {
 }
 
 export interface SessionAdapter {
-    readonly tool: ToolName;
+    readonly tool: SessionAdapterTool;
     // Glob pattern(s) this adapter watches, relative to the tool's home dir.
     readonly watchGlobs: string[];
     // True if this adapter owns the given absolute file path.
@@ -159,6 +163,29 @@ export interface SessionAdapter {
     // emitted once provably closed.
     // cursor advances once per emitted turn, never per parsed line.
     parseTurns(filePath: string, sinceCursor?: string, options?: ParseTurnsOptions): AsyncIterable<ParsedTurn>;
+}
+
+export type SessionAdapterMap = Record<SessionAdapterTool, SessionAdapter>;
+
+export interface OpenedSessionRow {
+    sessionId: string;
+    directory: string;
+    title?: string;
+    version?: string;
+    parentId?: string;
+    timeUpdated: number;
+}
+
+export interface SqliteSourceAdapter {
+    readonly tool: ToolName;
+    dirtySessions(db: Database.Database, sinceWatermark?: number): OpenedSessionRow[];
+    parseSessionTurns(
+        db: Database.Database,
+        session: OpenedSessionRow,
+        sinceCursor?: string,
+        options?: Pick<ParseTurnsOptions, 'closeTrailingOnIdle'>,
+    ): AsyncIterable<ParsedTurn> | Iterable<ParsedTurn>;
+    classifySession(session: OpenedSessionRow): SessionClassification;
 }
 
 // Model-derived half of a memory record. files_touched is computed deterministically, not by the model.

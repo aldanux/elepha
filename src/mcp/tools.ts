@@ -22,7 +22,7 @@ import {
 } from '../storage/paranoid-gate.js';
 import { type ProjectCandidate, type ProjectResolution, ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { isSubstantive, jsonArrayLength, readSessionByNaturalKey, type ServedSession } from '../storage/session-read-model.js';
-import { isToolName, type SessionAdapter, type ToolName } from '../types/index.js';
+import { isToolName, type SessionAdapterMap, type ToolName } from '../types/index.js';
 import type { McpResponseShaper, McpToolResult } from './server.js';
 
 interface PublicSessionId {
@@ -78,13 +78,13 @@ const defaultResponseShaper: McpResponseShaper = {
 // Creates the tool handlers' read-only query and rendering layer. Exported for focused tests.
 export class ElephaMcpService implements McpToolHandlers {
     private readonly consent: ConsentStore;
-    private readonly adapters: Record<ToolName, SessionAdapter>;
+    private readonly adapters: SessionAdapterMap;
     private readonly responses: McpResponseShaper;
 
     constructor(
         private readonly db: Parameters<typeof readSessionByNaturalKey>[0],
         responses: McpResponseShaper = defaultResponseShaper,
-        adapters: Record<ToolName, SessionAdapter> = defaultAdapters(),
+        adapters: SessionAdapterMap = defaultAdapters(),
     ) {
         this.consent = new ConsentStore(db);
         this.adapters = adapters;

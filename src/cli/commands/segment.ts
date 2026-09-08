@@ -15,7 +15,7 @@ import {
     type ResegmentationPlan,
     verifyResegmentation,
 } from '../../storage/resegmentation.js';
-import type { SessionAdapter, ToolName } from '../../types/index.js';
+import type { SessionAdapterMap } from '../../types/index.js';
 import { prepareDestructiveApply } from '../shared.js';
 
 export function registerSegment(program: Command): void {
@@ -38,7 +38,7 @@ export function registerSegment(program: Command): void {
             }
 
             const db = await openDb();
-            const adapters: Record<ToolName, SessionAdapter> = {
+            const adapters: SessionAdapterMap = {
                 'claude-code': new ClaudeCodeAdapter(),
                 codex: new CodexAdapter(),
             };

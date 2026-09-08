@@ -5,7 +5,7 @@ import { MINIMUM_NODE_VERSION, PRIVATE_FILE_MODE } from '../config/constants.js'
 import { claudeMcpPath, claudeSettingsPath, codexConfigPath, elephaHome } from '../config/paths.js';
 import { transformClaudeHook, transformCodexHook } from '../hooks/installer.js';
 import { transformClaudeMcp, transformCodexMcp } from '../mcp/installer.js';
-import { SUPPORTED_TOOLS, TOOL_METADATA } from '../types/index.js';
+import { SESSION_ADAPTER_TOOLS, TOOL_METADATA } from '../types/index.js';
 import { atomicWrite } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
 import {
@@ -253,7 +253,7 @@ export function installElepha(
     replayRollbackJournal(recoveryService);
     const present = detectPresentTools(inputPaths);
     if (!present.claude && !present.codex) {
-        const choices = SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName).join(' or ');
+        const choices = SESSION_ADAPTER_TOOLS.map((tool) => TOOL_METADATA[tool].displayName).join(' or ');
         throw new Error(`no supported tool found; install ${choices} first`);
     }
     const resolved = resolveInstalledElephaBin();

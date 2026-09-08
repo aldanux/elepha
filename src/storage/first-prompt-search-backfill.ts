@@ -2,8 +2,9 @@
 // its first retained turn. It never changes turns, boundaries, or rollups.
 
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { sessionAdapterFor } from '../adapters/index.js';
 import { isReadableProviderSource } from '../config/paths.js';
-import type { SessionAdapter, ToolName } from '../types/index.js';
+import type { SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 
@@ -71,7 +72,8 @@ const deriver: BackfillDeriver<SessionSeed, FirstPromptSearchChange, Map<number,
         if (firstStoredIndex === undefined) {
             return undefined;
         }
-        const after = await deriveFirstPrompt(session, adapters[session.tool], firstStoredIndex);
+        const adapter = sessionAdapterFor(adapters, session.tool);
+        const after = adapter ? await deriveFirstPrompt(session, adapter, firstStoredIndex) : undefined;
         if (after === undefined) {
             return {
                 sessionId: session.id,
@@ -145,7 +147,7 @@ function daemonBatchDeriver(
 
 export async function planFirstPromptSearchBackfill(
     db: Database,
-    adapters: Record<ToolName, SessionAdapter>,
+    adapters: SessionAdapterMap,
     scope?: FirstPromptSearchBackfillScope,
 ): Promise<FirstPromptSearchPlan> {
     return planBackfill(db, adapters, scope === undefined ? deriver : daemonBatchDeriver(scope));
@@ -154,7 +156,7 @@ export async function planFirstPromptSearchBackfill(
 // Applies only readable sessions' derived first-prompt search documents in one transaction.
 export async function applyFirstPromptSearchBackfill(
     db: Database,
-    adapters: Record<ToolName, SessionAdapter>,
+    adapters: SessionAdapterMap,
     scope?: FirstPromptSearchBackfillScope,
 ): Promise<FirstPromptSearchPlan> {
     return applyBackfill(db, adapters, scope === undefined ? deriver : daemonBatchDeriver(scope));

@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { ClaudeCodeAdapter } from '../../adapters/claude-code.js';
 import { CodexAdapter } from '../../adapters/codex.js';
+import { sessionAdapterFor } from '../../adapters/index.js';
 import { isWithinProviderStore } from '../../config/paths.js';
 import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
@@ -8,7 +9,7 @@ import { parseSince } from '../../storage/stats.js';
 import { SummarizerCallLog } from '../../summarizer/call-log.js';
 import { estimateCostUsd } from '../../summarizer/pricing.js';
 import { createConfiguredSynthesisProviders } from '../../summarizer/provider-config.js';
-import type { SessionAdapter, ToolName } from '../../types/index.js';
+import type { SessionAdapterMap } from '../../types/index.js';
 
 export function registerReingest(program: Command): void {
     program
@@ -34,7 +35,7 @@ export function registerReingest(program: Command): void {
                 return;
             }
 
-            const adapters: Record<ToolName, SessionAdapter> = {
+            const adapters: SessionAdapterMap = {
                 'claude-code': new ClaudeCodeAdapter(),
                 codex: new CodexAdapter(),
             };
@@ -53,7 +54,11 @@ export function registerReingest(program: Command): void {
                     console.log(`skipped ${session.native_id}: source_path outside provider store`);
                     continue;
                 }
-                const adapter = adapters[session.tool];
+                const adapter = sessionAdapterFor(adapters, session.tool);
+                if (!adapter) {
+                    console.log(`skipped ${session.native_id}: no JSONL adapter for ${session.tool}`);
+                    continue;
+                }
                 let sessionHadReingest = false;
                 // Re-walks the whole file from byte 0 - cheap/local, no API cost.
                 // Turns before the cutoff are re-derived but skipped, never

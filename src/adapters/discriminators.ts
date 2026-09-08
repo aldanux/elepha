@@ -3,7 +3,7 @@
 // corpus-measured, not assumed. Update this table if future corpus evidence
 // contradicts the values below.
 
-import type { SessionKind, SessionRowKind, SessionRowSurface } from '../types/index.js';
+import type { SessionKind, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
 
 // Claude Code's `entrypoint` field. Confirmed values only.
 export function claudeCodeSurface(entrypoint: string | undefined): SessionRowSurface | null {
@@ -27,6 +27,20 @@ export function codexSurface(originator: string | undefined): SessionRowSurface 
         return null;
     }
     return originator === 'Codex Desktop' ? 'desktop' : 'cli';
+}
+
+export function sessionSurface(tool: ToolName, raw: string | undefined): SessionRowSurface | null {
+    if (tool === 'claude-code') {
+        return claudeCodeSurface(raw);
+    }
+    if (tool === 'codex') {
+        return codexSurface(raw);
+    }
+    if (tool === 'opencode') {
+        // Slice 1 has no reliable OpenCode surface discriminator and is not wired into ingestion.
+        return null;
+    }
+    throw new Error(`Unsupported session surface provider: ${String(tool)}`);
 }
 
 const SESSION_KIND_MAP: Record<SessionKind, SessionRowKind> = {

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { JsonlTurnAdapter, malformedCompleteRecordsDiagnostic, type TurnBuilderState, textValues } from '../../src/adapters/base.js';
 import { MAX_JSON_VALUE_DEPTH, MAX_JSON_VALUE_NODES, MAX_TRANSCRIPT_RECORD_BYTES } from '../../src/config/constants.js';
-import type { ToolName } from '../../src/types/index.js';
+import type { SessionAdapterTool } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 interface TestLine {
@@ -14,7 +14,7 @@ interface TestLine {
 }
 
 class CountingAdapter extends JsonlTurnAdapter {
-    readonly tool: ToolName = 'claude-code';
+    readonly tool: SessionAdapterTool = 'claude-code';
     readonly watchGlobs = ['*.jsonl'];
     classifiedLines = 0;
 
