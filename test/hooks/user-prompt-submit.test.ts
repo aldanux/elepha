@@ -77,6 +77,7 @@ function addProjectSession(
     dbPath: string,
     {
         projectPath,
+        displayName = path.basename(projectPath),
         consented,
         nativeId,
         title,
@@ -86,6 +87,7 @@ function addProjectSession(
         sourcePath = tool === 'claude-code' ? CLAUDE_SOURCE : SOURCE,
     }: {
         projectPath: string;
+        displayName?: string;
         consented: boolean;
         nativeId: string;
         title: string;
@@ -97,8 +99,8 @@ function addProjectSession(
 ): void {
     const db = openUnmanagedDb(dbPath);
     const project = db
-        .prepare('INSERT INTO projects (path, display_name, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?)')
-        .run(projectPath, path.basename(projectPath), timestamp, timestamp);
+        .prepare('INSERT INTO projects (path, display_name, git_remote, first_seen_at, last_seen_at) VALUES (?, ?, ?, ?, ?)')
+        .run(projectPath, displayName, `https://example.test/${nativeId}.git`, timestamp, timestamp);
     const projectId = Number(project.lastInsertRowid);
     if (consented) {
         db.prepare("INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, 'approved', ?, 'cli')").run(
@@ -213,6 +215,7 @@ describe('D40 UserPromptSubmit command hook', () => {
         const directory = path.dirname(dbPath);
         addProjectSession(dbPath, {
             projectPath: path.join(directory, 'consented-claude'),
+            displayName: 'Claude workspace',
             consented: true,
             nativeId: 'global-claude',
             title: 'Global Claude newest',
@@ -231,6 +234,7 @@ describe('D40 UserPromptSubmit command hook', () => {
         });
         addProjectSession(dbPath, {
             projectPath: path.join(directory, 'consented-codex'),
+            displayName: 'Codex workspace',
             consented: true,
             nativeId: 'global-codex',
             title: 'Global Codex second',
@@ -258,13 +262,13 @@ describe('D40 UserPromptSubmit command hook', () => {
         const codexListContext = (codexList.output.hookSpecificOutput as Record<string, string>).additionalContext;
         const selectedContext = (selected.output.hookSpecificOutput as Record<string, string>).additionalContext;
         expect(lastContext).toContain('# Global Claude newest');
-        expect(listContext.indexOf('1. [1h ago | Claude Code Desktop] · Global Claude newest')).toBeLessThan(
-            listContext.indexOf('2. [1h ago | Codex CLI] · Global Codex second'),
+        expect(listContext.indexOf('1. [1h ago | Claude Code Desktop | Claude workspace] · Global Claude newest')).toBeLessThan(
+            listContext.indexOf('2. [1h ago | Codex CLI | Codex workspace] · Global Codex second'),
         );
-        expect(claudeListContext).toContain('1. [1h ago | Claude Code Desktop] · Global Claude newest');
+        expect(claudeListContext).toContain('1. [1h ago | Claude Code Desktop | Claude workspace] · Global Claude newest');
         expect(claudeListContext).not.toContain('Newest one-turn audit');
-        expect(codexListContext.indexOf('1. [1h ago | Codex CLI] · Global Codex second')).toBeLessThan(
-            codexListContext.indexOf('2. [2h ago | Codex CLI] · Newest one-turn audit'),
+        expect(codexListContext.indexOf('1. [1h ago | Codex CLI | Codex workspace] · Global Codex second')).toBeLessThan(
+            codexListContext.indexOf('2. [2h ago | Codex CLI | elepha] · Newest one-turn audit'),
         );
         expect(codexListContext).not.toContain('Global Claude newest');
         expect(selectedContext).toContain('# Global Claude newest');
@@ -301,7 +305,7 @@ describe('D40 UserPromptSubmit command hook', () => {
         }
         if (!('output' in list) || !('output' in last) || !('output' in storedSelected) || !('output' in selected)) return;
         expect((list.output.hookSpecificOutput as Record<string, string>).additionalContext).toContain(
-            '1. [2h ago | Codex CLI] · Newest one-turn audit',
+            '1. [2h ago | Codex CLI | elepha] · Newest one-turn audit',
         );
         expect((last.output.hookSpecificOutput as Record<string, string>).additionalContext).toContain('# Newest one-turn audit');
         expect((storedSelected.output.hookSpecificOutput as Record<string, string>).additionalContext).toContain('# Newest one-turn audit');
@@ -334,8 +338,8 @@ describe('D40 UserPromptSubmit command hook', () => {
         const listContext = (listed.output.hookSpecificOutput as Record<string, string>).additionalContext;
         const selectContext = (selected.output.hookSpecificOutput as Record<string, string>).additionalContext;
         expect(listContext).toContain('Recent sessions (2):');
-        expect(listContext.indexOf('1. [2h ago | Codex CLI] · Newest one-turn audit')).toBeLessThan(
-            listContext.indexOf('2. [3h ago | Codex CLI] · Middle episode'),
+        expect(listContext.indexOf('1. [2h ago | Codex CLI | elepha] · Newest one-turn audit')).toBeLessThan(
+            listContext.indexOf('2. [3h ago | Codex CLI | elepha] · Middle episode'),
         );
         expect(listContext).not.toContain(UNTITLED_EPISODE);
         expect(listContext).not.toContain('Oldest episode');

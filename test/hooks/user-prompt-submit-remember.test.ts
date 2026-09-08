@@ -319,7 +319,7 @@ describe('UserPromptSubmit lexical recall', () => {
             }),
         );
 
-        expect(global).toContain('1. [3h ago | Codex CLI] · remote-approved · Approved remote match');
+        expect(global).toContain('1. [3h ago | Codex CLI | remote-approved] · Approved remote match');
         expect(global).not.toContain('Denied remote match');
         expect(global).not.toContain('denied result must not leak');
         expect(global).not.toContain('recency cap');
@@ -487,7 +487,7 @@ describe('UserPromptSubmit lexical recall', () => {
             now: () => NOW + 1,
         });
 
-        expect(contextOf(remembered)).toContain('2. [2h ago | Codex CLI] · remote · Needle second hit');
+        expect(contextOf(remembered)).toContain('2. [2h ago | Codex CLI | remote] · Needle second hit');
         const openedContext = contextOf(opened);
         expect(openedContext).toContain('# Needle second hit');
         expect(openedContext).toContain('second cross-project answer');
