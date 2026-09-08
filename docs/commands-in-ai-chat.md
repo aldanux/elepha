@@ -17,7 +17,7 @@ This page is the full guide for in-chat recall commands.
 | `elepha:list:<n>`                                  | List the last `n` session titles, where `n` is from 1 to 100.                    |
 | `elepha:list:codex` / `elepha:list:claude`         | List recent sessions from only Codex or Claude Code.                             |
 | `elepha:list:<n>:codex` / `elepha:list:<n>:claude` | Apply both a 1–100 count and a tool filter, with the count before the tool.      |
-| `elepha:select:<n>`                                | Inject session `n` from the most recently shown query or list results.           |
+| `elepha:resume:<n>`                                | Load the nth session to continue it; the model presents a recap.                 |
 | `elepha:help`                                      | Show the in-chat command list.                                                   |
 
 **What a search looks at.** Search looks at session titles and how you opened each session; at what a session concluded

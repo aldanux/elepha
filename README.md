@@ -71,7 +71,7 @@ are excluded. See [protecting and recovering memory](docs/storage.md).
 
 1. **Capture.** A background service reads supported session files under approved project roots.
 2. **Index.** Session metadata, summaries, and optional filtered durable copies are stored in the local database.
-3. **Recall.** MCP exposes read-only project, session, and content lookup. `elepha:query`, `elepha:select:<n>`, and `elepha:last` provide the same context inside supported chats.
+3. **Recall.** MCP exposes read-only project, session, and content lookup. `elepha:query`, `elepha:resume:<n>`, and `elepha:last` provide the same context inside supported chats.
 
 Search uses stored titles, first prompts, rollups, and the filtered local full-text
 index where durable capture is available. Session recall renders filtered content
@@ -82,14 +82,14 @@ Full list: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
 
 ## In-AI-chat commands
 
-| Command                            | What it does                                                            |
-|------------------------------------|-------------------------------------------------------------------------|
-| `elepha:last`                      | Inject the newest available turns from the most recent session.         |
-| `elepha:list`                      | List the five most recent sessions, numbered.                           |
-| `elepha:list:<n>`                  | List the last `n`, up to 100.                                           |
-| `elepha:query <search terms>`      | Search every approved project.                                          |
-| `elepha:query:here <search terms>` | Search the current project only.                                        |
-| `elepha:select:<n>`                | Inject the available turns for session `n` from the last list or query. |
+| Command                            | What it does                                                     |
+|------------------------------------|------------------------------------------------------------------|
+| `elepha:last`                      | Inject the newest available turns from the most recent session.  |
+| `elepha:list`                      | List the five most recent sessions, numbered.                    |
+| `elepha:list:<n>`                  | List the last `n`, up to 100.                                    |
+| `elepha:query <search terms>`      | Search every approved project.                                   |
+| `elepha:query:here <search terms>` | Search the current project only.                                 |
+| `elepha:resume:<n>`                | Load the nth session to continue it; the model presents a recap. |
 
 ## Privacy and consent
 

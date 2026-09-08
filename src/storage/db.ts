@@ -191,7 +191,7 @@ CREATE TABLE IF NOT EXISTS injections (
 );
 CREATE INDEX IF NOT EXISTS idx_injections_session ON injections(tool, native_session_id);
 
--- The ordered session ids behind elepha:select:<n>. One row is the complete
+-- The ordered session ids behind elepha:resume:<n>. One row is the complete
 -- last list shown to one native chat, including an intentionally empty list.
 CREATE TABLE IF NOT EXISTS shown_session_lists (
   tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex')),

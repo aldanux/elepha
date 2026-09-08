@@ -7,6 +7,7 @@ import {
     DURABLE_CAPTURE_FILTER_VERSION,
     REMEMBER_SCAN_BUDGET_MS,
     REMEMBER_SESSION_RECENCY_CAP,
+    RESUME_CHAR_BUDGET,
     SESSION_CHAR_BUDGET,
 } from '../../src/config/constants.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
@@ -428,7 +429,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(log).toContain('user-prompt-submit codex session_id=current-session: discarded reason=project_unavailable_or_unconsented');
     });
 
-    it('uses stored no-Git project groups across query, last, list, and select', async () => {
+    it('uses stored no-Git project groups across query, last, list, and resume', async () => {
         const fixture = createTestDb('elepha-stored-hook-projects-');
         const current = addProject(fixture, 'current', 'approved');
         const remote = addProject(fixture, 'remote', 'approved');
@@ -448,7 +449,7 @@ describe('UserPromptSubmit lexical recall', () => {
         const resolveGitRoot = vi.fn(() => {
             throw new Error('hook consented-project enumeration must not resolve Git');
         });
-        for (const command of ['elepha:query cross project needle', 'elepha:last', 'elepha:list', 'elepha:select:1']) {
+        for (const command of ['elepha:query cross project needle', 'elepha:last', 'elepha:list', 'elepha:resume:1']) {
             const result = await runUserPromptSubmit(payload(current.projectPath, command), 'codex', {
                 dbPath: fixture.dbPath,
                 now: () => NOW,
@@ -482,7 +483,7 @@ describe('UserPromptSubmit lexical recall', () => {
             dbPath: fixture.dbPath,
             now: () => NOW,
         });
-        const opened = await runUserPromptSubmit(payload(current.projectPath, 'elepha:select:2'), 'codex', {
+        const opened = await runUserPromptSubmit(payload(current.projectPath, 'elepha:resume:2'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW + 1,
         });
@@ -496,11 +497,51 @@ describe('UserPromptSubmit lexical recall', () => {
         const db = openUnmanagedDb(fixture.dbPath);
         db.prepare("UPDATE consent_roots SET state = 'denied' WHERE path = ?").run(remote.projectPath);
         db.close();
-        const blocked = await runUserPromptSubmit(payload(current.projectPath, 'elepha:select:2'), 'codex', {
+        const blocked = await runUserPromptSubmit(payload(current.projectPath, 'elepha:resume:2'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW + 2,
         });
         expect(blocked).toEqual({ reason: 'project_unavailable_or_unconsented' });
+    });
+
+    it('uses the resume safety ceiling while last keeps the session presentation budget', async () => {
+        const fixture = createTestDb('elepha-resume-budget-');
+        const current = addProject(fixture, 'current', 'approved');
+        const turnChars = Math.floor(SESSION_CHAR_BUDGET * 0.55);
+        const oldest = `oldest-resume-turn-${'x'.repeat(turnChars)}`;
+        const newest = `newest-resume-turn-${'y'.repeat(turnChars)}`;
+        addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'large-resume',
+            title: 'Large resume session',
+            timestamp: '2026-08-22T11:00:00.000Z',
+            turns: [
+                { user: 'first request', assistant: oldest },
+                { user: 'second request', assistant: newest },
+            ],
+        });
+        fixture.close();
+
+        const resumed = contextOf(
+            await runUserPromptSubmit(payload(current.projectPath, 'elepha:resume:1'), 'codex', {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+            }),
+        );
+        const last = contextOf(
+            await runUserPromptSubmit(payload(current.projectPath, 'elepha:last'), 'codex', {
+                dbPath: fixture.dbPath,
+                now: () => NOW + 1,
+            }),
+        );
+
+        expect(resumed).toContain('oldest-resume-turn-');
+        expect(resumed).toContain('newest-resume-turn-');
+        expect(resumed.length).toBeGreaterThan(SESSION_CHAR_BUDGET);
+        expect(resumed.length).toBeLessThan(RESUME_CHAR_BUDGET);
+        expect(last).not.toContain('oldest-resume-turn-');
+        expect(last).toContain('newest-resume-turn-');
+        expect(last.length).toBeLessThanOrEqual(SESSION_CHAR_BUDGET);
+        expect(last.length).toBeLessThan(resumed.length);
     });
 
     it('requires every multi-term component across titles and first turns while preserving old and single-token matches', async () => {
@@ -849,7 +890,7 @@ describe('UserPromptSubmit lexical recall', () => {
             now: () => NOW,
         });
         expect(contextOf(beforeRevoke)).toContain('Revoked durable work');
-        const servedBeforeRevoke = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+        const servedBeforeRevoke = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:resume:2'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW + 1,
         });
@@ -867,7 +908,7 @@ describe('UserPromptSubmit lexical recall', () => {
         ).toEqual(copyBeforeRevoke);
         revokeDb.close();
 
-        const blockedServe = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+        const blockedServe = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:resume:2'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW + 2,
         });
@@ -896,7 +937,7 @@ describe('UserPromptSubmit lexical recall', () => {
             now: () => NOW + 4,
         });
         expect(contextOf(afterReapproval)).toContain('Revoked durable work');
-        const servedAfterReapproval = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:select:2'), 'codex', {
+        const servedAfterReapproval = await runUserPromptSubmit(payload(approved.projectPath, 'elepha:resume:2'), 'codex', {
             dbPath: fixture.dbPath,
             now: () => NOW + 5,
         });
