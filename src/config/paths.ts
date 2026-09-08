@@ -44,6 +44,17 @@ export function codexHome(): string {
     return override ? path.resolve(override) : path.join(homedir(), '.codex');
 }
 
+// OpenCode follows the XDG data-directory convention on every supported platform.
+export function opencodeStoreRoot(): string {
+    const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
+    const dataHome = xdgDataHome ? path.resolve(xdgDataHome) : path.join(homedir(), '.local', 'share');
+    return path.join(dataHome, 'opencode');
+}
+
+export function opencodeDbPath(): string {
+    return path.join(opencodeStoreRoot(), 'opencode.db');
+}
+
 export function claudeProjectsRoot(): string {
     return path.join(claudeConfigDir(), 'projects');
 }
@@ -58,6 +69,9 @@ export function providerStoreRoot(tool: ToolName): string {
     }
     if (tool === 'codex') {
         return codexSessionsRoot();
+    }
+    if (tool === 'opencode') {
+        return opencodeStoreRoot();
     }
     throw new Error(`Unsupported transcript provider: ${String(tool)}`);
 }

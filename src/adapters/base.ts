@@ -26,8 +26,8 @@ import type {
     ParsedTurn,
     ParseTurnsOptions,
     SessionAdapter,
+    SessionAdapterTool,
     SessionClassification,
-    ToolName,
 } from '../types/index.js';
 
 const NEWLINE = 0x0a;
@@ -400,7 +400,7 @@ export type LineClass = 'boundary' | 'content' | 'skip';
 // classification and folding logic; this class owns byte-offset tracking,
 // partial-line discard, and the boundary-vs-idle close rule.
 export abstract class JsonlTurnAdapter implements SessionAdapter {
-    abstract readonly tool: ToolName;
+    abstract readonly tool: SessionAdapterTool;
     abstract readonly watchGlobs: string[];
 
     // Called whenever classify() sees a line shape it doesn't explicitly

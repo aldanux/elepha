@@ -30,7 +30,7 @@
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { codexHome, codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
-import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionClassification, ToolName } from '../types/index.js';
+import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionAdapterTool, SessionClassification } from '../types/index.js';
 import {
     classifyEmptyJsonlSession,
     type EmptySessionSignals,
@@ -255,7 +255,7 @@ function extractReadFileePaths(name: string | undefined, argumentsRaw: string | 
 }
 
 export class CodexAdapter extends JsonlTurnAdapter {
-    readonly tool: ToolName = 'codex';
+    readonly tool: SessionAdapterTool = 'codex';
     readonly watchGlobs = ['*/*/*/rollout-*.jsonl'];
     private readonly userBoundaryByFile = new Map<string, 'event_msg' | 'response_item'>();
 

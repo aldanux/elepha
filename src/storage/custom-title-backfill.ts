@@ -3,8 +3,9 @@
 // rendered output, or rendered_chars.
 
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { sessionAdapterFor } from '../adapters/index.js';
 import { isReadableProviderSource } from '../config/paths.js';
-import type { SessionAdapter, ToolName } from '../types/index.js';
+import type { SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 
 export interface CustomTitleChange {
@@ -51,9 +52,22 @@ const deriver: BackfillDeriver<SessionSeed, CustomTitleChange> = {
             };
         }
 
+        const adapter = sessionAdapterFor(adapters, session.tool);
+        if (!adapter) {
+            return {
+                sessionId: session.id,
+                nativeId: session.native_id,
+                tool: session.tool,
+                sourcePath: session.source_path,
+                before: session.custom_title,
+                after: session.custom_title,
+                transcriptMissing: true,
+            };
+        }
+
         let title: string | undefined;
         try {
-            title = (await adapters[session.tool].readCustomTitle?.(session.source_path))?.customTitle;
+            title = (await adapter.readCustomTitle?.(session.source_path))?.customTitle;
         } catch {
             return {
                 sessionId: session.id,
@@ -87,11 +101,11 @@ const deriver: BackfillDeriver<SessionSeed, CustomTitleChange> = {
     },
 };
 
-export async function planCustomTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<CustomTitlePlan> {
+export async function planCustomTitleBackfill(db: Database, adapters: SessionAdapterMap): Promise<CustomTitlePlan> {
     return planBackfill(db, adapters, deriver);
 }
 
 // Applies only planned custom_title changes in one transaction.
-export async function applyCustomTitleBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<CustomTitlePlan> {
+export async function applyCustomTitleBackfill(db: Database, adapters: SessionAdapterMap): Promise<CustomTitlePlan> {
     return applyBackfill(db, adapters, deriver);
 }

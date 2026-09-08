@@ -8,11 +8,12 @@
 
 import { existsSync } from 'node:fs';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
+import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
+import { sessionAdapterFor } from '../adapters/index.js';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths, isWithinProviderStore } from '../config/paths.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';
-import type { ParsedTurn, SessionAdapter, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
 import { errorMessage } from '../util/error.js';
 import { DurableCaptureStore } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
@@ -141,7 +142,7 @@ function parseFiles(raw: string): string[] {
 }
 
 function normalizedSurface(tool: ToolName, raw: string | undefined): SessionRowSurface | null {
-    return tool === 'claude-code' ? claudeCodeSurface(raw) : codexSurface(raw);
+    return sessionSurface(tool, raw);
 }
 
 function gapHours(previousEndedAt: string, nextStartedAt: string): number {
@@ -358,7 +359,7 @@ function groupRows(rows: StoredSession[]): StoredSession[][] {
 }
 
 // Read-only preview. Re-reads JSONL so resumeMarkerBefore is not discarded.
-export async function planResegmentation(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<ResegmentationPlan> {
+export async function planResegmentation(db: Database, adapters: SessionAdapterMap): Promise<ResegmentationPlan> {
     const allSessions = sessionRows(db);
     const groups: ResegmentationGroupPlan[] = [];
     let retainedTurnsScanned = 0;
@@ -399,8 +400,13 @@ export async function planResegmentation(db: Database, adapters: Record<ToolName
         }
 
         try {
-            const classification = await adapters[latest.tool].classifySession(latest.source_path);
-            const parsed = await parseSource(adapters[latest.tool], latest.source_path);
+            const adapter = sessionAdapterFor(adapters, latest.tool);
+            if (!adapter) {
+                groups.push({ ...base, status: 'skipped', issue: 'source type has no JSONL adapter', resultingSegments: [], cuts: [] });
+                continue;
+            }
+            const classification = await adapter.classifySession(latest.source_path);
+            const parsed = await parseSource(adapter, latest.source_path);
             const existingByIndex = new Map(rows.map((row) => [row.segment_index, row]));
             const { segments, cuts } = buildSegments(
                 memories,
@@ -761,12 +767,16 @@ function sessionById(db: Database, id: number): StoredSession {
 
 export async function planManualSplit(
     db: Database,
-    adapters: Record<ToolName, SessionAdapter>,
+    adapters: SessionAdapterMap,
     sessionId: number,
     atTurnIndex: number,
 ): Promise<ManualSplitPlan> {
     const source = sessionById(db, sessionId);
-    const { memories, parsed, kind } = await parsedForManual(db, source, adapters[source.tool]);
+    const adapter = sessionAdapterFor(adapters, source.tool);
+    if (!adapter) {
+        throw new Error(`source type has no JSONL adapter: ${source.tool}`);
+    }
+    const { memories, parsed, kind } = await parsedForManual(db, source, adapter);
     const splitAt = memories.findIndex((memory) => memory.turn_index === atTurnIndex);
     if (splitAt <= 0) {
         throw new Error(`--at must name a retained turn after the first turn in session ${sessionId}`);
@@ -821,7 +831,7 @@ export function applyManualSplit(db: Database, plan: ManualSplitPlan): number {
 
 export async function planManualMerge(
     db: Database,
-    adapters: Record<ToolName, SessionAdapter>,
+    adapters: SessionAdapterMap,
     firstId: number,
     secondId: number,
 ): Promise<ManualMergePlan> {
@@ -840,8 +850,12 @@ export async function planManualMerge(
     if (!existsSync(left.source_path)) {
         throw new Error(`source transcript is missing: ${left.source_path}`);
     }
-    const parsed = await parseSource(adapters[left.tool], left.source_path);
-    const classification = await adapters[left.tool].classifySession(left.source_path);
+    const adapter = sessionAdapterFor(adapters, left.tool);
+    if (!adapter) {
+        throw new Error(`source type has no JSONL adapter: ${left.tool}`);
+    }
+    const parsed = await parseSource(adapter, left.source_path);
+    const classification = await adapter.classifySession(left.source_path);
     const memories = [...memoriesForSessions(db, [left.id]), ...memoriesForSessions(db, [right.id])].sort(
         (a, b) => a.turn_index - b.turn_index,
     );

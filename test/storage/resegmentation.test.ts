@@ -22,10 +22,10 @@ import {
 } from '../../src/storage/resegmentation.js';
 import { titleForSegment } from '../../src/storage/session-title.js';
 import { planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
-import type { SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
-const adapters: Record<ToolName, SessionAdapter> = {
+const adapters: SessionAdapterMap = {
     'claude-code': new ClaudeCodeAdapter(),
     codex: new CodexAdapter(),
 };
@@ -535,7 +535,7 @@ describe('manual segment corrections', () => {
                     return {
                         db,
                         sourcePath,
-                        plan: (guardedAdapters: Record<ToolName, SessionAdapter>) => planManualSplit(db, guardedAdapters, 1, 1),
+                        plan: (guardedAdapters: SessionAdapterMap) => planManualSplit(db, guardedAdapters, 1, 1),
                     };
                 },
             },
@@ -552,7 +552,7 @@ describe('manual segment corrections', () => {
                     return {
                         db,
                         sourcePath,
-                        plan: (guardedAdapters: Record<ToolName, SessionAdapter>) => planManualMerge(db, guardedAdapters, 1, newId),
+                        plan: (guardedAdapters: SessionAdapterMap) => planManualMerge(db, guardedAdapters, 1, newId),
                     };
                 },
             },

@@ -15,7 +15,7 @@ import { applyRenderedCharsBackfill, planRenderedCharsBackfill, type RenderedCha
 import { applyRootCommitBackfill, planRootCommitBackfill, type RootCommitBackfillPlan } from '../../storage/root-commit-backfill.js';
 import { applySessionFieldsBackfill, planSessionFieldsBackfill, type SessionFieldsPlan } from '../../storage/session-fields-backfill.js';
 import { applySessionTitleBackfill, planSessionTitleBackfill, type SessionTitlePlan } from '../../storage/session-title-backfill.js';
-import type { SessionAdapter, ToolName } from '../../types/index.js';
+import type { SessionAdapterMap } from '../../types/index.js';
 import { runDestructiveOp } from '../destructive-op.js';
 
 export function registerBackfills(program: Command): void {
@@ -72,7 +72,7 @@ export function registerBackfills(program: Command): void {
         .option('--apply', 'actually rewrite rendered_chars and rendered_turns after the preview (default is read-only)')
         .action(async (opts: { apply: boolean }) => {
             const db = await openDb();
-            const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
+            const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
             await runDestructiveOp({
                 applyRequested: opts.apply,
                 db,
@@ -118,7 +118,7 @@ export function registerBackfills(program: Command): void {
         .option('--apply', 'actually write first_prompt_search after the preview (default is a dry run)')
         .action(async (opts: { apply: boolean }) => {
             const db = await openDb();
-            const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
+            const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
             await runDestructiveOp({
                 applyRequested: opts.apply,
                 db,
@@ -164,7 +164,7 @@ export function registerBackfills(program: Command): void {
         .option('--apply', 'actually write titles after the preview (default is a dry run)')
         .action(async (opts: { apply: boolean }) => {
             const db = await openDb();
-            const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
+            const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
             await runDestructiveOp({
                 applyRequested: opts.apply,
                 db,
@@ -201,7 +201,7 @@ export function registerBackfills(program: Command): void {
         .option('--apply', 'actually write custom_title after the preview (default is a dry run)')
         .action(async (opts: { apply: boolean }) => {
             const db = await openDb();
-            const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
+            const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
             await runDestructiveOp({
                 applyRequested: opts.apply,
                 db,
@@ -241,7 +241,7 @@ export function registerBackfills(program: Command): void {
         .option('--apply', 'actually rewrite the affected fields (default is a dry run that only prints them)')
         .action(async (opts: { apply: boolean }) => {
             const db = await openDb();
-            const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
+            const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
             await runDestructiveOp({
                 applyRequested: opts.apply,
                 db,

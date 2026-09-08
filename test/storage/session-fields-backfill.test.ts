@@ -7,7 +7,7 @@ import { CodexAdapter } from '../../src/adapters/codex.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { applySessionFieldsBackfill, planSessionFieldsBackfill } from '../../src/storage/session-fields-backfill.js';
-import type { SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { SessionAdapterMap } from '../../src/types/index.js';
 
 const FIXTURE = `{"type":"attachment","uuid":"u0","timestamp":"2026-08-01T10:00:01.000Z","entrypoint":"cli","cwd":"/tmp/proj","sessionId":"sess-1","gitBranch":"main"}
 {"type":"user","parentUuid":"u0","message":{"role":"user","content":"hello"},"uuid":"u1","timestamp":"2026-08-01T10:00:02.000Z","entrypoint":"cli","cwd":"/tmp/proj","sessionId":"sess-1","gitBranch":"main"}
@@ -33,7 +33,7 @@ describe('session-fields-backfill', () => {
     let claudeProjects: string;
     let codexSessions: string;
     let filePath: string;
-    const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
+    const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
 
     beforeEach(() => {
         dir = mkdtempSync(path.join(tmpdir(), 'elepha-backfill-'));

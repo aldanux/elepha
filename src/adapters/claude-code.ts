@@ -19,7 +19,7 @@
 
 import path from 'node:path';
 import { claudeProjectsRoot, isWithin, toPosix } from '../config/paths.js';
-import type { EmptySessionAnalysis, ParsedToolCall, SessionClassification, ToolName } from '../types/index.js';
+import type { EmptySessionAnalysis, ParsedToolCall, SessionAdapterTool, SessionClassification } from '../types/index.js';
 import {
     classifyEmptyJsonlSession,
     type EmptySessionSignals,
@@ -154,7 +154,7 @@ function extractFilePaths(name: string, input: Record<string, unknown>, cwd: str
 }
 
 export class ClaudeCodeAdapter extends JsonlTurnAdapter {
-    readonly tool: ToolName = 'claude-code';
+    readonly tool: SessionAdapterTool = 'claude-code';
     readonly watchGlobs = ['*/*.jsonl'];
 
     matches(filePath: string): boolean {

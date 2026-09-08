@@ -8,9 +8,9 @@ import type Database from 'better-sqlite3-multiple-ciphers';
 import { HOOK_PAYLOAD_MAX_CHARS } from '../config/constants.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
-import type { ToolName } from '../types/index.js';
+import type { SessionAdapterTool } from '../types/index.js';
 
-export type HookTool = ToolName;
+export type HookTool = SessionAdapterTool;
 export type HookSource = 'startup' | 'clear' | 'resume' | 'compact';
 
 interface CommonHookPayload {

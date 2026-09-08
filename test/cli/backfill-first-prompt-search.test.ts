@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import { planFirstPromptSearchBackfill } from '../../src/storage/first-prompt-search-backfill.js';
-import type { SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -104,7 +104,7 @@ describe('elepha backfill-first-prompt-search', () => {
         fixture.db.prepare('UPDATE sessions SET first_prompt_search = NULL WHERE id = ?').run(session.id);
         const parseTurns = vi.fn(async function* () {});
         const adapter = { parseTurns } as unknown as SessionAdapter;
-        const adapters: Record<ToolName, SessionAdapter> = { 'claude-code': adapter, codex: adapter };
+        const adapters: SessionAdapterMap = { 'claude-code': adapter, codex: adapter };
         const previousClaudeConfigDir = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(fixture.directory, 'claude-home');
 

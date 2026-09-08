@@ -1,5 +1,5 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import type { SessionAdapter, ToolName } from '../types/index.js';
+import type { SessionAdapterMap } from '../types/index.js';
 
 export interface BackfillChange {
     transcriptMissing: boolean;
@@ -17,23 +17,18 @@ export interface BackfillWriteResult {
 
 export interface BackfillDeriver<Session, Change extends BackfillChange, State = undefined> {
     load(db: Database): { sessions: Session[]; state: State };
-    derive(input: {
-        db: Database;
-        adapters: Record<ToolName, SessionAdapter>;
-        session: Session;
-        state: State;
-    }): Promise<Change | undefined>;
+    derive(input: { db: Database; adapters: SessionAdapterMap; session: Session; state: State }): Promise<Change | undefined>;
     shouldWrite(change: Change): boolean;
     write(db: Database, change: Change): BackfillWriteResult;
     finalize?(plan: BackfillPlan<Change>, state: State): BackfillPlan<Change>;
     recordConcurrentSkips?(plan: BackfillPlan<Change>, skipped: number): void;
-    afterApply?(input: { db: Database; adapters: Record<ToolName, SessionAdapter>; plan: BackfillPlan<Change> }): Promise<void>;
+    afterApply?(input: { db: Database; adapters: SessionAdapterMap; plan: BackfillPlan<Change> }): Promise<void>;
 }
 
 // Plans and applies transcript-derived storage backfills. Verification reuses its plan result.
 export async function planBackfill<Session, Change extends BackfillChange, State>(
     db: Database,
-    adapters: Record<ToolName, SessionAdapter>,
+    adapters: SessionAdapterMap,
     deriver: BackfillDeriver<Session, Change, State>,
 ): Promise<BackfillPlan<Change>> {
     const { sessions, state } = deriver.load(db);
@@ -56,7 +51,7 @@ export async function planBackfill<Session, Change extends BackfillChange, State
 
 export async function applyBackfill<Session, Change extends BackfillChange, State>(
     db: Database,
-    adapters: Record<ToolName, SessionAdapter>,
+    adapters: SessionAdapterMap,
     deriver: BackfillDeriver<Session, Change, State>,
 ): Promise<BackfillPlan<Change>> {
     const plan = await planBackfill(db, adapters, deriver);

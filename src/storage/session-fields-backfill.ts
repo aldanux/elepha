@@ -17,10 +17,11 @@
 // reporting isn't worth the extra surface.
 
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { claudeCodeSurface, codexSurface, toSessionRowKind } from '../adapters/discriminators.js';
+import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
+import { sessionAdapterFor } from '../adapters/index.js';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths, isReadableProviderSource } from '../config/paths.js';
-import type { ParsedTurn, SessionAdapter, ToolName } from '../types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 
 export interface SessionFieldsBefore {
@@ -110,7 +111,7 @@ async function deriveForSession(
     const lastWithBranch = [...turns].reverse().find((t) => t.gitBranch !== undefined);
 
     const rawSurface = firstWithSurface?.surface;
-    const surface = session.tool === 'claude-code' ? claudeCodeSurface(rawSurface) : codexSurface(rawSurface);
+    const surface = sessionSurface(session.tool, rawSurface);
 
     // trailing_files: most-recent-first across the re-parsed turns, same cap
     // and dedupe as the live updateTrailingState path (MemoryStore.recordTurn).
@@ -142,7 +143,9 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
         };
     },
     async derive({ db, adapters, session }) {
-        const { after, turns, transcriptMissing } = await deriveForSession(session, adapters[session.tool]);
+        const adapter = sessionAdapterFor(adapters, session.tool);
+        const result = adapter ? await deriveForSession(session, adapter) : unreadableResult(session);
+        const { after, turns, transcriptMissing } = result;
         const before: SessionFieldsBefore = {
             surface: session.surface,
             git_branch: session.git_branch,
@@ -219,7 +222,10 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
             const session = db
                 .prepare('SELECT id, tool, native_id, source_path FROM sessions WHERE id = ?')
                 .get(change.sessionId) as SessionSeed;
-            const adapter = adapters[session.tool];
+            const adapter = sessionAdapterFor(adapters, session.tool);
+            if (!adapter) {
+                continue;
+            }
             const updateFlag = db.prepare('UPDATE memories SET has_external_content = ? WHERE session_id = ? AND turn_index = ?');
             const writeFlags = db.transaction((turns: ParsedTurn[]) => {
                 for (const turn of turns) {
@@ -248,11 +254,11 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
     },
 };
 
-export async function planSessionFieldsBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionFieldsPlan> {
+export async function planSessionFieldsBackfill(db: Database, adapters: SessionAdapterMap): Promise<SessionFieldsPlan> {
     return planBackfill(db, adapters, deriver);
 }
 
 // Planning finishes transcript reads before the single write transaction begins.
-export async function applySessionFieldsBackfill(db: Database, adapters: Record<ToolName, SessionAdapter>): Promise<SessionFieldsPlan> {
+export async function applySessionFieldsBackfill(db: Database, adapters: SessionAdapterMap): Promise<SessionFieldsPlan> {
     return applyBackfill(db, adapters, deriver);
 }

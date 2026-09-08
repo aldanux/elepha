@@ -17,14 +17,14 @@ import { ConsentStore } from '../../src/storage/consent-store.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
-import type { ParsedTurn, SessionAdapter, ToolName } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 class FixtureAdapter implements SessionAdapter {
-    readonly tool: ToolName;
+    readonly tool: SessionAdapterTool;
 
     constructor(
-        tool: ToolName,
+        tool: SessionAdapterTool,
         private readonly turnsByPath: Map<string, ParsedTurn[]>,
         private readonly beforeParse?: () => Promise<void>,
     ) {
@@ -519,7 +519,7 @@ describe('elepha MCP server surface', () => {
                     ('beta-root', ?, 'approved', '2026-08-16T00:00:00.000Z', 'cli')`,
         ).run(realpathSync(known), realpathSync(empty), realpathSync(alpha), realpathSync(beta));
 
-        const adapters: Record<ToolName, SessionAdapter> = {
+        const adapters: SessionAdapterMap = {
             codex: new FixtureAdapter('codex', turnsByPath),
             'claude-code': new FixtureAdapter('claude-code', turnsByPath),
         };
