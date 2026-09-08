@@ -284,7 +284,7 @@ export class IngestionDaemon {
         }
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
-        this.captureOpencode = configResult.config.captureOpencode ?? false;
+        this.captureOpencode = configResult.config.captureOpencode ?? true;
         this.durableCapture = configResult.config.durableCapture ?? false;
         this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
         this.store = options.store;

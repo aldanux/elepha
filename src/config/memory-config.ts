@@ -16,7 +16,7 @@ export interface MemoryConfig {
 export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
     captureClaudeCode: true,
     captureCodex: true,
-    captureOpencode: false,
+    captureOpencode: true,
     durableCapture: false,
     durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };

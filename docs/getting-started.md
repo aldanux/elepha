@@ -47,6 +47,12 @@ ask for approval again if an update changes a hook.
 Claude Code does not require this extra step; its hooks become active as soon as the
 installer registers them.
 
+OpenCode capture does not depend on a chat hook. The background service passively reads
+OpenCode's local session database, with capture on by default and every project still
+protected by the consent choices in `elepha init` or `elepha consent`. OpenCode memory is
+available to a connected client through elepha's MCP server. In-chat `elepha:` command
+interception is not currently claimed for OpenCode.
+
 ## Verify the installation
 
 Use the quick and deep checks in [Troubleshooting](troubleshooting.md) after choosing
@@ -65,7 +71,7 @@ upgrade; no manual export or import is required. See
 recovery requirements.
 
 Nothing is written into your project directories, and elepha never modifies the
-original Claude Code or Codex transcripts. Use the [storage tools](storage.md) to
+original Claude Code or Codex transcripts or the OpenCode session database. Use the [storage tools](storage.md) to
 make encrypted same-installation backups instead of treating the database as
 disposable: it holds privacy and lifecycle state and, when durable capture is enabled,
 may hold the only surviving sanitized copy of a deleted source transcript.

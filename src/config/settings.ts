@@ -36,7 +36,7 @@ export const SETTING_SCHEMA = {
     'update-check': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-claude-code': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-codex': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
-    'capture-opencode': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
+    'capture-opencode': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'durable-capture': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
     'query-matching': { kind: 'enum', values: ['strict', 'lax'], default: 'strict' },
 } as const satisfies Record<SettingKey, SettingSchema>;

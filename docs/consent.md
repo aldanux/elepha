@@ -13,11 +13,12 @@ Run the onboarding wizard after installation:
 elepha init
 ```
 
-The wizard detects local sessions from supported AI coding tools and discovers eligible
-Git projects, and asks whether you want to approve whole workspace folders or individual
-projects. Folder mode covers projects already inside the selected folder and discovers
-new projects there automatically. Individual mode gives you a project-by-project
-selection.
+The wizard detects local sessions from supported AI coding tools, lets you choose which
+detected tools should be captured, discovers eligible Git projects, and asks whether you
+want to approve whole workspace folders or individual projects. Every detected tool is
+selected for capture by default, and at least one must remain enabled. Folder mode covers
+projects already inside the selected folder and discovers new projects there
+automatically. Individual mode gives you a project-by-project selection.
 
 New approvals are backfilled immediately from eligible transcripts already on disk,
 so elepha can remember earlier work as well as future sessions. The wizard is

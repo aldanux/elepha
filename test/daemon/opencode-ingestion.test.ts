@@ -70,7 +70,7 @@ afterEach(() => {
 });
 
 describe('OpenCode daemon ingestion', () => {
-    it('keeps capture off by default and accounts the skipped database', async () => {
+    it('captures OpenCode sessions by default', async () => {
         const sourceRoot = withGrantableTestDir('elepha-opencode-disabled-source-');
         const projectPath = withGrantableTestDir('elepha-opencode-disabled-project-');
         vi.stubEnv('XDG_DATA_HOME', sourceRoot);
@@ -87,7 +87,7 @@ describe('OpenCode daemon ingestion', () => {
                 stderr: pathFor(fixture.directory, 'daemon.stderr.log'),
             },
             watcherUsePolling: true,
-            readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG } }),
+            readConfig: () => ({ config: { captureClaudeCode: true, captureCodex: true } }),
             updateCheck: () => undefined,
             log: (message) => logs.push(message),
         });
@@ -95,8 +95,8 @@ describe('OpenCode daemon ingestion', () => {
             daemon.start();
             await waitFor(() => logs.some((message) => message.startsWith('[elepha] startup sweep:')));
 
-            expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE tool = 'opencode'").get()).toEqual({ count: 0 });
-            expect(logs.some((message) => message.includes('capture disabled: 1'))).toBe(true);
+            expect(fixture.db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE tool = 'opencode'").get()).toEqual({ count: 1 });
+            expect(logs.some((message) => message.includes('capture disabled'))).toBe(false);
         } finally {
             await daemon.stop();
         }

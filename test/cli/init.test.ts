@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { type InitPrompts, runInit } from '../../src/cli/init.js';
 import type { DiscoveryResult } from '../../src/discovery/session-projects.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -12,13 +12,25 @@ import { withGrantableTestDir } from '../helpers/tmp.js';
 
 const CANCELLED = Symbol('cancelled');
 
+beforeEach(() => {
+    vi.stubEnv('ELEPHA_HOME', withGrantableTestDir('elepha-init-config-'));
+});
+
+afterEach(() => {
+    vi.unstubAllEnvs();
+});
+
 function ttyStream(): PassThrough {
     const stream = new PassThrough();
     Object.defineProperty(stream, 'isTTY', { value: true });
     return stream;
 }
 
-function fakePrompts(mode: 'folder' | 'individual' | typeof CANCELLED, selection: string[] | typeof CANCELLED) {
+function fakePrompts(
+    mode: 'folder' | 'individual' | typeof CANCELLED,
+    selection: string[] | typeof CANCELLED,
+    captureSelections: Array<string[] | typeof CANCELLED> = [],
+) {
     const events: string[] = [];
     const output = new PassThrough();
     const prompts: InitPrompts = {
@@ -26,7 +38,9 @@ function fakePrompts(mode: 'folder' | 'individual' | typeof CANCELLED, selection
         note: (message) => events.push(`note:${message}`),
         spinner: () => ({ start: (message) => events.push(`start:${message}`), stop: () => events.push('stop') }),
         select: vi.fn(async () => mode),
-        multiselect: vi.fn(async () => selection),
+        multiselect: vi.fn(async ({ message, initialValues }) =>
+            message === 'Which tools should elepha capture?' ? (captureSelections.shift() ?? initialValues) : selection,
+        ),
         isCancel: (value) => value === CANCELLED,
         cancel: (message) => events.push(`cancel:${message}`),
         outro: (message) => events.push(`outro:${message}`),
@@ -95,6 +109,14 @@ describe('elepha init', () => {
             ).resolves.toBe(0);
 
             expect(consent.prompts.select).toHaveBeenCalledOnce();
+            expect(consent.prompts.multiselect).toHaveBeenNthCalledWith(1, {
+                message: 'Which tools should elepha capture?',
+                options: [
+                    { value: 'claude-code', label: 'Claude Code' },
+                    { value: 'codex', label: 'Codex' },
+                ],
+                initialValues: ['claude-code', 'codex'],
+            });
             expect(consent.prompts.select).toHaveBeenCalledWith({
                 message: 'How should elepha remember your projects?',
                 options: [
@@ -108,6 +130,107 @@ describe('elepha init', () => {
         } finally {
             db.close();
             rmSync(directory, { recursive: true, force: true });
+        }
+    });
+
+    it('defaults every detected capture tool on and writes unchecked tools off', async () => {
+        const directory = withGrantableTestDir('elepha-init-tool-capture-');
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
+        const configPath = path.join(directory, 'config.json');
+        const { prompts, output } = fakePrompts(CANCELLED, [], [['claude-code', 'opencode']]);
+
+        try {
+            await expect(
+                runInit({
+                    input: ttyStream(),
+                    output,
+                    store: new MemoryStore(db),
+                    configPath,
+                    prompts,
+                    detectTools: async () => ['claude-code', 'codex', 'opencode'],
+                    discover: async () => discovery([{ root: directory, displayName: path.basename(directory), sessionCount: 1 }]),
+                }),
+            ).resolves.toBe(0);
+
+            expect(prompts.multiselect).toHaveBeenNthCalledWith(1, {
+                message: 'Which tools should elepha capture?',
+                options: [
+                    { value: 'claude-code', label: 'Claude Code' },
+                    { value: 'codex', label: 'Codex' },
+                    { value: 'opencode', label: 'OpenCode' },
+                ],
+                initialValues: ['claude-code', 'codex', 'opencode'],
+            });
+            expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
+                'capture-claude-code': true,
+                'capture-opencode': true,
+                'capture-codex': false,
+            });
+        } finally {
+            db.close();
+        }
+    });
+
+    it('prechecks capture boxes from the current config, not a blanket all-on', async () => {
+        const directory = withGrantableTestDir('elepha-init-tool-capture-rerun-');
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
+        const configPath = path.join(directory, 'config.json');
+        writeFileSync(configPath, JSON.stringify({ 'capture-codex': false }));
+        const { prompts, output } = fakePrompts(CANCELLED, [], [['claude-code', 'opencode']]);
+
+        try {
+            await expect(
+                runInit({
+                    input: ttyStream(),
+                    output,
+                    store: new MemoryStore(db),
+                    configPath,
+                    prompts,
+                    detectTools: async () => ['claude-code', 'codex', 'opencode'],
+                    discover: async () => discovery([{ root: directory, displayName: path.basename(directory), sessionCount: 1 }]),
+                    entry: 'consent',
+                }),
+            ).resolves.toBe(0);
+
+            // codex was previously turned off, so its box must not start checked.
+            expect(prompts.multiselect).toHaveBeenNthCalledWith(1, {
+                message: 'Which tools should elepha capture?',
+                options: [
+                    { value: 'claude-code', label: 'Claude Code' },
+                    { value: 'codex', label: 'Codex' },
+                    { value: 'opencode', label: 'OpenCode' },
+                ],
+                initialValues: ['claude-code', 'opencode'],
+            });
+        } finally {
+            db.close();
+        }
+    });
+
+    it('refuses an empty capture selection without writing an all-off config', async () => {
+        const directory = withGrantableTestDir('elepha-init-tool-capture-empty-');
+        const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
+        const configPath = path.join(directory, 'config.json');
+        const { prompts, events, output } = fakePrompts(CANCELLED, [], [[], CANCELLED]);
+
+        try {
+            await expect(
+                runInit({
+                    input: ttyStream(),
+                    output,
+                    store: new MemoryStore(db),
+                    configPath,
+                    prompts,
+                    detectTools: async () => ['claude-code', 'codex', 'opencode'],
+                }),
+            ).resolves.toBe(0);
+
+            expect(prompts.multiselect).toHaveBeenCalledTimes(2);
+            expect(events).toContain('note:At least one capture tool must remain enabled.');
+            expect(events).toContain('cancel:Operation cancelled. No changes were made.');
+            expect(existsSync(configPath)).toBe(false);
+        } finally {
+            db.close();
         }
     });
 

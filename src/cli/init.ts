@@ -2,13 +2,14 @@ import path from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import * as clack from '@clack/prompts';
 import { isWithin, normalizeForCompare, samePath } from '../config/paths.js';
+import { getSetting, type SettingKey, setSetting } from '../config/settings.js';
 import { IngestionDaemon } from '../daemon/index.js';
 import { type DiscoveryResult, detectSessionTools, discoverFolderRepos, discoverSessionProjects } from '../discovery/session-projects.js';
 import { reconcileCaptureService, serviceBackend } from '../install/service-backend.js';
 import { SessionReader } from '../serving/session-reader.js';
 import type { MemoryStore } from '../storage/memory-store.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
-import { TOOL_METADATA } from '../types/index.js';
+import { TOOL_METADATA, type ToolName } from '../types/index.js';
 import {
     consentChanges,
     folderCandidates,
@@ -65,6 +66,7 @@ export interface InitOptions {
     store: MemoryStore;
     discover?: () => Promise<DiscoveryResult>;
     detectTools?: () => Promise<DiscoveryResult['detectedTools']>;
+    configPath?: string;
     daemon?: Pick<IngestionDaemon, 'backfillApprovedRoots'>;
     reconcile?: (approvedRoots: number) => void;
     // Test seam; production routes every visual element through @clack/prompts.
@@ -82,6 +84,12 @@ function plural(count: number, singular: string): string {
 function toolLabel(tool: DiscoveryResult['detectedTools'][number]): string {
     return TOOL_METADATA[tool].displayName;
 }
+
+const CAPTURE_SETTING_FOR_TOOL = {
+    'claude-code': 'capture-claude-code',
+    codex: 'capture-codex',
+    opencode: 'capture-opencode',
+} as const satisfies Record<ToolName, SettingKey>;
 
 function clackPrompts(input: InitInput, output: InitOutput): InitPrompts {
     const common = { input, output };
@@ -123,8 +131,41 @@ export async function runInit(options: InitOptions): Promise<number> {
     }
 
     const prompts = options.prompts ?? clackPrompts(input, output);
-    const detected = (await (options.detectTools ?? detectSessionTools)()).map(toolLabel);
-    prompts.note(`Tools detected: ${detected.join(', ') || 'none'}`);
+    const detectedTools = await (options.detectTools ?? detectSessionTools)();
+    if (detectedTools.length === 0) {
+        prompts.note('Tools detected: none');
+    } else {
+        // Pre-check each box from the tool's current capture setting, not a
+        // blanket "all on": a returning `elepha consent` run must not silently
+        // re-enable a tool the user previously turned off. On first `init` no
+        // config exists yet, so every capture default is true and all boxes
+        // start checked, which is the intended onboarding state.
+        const initialTools = detectedTools.filter(
+            (tool) => getSetting(CAPTURE_SETTING_FOR_TOOL[tool], undefined, options.configPath).value === true,
+        );
+        let selectedTools: string[] | symbol;
+        for (;;) {
+            selectedTools = await prompts.multiselect({
+                message: 'Which tools should elepha capture?',
+                options: detectedTools.map((tool) => ({ value: tool, label: toolLabel(tool) })),
+                initialValues: initialTools,
+            });
+            if (prompts.isCancel(selectedTools) || !Array.isArray(selectedTools)) {
+                return cancellation(prompts);
+            }
+            if (selectedTools.length > 0) {
+                break;
+            }
+            prompts.note('At least one capture tool must remain enabled.', 'Capture unchanged');
+        }
+        const selected = new Set(selectedTools);
+        for (const tool of detectedTools.filter((tool) => selected.has(tool))) {
+            setSetting(CAPTURE_SETTING_FOR_TOOL[tool], 'true', options.configPath);
+        }
+        for (const tool of detectedTools.filter((tool) => !selected.has(tool))) {
+            setSetting(CAPTURE_SETTING_FOR_TOOL[tool], 'false', options.configPath);
+        }
+    }
     const scan = prompts.spinner();
     scan.start('Scanning local sessions…');
     const discovery = await (options.discover ?? discoverSessionProjects)();
