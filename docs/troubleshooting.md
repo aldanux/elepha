@@ -16,10 +16,10 @@ controls in [Controlling capture](capture.md) when you want to change that state
 
 ## Deep health check and repair
 
-`elepha doctor` checks the daemon, SessionStart and UserPromptSubmit hooks, MCP
-registrations, database and migrations, consent roots, managed launcher, and any
-interrupted installation state. It exits successfully only when every required check
-passes.
+`elepha doctor` checks the daemon, SessionStart and UserPromptSubmit hooks, Claude Code,
+Codex, and OpenCode MCP registrations where those tools are detected, database and
+migrations, consent roots, managed launcher, and any interrupted installation state. It
+exits successfully only when every required check passes.
 
 When the managed daemon is down, doctor stops any stale service state, restarts it, and
 waits for a healthy heartbeat. It does not rewrite missing or invalid installation

@@ -55,6 +55,17 @@ export function opencodeDbPath(): string {
     return path.join(opencodeStoreRoot(), 'opencode.db');
 }
 
+// OpenCode keeps configuration under XDG_CONFIG_HOME, separately from its XDG data store.
+export function opencodeConfigDir(): string {
+    const xdgConfigHome = process.env.XDG_CONFIG_HOME?.trim();
+    const configHome = xdgConfigHome ? path.resolve(xdgConfigHome) : path.join(homedir(), '.config');
+    return path.join(configHome, 'opencode');
+}
+
+export function opencodeConfigPath(): string {
+    return path.join(opencodeConfigDir(), 'opencode.json');
+}
+
 export function claudeProjectsRoot(): string {
     return path.join(claudeConfigDir(), 'projects');
 }

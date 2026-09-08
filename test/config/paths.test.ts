@@ -10,6 +10,8 @@ import {
     isRefusedProjectRoot,
     isWithin,
     isWithinProviderStore,
+    opencodeConfigDir,
+    opencodeConfigPath,
     opencodeDbPath,
     opencodeStoreRoot,
     providerStoreRoot,
@@ -127,5 +129,21 @@ describe('provider transcript stores', () => {
 
         expect(opencodeStoreRoot()).toBe('/Users/test/.xdg-data/opencode');
         expect(opencodeDbPath()).toBe('/Users/test/.xdg-data/opencode/opencode.db');
+    });
+
+    it('honors XDG_CONFIG_HOME for OpenCode config without reusing its data root', () => {
+        process.env.XDG_CONFIG_HOME = '/Users/test/.xdg-config';
+        process.env.XDG_DATA_HOME = '/Users/test/.xdg-data';
+
+        expect(opencodeConfigDir()).toBe('/Users/test/.xdg-config/opencode');
+        expect(opencodeConfigPath()).toBe('/Users/test/.xdg-config/opencode/opencode.json');
+        expect(opencodeConfigPath()).not.toContain('/Users/test/.xdg-data');
+    });
+
+    it('defaults OpenCode config to the user XDG config directory', () => {
+        delete process.env.XDG_CONFIG_HOME;
+
+        expect(opencodeConfigDir()).toBe(path.join(homedir(), '.config', 'opencode'));
+        expect(opencodeConfigPath()).toBe(path.join(homedir(), '.config', 'opencode', 'opencode.json'));
     });
 });

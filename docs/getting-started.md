@@ -49,8 +49,9 @@ installer registers them.
 
 OpenCode capture does not depend on a chat hook. The background service passively reads
 OpenCode's local session database, with capture on by default and every project still
-protected by the consent choices in `elepha init` or `elepha consent`. OpenCode memory is
-available to a connected client through elepha's MCP server. In-chat `elepha:` command
+protected by the consent choices in `elepha init` or `elepha consent`. When OpenCode is
+detected, `elepha install` registers the local elepha MCP server in its global `opencode.json`,
+making recall available through MCP tools. In-chat `elepha:` command
 interception is not currently claimed for OpenCode.
 
 ## Verify the installation
