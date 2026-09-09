@@ -47,15 +47,9 @@ ask for approval again if an update changes a hook.
 Claude Code does not require this extra step; its hooks become active as soon as the
 installer registers them.
 
-OpenCode capture does not depend on a chat hook. The background service passively reads
-OpenCode's local session database, with capture on by default and every project still
-protected by the consent choices in `elepha init` or `elepha consent`. When OpenCode is
-detected, `elepha install` registers the local elepha MCP server in its global `opencode.json`,
-making recall available through MCP tools. It also installs the elepha plugin at
-`~/.config/opencode/plugins/elepha.js` (or `$XDG_CONFIG_HOME/opencode/plugins/elepha.js`).
-The plugin enables `elepha:list`, `elepha:resume`, `elepha:query`, `elepha:last`,
-`elepha:info`, `elepha:help`, and `elepha:update` in chat, matching Claude Code and Codex.
-Restart OpenCode after installation to load the plugin.
+OpenCode uses a plugin rather than a chat hook. When OpenCode is detected, `elepha install`
+registers elepha's MCP server and installs the elepha plugin; restart OpenCode afterwards to
+load it. Capture is on by default and consent-gated, the same as the other tools.
 
 ## Verify the installation
 

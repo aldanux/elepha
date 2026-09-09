@@ -205,8 +205,14 @@ describe('D40 UserPromptSubmit command hook', () => {
             count: ELEPHA_LIST_DEFAULT_LIMIT,
             tool: 'claude-code',
         });
+        expect(parseUserPromptCommand('elepha:list:opencode')).toEqual({
+            kind: 'list',
+            count: ELEPHA_LIST_DEFAULT_LIMIT,
+            tool: 'opencode',
+        });
         expect(parseUserPromptCommand('elepha:list:7:codex')).toEqual({ kind: 'list', count: 7, tool: 'codex' });
         expect(parseUserPromptCommand('elepha:list:7:claude')).toEqual({ kind: 'list', count: 7, tool: 'claude-code' });
+        expect(parseUserPromptCommand('elepha:list:7:opencode')).toEqual({ kind: 'list', count: 7, tool: 'opencode' });
         expect(parseUserPromptCommand('elepha:resume:1')).toEqual({ kind: 'resume', index: 1 });
         expect(parseUserPromptCommand('elepha:update')).toEqual({ kind: 'action', command: 'self-update' });
         for (const input of [
