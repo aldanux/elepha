@@ -51,8 +51,9 @@ Codex desktop, and OpenCode. All supported tools use the same local memory datab
 
 OpenCode capture is passive, automatic, on by default, and consent-gated per project.
 `elepha install` automatically registers elepha's MCP server in OpenCode, so its model can
-recall past work through the same read-only MCP tools. In-chat `elepha:` command
-interception is supported in Claude Code and Codex; it is not currently claimed for OpenCode.
+recall past work through the same read-only MCP tools. It also installs the elepha plugin at
+`~/.config/opencode/plugins/elepha.js` (or `$XDG_CONFIG_HOME/opencode/plugins/elepha.js`)
+for in-chat `elepha:` commands, reaching parity with Claude Code and Codex.
 
 It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 

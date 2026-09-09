@@ -166,10 +166,15 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
                 ? '✓ MCP: Claude, Codex, and OpenCode registered where detected'
                 : '✗ MCP: Claude, Codex, and OpenCode must be registered where detected',
         );
+        lines.push(
+            !present.opencode
+                ? '⚠ OpenCode plugin: OpenCode not detected'
+                : `${status.opencodePlugin === 'installed' ? '✓' : '✗'} OpenCode plugin: ${status.opencodePlugin}`,
+        );
         const needsInstall =
             (present.claude && (!claudeReady || status.claudeMcp !== 'registered')) ||
             (present.codex && ((!codexReady && !hasCodexApprovalIssue(status)) || status.codexMcp !== 'registered')) ||
-            (present.opencode && status.opencodeMcp !== 'registered');
+            (present.opencode && (status.opencodeMcp !== 'registered' || status.opencodePlugin !== 'installed'));
         if (needsInstall) {
             addNextStep(nextSteps, terminalHandoff('install'));
         }
@@ -216,7 +221,8 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
             (integrations.status.codexHook === 'active' &&
                 integrations.status.codexUserPromptSubmitHook === 'active' &&
                 integrations.status.codexMcp === 'registered')) &&
-        (!integrations.present.opencode || integrations.status.opencodeMcp === 'registered');
+        (!integrations.present.opencode ||
+            (integrations.status.opencodeMcp === 'registered' && integrations.status.opencodePlugin === 'installed'));
     const healthy = daemonOk && approvedRoots !== undefined && approvedRoots > 0 && integrationsOk && launcherOk && installRecoveryOk;
     if (nextSteps.length > 0) {
         lines.push('Next steps:');

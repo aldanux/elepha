@@ -7,6 +7,7 @@ import {
     daemonHeartbeatPath,
     elephaLauncherPath,
     opencodeConfigPath,
+    opencodePluginPath,
     opencodeStoreRoot,
 } from '../config/paths.js';
 import { HEARTBEAT_STALE_MS, type Heartbeat, isPidAlive, readHeartbeat } from '../daemon/heartbeat.js';
@@ -15,6 +16,7 @@ import { readJson } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
 import { launcherHash } from './launcher.js';
 import { LAUNCHER_MARKER } from './markers.js';
+import { readOpencodePlugin } from './opencode-plugin.js';
 import { detectPresentTools, type PresentTools, type ToolConfigPaths } from './present-tools.js';
 import { type ServiceBackend, serviceBackend } from './service-backend.js';
 import { type InstallStatus, installationStatus } from './status.js';
@@ -98,6 +100,7 @@ export function integrationHealth(
             text(paths.opencodeConfig, ''),
             bin,
             present,
+            readOpencodePlugin(opencodePluginPath(paths.opencodeConfig)),
         ),
     };
 }

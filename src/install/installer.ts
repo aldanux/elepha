@@ -2,7 +2,15 @@ import { existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { parse } from 'smol-toml';
 import { MINIMUM_NODE_VERSION, PRIVATE_FILE_MODE } from '../config/constants.js';
-import { claudeMcpPath, claudeSettingsPath, codexConfigPath, elephaHome, opencodeConfigPath, opencodeStoreRoot } from '../config/paths.js';
+import {
+    claudeMcpPath,
+    claudeSettingsPath,
+    codexConfigPath,
+    elephaHome,
+    opencodeConfigPath,
+    opencodePluginPath,
+    opencodeStoreRoot,
+} from '../config/paths.js';
 import { transformClaudeHook, transformCodexHook } from '../hooks/installer.js';
 import { transformClaudeMcp, transformCodexMcp, transformOpencodeMcp } from '../mcp/installer.js';
 import { SUPPORTED_TOOLS, TOOL_METADATA } from '../types/index.js';
@@ -17,6 +25,7 @@ import {
     restoreInstallSnapshot,
 } from './config-file.js';
 import { detectLauncherBackend, renderLauncher } from './launcher.js';
+import { ownsOpencodePlugin, readOpencodePlugin, transformOpencodePlugin } from './opencode-plugin.js';
 import { isSupportedPlatform, isWsl, linuxServiceManagerError } from './platform.js';
 import { detectPresentTools, type ToolConfigPaths } from './present-tools.js';
 import { reconcileCaptureService, type ServiceBackend, type ServiceStatus, serviceBackend } from './service-backend.js';
@@ -291,6 +300,7 @@ export function installElepha(
         claudeMcp: text(inputPaths.claudeMcp),
         codex: text(inputPaths.codexConfig),
         opencode: text(inputPaths.opencodeConfig),
+        opencodePlugin: readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
     };
     const preparingPhase = 'Preparing hooks & MCP';
     runtime.onPhase?.(preparingPhase, 'start');
@@ -333,6 +343,16 @@ export function installElepha(
                           file: inputPaths.opencodeConfig,
                           text: transformOpencodeMcp(before.opencode, launcher),
                           validate: validateJson('OpenCode opencode.json'),
+                      },
+                      {
+                          kind: 'write' as const,
+                          file: opencodePluginPath(inputPaths.opencodeConfig),
+                          text: transformOpencodePlugin(before.opencodePlugin, launcher),
+                          validate: (value: string) => {
+                              if (value !== transformOpencodePlugin(value, launcher)) {
+                                  throw new Error('OpenCode plugin failed read-back verification');
+                              }
+                          },
                       },
                   ]
                 : []),
@@ -420,6 +440,7 @@ export function installElepha(
         text(inputPaths.opencodeConfig),
         launcher,
         present,
+        readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
     );
     return { bin: resolved.bin, launcher: service?.launcherPath, changed, status: after, service: serviceState };
 }
@@ -449,6 +470,7 @@ export function uninstallElepha(
         claudeMcp: text(inputPaths.claudeMcp),
         codex: text(inputPaths.codexConfig),
         opencode: text(inputPaths.opencodeConfig),
+        opencodePlugin: readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
     };
     const snapshots = installSnapshotsDirectory(runtime);
     const uninstallConfigs = [
@@ -489,6 +511,9 @@ export function uninstallElepha(
         const restored = restore?.kind === 'text' ? restore.text : current;
         return [{ kind: 'write' as const, file, text: remove(restored), validate }];
     });
+    if (ownsOpencodePlugin(before.opencodePlugin)) {
+        changes.push({ kind: 'delete', file: opencodePluginPath(inputPaths.opencodeConfig) });
+    }
     if (service) {
         writeRollbackJournal(service.transactionPath, {
             version: 1,
@@ -518,6 +543,7 @@ export function uninstallElepha(
         text(inputPaths.opencodeConfig),
         launcher,
         detectPresentTools(inputPaths),
+        readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
     );
     return { bin: resolved.bin, launcher: service?.launcherPath, changed, status: after, service: service ? 'not installed' : undefined };
 }

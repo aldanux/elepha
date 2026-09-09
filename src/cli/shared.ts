@@ -43,6 +43,7 @@ export function printInstallation(result: ReturnType<typeof installElepha>, acti
     console.log(`Codex UserPromptSubmit hook: ${result.status.codexUserPromptSubmitHook}`);
     console.log(`Codex MCP: ${result.status.codexMcp}`);
     console.log(`OpenCode MCP: ${result.status.opencodeMcp}`);
+    console.log(`OpenCode plugin: ${result.status.opencodePlugin}`);
     if (
         action === 'install' &&
         (result.status.codexHook !== 'not present' || result.status.codexUserPromptSubmitHook !== 'not present') &&

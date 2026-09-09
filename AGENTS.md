@@ -43,7 +43,11 @@ subprocesses live in `src/security/subprocess-allowlist.ts`: a fixed set of read
 `git` subcommands, the platform service manager (`launchctl` / `systemctl --user`) with
 fixed lifecycle verbs, the resolved npm backend with fixed package-management argv
 for self-update, and fixed read-only macOS `/bin/ps` and `/usr/sbin/lsof` probes for
-installer-owned legacy MCP retirement. Those probes accept only a configured database
+installer-owned legacy MCP retirement, and the generated OpenCode plugin client invoking
+only the installed elepha launcher with `hook user-prompt-submit --tool opencode`
+and a JSON payload on stdin. The plugin client is rendered by the allowlist module;
+its fixed argv, `shell: false`, and stdin boundary are enforced by
+`test/install/opencode-plugin.test.ts`. Those probes accept only a configured database
 path or a validated OS process ID; Linux uses `/proc` without subprocesses. Every
 subprocess uses an argv array with `shell: false`. **No
 argument — including `cwd` — may derive from transcript content or a transcript path;**

@@ -49,6 +49,7 @@ export function registerStatus(program: Command): void {
                 console.log(`Claude MCP: ${install.claudeMcp}`);
                 console.log(`Codex MCP: ${install.codexMcp}`);
                 console.log(`OpenCode MCP: ${install.opencodeMcp}`);
+                console.log(`OpenCode plugin: ${install.opencodePlugin}`);
                 console.log(`install: ${install.ready ? 'ready' : 'action required'}`);
                 process.exitCode = healthy && synthesis.healthy && install.ready ? 0 : 1;
             } catch (error) {

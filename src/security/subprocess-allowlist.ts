@@ -17,14 +17,40 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
+    INSTALLED_HOOK_TIMEOUT_SECONDS,
     LEGACY_MCP_INSPECTION_MAX_BYTES,
     LEGACY_MCP_INSPECTION_TIMEOUT_MS,
     NPM_INSTALL_TIMEOUT_MS,
     NPM_REGISTRY_LOOKUP_TIMEOUT_MS,
+    OPENCODE_PLUGIN_OUTPUT_MAX_BYTES,
     SYSTEMD_SERVICE_NAME,
 } from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
 import type { LauncherBackend } from '../install/launcher.js';
+
+export const OPENCODE_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'opencode'] as const;
+
+// This client runs inside OpenCode. Only the trusted installed launcher is
+// baked into its code; project directory, session ID, and prompt stay on stdin.
+export function renderOpencodeHookClient(launcher: string): string {
+    if (!path.isAbsolute(launcher)) {
+        throw new Error('OpenCode plugin launcher must be an absolute path');
+    }
+    return `import { execFileSync } from 'node:child_process';
+const launcher = ${JSON.stringify(launcher)};
+function runHook(payload) {
+    return execFileSync(launcher, ${JSON.stringify(OPENCODE_HOOK_ARGS)}, {
+        shell: false,
+        input: JSON.stringify(payload),
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
+        killSignal: 'SIGKILL',
+        maxBuffer: ${OPENCODE_PLUGIN_OUTPUT_MAX_BYTES},
+    });
+}
+`;
+}
 
 // A consent-checked project directory can still contain hostile .git/config
 // values. Git's config precedence is

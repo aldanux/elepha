@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { detectPresentTools } from '../../src/install/present-tools.js';
 import { installationStatus } from '../../src/install/status.js';
 import { ELEPHA_MCP_ARGS, ELEPHA_MCP_SERVER_NAME } from '../../src/mcp/installer.js';
@@ -33,7 +34,7 @@ describe('OpenCode installation status', () => {
         }
     });
 
-    it('requires a registered MCP only for a detected OpenCode installation', () => {
+    it('requires a registered MCP alongside the plugin only for a detected OpenCode installation', () => {
         const present = { claude: false, codex: false, opencode: true };
         const registeredConfig = JSON.stringify({
             mcp: {
@@ -41,7 +42,7 @@ describe('OpenCode installation status', () => {
             },
         });
 
-        const registered = installationStatus('', '', '', '/config.toml', registeredConfig, bin, present);
+        const registered = installationStatus('', '', '', '/config.toml', registeredConfig, bin, present, renderOpencodePlugin(bin));
         const missing = installationStatus('', '', '', '/config.toml', '{}', bin, present);
 
         expect(registered.opencodeMcp).toBe('registered');
