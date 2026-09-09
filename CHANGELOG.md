@@ -1,5 +1,20 @@
 # elepha
 
+## 0.6.0
+
+### Highlights
+
+- OpenCode is now supported
+
+### Changes
+
+- Register elepha's MCP server automatically in OpenCode so its model can recall local project memory by [@aldanux](https://github.com/aldanux) in [#89](https://github.com/aldanux/elepha/pull/89)
+- Add passive, consent-gated OpenCode session capture and recall through elepha's MCP server by [@aldanux](https://github.com/aldanux) in [#87](https://github.com/aldanux/elepha/pull/87)
+- OpenCode now has full parity with Claude Code and Codex: passive capture, recall via MCP, and in-chat `elepha:` commands through the automatically installed elepha plugin by [@aldanux](https://github.com/aldanux) in [#91](https://github.com/aldanux/elepha/pull/91)
+
+- Show real OpenCode session titles instead of create-time placeholders, including titles generated after initial ingestion by [@aldanux](https://github.com/aldanux) in [#88](https://github.com/aldanux/elepha/pull/88)
+- Add `opencode` to the `elepha:list` tool filter, so `elepha:list:opencode` and `elepha:list:<n>:opencode` list only OpenCode sessions, matching the codex and claude filters by [@aldanux](https://github.com/aldanux) in [#92](https://github.com/aldanux/elepha/pull/92)
+
 ## 0.5.0
 
 ### Highlights
