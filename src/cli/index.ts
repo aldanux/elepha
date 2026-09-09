@@ -31,6 +31,7 @@ import { registerSelfUpdate } from './commands/self-update.js';
 import { registerStart } from './commands/start.js';
 import { registerStats } from './commands/stats.js';
 import { registerStatus } from './commands/status.js';
+import { registerStop } from './commands/stop.js';
 import { registerUninstall } from './commands/uninstall.js';
 
 // Before anything reads process.env. Fixed locations only, never cwd - see
@@ -68,6 +69,7 @@ registerInspect(program);
 registerProjects(program);
 registerConsent(program);
 registerDaemonControl(program);
+registerStop(program);
 
 registerStatus(program);
 registerDoctor(program);

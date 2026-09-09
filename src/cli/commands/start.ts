@@ -39,6 +39,7 @@ export function registerStart(program: Command, runtime: StartCommandRuntime = d
             const db = await openDb();
             const store = new MemoryStore(db);
             if (store.consent.list('approved').length === 0) {
+                db.close();
                 console.log('capture is awaiting consent; run `elepha init` to choose projects, nothing to do, exiting.');
                 return;
             }
@@ -68,7 +69,12 @@ export function registerStart(program: Command, runtime: StartCommandRuntime = d
                 // No diagnostic record is the normal case.
             }
             const shutdown = () => {
-                void daemon.stop().then(() => process.exit(0));
+                void daemon.stop().then(() => {
+                    // Native process exit cannot release the managed lifecycle
+                    // lease. Close after daemon shutdown so resume sees a clean owner.
+                    db.close();
+                    process.exit(0);
+                });
             };
             process.on('SIGINT', shutdown);
             process.on('SIGTERM', shutdown);
