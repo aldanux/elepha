@@ -1,10 +1,8 @@
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { openUnmanagedDb, SQLITE_SOURCE_WATERMARK_SCHEMA } from '../../src/storage/db.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 describe('sessions table migration', () => {
     it('a fresh :memory: DB has the final schema with no migration needed', () => {
@@ -291,7 +289,7 @@ describe('shown-session-list tool migration', () => {
 
 describe('migration idempotency and reversibility', () => {
     it('adds first_prompt_search to an existing sessions table and leaves historical rows NULL on reopen', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-first-prompt-search-column-'));
+        const dir = withTempDir('elepha-first-prompt-search-column-');
         const dbPath = path.join(dir, 'test.db');
         const prior = openUnmanagedDb(dbPath);
         prior.exec(`
@@ -316,7 +314,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('adds the first-prompt background skip table to an existing database and is a no-op when reopened', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-first-prompt-search-skips-'));
+        const dir = withTempDir('elepha-first-prompt-search-skips-');
         const dbPath = path.join(dir, 'test.db');
         const prior = openUnmanagedDb(dbPath);
         prior.exec('DROP TABLE first_prompt_search_backfill_skips');
@@ -338,7 +336,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('adds the shown-session-list table to an existing database and is a no-op when reopened', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-shown-session-list-table-'));
+        const dir = withTempDir('elepha-shown-session-list-table-');
         const dbPath = path.join(dir, 'test.db');
         const prior = openUnmanagedDb(dbPath);
         prior.exec('DROP TABLE shown_session_lists');
@@ -362,7 +360,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('adds the incognito tombstone table to an existing database and preserves it on reopen', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-incognito-table-'));
+        const dir = withTempDir('elepha-incognito-table-');
         const dbPath = path.join(dir, 'test.db');
         const prior = openUnmanagedDb(dbPath);
         prior.exec('DROP TABLE incognito_transcripts');
@@ -387,7 +385,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('adds git_root_commit to a legacy projects table and is a no-op when reopened', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-project-root-commit-column-'));
+        const dir = withTempDir('elepha-project-root-commit-column-');
         const dbPath = path.join(dir, 'test.db');
         const legacy = new Database(dbPath);
         legacy.exec(`
@@ -419,7 +417,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('adds nudged_at to a legacy consent_roots table and is a no-op when reopened', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-consent-nudge-column-'));
+        const dir = withTempDir('elepha-consent-nudge-column-');
         const dbPath = path.join(dir, 'test.db');
         const legacy = new Database(dbPath);
         legacy.exec(`
@@ -450,7 +448,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('drops the legacy session_rollups substantive column once and is a no-op when reopened', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-rollup-column-'));
+        const dir = withTempDir('elepha-rollup-column-');
         const dbPath = path.join(dir, 'test.db');
 
         const fresh = openUnmanagedDb(dbPath);
@@ -486,7 +484,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('running openUnmanagedDb twice on the same file is a no-op the second time (idempotent)', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-migration-'));
+        const dir = withTempDir('elepha-migration-');
         const dbPath = path.join(dir, 'test.db');
 
         const first = openUnmanagedDb(dbPath);
@@ -513,7 +511,7 @@ describe('migration idempotency and reversibility', () => {
     });
 
     it('the old-shape sessions table (pre-migration) upgrades cleanly and preserves every row', () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-migration-old-'));
+        const dir = withTempDir('elepha-migration-old-');
         const dbPath = path.join(dir, 'test.db');
 
         // Build the OLD shape directly (bypassing openUnmanagedDb, which always writes

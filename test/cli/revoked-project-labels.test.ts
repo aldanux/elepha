@@ -1,5 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { rmSync } from 'node:fs';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
@@ -7,6 +6,7 @@ import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard
 import { type PurgePrompts, runPurgeWizard } from '../../src/cli/purge-wizard.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const CANCELLED = Symbol('cancelled');
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -18,7 +18,7 @@ function ttyStream(): PassThrough {
 }
 
 function projectFixture() {
-    const directory = mkdtempSync(path.join(tmpdir(), 'elepha-project-labels-'));
+    const directory = withTempDir('elepha-project-labels-');
     const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
     const store = new MemoryStore(db);
     const childPath = path.join(repositoryRoot, 'src');

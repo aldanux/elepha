@@ -1,10 +1,10 @@
-import { appendFileSync, createReadStream, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, createReadStream, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const CUSTOM_TITLE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.229-custom-title.jsonl');
 const FRAME_LINK = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.232-frame-link.jsonl');
@@ -74,7 +74,7 @@ describe('recognized transcript decoration and metadata line types', () => {
     });
 
     it('reads complete custom-title lines incrementally and leaves a partial append for the next scan', async () => {
-        const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-custom-title-')), 'session.jsonl');
+        const filePath = path.join(withTempDir('elepha-custom-title-'), 'session.jsonl');
         const adapter = new ClaudeCodeAdapter();
         writeFileSync(filePath, `${JSON.stringify({ type: 'user' })}\n`);
 
@@ -105,7 +105,7 @@ describe('recognized transcript decoration and metadata line types', () => {
     });
 
     it('keeps customTitle and scannedTo byte-identical to the previous reader from zero and a resumed offset', async () => {
-        const filePath = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-custom-title-offset-')), 'session.jsonl');
+        const filePath = path.join(withTempDir('elepha-custom-title-offset-'), 'session.jsonl');
         const firstLine = `${JSON.stringify({ type: 'user', message: { content: 'Multibyte é🙂' } })}\n`;
         writeFileSync(
             filePath,

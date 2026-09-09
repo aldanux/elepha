@@ -1,5 +1,3 @@
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
@@ -7,6 +5,7 @@ import type { RollupService } from '../../src/daemon/rollup-service.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter, SessionClassification } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 describe('daemon log routing', () => {
     let daemon: IngestionDaemon | undefined;
@@ -16,7 +15,7 @@ describe('daemon log routing', () => {
     });
 
     it('routes failures to logError, keeps lifecycle and captures on log, and attributes session-scoped lines', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-log-routing-'));
+        const root = withTempDir('elepha-daemon-log-routing-');
         const sourcePath = path.join(root, 'native-session.jsonl');
         const logs: string[] = [];
         const errors: string[] = [];

@@ -1,10 +1,10 @@
-import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { titleForSegment } from '../../src/storage/session-title.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'sample-session.jsonl');
 
@@ -76,7 +76,7 @@ describe('ClaudeCodeAdapter.classifySession', () => {
 
 describe('ClaudeCodeAdapter.parseTurns against fixture', () => {
     it('attaches a standalone ai-title to its active turn without treating it as turn content or an unknown line', async () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-ai-title-'));
+        const dir = withTempDir('elepha-ai-title-');
         const file = path.join(dir, 'session.jsonl');
         const line = (value: Record<string, unknown>) =>
             JSON.stringify({ cwd: '/Users/test/demo-project', sessionId: 'ai-title-sample', ...value });
@@ -104,7 +104,7 @@ describe('ClaudeCodeAdapter.parseTurns against fixture', () => {
     });
 
     it('uses the truncated first prompt as the session-title fallback when the transcript has no ai-title', async () => {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-title-fallback-'));
+        const dir = withTempDir('elepha-title-fallback-');
         const file = path.join(dir, 'session.jsonl');
         const prompt = 'Implement the session title fallback so ticket-driven Claude sessions remain legible in the session list.';
         const line = (value: Record<string, unknown>) =>
@@ -196,7 +196,7 @@ describe('ClaudeCodeAdapter turn-boundary timing', () => {
     }
 
     function tmpFile(): string {
-        const dir = mkdtempSync(path.join(tmpdir(), 'elepha-cc-'));
+        const dir = withTempDir('elepha-cc-');
         const file = path.join(dir, 'session.jsonl');
         writeFileSync(file, '');
         return file;

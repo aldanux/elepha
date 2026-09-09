@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HOOK_LOG_MAX_BYTES } from '../../src/config/constants.js';
 import { appendHookLog } from '../../src/hooks/hook-log.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 describe('appendHookLog', () => {
     const priorHookLogPath = process.env.ELEPHA_HOOK_LOG_PATH;
@@ -17,7 +17,7 @@ describe('appendHookLog', () => {
     });
 
     it('drops the oldest content past the byte ceiling while retaining the newest content', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-hook-log-growth-'));
+        const directory = withTempDir('elepha-hook-log-growth-');
         const logPath = path.join(directory, 'hook.log');
         process.env.ELEPHA_HOOK_LOG_PATH = logPath;
         const fillerLine = 'x'.repeat(510);
@@ -34,7 +34,7 @@ describe('appendHookLog', () => {
     });
 
     it('keeps the appended line when rotation fails', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-hook-log-rotation-failure-'));
+        const directory = withTempDir('elepha-hook-log-rotation-failure-');
         const logPath = path.join(directory, 'hook.log');
         process.env.ELEPHA_HOOK_LOG_PATH = logPath;
         writeFileSync(logPath, `${'x'.repeat(HOOK_LOG_MAX_BYTES)}\n`);

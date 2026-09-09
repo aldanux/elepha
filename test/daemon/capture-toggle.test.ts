@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function claudeTranscript(cwd: string, sessionId: string): string {
     return `${JSON.stringify({
@@ -68,7 +68,7 @@ describe('per-tool capture toggle', () => {
     });
 
     it('skips Codex-store files while continuing to ingest Claude Code when Codex capture is disabled', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-capture-toggle-'));
+        const root = withTempDir('elepha-capture-toggle-');
         const claudeRoot = path.join(root, '.claude', 'projects');
         const codexRoot = path.join(root, '.codex', 'sessions');
         const claudeProject = '/Users/test/capture-toggle-claude';

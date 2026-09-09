@@ -1,11 +1,11 @@
-import { appendFileSync, mkdtempSync, readFileSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, readFileSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { EmptySessionAnalysis, ParsedTurn, SessionAdapter, SessionClassification } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 class TitleAdapter implements SessionAdapter {
     readonly tool = 'claude-code' as const;
@@ -63,7 +63,7 @@ type CustomTitleSeam = {
 };
 
 function setup(): { adapter: TitleAdapter; daemon: CustomTitleSeam; filePath: string } {
-    const directory = mkdtempSync(path.join(tmpdir(), 'elepha-custom-title-cache-'));
+    const directory = withTempDir('elepha-custom-title-cache-');
     const filePath = path.join(directory, 'session.jsonl');
     const adapter = new TitleAdapter();
     const daemon = new IngestionDaemon({

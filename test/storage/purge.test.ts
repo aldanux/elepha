@@ -3,8 +3,7 @@
 // all), the emptied-project cleanup, and that a partial purge leaves a
 // project row alone when it still has sessions outside the purged scope.
 
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
@@ -13,6 +12,7 @@ import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type PurgeScope } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 function makeTurn(overrides: Partial<ParsedTurn> = {}): ParsedTurn {
     return {
@@ -250,7 +250,7 @@ describe('purge', () => {
     });
 
     it('applies empty resolved scopes as strict no-ops without backup or delete side effects', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-empty-purge-'));
+        const directory = withTempDir('elepha-empty-purge-');
         const dbPath = path.join(directory, 'elepha.db');
         const previousDbPath = process.env.ELEPHA_DB_PATH;
         process.env.ELEPHA_DB_PATH = dbPath;
@@ -330,7 +330,7 @@ describe('purge', () => {
     });
 
     it('plans a project-root purge through a symlink against the stored physical path', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-symlink-'));
+        const directory = withGrantableTestDir('elepha-purge-symlink-');
         const physicalRoot = path.join(directory, 'repo');
         const aliasRoot = path.join(directory, 'link');
         const projectPath = path.join(physicalRoot, 'packages', 'app');
@@ -348,7 +348,7 @@ describe('purge', () => {
     });
 
     it('uses lexical project-root containment when paths do not exist', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-missing-'));
+        const directory = withTempDir('elepha-purge-missing-');
         const root = path.join(directory, 'missing-root');
         const child = store.upsertProject(path.join(root, 'packages', 'app'));
         const outside = store.upsertProject(path.join(directory, 'other'));

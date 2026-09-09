@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CAPTURE_PAUSE_DEADLINE_MS, DAEMON_HEALTH_CHECK_POLL_MS } from '../../src/config/constants.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
 import type { openUnmanagedDb } from '../../src/storage/db.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const { backupDatabaseAndReport, daemonHealth, defaultDbPath, serviceBackend } = vi.hoisted(() => ({
     backupDatabaseAndReport: vi.fn(),
@@ -64,7 +64,7 @@ describe('prepareDestructiveApply daemon liveness gate', () => {
     let log: ReturnType<typeof vi.spyOn>;
 
     beforeEach(() => {
-        root = mkdtempSync(path.join(tmpdir(), 'elepha-destructive-apply-'));
+        root = withTempDir('elepha-destructive-apply-');
         const dbPath = path.join(root, 'elepha.db');
         defaultDbPath.mockReturnValue(dbPath);
         writeFileSync(dbPath, 'database');

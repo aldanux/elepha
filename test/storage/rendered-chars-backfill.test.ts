@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -7,6 +6,7 @@ import { CodexAdapter } from '../../src/adapters/codex.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { applyRenderedCharsBackfill, planRenderedCharsBackfill } from '../../src/storage/rendered-chars-backfill.js';
 import type { SessionAdapterMap } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const FIXTURE =
     '{"type":"user","uuid":"u1","timestamp":"2026-08-01T10:00:02.000Z","entrypoint":"cli","cwd":"/tmp/proj","sessionId":"sess-1","message":{"role":"user","content":"hello"}}\n' +
@@ -18,7 +18,7 @@ describe('rendered-chars backfill', () => {
     const adapters: SessionAdapterMap = { 'claude-code': new ClaudeCodeAdapter(), codex: new CodexAdapter() };
 
     beforeEach(() => {
-        dir = mkdtempSync(path.join(tmpdir(), 'elepha-rendered-chars-'));
+        dir = withTempDir('elepha-rendered-chars-');
         const claudeConfigDir = path.join(dir, 'claude-home');
         const providerRoot = path.join(claudeConfigDir, 'projects');
         mkdirSync(providerRoot, { recursive: true });

@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -9,6 +8,7 @@ import { wrap } from '../../src/security/sentinel.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter, SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 class CountingSummarizer implements SummarizationProvider {
     calls: SummarizationInput[] = [];
@@ -90,7 +90,7 @@ describe('Rule 4 self-ingestion guard', () => {
         ['claude-code', ClaudeCodeAdapter, claudeTranscript],
         ['codex', CodexAdapter, codexTranscript],
     ] as const)('drops sentinel content for %s, logs once, and advances its cursor', async (_tool, Adapter, transcript) => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-rule4-'));
+        const root = withTempDir('elepha-rule4-');
         previousClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
         previousCodexHome = process.env.CODEX_HOME;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
@@ -121,7 +121,7 @@ describe('Rule 4 self-ingestion guard', () => {
     });
 
     it('does not resurrect a sentinel-dropped transcript tombstoned after the early scan gate', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-rule4-tombstone-'));
+        const root = withTempDir('elepha-rule4-tombstone-');
         previousClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
         const watchRoot = path.join(root, '.claude', 'projects');
@@ -151,7 +151,7 @@ describe('Rule 4 self-ingestion guard', () => {
     });
 
     it('drops a forged sentinel while normal prose mentioning elepha persists', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-rule4-'));
+        const root = withTempDir('elepha-rule4-');
         previousClaudeConfig = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
         const watchRoot = path.join(root, '.claude', 'projects');
@@ -174,7 +174,7 @@ describe('Rule 4 self-ingestion guard', () => {
     });
 
     it('does not ingest Codex developer-channel additionalContext', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-rule4-'));
+        const root = withTempDir('elepha-rule4-');
         previousCodexHome = process.env.CODEX_HOME;
         process.env.CODEX_HOME = path.join(root, '.codex');
         const watchRoot = path.join(root, '.codex', 'sessions');

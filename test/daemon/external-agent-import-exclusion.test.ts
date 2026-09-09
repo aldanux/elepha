@@ -1,11 +1,11 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const FIXTURE = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -40,7 +40,7 @@ describe('external-agent import exclusion', () => {
     });
 
     it('reports a real imported rollout in the startup summary and creates no store rows', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-external-import-'));
+        const root = withTempDir('elepha-external-import-');
         previousCodexHome = process.env.CODEX_HOME;
         process.env.CODEX_HOME = path.join(root, '.codex');
 

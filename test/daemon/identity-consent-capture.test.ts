@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
@@ -7,7 +6,7 @@ import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 class IdentityAdapter implements SessionAdapter {
     readonly tool = 'claude-code' as const;
@@ -48,7 +47,7 @@ type ScanFileSeam = {
 };
 
 function transcriptFor(cwd: string): { transcript: string; watchRoot: string } {
-    const directory = mkdtempSync(path.join(tmpdir(), 'elepha-identity-consent-'));
+    const directory = withTempDir('elepha-identity-consent-');
     const claudeConfigDir = path.join(directory, '.claude');
     vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
     const transcripts = path.join(claudeConfigDir, 'projects');
@@ -110,7 +109,7 @@ describe('capture consent', () => {
     it('keeps an identity-matching checkout pending before parsing, without consulting git, and emits the pending nudge', async () => {
         const approved = projectRoot('approved');
         const moved = projectRoot('moved');
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-identity-consent-db-'));
+        const directory = withTempDir('elepha-identity-consent-db-');
         const dbPath = path.join(directory, 'elepha.db');
         const remote = 'git@example.test:team/repo.git';
         const commit = '1111111111111111111111111111111111111111';
@@ -162,7 +161,7 @@ describe('capture consent', () => {
 
     it('captures a checkout within an approved root', async () => {
         const approved = projectRoot('approved');
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-identity-consent-db-'));
+        const directory = withTempDir('elepha-identity-consent-db-');
         const { store } = identityStore(path.join(directory, 'elepha.db'), { [approved]: approved }, {}, {});
         store.consent.grant(approved);
         const adapter = new IdentityAdapter(approved);
@@ -179,7 +178,7 @@ describe('capture consent', () => {
         const approved = projectRoot('approved');
         const denied = projectRoot('denied');
         const remote = 'git@example.test:team/repo.git';
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-identity-consent-db-'));
+        const directory = withTempDir('elepha-identity-consent-db-');
         const { store } = identityStore(
             path.join(directory, 'elepha.db'),
             { [approved]: approved, [denied]: denied },

@@ -1,5 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, SYSTEMD_SERVICE_NAME } from '../../src/config/constants.js';
@@ -13,6 +12,7 @@ import {
     SystemdBackend,
     systemdArtifactsMatch,
 } from '../../src/install/systemd-backend.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const savedEnvironment = { ...process.env };
 const propagatedEnvironmentKeys = [
@@ -92,7 +92,7 @@ describe('systemd service ownership', () => {
     });
 
     it('renders a deterministic, hash-stable user unit around the shared launcher', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+        const home = withTempDir('elepha-systemd-');
         const paths = defaultSystemdServicePaths(home, {});
         const environment = {
             ELEPHA_HOME: path.join(home, 'isolated-elepha'),
@@ -115,7 +115,7 @@ describe('systemd service ownership', () => {
     });
 
     it('writes matching private artifacts, reloads systemd, and detects launcher or unit drift', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+        const home = withTempDir('elepha-systemd-');
         const paths = defaultSystemdServicePaths(home, {});
         const executor = new FakeSystemctl();
         const service = new SystemdBackend(paths, executor);
@@ -139,7 +139,7 @@ describe('systemd service ownership', () => {
     });
 
     it('runs install and uninstall lifecycle verbs in order, including both daemon reloads', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+        const home = withTempDir('elepha-systemd-');
         const paths = defaultSystemdServicePaths(home, {});
         const executor = new FakeSystemctl();
         const service = new SystemdBackend(paths, executor);
@@ -159,7 +159,7 @@ describe('systemd service ownership', () => {
     });
 
     it('maps every control method to its fixed systemctl user-service invocation', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+        const home = withTempDir('elepha-systemd-');
         const executor = new FakeSystemctl();
         const service = new SystemdBackend(defaultSystemdServicePaths(home, {}), executor);
 
@@ -186,7 +186,7 @@ describe('systemd service ownership', () => {
         ] as const;
 
         for (const testCase of cases) {
-            const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+            const home = withTempDir('elepha-systemd-');
             const paths = defaultSystemdServicePaths(home, {});
             const executor = new ScriptedSystemctl([{ stdout: '', stderr: 'Unit elepha.service not loaded.', status: 5 }, testCase.probe]);
             const service = new SystemdBackend(paths, executor);
@@ -215,7 +215,7 @@ describe('systemd service ownership', () => {
         ] as const;
 
         for (const testCase of cases) {
-            const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+            const home = withTempDir('elepha-systemd-');
             const executor = new ScriptedSystemctl([{ stdout: '', stderr: '', status: 1 }, testCase.probe]);
             const service = new SystemdBackend(defaultSystemdServicePaths(home, {}), executor);
 
@@ -232,7 +232,7 @@ describe('systemd service ownership', () => {
     });
 
     it('maps enabled, disabled, and unknown unit states without treating inactivity as absence', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+        const home = withTempDir('elepha-systemd-');
         const executor = new FakeSystemctl();
         const service = new SystemdBackend(defaultSystemdServicePaths(home, {}), executor);
 
@@ -253,7 +253,7 @@ describe('systemd service ownership', () => {
     });
 
     it('uses the shared heartbeat waiter instead of systemctl status', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-systemd-'));
+        const home = withTempDir('elepha-systemd-');
         const executor = new FakeSystemctl();
         let now = 0;
         const service = new SystemdBackend(defaultSystemdServicePaths(home, {}), executor, {

@@ -1,10 +1,10 @@
-import { copyFileSync, mkdirSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const SOURCE_FIXTURE = path.join(
     __dirname,
@@ -35,7 +35,7 @@ describe('Codex response_item-only cold start', () => {
     });
 
     it('ingests the trimmed real no-event_msg rollout with no existing cursor', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-codex-cold-start-'));
+        const root = withTempDir('elepha-codex-cold-start-');
         const codexHome = path.join(root, '.codex');
         const sessionsRoot = path.join(codexHome, 'sessions');
         const rollout = path.join(sessionsRoot, '2026', '08', '11', path.basename(SOURCE_FIXTURE));

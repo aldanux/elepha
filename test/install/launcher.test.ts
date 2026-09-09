@@ -1,10 +1,10 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { MINIMUM_NODE_VERSION } from '../../src/config/constants.js';
 import { detectLauncherBackend, renderLauncher } from '../../src/install/launcher.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const fsFixture = vi.hoisted(() => ({ preserveDistroExecPath: false }));
 
@@ -29,7 +29,7 @@ function nvmFixture({ defaultAlias = '22', versions = ['v22.2.1'], activeVersion
     packageRoot: string;
     sourceBin: string;
 } {
-    const root = mkdtempSync(path.join(tmpdir(), 'elepha-nvm-'));
+    const root = withTempDir('elepha-nvm-');
     const node = path.join(root, 'versions', 'node', activeVersion, 'bin', 'node');
     const packageRoot = path.join(root, 'global', 'lib', 'node_modules', 'elepha');
     const sourceBin = path.join(root, 'global', 'bin', 'elepha');
@@ -57,7 +57,7 @@ function nvmFixture({ defaultAlias = '22', versions = ['v22.2.1'], activeVersion
 
 describe('stable launcher backend', () => {
     it('resolves fnm from PATH for a Linux-style installation', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-fnm-linux-'));
+        const fixture = withTempDir('elepha-fnm-linux-');
         const root = path.join(fixture, 'fnm-data');
         const node = path.join(root, 'node-versions', 'v22.2.1', 'installation', 'bin', 'node');
         const managerBin = path.join(fixture, 'local', 'bin');
@@ -86,7 +86,7 @@ describe('stable launcher backend', () => {
     });
 
     it('resolves asdf from PATH for a Linux-style installation', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-asdf-linux-'));
+        const fixture = withTempDir('elepha-asdf-linux-');
         const root = path.join(fixture, 'asdf-data');
         const home = path.join(fixture, 'home');
         const node = path.join(root, 'installs', 'nodejs', '22.2.1', 'bin', 'node');
@@ -118,7 +118,7 @@ describe('stable launcher backend', () => {
     });
 
     it('resolves a Linux distro Node path as standalone', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-distro-node-'));
+        const fixture = withTempDir('elepha-distro-node-');
         const packageRoot = path.join(fixture, 'package');
         mkdirSync(packageRoot, { recursive: true });
         writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ engines: { node: `>=${MINIMUM_NODE_VERSION}` } }));
@@ -160,7 +160,7 @@ describe('stable launcher backend', () => {
     });
 
     it('lets a managed service stop cleanly when the package disappears', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-launcher-retirement-'));
+        const fixture = withTempDir('elepha-launcher-retirement-');
         const command = path.join(fixture, 'elepha');
         const launcherPath = path.join(fixture, 'launcher');
         writeFileSync(command, '#!/bin/sh\nexit 66\n');

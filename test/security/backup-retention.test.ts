@@ -3,13 +3,13 @@
 // of exactly the data the user asked to erase, and (before this fix) at the
 // process umask - world-readable. Undercuts "revocation = deletion."
 
-import { copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { backupDatabaseAndReport, pruneBackups, writeBackup } from '../../src/storage/backup.js';
 import { openKeyedDatabase, rekeyDatabaseConnection } from '../../src/storage/db.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
 
@@ -19,7 +19,7 @@ function mode(p: string): number {
 
 describe('writeBackup', () => {
     it('copies the DB file to a timestamped .bak- path, mode 0600', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-backup-'));
+        const root = withTempDir('elepha-backup-');
         const dbPath = path.join(root, 'elepha.db');
         const db = new Database(dbPath);
         db.pragma('journal_mode = WAL');
@@ -33,7 +33,7 @@ describe('writeBackup', () => {
     });
 
     it('includes committed rows that existed only in the WAL before the backup checkpoint', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-backup-wal-'));
+        const root = withTempDir('elepha-backup-wal-');
         const dbPath = path.join(root, 'elepha.db');
         const db = new Database(dbPath);
         db.pragma('journal_mode = WAL');
@@ -56,7 +56,7 @@ describe('writeBackup', () => {
     });
 
     it('aborts without writing a file when the checkpoint is incomplete', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-backup-busy-'));
+        const root = withTempDir('elepha-backup-busy-');
         const dbPath = path.join(root, 'elepha.db');
         writeFileSync(dbPath, 'database');
         const db = { pragma: () => [{ busy: 1, log: 1, checkpointed: 0 }] } as unknown as Database.Database;
@@ -68,7 +68,7 @@ describe('writeBackup', () => {
 
 describe('pruneBackups', () => {
     it('deletes all but the N most recent backups', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-backup-'));
+        const root = withTempDir('elepha-backup-');
         const dbPath = path.join(root, 'elepha.db');
         writeFileSync(dbPath, 'fake db contents');
 
@@ -95,7 +95,7 @@ describe('pruneBackups', () => {
     });
 
     it('is a no-op when there are fewer backups than the keep count', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-backup-'));
+        const root = withTempDir('elepha-backup-');
         const dbPath = path.join(root, 'elepha.db');
         writeFileSync(dbPath, 'fake db contents');
         writeFileSync(`${dbPath}.bak-2026-08-10`, 'backup');
@@ -109,7 +109,7 @@ describe('pruneBackups', () => {
 
 describe('backupDatabaseAndReport', () => {
     it('writes, prunes to the configured retention count, and reports both actions through the injected logger', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-backup-'));
+        const root = withTempDir('elepha-backup-');
         const dbPath = path.join(root, 'elepha.db');
         const db = new Database(dbPath);
         db.pragma('journal_mode = WAL');
@@ -127,7 +127,7 @@ describe('backupDatabaseAndReport', () => {
     });
 
     it('copies encrypted bytes and removes stale plaintext managed snapshots', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-encrypted-backup-'));
+        const root = withTempDir('elepha-encrypted-backup-');
         const dbPath = path.join(root, 'elepha.db');
         const db = new Database(dbPath);
         db.exec("CREATE TABLE records (value TEXT NOT NULL); INSERT INTO records VALUES ('encrypted')");

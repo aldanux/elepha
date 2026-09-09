@@ -1,10 +1,10 @@
-import { copyFileSync, mkdirSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const FIXTURE_PATH = path.resolve('test/fixtures/codex/rollout-2026-07-22T15-29-54-019f88f2-145b-7853-8390-75dac88737d6.jsonl');
 const PROJECT_PATH = '/Users/test/demo-project';
@@ -59,7 +59,7 @@ describe('elepha MCP stdio transport', () => {
     });
 
     it('serializes a rendered get_session episode as a text content block', async () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-stdio-home-'));
+        const home = withTempDir('elepha-mcp-stdio-home-');
         const sourcePath = path.join(home, '.codex', 'sessions', 'fixture.jsonl');
         mkdirSync(path.dirname(sourcePath), { recursive: true });
         copyFileSync(FIXTURE_PATH, sourcePath);

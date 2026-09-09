@@ -1,10 +1,9 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { atomicCopyPrivateFile, atomicWrite } from '../../src/util/fs.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 function injectedFsError(message: string, code: string): NodeJS.ErrnoException {
     const error = new Error(message) as NodeJS.ErrnoException;
@@ -30,7 +29,7 @@ function randomizedTemporaryArtifacts(destination: string): string[] {
 
 describe('atomicWrite', () => {
     it('writes through a symlink without replacing it', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-util-fs-'));
+        const root = withTempDir('elepha-util-fs-');
         const target = path.join(root, 'dotfiles', 'settings.json');
         const link = path.join(root, 'config', 'settings.json');
         mkdirSync(path.dirname(target), { recursive: true });

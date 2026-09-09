@@ -1,10 +1,10 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import type { ProjectRow } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
@@ -25,7 +25,7 @@ function runRekeyCli(dbPath: string, apply = true) {
 
 describe('elepha rekey-projects --apply', () => {
     it('backs up first, merges cwd rows, and leaves the repository root as the stored project path', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-rekey-projects-'));
+        const directory = withTempDir('elepha-rekey-projects-');
         const dbPath = path.join(directory, 'elepha.db');
         const repo = path.join(directory, 'repo');
         const subdirectory = path.join(repo, 'packages', 'app');
@@ -83,7 +83,7 @@ describe('elepha rekey-projects --apply', () => {
     }, 15000);
 
     it('leaves project rows untouched during the default dry run', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-rekey-dry-run-'));
+        const directory = withTempDir('elepha-rekey-dry-run-');
         const dbPath = path.join(directory, 'elepha.db');
         const repo = path.join(directory, 'repo');
         const subdirectory = path.join(repo, 'packages', 'app');
@@ -115,7 +115,7 @@ describe('elepha rekey-projects --apply', () => {
     }, 15000);
 
     it('refuses apply while a daemon heartbeat is healthy without writing a backup or merge', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-rekey-daemon-running-'));
+        const directory = withTempDir('elepha-rekey-daemon-running-');
         const dbPath = path.join(directory, 'elepha.db');
         const repo = path.join(directory, 'repo');
         const subdirectory = path.join(repo, 'packages', 'app');

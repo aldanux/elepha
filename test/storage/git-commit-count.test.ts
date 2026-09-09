@@ -1,13 +1,12 @@
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 describe('P2.8 git_commit_count schema migration', () => {
     it('adds a NULL baseline to a pre-git_commit_count P2.1 database and preserves its rows', () => {
-        const file = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-legacy-count-')), 'legacy.db');
+        const file = path.join(withTempDir('elepha-legacy-count-'), 'legacy.db');
         const db = new Database(file);
         db.exec(`
             CREATE TABLE projects (

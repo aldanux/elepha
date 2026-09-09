@@ -3,12 +3,12 @@
 // synthesized from session transcripts sitting in a location any local user
 // or process can read. Tighten the directory to 0700 and files to 0600.
 
-import { existsSync, mkdtempSync, readdirSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { SummarizerCallLog } from '../../src/summarizer/call-log.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function mode(p: string): number {
     return statSync(p).mode & 0o777;
@@ -16,7 +16,7 @@ function mode(p: string): number {
 
 describe('~/.elepha permissions', () => {
     it('creates the DB directory 0700 and the DB file 0600', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-perms-'));
+        const root = withTempDir('elepha-perms-');
         const dbPath = path.join(root, '.elepha', 'elepha.db');
 
         openUnmanagedDb(dbPath);
@@ -26,7 +26,7 @@ describe('~/.elepha permissions', () => {
     });
 
     it('creates the WAL/SHM sidecar files 0600 too', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-perms-'));
+        const root = withTempDir('elepha-perms-');
         const dbPath = path.join(root, '.elepha', 'elepha.db');
 
         openUnmanagedDb(dbPath);
@@ -39,7 +39,7 @@ describe('~/.elepha permissions', () => {
     });
 
     it('creates the summarizer call-log directory 0700 and log files 0600', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-perms-'));
+        const root = withTempDir('elepha-perms-');
         const logDir = path.join(root, '.elepha', 'logs');
         const log = new SummarizerCallLog(logDir);
 

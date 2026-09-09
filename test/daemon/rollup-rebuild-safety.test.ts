@@ -14,8 +14,6 @@
 // for external code to land in; the race only exists across real OS
 // processes/connections.
 
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { RollupService } from '../../src/daemon/rollup-service.js';
@@ -25,6 +23,7 @@ import { ROLLUP_VERSION, RollupStore } from '../../src/storage/rollup-store.js';
 import type { RollupTurnInput } from '../../src/summarizer/rollup-prompt.js';
 import type { RollupProvider, RollupResult } from '../../src/summarizer/rollup-provider.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function makeTurn(index: number): ParsedTurn {
     return {
@@ -63,7 +62,7 @@ describe('rebuild vs. concurrent daemon activity', () => {
     let session: SessionRow;
 
     beforeEach(() => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-rebuild-race-'));
+        const root = withTempDir('elepha-rebuild-race-');
         dbPath = path.join(root, 'elepha.db');
 
         const setupDb = openUnmanagedDb(dbPath);

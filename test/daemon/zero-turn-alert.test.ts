@@ -1,11 +1,11 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
     const started = Date.now();
@@ -28,7 +28,7 @@ describe('zero-turn skip reporting', () => {
     });
 
     it('reports assistant content under an unrecognized transcript shape in the startup summary', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-zero-turn-alert-'));
+        const root = withTempDir('elepha-zero-turn-alert-');
         previousCodexHome = process.env.CODEX_HOME;
         process.env.CODEX_HOME = root;
         const sessionsRoot = path.join(root, 'sessions', '2026', '08', '16');

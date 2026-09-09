@@ -10,7 +10,6 @@ import {
     symlinkSync,
     writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parse } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -27,6 +26,7 @@ import type { LauncherBackend } from '../../src/install/launcher.js';
 import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { defaultSystemdServicePaths, type SystemctlExecutor, SystemdBackend } from '../../src/install/systemd-backend.js';
 import { ELEPHA_MCP_ARGS, ELEPHA_MCP_SERVER_NAME } from '../../src/mcp/installer.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const bin = '/opt/npm/bin/elepha';
 const launcherMock = vi.hoisted(() => ({
@@ -121,7 +121,7 @@ class FakeSystemctl implements SystemctlExecutor {
 
 describe('installer transaction', () => {
     it('runs install and uninstall through the systemd backend on Linux', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-linux-'));
+        const root = withTempDir('elepha-installer-linux-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -148,7 +148,7 @@ describe('installer transaction', () => {
     });
 
     it('rejects WSL without systemd before writing config, service artifacts, or a journal', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-wsl-preflight-'));
+        const root = withTempDir('elepha-installer-wsl-preflight-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const original = { claudeSettings: '{}', claudeMcp: '{}', codexConfig: '# untouched\n' };
@@ -181,7 +181,7 @@ describe('installer transaction', () => {
         ['install', installElepha],
         ['uninstall', uninstallElepha],
     ] as const)('refuses %s on Windows before touching lifecycle state', (_operation, lifecycle) => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-win32-'));
+        const root = withTempDir('elepha-installer-win32-');
 
         expect(() => lifecycle(installPaths(root), { platform: 'win32', home: root, approvedRoots: 0 })).toThrow(
             'supported on macOS and Linux',
@@ -189,7 +189,7 @@ describe('installer transaction', () => {
     });
 
     it('rewrites managed artifacts when the freshly rendered launcher changes backend', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-launcher-refresh-'));
+        const root = withTempDir('elepha-installer-launcher-refresh-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -224,7 +224,7 @@ describe('installer transaction', () => {
     });
 
     it('leaves exact-match managed artifacts untouched on a repeated install', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-launcher-repeat-'));
+        const root = withTempDir('elepha-installer-launcher-repeat-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -248,7 +248,7 @@ describe('installer transaction', () => {
     });
 
     it('refuses to overwrite a user-modified managed artifact', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-launcher-modified-'));
+        const root = withTempDir('elepha-installer-launcher-modified-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -273,7 +273,7 @@ describe('installer transaction', () => {
     });
 
     it('runs the injected inert install -> approval projection -> uninstall lifecycle without a real launchctl domain', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-service-'));
+        const root = withTempDir('elepha-installer-service-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -330,7 +330,7 @@ describe('installer transaction', () => {
     });
 
     it('waits for a late managed heartbeat during install', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-late-heartbeat-'));
+        const root = withTempDir('elepha-installer-late-heartbeat-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -383,7 +383,7 @@ describe('installer transaction', () => {
     });
 
     it('waits for the complete deadline before failing the replacement and accepts a late rollback heartbeat', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-rollback-'));
+        const root = withTempDir('elepha-installer-rollback-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const original = { claudeSettings: '{"legacy":true}', claudeMcp: '{"legacy":true}', codexConfig: '# legacy\n' };
@@ -468,7 +468,7 @@ describe('installer transaction', () => {
     });
 
     it('keeps managed service artifacts and launchd state on failure when debug preservation is enabled', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-keep-failure-'));
+        const root = withTempDir('elepha-installer-keep-failure-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -507,7 +507,7 @@ describe('installer transaction', () => {
     });
 
     it('replays a leftover install journal before applying a new install', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-replay-'));
+        const root = withTempDir('elepha-installer-replay-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const original = { claudeSettings: '{"before":true}', claudeMcp: '{"before":true}', codexConfig: '# before\n' };
@@ -596,7 +596,7 @@ describe('installer transaction', () => {
     });
 
     it('restores files and clears the journal when the prior daemon stays unhealthy, allowing the next install to proceed', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-n2-'));
+        const root = withTempDir('elepha-installer-n2-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const original = { claudeSettings: '{}\n', claudeMcp: '{}\n' };
@@ -672,7 +672,7 @@ describe('installer transaction', () => {
     });
 
     it('defaults the optional journal unknown state to false', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-journal-'));
+        const root = withTempDir('elepha-installer-journal-');
         const transaction = path.join(root, 'install-transaction.json');
         writeFileSync(
             transaction,
@@ -687,7 +687,7 @@ describe('installer transaction', () => {
     });
 
     it('leaves the service stopped and disabled when install rollback began from an unknown state', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-unknown-service-'));
+        const root = withTempDir('elepha-installer-unknown-service-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const original = { claudeSettings: '{}\n', claudeMcp: '{}\n', codexConfig: '# unchanged\n' };
@@ -741,7 +741,7 @@ describe('installer transaction', () => {
     });
 
     it('replays and clears a leftover journal before uninstalling', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-uninstall-journal-'));
+        const root = withTempDir('elepha-installer-uninstall-journal-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{"partial":true}\n');
@@ -770,7 +770,7 @@ describe('installer transaction', () => {
     });
 
     it('journals a failed uninstall and replays its installed state before the next lifecycle operation', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-uninstall-recovery-'));
+        const root = withTempDir('elepha-installer-uninstall-recovery-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}\n');
@@ -853,7 +853,7 @@ describe('installer transaction', () => {
     });
 
     it('refuses to install when a leftover rollback journal is malformed', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-malformed-journal-'));
+        const root = withTempDir('elepha-installer-malformed-journal-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{"before":true}');
@@ -871,7 +871,7 @@ describe('installer transaction', () => {
     });
 
     it('both-present registers both tools and removes only mcpServers.elepha from the user-scoped Claude config', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
+        const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const claudeConfig = {
@@ -900,7 +900,7 @@ describe('installer transaction', () => {
     });
 
     it('Claude-only registers Claude without creating or modifying the absent Codex config', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
+        const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
 
@@ -915,7 +915,7 @@ describe('installer transaction', () => {
     });
 
     it('uninstalls a single-tool Claude installation without reading the absent Codex config', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-h1-'));
+        const root = withTempDir('elepha-installer-h1-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
@@ -928,7 +928,7 @@ describe('installer transaction', () => {
     });
 
     it('deletes a settings file created by elepha when uninstall restores an absent original', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-h2-'));
+        const root = withTempDir('elepha-installer-h2-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
 
@@ -940,7 +940,7 @@ describe('installer transaction', () => {
     });
 
     it('refreshes snapshots on a second install so a later uninstall preserves the user edit', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-h3-'));
+        const root = withTempDir('elepha-installer-h3-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
@@ -957,7 +957,7 @@ describe('installer transaction', () => {
     });
 
     it('removes elepha from a re-install snapshot while preserving a user-added hook group', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-n1-'));
+        const root = withTempDir('elepha-installer-n1-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}\n');
@@ -989,7 +989,7 @@ describe('installer transaction', () => {
     });
 
     it('keeps config snapshots private to elepha and leaves no sibling backups after install', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-m8-'));
+        const root = withTempDir('elepha-installer-m8-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
@@ -1004,7 +1004,7 @@ describe('installer transaction', () => {
     });
 
     it('preserves a symlinked config file when a transaction writes it', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-m9-'));
+        const root = withTempDir('elepha-installer-m9-');
         const paths = installPaths(root);
         const target = path.join(root, 'dotfiles', 'settings.json');
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
@@ -1018,7 +1018,7 @@ describe('installer transaction', () => {
     });
 
     it('leaves a running launchd service untouched when the uninstall config transaction fails', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-uninstall-ordering-'));
+        const root = withTempDir('elepha-installer-uninstall-ordering-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}');
@@ -1050,7 +1050,7 @@ describe('installer transaction', () => {
     });
 
     it('Codex-only registers Codex without writing either Claude config', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
+        const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.codexConfig), { recursive: true });
 
@@ -1173,7 +1173,7 @@ describe('installer transaction', () => {
     });
 
     it('refuses when neither supported tool is present without writing a config', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
+        const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
 
         expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow(
@@ -1189,7 +1189,7 @@ describe('installer transaction', () => {
         ['malformed', '{'],
         ['user-owned conflict', JSON.stringify({ mcpServers: { elepha: { command: 'other' } } })],
     ])('refuses a %s Claude user config before writing any transaction file', (_case, claudeMcp) => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
+        const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const before = { claudeSettings: '{\n}', claudeMcp, codexConfig: '# retain\n' };
@@ -1204,7 +1204,7 @@ describe('installer transaction', () => {
     });
 
     it('preserves a sanitized real-world Codex config when uninstalling an approved elepha hook', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-installer-'));
+        const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         const codexConfig = `[mcp_servers.docs]

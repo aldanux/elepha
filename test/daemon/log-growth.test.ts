@@ -1,5 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -8,6 +7,7 @@ import { DAEMON_LOG_ROTATE_MAX_BYTES } from '../../src/daemon/log-rotation.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 async function drain(iter: AsyncIterable<ParsedTurn>): Promise<void> {
     for await (const _ of iter) void _;
@@ -22,7 +22,7 @@ describe('IngestionDaemon log growth bounds', () => {
     });
 
     it('emits each default-adapter unknown-line warning once, but preserves a distinct type or file warning', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-log-growth-'));
+        const root = withTempDir('elepha-daemon-log-growth-');
         const firstFile = path.join(root, 'first.jsonl');
         const secondFile = path.join(root, 'second.jsonl');
         writeFileSync(
@@ -53,7 +53,7 @@ describe('IngestionDaemon log growth bounds', () => {
     });
 
     it('rotates oversized launchd logs to one archive and recreates empty primaries at startup', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-log-rotation-'));
+        const root = withTempDir('elepha-daemon-log-rotation-');
         const stdout = path.join(root, 'daemon.stdout.log');
         const stderr = path.join(root, 'daemon.stderr.log');
         writeFileSync(stdout, 'current stdout'.repeat(Math.ceil((DAEMON_LOG_ROTATE_MAX_BYTES + 1) / 14)));

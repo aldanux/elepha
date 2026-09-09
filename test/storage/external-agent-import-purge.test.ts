@@ -1,5 +1,4 @@
-import { copyFileSync, mkdirSync, mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +12,7 @@ import {
 import { MemoryStore, type SessionRow } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const FIXTURES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'codex');
 const IMPORTED_FIXTURE = path.join(FIXTURES, 'rollout-codex-v0.148.0-alpha.9-external-agent-import.jsonl');
@@ -48,7 +48,7 @@ describe('external-agent import purge', () => {
     const projectPath = '/Users/test/external-import-project';
 
     beforeEach(() => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-external-import-purge-'));
+        const root = withTempDir('elepha-external-import-purge-');
         const codexHome = path.join(root, 'codex-home');
         const codexSessions = path.join(codexHome, 'sessions');
         mkdirSync(codexSessions, { recursive: true });

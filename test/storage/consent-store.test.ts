@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { individualCandidates } from '../../src/cli/init-wizard.js';
@@ -8,6 +8,7 @@ import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherCons
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = realpathSync(path.resolve(import.meta.dirname, '..', '..'));
 const consentFixtures: string[] = [];
@@ -158,7 +159,7 @@ describe('consent roots', () => {
     });
 
     it('normalizes and deduplicates benign decided-root spellings on open without touching distinct roots', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-consent-legacy-alias-'));
+        const fixture = withTempDir('elepha-consent-legacy-alias-');
         const physicalRoot = path.join(fixture, 'physical-root');
         const unrelatedRoot = path.join(fixture, 'unrelated-root');
         const dbPath = path.join(fixture, 'elepha.db');
@@ -201,7 +202,7 @@ describe('consent roots', () => {
     });
 
     it('breaks equal-depth normalized-root ties by the newest explicit decision regardless of stored path order', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-consent-equal-depth-'));
+        const fixture = withTempDir('elepha-consent-equal-depth-');
         const physicalRoot = path.join(fixture, 'physical-root');
         mkdirSync(path.join(physicalRoot, 'project'), { recursive: true });
         const canonicalPhysicalRoot = realpathSync(physicalRoot);
@@ -229,7 +230,7 @@ describe('consent roots', () => {
     });
 
     it('chooses canonical winners by explicit source, then decision time, then ulid', () => {
-        const fixture = mkdtempSync(path.join(tmpdir(), 'elepha-consent-winner-order-'));
+        const fixture = withTempDir('elepha-consent-winner-order-');
         const db = openUnmanagedDb(':memory:');
         const insert = db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)');
 
@@ -593,7 +594,7 @@ describe('consent roots', () => {
     it('backfills a newly approved root in capture-only mode', async () => {
         const db = openUnmanagedDb(':memory:');
         const store = new MemoryStore(db);
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-backfill-'));
+        const directory = withTempDir('elepha-consent-backfill-');
         const claudeConfigDir = path.join(directory, '.claude');
         vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
         const watchRoot = path.join(claudeConfigDir, 'projects');
@@ -610,7 +611,7 @@ describe('consent roots', () => {
     });
 
     it('gates unapproved transcript bodies by metadata before parseTurns and records only a pending root', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-gate-'));
+        const directory = withTempDir('elepha-consent-gate-');
         const claudeConfigDir = path.join(directory, '.claude');
         vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
         const watchRoot = path.join(claudeConfigDir, 'projects');
@@ -636,7 +637,7 @@ describe('consent roots', () => {
     });
 
     it('does not record pending roots for missing directories or tool-internal cwds', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-gate-'));
+        const directory = withTempDir('elepha-consent-gate-');
         const claudeConfigDir = path.join(directory, '.claude');
         vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
         const watchRoot = path.join(claudeConfigDir, 'projects');
@@ -675,7 +676,7 @@ describe('consent roots', () => {
     });
 
     it('still fully ingests an approved transcript and skips an out-of-root backfill before parseTurns', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-gate-'));
+        const directory = withTempDir('elepha-consent-gate-');
         const claudeConfigDir = path.join(directory, '.claude');
         vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
         const watchRoot = path.join(claudeConfigDir, 'projects');

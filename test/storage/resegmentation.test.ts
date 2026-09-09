@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -23,7 +22,7 @@ import {
 import { titleForSegment } from '../../src/storage/session-title.js';
 import { planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
 import type { SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { testScratchRoot, withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const adapters: SessionAdapterMap = {
     'claude-code': new ClaudeCodeAdapter(),
@@ -33,14 +32,18 @@ const adapters: SessionAdapterMap = {
 const CAPTURED_AT = '2026-09-05T00:00:00.000Z';
 
 let previousCodexHome: string | undefined;
+let testCodexHome: string;
 
 beforeAll(() => {
+    mkdirSync(testScratchRoot, { recursive: true });
     previousCodexHome = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = mkdtempSync(path.join(tmpdir(), 'elepha-resegment-codex-home-'));
+    testCodexHome = mkdtempSync(path.join(testScratchRoot, 'elepha-resegment-codex-home-'));
+    process.env.CODEX_HOME = testCodexHome;
     mkdirSync(codexSessionsRoot(), { recursive: true });
 });
 
 afterAll(() => {
+    rmSync(testCodexHome, { recursive: true, force: true });
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousCodexHome;
 });
@@ -98,9 +101,7 @@ function seed(options: { markerBeforeSecond?: boolean; missingSource?: boolean; 
     const db = openUnmanagedDb(':memory:');
     const projectPath = withGrantableTestDir('elepha-resegment-project-');
     const dir = realpathSync(
-        options.outsideStore
-            ? mkdtempSync(path.join(tmpdir(), 'elepha-resegment-outside-'))
-            : mkdtempSync(path.join(codexSessionsRoot(), 'elepha-resegment-')),
+        options.outsideStore ? withTempDir('elepha-resegment-outside-') : mkdtempSync(path.join(codexSessionsRoot(), 'elepha-resegment-')),
     );
     const sourcePath = path.join(dir, 'rollout-native-1.jsonl');
     if (!options.missingSource) {
@@ -545,7 +546,7 @@ describe('manual segment corrections', () => {
                     const { db } = seed();
                     const split = await planManualSplit(db, adapters, 1, 1);
                     const newId = applyManualSplit(db, split);
-                    const outsideDirectory = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-resegment-merge-outside-')));
+                    const outsideDirectory = realpathSync(withTempDir('elepha-resegment-merge-outside-'));
                     const sourcePath = path.join(outsideDirectory, 'rollout-native-1.jsonl');
                     writeFileSync(sourcePath, codexFixture());
                     db.prepare("UPDATE sessions SET source_path = ? WHERE tool = 'codex' AND native_id = 'native-1'").run(sourcePath);

@@ -1,11 +1,11 @@
 // The .env loader is a security surface, not a convenience: it decides which
 // file can change this process's environment, and which variables it may set.
 
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { envFileCandidates, loadEnvFile, parseEnv } from '../../src/config/env.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 describe('parseEnv', () => {
     it('reads plain and quoted assignments', () => {
@@ -40,7 +40,7 @@ describe('loadEnvFile', () => {
     const saved = { ...process.env };
 
     beforeEach(() => {
-        dir = mkdtempSync(path.join(tmpdir(), 'elepha-env-'));
+        dir = withTempDir('elepha-env-');
     });
 
     afterEach(() => {
@@ -145,7 +145,7 @@ describe('envFileCandidates', () => {
         const fromHere = envFileCandidates();
         const cwd = process.cwd();
         try {
-            process.chdir(tmpdir());
+            process.chdir(withTempDir('elepha-env-cwd-'));
             expect(envFileCandidates()).toEqual(fromHere);
         } finally {
             process.chdir(cwd);

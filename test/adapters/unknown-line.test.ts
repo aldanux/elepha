@@ -1,5 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -7,6 +6,7 @@ import { CodexAdapter } from '../../src/adapters/codex.js';
 import { MAX_UNKNOWN_LINE_DISCRIMINATOR_CHARS } from '../../src/config/constants.js';
 import { deduplicateDaemonUnknownLineWarnings } from '../../src/daemon/index.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 async function drain(iter: AsyncIterable<ParsedTurn>): Promise<void> {
     for await (const _ of iter) void _;
@@ -19,7 +19,7 @@ async function collect(iter: AsyncIterable<ParsedTurn>): Promise<ParsedTurn[]> {
 }
 
 function tmpFile(name: string): string {
-    const dir = mkdtempSync(path.join(tmpdir(), 'elepha-unknown-'));
+    const dir = withTempDir('elepha-unknown-');
     return path.join(dir, name);
 }
 

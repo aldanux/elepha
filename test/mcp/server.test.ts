@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -19,6 +18,7 @@ import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 class FixtureAdapter implements SessionAdapter {
     readonly tool: SessionAdapterTool;
@@ -434,7 +434,7 @@ describe('elepha MCP server surface', () => {
     it('keeps every empty and failure state distinct while serving a raw episode without internal IDs', async () => {
         const db = openUnmanagedDb(':memory:');
         databases.push(db);
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-'));
+        const root = withGrantableTestDir('elepha-mcp-');
         previousCodexHome = process.env.CODEX_HOME;
         process.env.CODEX_HOME = root;
         const sessionsRoot = path.join(root, 'sessions');
@@ -679,7 +679,7 @@ describe('elepha MCP server surface', () => {
     });
 
     it('opens the serving database read-only', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-read-only-'));
+        const root = withTempDir('elepha-mcp-read-only-');
         const dbPath = path.join(root, 'elepha.db');
         const writable = openUnmanagedDb(dbPath);
         writable.close();
@@ -691,7 +691,7 @@ describe('elepha MCP server surface', () => {
     });
 
     it('refuses a database missing consent_roots without changing its schema, bytes, or directory mode', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-schema-refusal-'));
+        const root = withTempDir('elepha-mcp-schema-refusal-');
         chmodSync(root, 0o751);
         const dbPath = path.join(root, 'elepha.db');
         const setup = new Database(dbPath);

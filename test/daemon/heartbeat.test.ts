@@ -1,8 +1,8 @@
-import { mkdtempSync, renameSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { clearHeartbeat, isPidAlive, readHeartbeat, writeHeartbeat } from '../../src/daemon/heartbeat.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 vi.mock('node:fs', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:fs')>();
@@ -14,7 +14,7 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 function tmpHeartbeatPath(): string {
-    return path.join(mkdtempSync(path.join(tmpdir(), 'elepha-heartbeat-')), 'daemon.heartbeat.json');
+    return path.join(withTempDir('elepha-heartbeat-'), 'daemon.heartbeat.json');
 }
 
 describe('heartbeat', () => {

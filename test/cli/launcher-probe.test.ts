@@ -1,10 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { MINIMUM_NODE_VERSION } from '../../src/config/constants.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -22,7 +22,7 @@ function runVersion(bin: string) {
 
 describe('launcher probe', () => {
     it('runs from a real packed global installation and rejects invalid installed manifests', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-launcher-probe-'));
+        const root = withTempDir('elepha-launcher-probe-');
         const packDirectory = path.join(root, 'pack');
         const prefix = path.join(root, 'prefix');
         try {

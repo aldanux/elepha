@@ -1,5 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Command } from 'commander';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,6 +10,7 @@ import type { DaemonHealth } from '../../src/install/health-checks.js';
 import { defaultLaunchdServicePaths, type LaunchctlExecutor, LaunchdBackend } from '../../src/install/launchd-backend.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
 import { defaultSystemdServicePaths, type SystemctlExecutor, SystemdBackend } from '../../src/install/systemd-backend.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const STARTED_AT = '2026-08-28T00:00:00.000Z';
 
@@ -310,7 +310,7 @@ describe('elepha pause and resume', () => {
     });
 
     it('fails an indeterminate systemd pause without clearing the heartbeat', async () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-control-linux-'));
+        const home = withTempDir('elepha-daemon-control-linux-');
         const paths = defaultSystemdServicePaths(home, {});
         const executor = new TransportFailingSystemctl();
         mkdirSync(path.dirname(paths.heartbeat), { recursive: true });
