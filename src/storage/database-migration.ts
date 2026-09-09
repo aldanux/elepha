@@ -1570,6 +1570,19 @@ export async function migratePrimaryDatabaseToEncrypted(
 ): Promise<DatabaseMigrationResult> {
     const pinnedDatabasePath = path.resolve(databasePath);
     assertSupportedRuntime(runtime);
+    // This header-only no-op neither opens SQLite nor authorizes database use,
+    // so existing readers need not retire. Check migration state again after the
+    // header read: an encrypted canonical file may still need recovery after a
+    // swap. All recovery and plaintext replacement retain exclusive ownership;
+    // subsequent managed opens independently enforce lifecycle and migration gates.
+    if (
+        !databaseMigrationIsActive(runtime) &&
+        existsSync(pinnedDatabasePath) &&
+        !hasPlaintextHeader(pinnedDatabasePath) &&
+        !databaseMigrationIsActive(runtime)
+    ) {
+        return { status: 'already-encrypted' };
+    }
     const recoveryId = activeMigrationRecoveryId(pinnedDatabasePath, runtime);
     return withExclusiveDatabaseLifecycle(
         pinnedDatabasePath,

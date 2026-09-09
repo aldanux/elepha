@@ -174,6 +174,53 @@ afterEach(() => {
 });
 
 describe('plaintext primary database encryption migration', () => {
+    it('skips exclusivity for an encrypted database with a managed connection still open', async () => {
+        const { directory, dbPath } = fixture('elepha-database-encrypted-reader-');
+        const migrationRuntime = runtime(directory);
+        await migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime);
+        const reader = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption: migrationRuntime });
+        try {
+            await expect(migratePrimaryDatabaseToEncrypted(dbPath, migrationRuntime)).resolves.toEqual({ status: 'already-encrypted' });
+            expect(reader.open).toBe(true);
+            expect(reader.prepare('SELECT native_id FROM sessions').get()).toEqual({ native_id: 'migration-session' });
+            expect(hasLifecycleIntent(dbPath)).toBe(false);
+        } finally {
+            reader.close();
+        }
+    });
+
+    it('recovers an encrypted canonical swap under exclusive ownership instead of skipping the active migration', async () => {
+        const { directory, dbPath } = fixture('elepha-database-encrypted-recovery-');
+        await expect(
+            migratePrimaryDatabaseToEncrypted(
+                dbPath,
+                runtime(directory, {
+                    failpoint: (point) => {
+                        if (point === 'after_canonical_swap') {
+                            throw new Error('interrupted after swap');
+                        }
+                    },
+                }),
+            ),
+        ).rejects.toThrow('interrupted after swap');
+        expect(isPlaintext(dbPath)).toBe(false);
+        expect(hasLifecycleIntent(dbPath)).toBe(true);
+        const checkpoints: string[] = [];
+        const recovery = runtime(directory, {
+            failpoint: (point) => {
+                checkpoints.push(point);
+                expect(hasLifecycleIntent(dbPath)).toBe(true);
+            },
+        });
+
+        await expect(migratePrimaryDatabaseToEncrypted(dbPath, recovery)).resolves.toEqual({ status: 'migrated' });
+        expect(checkpoints).toContain('after_lock_acquired');
+        expect(existsSync(recovery.statePaths?.manifest ?? '')).toBe(false);
+        expect(existsSync(recovery.statePaths?.lock ?? '')).toBe(false);
+        expect(hasLifecycleIntent(dbPath)).toBe(false);
+        await assertEncryptedOpenable(dbPath, recovery);
+    });
+
     it('atomically encrypts the primary with identical schema and rows, then becomes a no-op', async () => {
         const { directory, dbPath } = fixture('elepha-database-migration-');
         const migrationRuntime = runtime(directory);

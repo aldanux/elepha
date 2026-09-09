@@ -46,9 +46,16 @@ async function runInstall(): Promise<void> {
         priorService = service.status();
         service.stop();
         await migrateDatabaseForInstall(defaultDbPath());
+        const db = await openDb();
+        let approvedRoots: number;
+        try {
+            approvedRoots = new ConsentStore(db).countApproved();
+        } finally {
+            db.close();
+        }
         const onPhase = createInstallProgressReporter();
         const runtime = {
-            approvedRoots: new ConsentStore(await openDb()).countApproved(),
+            approvedRoots,
             service,
             ...(onPhase ? { onPhase } : {}),
         };
