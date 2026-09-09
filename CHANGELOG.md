@@ -1,5 +1,10 @@
 # elepha
 
+## 0.6.5
+
+- Show progress while pausing and resuming capture for maintenance operations, keeping destructive previews, confirmation prompts, backup locations, and failures visible by [@aldanux](https://github.com/aldanux) in [#106](https://github.com/aldanux/elepha/pull/106)
+- Show install progress while preparing and migrating the database, including a failure indicator when preparation fails by [@aldanux](https://github.com/aldanux) in [#105](https://github.com/aldanux/elepha/pull/105)
+
 ## 0.6.4
 
 - Render OpenCode command output once in the assistant response, preserving the typed command in the user bubble by injecting only into the model message view.
