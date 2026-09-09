@@ -79,7 +79,11 @@ export function isElephaOpencodeMcp(value: unknown): boolean {
     );
 }
 
-export function transformOpencodeMcp(text: string, bin: string, uninstall = false): string {
+// Registers/removes elepha's MCP server and (when pluginPath is given) the elepha
+// plugin in opencode.json. OpenCode only loads plugins listed in the `plugin`
+// array, so dropping the plugin file on disk is not enough — its absolute path
+// must be registered here too.
+export function transformOpencodeMcp(text: string, bin: string, uninstall = false, pluginPath?: string): string {
     let config: Record<string, unknown> = {};
     if (text.trim()) {
         try {
@@ -94,26 +98,56 @@ export function transformOpencodeMcp(text: string, bin: string, uninstall = fals
     >;
     const current = servers[ELEPHA_MCP_SERVER_NAME];
     const expected = { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true };
+    let changed = false;
     if (uninstall) {
-        if (current === undefined) {
-            return text;
+        if (current !== undefined) {
+            if (!isElephaOpencodeMcp(current)) {
+                throw new Error('conflicting user-owned OpenCode MCP server named elepha');
+            }
+            const next = { ...servers };
+            delete next[ELEPHA_MCP_SERVER_NAME];
+            config.mcp = next;
+            changed = true;
         }
-        if (!isElephaOpencodeMcp(current)) {
-            throw new Error('conflicting user-owned OpenCode MCP server named elepha');
-        }
-        const next = { ...servers };
-        delete next[ELEPHA_MCP_SERVER_NAME];
-        config.mcp = next;
     } else if (current === undefined) {
         config.mcp = { ...servers, [ELEPHA_MCP_SERVER_NAME]: expected };
-    } else if (isDeepStrictEqual(current, expected)) {
-        return text;
+        changed = true;
     } else if (isElephaOpencodeMcp(current)) {
-        config.mcp = { ...servers, [ELEPHA_MCP_SERVER_NAME]: expected };
+        if (!isDeepStrictEqual(current, expected)) {
+            config.mcp = { ...servers, [ELEPHA_MCP_SERVER_NAME]: expected };
+            changed = true;
+        }
     } else {
         throw new Error('conflicting user-owned OpenCode MCP server named elepha');
     }
-    return `${JSON.stringify(config, null, 2)}\n`;
+    if (pluginPath !== undefined) {
+        changed = applyOpencodePluginRegistration(config, pluginPath, uninstall) || changed;
+    }
+    return changed ? `${JSON.stringify(config, null, 2)}\n` : text;
+}
+
+// Only elepha's own plugin path is added or removed; any user-listed plugins are
+// left intact. Returns whether the config's plugin array changed.
+function applyOpencodePluginRegistration(config: Record<string, unknown>, pluginPath: string, uninstall: boolean): boolean {
+    const existing = Array.isArray(config.plugin) ? (config.plugin as unknown[]).filter((entry) => typeof entry === 'string') : [];
+    const others = existing.filter((entry) => entry !== pluginPath);
+    const alreadyPresent = existing.includes(pluginPath);
+    if (uninstall) {
+        if (!alreadyPresent) {
+            return false;
+        }
+        if (others.length > 0) {
+            config.plugin = others;
+        } else {
+            delete config.plugin;
+        }
+        return true;
+    }
+    if (alreadyPresent && existing.length === others.length + 1 && existing[existing.length - 1] === pluginPath) {
+        return false;
+    }
+    config.plugin = [...others, pluginPath];
+    return true;
 }
 
 function blockPattern(start: string, end: string): RegExp {

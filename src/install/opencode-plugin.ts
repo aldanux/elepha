@@ -1,20 +1,26 @@
 import { lstatSync, readFileSync } from 'node:fs';
-import { OPENCODE_PLUGIN_MAX_PENDING_SESSIONS } from '../config/constants.js';
 import { renderOpencodeHookClient } from '../security/subprocess-allowlist.js';
-import { OPENCODE_PLUGIN_DROPPED_CONTEXT, OPENCODE_PLUGIN_MARKER } from './markers.js';
+import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 
-// OpenCode 1.18.29 loads plugins/*.js; PluginInput.directory is the working
-// directory. Keep this standalone so OpenCode needs no elepha package imports.
+// OpenCode loads plugins listed in opencode.json's `plugin` array (the installer
+// registers this file there). PluginInput.directory is the working directory.
+// Keep this standalone so OpenCode needs no elepha package imports.
+//
+// The plugin runs elepha's hook and rewrites the user's message with the result.
+// Rewriting the user text part is the only channel OpenCode's model reliably
+// renders: system-prompt injection (experimental.chat.system.transform) is
+// ignored by smaller models, which is why the earlier version did nothing.
+// Verified against opencode 1.18.x with the default model.
 export function renderOpencodePlugin(launcher: string): string {
     return `${OPENCODE_PLUGIN_MARKER}
 ${renderOpencodeHookClient(launcher)}
-const pending = new Map();
 export const ElephaPlugin = async ({ directory }) => ({
     'chat.message': async (input, output) => {
         try {
-            // A subsequent message must never receive an abandoned command's context.
-            pending.delete(input.sessionID);
-            const prompt = output.parts.filter((part) => part.type === 'text').map((part) => part.text).join('\\n');
+            const parts = (output && output.parts) || [];
+            const textPart = parts.find((part) => part.type === 'text');
+            if (!textPart) return;
+            const prompt = parts.filter((part) => part.type === 'text').map((part) => part.text).join('\\n');
             if (!prompt.trim().startsWith('elepha:')) return;
             const stdout = runHook({
                 hook_event_name: 'UserPromptSubmit',
@@ -25,22 +31,21 @@ export const ElephaPlugin = async ({ directory }) => ({
             if (!stdout.trim()) return;
             const context = JSON.parse(stdout)?.hookSpecificOutput?.additionalContext;
             if (typeof context !== 'string' || !context) return;
-            // Cancelled turns may never reach system.transform. Bound their retention.
-            let dropped = false;
-            if (pending.size >= ${OPENCODE_PLUGIN_MAX_PENDING_SESSIONS}) {
-                pending.delete(pending.keys().next().value);
-                dropped = true;
-            }
-            pending.set(input.sessionID, dropped ? ${JSON.stringify(OPENCODE_PLUGIN_DROPPED_CONTEXT)} + '\\n' + context : context);
+            // Strip elepha's brief sentinel wrapper (open/close lines) so a weak
+            // model does not treat the whole block as inert background context; the
+            // inner per-command instructions (verbatim display for list/info, recap
+            // for resume) drive the reply. Rule 4 still holds: elepha recorded this
+            // injection and its ingestion quote-back drops the echoed content per
+            // session, so the rewritten turn does not re-enter memory.
+            const body = context
+                .split('\\n')
+                .filter((line) => !line.startsWith('[[elepha:brief:') && line.trim() !== '[[/elepha]]')
+                .join('\\n')
+                .trim();
+            if (body) textPart.text = body;
         } catch {
             // Fail open without logging private prompt or context data.
         }
-    },
-    'experimental.chat.system.transform': async (input, output) => {
-        const context = pending.get(input.sessionID);
-        if (context === undefined) return;
-        pending.delete(input.sessionID);
-        output.system.push(context);
     },
 });
 `;
