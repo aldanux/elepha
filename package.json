@@ -1,6 +1,6 @@
 {
     "name": "elepha",
-    "version": "0.6.4",
+    "version": "0.6.5",
     "description": "Local memory across Claude Code, Codex (CLI & Desktop) and more. Reads your transcripts, serves context via MCP.",
     "keywords": [
         "claude-code",
