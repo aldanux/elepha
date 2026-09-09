@@ -1,5 +1,10 @@
 # elepha
 
+## 0.6.1
+
+- Add `elepha stop` to stop the background daemon and confirm its process exits without disabling the service. Close the daemon's database handle before signal-driven exit so the managed lifecycle lease is released for the next startup. Use `elepha resume` to start capture again by [@aldanux](https://github.com/aldanux) in [#96](https://github.com/aldanux/elepha/pull/96)
+- Close install and uninstall database readers before changing the capture service. Skip exclusive encryption-migration ownership for already-encrypted databases when no migration needs recovery, allowing upgrades alongside active readers by [@aldanux](https://github.com/aldanux) in [#96](https://github.com/aldanux/elepha/pull/96)
+
 ## 0.6.0
 
 ### Highlights
