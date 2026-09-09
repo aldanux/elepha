@@ -80,6 +80,7 @@ function installPaths(root: string) {
         claudeMcp: path.join(root, '.claude.json'),
         codexConfig: path.join(root, '.codex', 'config.toml'),
         opencodeConfig: path.join(root, '.config', 'opencode', 'opencode.json'),
+        kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         opencodeStore: path.join(root, '.local', 'share', 'opencode'),
     };
 }
@@ -124,6 +125,7 @@ describe('installer transaction', () => {
         const root = withTempDir('elepha-installer-linux-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
         writeFileSync(paths.claudeMcp, '{}');
         writeFileSync(paths.codexConfig, '');
@@ -138,11 +140,18 @@ describe('installer transaction', () => {
             approvedRoots: 0,
         };
 
-        expect(installElepha(paths, runtime).service).toBe('registered, awaiting consent');
+        const installed = installElepha(paths, runtime);
+        expect(installed.service).toBe('registered, awaiting consent');
+        expect(JSON.parse(readFileSync(paths.kimiMcp, 'utf8')).mcpServers[ELEPHA_MCP_SERVER_NAME]).toEqual({
+            command: installed.launcher,
+            args: [...ELEPHA_MCP_ARGS],
+        });
+        expect(installed.launcher).toBe(service.launcherPath);
         expect(existsSync(servicePaths.unit)).toBe(true);
 
         expect(uninstallElepha(paths, runtime).service).toBe('not installed');
         expect(existsSync(servicePaths.unit)).toBe(false);
+        expect(existsSync(paths.kimiMcp)).toBe(false);
         expect(executor.calls).toContainEqual(['--user', 'daemon-reload']);
         expect(executor.calls).toContainEqual(['--user', 'disable', 'elepha.service']);
     });
@@ -386,6 +395,9 @@ describe('installer transaction', () => {
         const root = withTempDir('elepha-installer-rollback-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
+        const kimiOriginal = '{ "mcpServers": {"user": {"command":"docs"}} }\n';
+        writeFileSync(paths.kimiMcp, kimiOriginal);
         const original = { claudeSettings: '{"legacy":true}', claudeMcp: '{"legacy":true}', codexConfig: '# legacy\n' };
         writeFileSync(paths.claudeSettings, original.claudeSettings);
         writeFileSync(paths.claudeMcp, original.claudeMcp);
@@ -456,6 +468,7 @@ describe('installer transaction', () => {
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(original.claudeSettings);
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(original.claudeMcp);
         expect(readFileSync(paths.codexConfig, 'utf8')).toBe(original.codexConfig);
+        expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(kimiOriginal);
         expect(readFileSync(launcher, 'utf8')).toBe(legacyLauncher);
         expect(readFileSync(plist, 'utf8')).toBe(legacyPlist);
         expect(existsSync(path.join(serviceRoot, 'service', 'install-state.json'))).toBe(false);
@@ -1177,7 +1190,7 @@ describe('installer transaction', () => {
         const paths = installPaths(root);
 
         expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow(
-            'no supported tool found; install Claude Code or Codex or OpenCode first',
+            'no supported tool found; install Claude Code or Codex or OpenCode or Kimi Code first',
         );
         expect(existsSync(paths.claudeSettings)).toBe(false);
         expect(existsSync(paths.claudeMcp)).toBe(false);
@@ -1273,5 +1286,75 @@ trusted_hash = "sha256:elepha-session-start"
         expect(uninstalled).toContain('[mcp_servers.database]');
         expect(uninstalled).not.toContain('elepha-session-start');
         expect(uninstalled).not.toContain('mcp_servers.elepha');
+    });
+});
+
+describe('Kimi Code MCP installation', () => {
+    it('detects a Kimi-only home, writes the exact user config, and removes it on uninstall', () => {
+        const root = withTempDir('kimi-installer-');
+        const paths = installPaths(root);
+        const runtime = { home: root, approvedRoots: 0 };
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
+        const projectMcp = path.join(root, 'project', '.kimi-code', 'mcp.json');
+        mkdirSync(path.dirname(projectMcp), { recursive: true });
+        writeFileSync(projectMcp, '{"mcpServers":{"elepha":{"command":"project-owned"}}}');
+        const installed = installElepha(paths, runtime);
+        expect(installed.status.kimiMcp).toBe('registered');
+        expect(installed.status.ready).toBe(true);
+        const expected = { mcpServers: { [ELEPHA_MCP_SERVER_NAME]: { command: bin, args: [...ELEPHA_MCP_ARGS] } } };
+        const written = readFileSync(paths.kimiMcp, 'utf8');
+        expect(JSON.parse(written)).toEqual(expected);
+        expect(written).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+        expect(integrationHealth(paths).status.kimiMcp).toBe('registered');
+        expect(installElepha(paths, runtime).changed).toBe(false);
+        expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(written);
+        expect(existsSync(paths.claudeSettings)).toBe(false);
+        expect(existsSync(paths.codexConfig)).toBe(false);
+        expect(existsSync(paths.opencodeConfig)).toBe(false);
+        expect(uninstallElepha(paths, runtime).status.kimiMcp).toBe('not installed');
+        expect(existsSync(paths.kimiMcp)).toBe(false);
+        expect(readFileSync(projectMcp, 'utf8')).toBe('{"mcpServers":{"elepha":{"command":"project-owned"}}}');
+    });
+
+    it('preserves existing and later user servers on uninstall', () => {
+        const root = withTempDir('kimi-installer-preserve-');
+        const paths = installPaths(root);
+        const runtime = { home: root, approvedRoots: 0 };
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
+        const original = { mcpServers: { docs: { command: 'docs' } } };
+        writeFileSync(paths.kimiMcp, JSON.stringify(original));
+        installElepha(paths, runtime);
+        const config = JSON.parse(readFileSync(paths.kimiMcp, 'utf8'));
+        config.mcpServers.later = { command: 'later' };
+        writeFileSync(paths.kimiMcp, JSON.stringify(config));
+        uninstallElepha(paths, runtime);
+        expect(JSON.parse(readFileSync(paths.kimiMcp, 'utf8'))).toEqual({
+            mcpServers: { ...original.mcpServers, later: { command: 'later' } },
+        });
+    });
+
+    it('leaves a conflicting entry untouched and aborts before writing other integrations', () => {
+        const root = withTempDir('kimi-installer-conflict-');
+        const paths = installPaths(root);
+        const runtime = { home: root, approvedRoots: 0 };
+        createConfigDirectories(paths);
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
+        const source = '{"mcpServers":{"elepha":{"command":"user-owned"}}}';
+        writeFileSync(paths.kimiMcp, source);
+        expect(() => installElepha(paths, runtime)).toThrow('conflicting user-owned Kimi Code MCP');
+        expect(existsSync(paths.claudeSettings)).toBe(false);
+        expect(existsSync(paths.codexConfig)).toBe(false);
+        expect(() => uninstallElepha(paths, runtime)).toThrow('conflicting user-owned Kimi Code MCP');
+        expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(source);
+        expect(integrationHealth(paths).status.kimiMcp).toBe('conflict');
+    });
+
+    it('does not create a Kimi home for an absent client', () => {
+        const root = withTempDir('kimi-installer-absent-');
+        const paths = installPaths(root);
+        createConfigDirectories(paths);
+        const installed = installElepha(paths, { home: root, approvedRoots: 0 });
+        expect(installed.status.kimiMcp).toBe('not present');
+        expect(existsSync(path.dirname(paths.kimiMcp))).toBe(false);
     });
 });

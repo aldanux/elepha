@@ -13,10 +13,11 @@ const activeIntegrations: IntegrationHealth = {
         claudeMcp: 'registered',
         codexMcp: 'registered',
         opencodeMcp: 'registered',
+        kimiMcp: 'registered',
         opencodePlugin: 'installed',
         ready: true,
     },
-    present: { claude: true, codex: true, opencode: true },
+    present: { claude: true, codex: true, opencode: true, kimi: true },
 };
 
 function daemon(healthy: boolean): DaemonHealth {
@@ -36,6 +37,27 @@ function runtime(overrides: Partial<DoctorRuntime> = {}): DoctorRuntime {
 }
 
 describe('elepha doctor', () => {
+    it.each(['registered', 'not installed', 'stale binary', 'conflict', 'invalid', 'disabled', 'not present'] as const)(
+        'reports Kimi user registration %s with project override precedence',
+        async (kimiMcp) => {
+            const result = await runDoctor(
+                runtime({
+                    inspectIntegrations: () => ({
+                        ...activeIntegrations,
+                        present: { ...activeIntegrations.present, kimi: kimiMcp !== 'not present' },
+                        status: { ...activeIntegrations.status, kimiMcp },
+                    }),
+                }),
+            );
+            const line = result.lines.find((value) => value.includes('Kimi Code MCP (user)'));
+            expect(line).toContain(kimiMcp);
+            expect(line).toContain('project .kimi-code/mcp.json can override elepha');
+            const ready = kimiMcp === 'registered' || kimiMcp === 'not present';
+            expect(result.exitCode).toBe(ready ? 0 : 1);
+            expect(result.nextSteps).toEqual(ready ? [] : [terminalHandoff('install')]);
+        },
+    );
+
     it.each(['not installed', 'stale binary', 'conflict', 'stale plugin'] as const)(
         'reports an OpenCode plugin %s and provides the install handoff',
         async (opencodePlugin) => {
@@ -62,7 +84,7 @@ describe('elepha doctor', () => {
                 '✓ Daemon: RUNNING (pid 123, heartbeat 1s ago)',
                 '✓ Claude Code hooks: SessionStart + UserPromptSubmit installed',
                 '✓ Codex hooks: SessionStart + UserPromptSubmit installed and approved',
-                '✓ MCP: Claude, Codex, and OpenCode registered where detected',
+                '✓ MCP: Claude, Codex, OpenCode, and Kimi Code registered where detected',
                 '✓ Database: opens and migrations apply',
                 '✓ Consent: 1 approved root',
                 '✓ Launcher: managed launcher is valid',
@@ -183,7 +205,7 @@ describe('elepha doctor', () => {
             }),
         );
 
-        expect(result.lines).toContain('✗ MCP: Claude, Codex, and OpenCode must be registered where detected');
+        expect(result.lines).toContain('✗ MCP: Claude, Codex, OpenCode, and Kimi Code must be registered where detected');
         expect(result.nextSteps).toEqual([terminalHandoff('install')]);
         expect(result.exitCode).toBe(1);
     });

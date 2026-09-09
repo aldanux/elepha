@@ -44,6 +44,17 @@ export function codexHome(): string {
     return override ? path.resolve(override) : path.join(homedir(), '.codex');
 }
 
+export function kimiConfigDir(): string {
+    const override = process.env.KIMI_CODE_HOME?.trim();
+    return override ? path.resolve(override) : path.join(homedir(), '.kimi-code');
+}
+
+// Only the user registry is managed here; project .kimi-code/mcp.json entries
+// override same-named user servers inside Kimi Code.
+export function kimiMcpPath(): string {
+    return path.join(kimiConfigDir(), 'mcp.json');
+}
+
 // OpenCode follows the XDG data-directory convention on every supported platform.
 export function opencodeStoreRoot(): string {
     const xdgDataHome = process.env.XDG_DATA_HOME?.trim();

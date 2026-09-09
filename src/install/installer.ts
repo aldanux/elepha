@@ -7,12 +7,13 @@ import {
     claudeSettingsPath,
     codexConfigPath,
     elephaHome,
+    kimiMcpPath,
     opencodeConfigPath,
     opencodePluginPath,
     opencodeStoreRoot,
 } from '../config/paths.js';
 import { transformClaudeHook, transformCodexHook } from '../hooks/installer.js';
-import { transformClaudeMcp, transformCodexMcp, transformOpencodeMcp } from '../mcp/installer.js';
+import { transformClaudeMcp, transformCodexMcp, transformKimiMcp, transformOpencodeMcp } from '../mcp/installer.js';
 import { SUPPORTED_TOOLS, TOOL_METADATA } from '../types/index.js';
 import { atomicWrite } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
@@ -63,6 +64,7 @@ function paths(): InstallPaths {
         claudeMcp: claudeMcpPath(),
         codexConfig: codexConfigPath(),
         opencodeConfig: opencodeConfigPath(),
+        kimiMcp: kimiMcpPath(),
         opencodeStore: opencodeStoreRoot(),
     };
 }
@@ -184,6 +186,7 @@ function isDefaultPaths(input: InstallPaths): boolean {
         input.claudeMcp === current.claudeMcp &&
         input.codexConfig === current.codexConfig &&
         input.opencodeConfig === current.opencodeConfig &&
+        input.kimiMcp === current.kimiMcp &&
         input.opencodeStore === current.opencodeStore
     );
 }
@@ -270,8 +273,8 @@ export function installElepha(
     const recoveryService = runtime.service ?? serviceBackend({ platform, home: runtime.home });
     replayRollbackJournal(recoveryService);
     const present = detectPresentTools(inputPaths);
-    if (!present.claude && !present.codex && !present.opencode) {
-        const choices = SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName).join(' or ');
+    if (!present.claude && !present.codex && !present.opencode && !present.kimi) {
+        const choices = [...SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName), 'Kimi Code'].join(' or ');
         throw new Error(`no supported tool found; install ${choices} first`);
     }
     const resolved = resolveInstalledElephaBin();
@@ -301,6 +304,7 @@ export function installElepha(
         claudeMcp: text(inputPaths.claudeMcp),
         codex: text(inputPaths.codexConfig),
         opencode: text(inputPaths.opencodeConfig),
+        kimiMcp: text(inputPaths.kimiMcp),
         opencodePlugin: readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
     };
     const preparingPhase = 'Preparing hooks & MCP';
@@ -325,6 +329,7 @@ export function installElepha(
                     claudeMcp: before.claudeMcp,
                     codexConfig: present.codex ? transformCodexHook(before.codex, launcher) : before.codex,
                     opencodeConfig: before.opencode,
+                    kimiMcp: before.kimiMcp,
                     opencodePlugin: before.opencodePlugin,
                 },
                 launcher,
@@ -416,6 +421,7 @@ export function installElepha(
         launcher,
         present,
         readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
+        text(inputPaths.kimiMcp),
     );
     return { bin: resolved.bin, launcher: service?.launcherPath, changed, status: after, service: serviceState };
 }
@@ -445,6 +451,7 @@ export function uninstallElepha(
         claudeMcp: text(inputPaths.claudeMcp),
         codex: text(inputPaths.codexConfig),
         opencode: text(inputPaths.opencodeConfig),
+        kimiMcp: text(inputPaths.kimiMcp),
         opencodePlugin: readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
     };
     const snapshots = installSnapshotsDirectory(runtime);
@@ -473,6 +480,12 @@ export function uninstallElepha(
             current: before.opencode,
             validate: validateJson('OpenCode opencode.json'),
             remove: (current: string) => transformOpencodeMcp(current, launcher, true, opencodePluginPath(inputPaths.opencodeConfig)),
+        },
+        {
+            file: inputPaths.kimiMcp,
+            current: before.kimiMcp,
+            validate: validateJson('Kimi Code mcp.json'),
+            remove: (current: string) => transformKimiMcp(current, launcher, true),
         },
     ];
     const changes = uninstallConfigs.flatMap<ConfigChange>(({ file, current, validate, remove }) => {
@@ -519,6 +532,7 @@ export function uninstallElepha(
         launcher,
         detectPresentTools(inputPaths),
         readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
+        text(inputPaths.kimiMcp),
     );
     return { bin: resolved.bin, launcher: service?.launcherPath, changed, status: after, service: service ? 'not installed' : undefined };
 }
