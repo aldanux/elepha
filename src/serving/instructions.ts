@@ -15,7 +15,7 @@ export const HELP = [
     'elepha:query <query> — Search all consented projects.',
     'elepha:query:here <query> — Search the current consented project.',
     "elepha:last — Inject the most recent session's turns.",
-    'elepha:list[:<n>][:codex|:claude] — List 1–100 recent sessions, optionally filtered by tool.',
+    'elepha:list[:<n>][:codex|:claude|:opencode] — List 1–100 recent sessions, optionally filtered by tool.',
     'elepha:resume:<n> — Load the nth session to continue it; the model presents a recap.',
     INFO_HELP,
     'elepha:update — Show the terminal command for updating elepha.',

@@ -116,7 +116,7 @@ export function parseUserPromptCommand(prompt: string): UserPromptCommand | unde
     if (resume?.[1]) {
         return { kind: 'resume', index: Number(resume[1]) };
     }
-    const list = /^elepha:list(?::([1-9]\d*))?(?::(codex|claude))?$/.exec(command);
+    const list = /^elepha:list(?::([1-9]\d*))?(?::(codex|claude|opencode))?$/.exec(command);
     if (list) {
         const count = list[1] === undefined ? ELEPHA_LIST_DEFAULT_LIMIT : Number(list[1]);
         if (count >= 1 && count <= ELEPHA_LIST_MAX_LIMIT) {

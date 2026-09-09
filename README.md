@@ -46,14 +46,13 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 
 ## Supported tools and platforms
 
-**elepha** supports Claude Code CLI and the Claude desktop Code tab, Codex CLI and
-Codex desktop, and OpenCode. All supported tools use the same local memory database.
+**elepha** supports:
 
-OpenCode capture is passive, automatic, on by default, and consent-gated per project.
-`elepha install` automatically registers elepha's MCP server in OpenCode, so its model can
-recall past work through the same read-only MCP tools. It also installs the elepha plugin at
-`~/.config/opencode/plugins/elepha.js` (or `$XDG_CONFIG_HOME/opencode/plugins/elepha.js`)
-for in-chat `elepha:` commands, reaching parity with Claude Code and Codex.
+- Claude Code CLI & desktop
+- Codex CLI & desktop
+- OpenCode
+
+All supported tools use the same local memory database.
 
 It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 

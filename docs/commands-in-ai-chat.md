@@ -15,8 +15,8 @@ This page is the full guide for in-chat recall commands.
 | `elepha:query:here <q>`                            | Same as `elepha:query`, but only the current project.                                                                                     |
 | `elepha:list`                                      | List the five most recent session titles, numbered for selection.                                                                         |
 | `elepha:list:<n>`                                  | List the last `n` session titles, where `n` is from 1 to 100.                                                                             |
-| `elepha:list:codex` / `elepha:list:claude`         | List recent sessions from only Codex or Claude Code.                                                                                      |
-| `elepha:list:<n>:codex` / `elepha:list:<n>:claude` | Apply both a 1–100 count and a tool filter, with the count before the tool.                                                               |
+| `elepha:list:<tool>`                               | Filter recent sessions by tool: `codex`, `claude`, or `opencode`.                                                                         |
+| `elepha:list:<n>:<tool>`                           | Apply both a 1–100 count and a tool filter, with the count before the tool.                                                               |
 | `elepha:resume:<n>`                                | Load the nth session to continue it; the model presents a recap.                                                                          |
 | `elepha:info`                                      | Show elepha status: sessions here and total, capture state, the last session with its project, and any capture or new-version alert.      |
 | `elepha:help`                                      | Show the in-chat command list.                                                                                                            |
@@ -41,10 +41,8 @@ past work, the model calls elepha's `recall` MCP tool, which returns the relevan
 (decisions, the reasoning, and open items) with its provenance (project, tool, session,
 date) so the model can answer in place. `recall` needs elepha's MCP tools connected; it is
 not typed as an `elepha:` command. `elepha install` connects those MCP tools automatically
-for detected Claude Code, Codex, and OpenCode installations. For OpenCode it also installs
-`~/.config/opencode/plugins/elepha.js` (under `$XDG_CONFIG_HOME` when set). This plugin
-handles all the in-chat `elepha:` commands on this page and injects their results before
-model dispatch. Restart OpenCode after installation to load it.
+for detected Claude Code, Codex, and OpenCode installations. The `elepha:` commands on this
+page work in all three.
 
 ## Maintenance
 
