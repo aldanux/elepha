@@ -9,6 +9,11 @@ import { opencodePluginStatus, renderOpencodePlugin, transformOpencodePlugin } f
 import { installationStatus } from '../../src/install/status.js';
 import { transformOpencodeMcp } from '../../src/mcp/installer.js';
 import { OPENCODE_HOOK_ARGS } from '../../src/security/subprocess-allowlist.js';
+import {
+    DISPLAY_VERBATIM_INSTRUCTIONS,
+    OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS,
+    RESUME_RECAP_INSTRUCTIONS,
+} from '../../src/serving/instructions.js';
 
 const launcher = '/opt/elepha with spaces/elepha';
 const directory = '/projects/current worktree';
@@ -65,13 +70,18 @@ describe('generated OpenCode plugin', () => {
         expect(rewritten).toBe('rendered context');
     });
 
-    it('strips the brief sentinel wrapper, keeping the inner instructions and payload', async () => {
-        const context =
-            '[[elepha:brief:01ABCDEF]]\nDisplay everything below this line to the user exactly as written.\n🐘 status line\n[[/elepha]]';
+    it('strips the brief sentinel wrapper and replaces the leading verbatim instruction while keeping the payload', async () => {
+        const context = `[[elepha:brief:01ABCDEF]]\n${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 status line\n[[/elepha]]`;
         const { hooks } = await fixture(response(context));
-        expect(await message(hooks, 'elepha:info')).toBe(
-            'Display everything below this line to the user exactly as written.\n🐘 status line',
-        );
+        const rewritten = await message(hooks, 'elepha:info');
+        expect(rewritten).toBe(`${OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 status line`);
+        expect(rewritten).not.toContain('Display everything below this line');
+    });
+
+    it('keeps the resume recap instruction while stripping the brief sentinel wrapper', async () => {
+        const context = `[[elepha:brief:01ABCDEF]]\n${RESUME_RECAP_INSTRUCTIONS}\n# Session title\n\nSession turns\n[[/elepha]]`;
+        const { hooks } = await fixture(response(context));
+        expect(await message(hooks, 'elepha:resume:1')).toBe(`${RESUME_RECAP_INSTRUCTIONS}\n# Session title\n\nSession turns`);
     });
 
     it('joins text parts for the payload and rewrites only the first text part', async () => {

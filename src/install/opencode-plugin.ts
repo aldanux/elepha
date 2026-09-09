@@ -1,5 +1,6 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { renderOpencodeHookClient } from '../security/subprocess-allowlist.js';
+import { DISPLAY_VERBATIM_INSTRUCTIONS, OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS } from '../serving/instructions.js';
 import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 
 // OpenCode loads plugins listed in opencode.json's `plugin` array (the installer
@@ -14,6 +15,8 @@ import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 export function renderOpencodePlugin(launcher: string): string {
     return `${OPENCODE_PLUGIN_MARKER}
 ${renderOpencodeHookClient(launcher)}
+const displayVerbatimInstructions = ${JSON.stringify(DISPLAY_VERBATIM_INSTRUCTIONS)};
+const opencodeDisplayVerbatimInstructions = ${JSON.stringify(OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS)};
 export const ElephaPlugin = async ({ directory }) => ({
     'chat.message': async (input, output) => {
         try {
@@ -31,17 +34,16 @@ export const ElephaPlugin = async ({ directory }) => ({
             if (!stdout.trim()) return;
             const context = JSON.parse(stdout)?.hookSpecificOutput?.additionalContext;
             if (typeof context !== 'string' || !context) return;
-            // Strip elepha's brief sentinel wrapper (open/close lines) so a weak
-            // model does not treat the whole block as inert background context; the
-            // inner per-command instructions (verbatim display for list/info, recap
-            // for resume) drive the reply. Rule 4 still holds: elepha recorded this
-            // injection and its ingestion quote-back drops the echoed content per
-            // session, so the rewritten turn does not re-enter memory.
-            const body = context
+            // OpenCode displays the rewritten model input as the user's bubble. Its
+            // default model ignores a bare payload, so replace the exact leading
+            // directive with the shortest verified compliant wording while preserving
+            // recap and data-safety instructions used by other commands. Rule 4 still
+            // holds: recorded injection quote-back drops the echoed content per session.
+            const bodyLines = context
                 .split('\\n')
-                .filter((line) => !line.startsWith('[[elepha:brief:') && line.trim() !== '[[/elepha]]')
-                .join('\\n')
-                .trim();
+                .filter((line) => !line.startsWith('[[elepha:brief:') && line.trim() !== '[[/elepha]]');
+            if (bodyLines[0]?.trimEnd() === displayVerbatimInstructions) bodyLines[0] = opencodeDisplayVerbatimInstructions;
+            const body = bodyLines.join('\\n').trim();
             if (body) textPart.text = body;
         } catch {
             // Fail open without logging private prompt or context data.
