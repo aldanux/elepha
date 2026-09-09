@@ -8,6 +8,8 @@ import { errorMessage } from '../util/error.js';
 import { removeFileIfExists } from '../util/fs.js';
 import { type ResolvedElephaBin, resolveInstalledElephaBin } from './binary.js';
 import { migrateDatabaseForInstall } from './database-migration.js';
+import { refreshInstalledIntegrations } from './integration-refresh.js';
+import { type IntegrationRefresh, restoreRefreshedIntegrations } from './integrations.js';
 import { detectLauncherBackend, type LauncherBackend } from './launcher.js';
 import { isSupportedPlatform } from './platform.js';
 import { reconcileCaptureServiceAsync, type ServiceBackend, serviceBackend } from './service-backend.js';
@@ -31,6 +33,8 @@ export interface SelfUpdateRuntime {
     approvedRoots?: number;
     readApprovedRoots?: () => Promise<number>;
     reconcile?: Reconcile;
+    refreshIntegrations?: (installed: ResolvedElephaBin, launcher: string) => IntegrationRefresh | Promise<IntegrationRefresh>;
+    report?: (message: string) => void;
     migrateDatabase?: () => Promise<unknown>;
 }
 
@@ -102,8 +106,8 @@ async function restart(
 }
 
 // Updates the globally-installed elepha package and restarts its managed
-// capture service. Rollback restores only the prior code and healthy service;
-// additive schema migrations are intentionally left in place.
+// capture service. Rollback restores prior code, integration bytes, and healthy
+// service; additive schema migrations are intentionally left in place.
 export function selfUpdate(runtime: SelfUpdateRuntime): Promise<SelfUpdateResult>;
 export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoots()): Promise<SelfUpdateResult> {
     const platform = runtime.platform ?? process.platform;
@@ -151,7 +155,9 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
     }
 
     let installedVersion: string;
+    let integrations: IntegrationRefresh | undefined;
     try {
+        integrations = await (runtime.refreshIntegrations ?? refreshInstalledIntegrations)(resolved, service.launcherPath);
         await restart(service, readApprovedRoots, reconcile, migrateDatabase);
         installedVersion = (runtime.readPackageVersion ?? packageVersion)(resolved.packageRoot);
     } catch (updateError) {
@@ -165,6 +171,18 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
             await npm.installVersion(previousVersion);
         } catch (rollbackError) {
             throw new Error(`${prefix}; rollback to ${previousVersion} failed: ${errorMessage(rollbackError)}; run elepha doctor`);
+        }
+        // Refresh write failures restore themselves transactionally and enter the
+        // normal package rollback. Later failures also restore pre-update config
+        // bytes; the old package need not implement this new refresh entry point.
+        try {
+            if (integrations) {
+                restoreRefreshedIntegrations(integrations);
+            }
+        } catch (restoreError) {
+            throw new Error(
+                `${prefix}; package reverted to ${previousVersion} but integration restore failed: ${errorMessage(restoreError)}; run elepha doctor`,
+            );
         }
         try {
             await restart(service, readApprovedRoots, reconcile, migrateDatabase);
@@ -181,6 +199,13 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
         return { status: 'rolled-back', previousVersion, attemptedVersion: latestVersion, failure: updateFailure };
     }
 
+    const report = runtime.report ?? console.log;
+    for (const file of integrations.refreshed) {
+        report(`Refreshed integration: ${file}`);
+    }
+    for (const skipped of integrations.skipped) {
+        report(`${skipped.integration}: ${skipped.status} — left untouched (${skipped.file}); run elepha doctor`);
+    }
     removeFileIfExists(updateAvailablePath());
     return { status: 'updated', previousVersion, version: installedVersion };
 }
