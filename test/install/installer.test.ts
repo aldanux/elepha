@@ -1086,6 +1086,7 @@ describe('installer transaction', () => {
                 mcp: {
                     [ELEPHA_MCP_SERVER_NAME]: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true },
                 },
+                plugin: [opencodePluginPath(paths.opencodeConfig)],
             });
             expect(existsSync(paths.claudeSettings)).toBe(false);
             expect(existsSync(paths.codexConfig)).toBe(false);

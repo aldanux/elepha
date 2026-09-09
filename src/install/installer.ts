@@ -341,7 +341,7 @@ export function installElepha(
                       {
                           kind: 'write' as const,
                           file: inputPaths.opencodeConfig,
-                          text: transformOpencodeMcp(before.opencode, launcher),
+                          text: transformOpencodeMcp(before.opencode, launcher, false, opencodePluginPath(inputPaths.opencodeConfig)),
                           validate: validateJson('OpenCode opencode.json'),
                       },
                       {
@@ -497,7 +497,7 @@ export function uninstallElepha(
             file: inputPaths.opencodeConfig,
             current: before.opencode,
             validate: validateJson('OpenCode opencode.json'),
-            remove: (current: string) => transformOpencodeMcp(current, launcher, true),
+            remove: (current: string) => transformOpencodeMcp(current, launcher, true, opencodePluginPath(inputPaths.opencodeConfig)),
         },
     ];
     const changes = uninstallConfigs.flatMap<ConfigChange>(({ file, current, validate, remove }) => {
