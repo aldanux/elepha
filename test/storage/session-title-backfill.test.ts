@@ -1,5 +1,4 @@
-import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -9,6 +8,7 @@ import { openUnmanagedDb } from '../../src/storage/db.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import { applySessionTitleBackfill, planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const SOURCE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'sample-session.jsonl');
 const CUSTOM_TITLE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.229-custom-title.jsonl');
@@ -93,7 +93,7 @@ describe('session-title backfill', () => {
     afterEach(() => vi.unstubAllEnvs());
 
     it('writes titles only for segments with substantive prompts and uses Codex first messages', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-session-title-backfill-'));
+        const root = withTempDir('elepha-session-title-backfill-');
         const claudeConfigDir = path.join(root, 'claude-home');
         const claudeProjects = path.join(claudeConfigDir, 'projects');
         const codexHome = path.join(root, 'codex-home');

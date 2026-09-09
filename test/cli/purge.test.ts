@@ -8,7 +8,7 @@ import { PURGE_HERE_UNCONSENTED } from '../../src/cli/purge-wizard.js';
 import { consentedProject } from '../../src/hooks/common.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const testScratchRoot = path.join(repositoryRoot, '.test-scratch');
@@ -83,7 +83,7 @@ function databaseRows(dbPath: string): Record<string, unknown[]> {
 
 describe('elepha purge orphan project scope', () => {
     it('applies only surviving previewed ids when matching sessions appear during confirmation', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');
         const previousDbPath = process.env.ELEPHA_DB_PATH;
         const previousElephaHome = process.env.ELEPHA_HOME;
@@ -147,13 +147,13 @@ describe('elepha purge orphan project scope', () => {
     });
 
     it('resolves orphan ids in the CLI, previews before writing, and applies only them', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const projectDirectory = mkdtempSync(path.join(testScratchRoot, 'purge-'));
         const dbPath = path.join(directory, 'elepha.db');
-        const tempPath = path.join(directory, 'temp-project');
+        // The OS-temp project is the refused-root subject; database scratch stays in-repo.
+        const tempPath = mkdtempSync(path.join(tmpdir(), 'elepha-purge-temp-project-'));
         const missingPath = path.join(projectDirectory, 'missing-project');
         const livePath = path.join(projectDirectory, 'live-project');
-        mkdirSync(tempPath);
         mkdirSync(livePath);
         const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
@@ -199,11 +199,12 @@ describe('elepha purge orphan project scope', () => {
         } finally {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
+            removeDirectory(tempPath);
         }
     }, 15000);
 
     it('reports and verifies durable-copy deletion through the CLI purge lifecycle', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-durable-'));
+        const directory = withTempDir('elepha-purge-durable-');
         const dbPath = path.join(directory, 'elepha.db');
         const projectPath = path.join(directory, 'durable-project');
         const db = openUnmanagedDb(dbPath);
@@ -251,7 +252,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('resolves only denied and unapproved projects as revoked, then preserves their denied consent after applying', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const projectDirectory = withGrantableTestDir('purge-revoked-');
         const dbPath = path.join(directory, 'elepha.db');
         const deniedRoot = path.join(projectDirectory, 'revoked-root');
@@ -294,7 +295,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('combines a project scope with --older-than without touching other projects or newer sessions', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');
         const selectedPath = path.join(directory, 'selected-project');
         const retainedPath = path.join(directory, 'retained-project');
@@ -328,7 +329,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('--here rejects an unconsented parent and resolves a consented project from its subdirectory', () => {
-        const directory = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-purge-')));
+        const directory = realpathSync(withTempDir('elepha-purge-'));
         const projectDirectory = realpathSync(withGrantableTestDir('purge-here-'));
         const dbPath = path.join(directory, 'elepha.db');
         const projectRoot = path.join(projectDirectory, 'project');
@@ -384,7 +385,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('rejects invalid selector combinations without mutating any database row', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');
         const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
@@ -429,7 +430,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('rejects empty project queries without mutating any database row', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');
         const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
@@ -452,7 +453,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('errors without a scope or time filter in non-TTY mode', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');
 
         try {
@@ -467,7 +468,7 @@ describe('elepha purge orphan project scope', () => {
     }, 15000);
 
     it('asks a TTY to confirm, leaves memory untouched on no, and deletes on yes', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-purge-'));
+        const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');
         const missingPath = path.join(directory, 'missing-project');
         const db = openUnmanagedDb(dbPath);

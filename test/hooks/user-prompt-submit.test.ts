@@ -1,5 +1,4 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ELEPHA_LIST_DEFAULT_LIMIT, RESUME_CHAR_BUDGET, RESUME_TOKEN_BUDGET } from '../../src/config/constants.js';
@@ -20,10 +19,12 @@ import {
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
+import { testScratchRoot, withTempDir } from '../helpers/tmp.js';
 
 const NOW = Date.parse('2026-08-19T00:00:00.000Z');
-const testCodexHome = mkdtempSync(path.join(tmpdir(), 'elepha-user-prompt-codex-'));
-const testClaudeConfigDir = mkdtempSync(path.join(tmpdir(), 'elepha-user-prompt-claude-'));
+mkdirSync(testScratchRoot, { recursive: true });
+const testCodexHome = mkdtempSync(path.join(testScratchRoot, 'elepha-user-prompt-codex-'));
+const testClaudeConfigDir = mkdtempSync(path.join(testScratchRoot, 'elepha-user-prompt-claude-'));
 const SOURCE = path.join(testCodexHome, 'sessions', 'source.jsonl');
 const CLAUDE_SOURCE = path.join(testClaudeConfigDir, 'projects', 'source.jsonl');
 const priorCodexHome = process.env.CODEX_HOME;
@@ -42,6 +43,9 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+    rmSync(testCodexHome, { recursive: true, force: true });
+    rmSync(testClaudeConfigDir, { recursive: true, force: true });
+
     if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = priorCodexHome;
     if (priorClaudeConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
@@ -437,7 +441,7 @@ describe('D40 UserPromptSubmit command hook', () => {
 
     it('serves global list and last outside a consented project and gracefully rejects resume fallback', async () => {
         const { dbPath } = seededDb();
-        const unconsentedCwd = mkdtempSync(path.join(tmpdir(), 'elepha-unconsented-cwd-'));
+        const unconsentedCwd = withTempDir('elepha-unconsented-cwd-');
         const logs: string[] = [];
 
         const list = await runUserPromptSubmit(payload(unconsentedCwd, 'elepha:list'), 'codex', {
@@ -585,13 +589,13 @@ describe('D40 UserPromptSubmit command hook', () => {
 
     it('fails open without output when the database is unavailable', async () => {
         const result = await runUserPromptSubmit(payload(process.cwd(), 'elepha:last'), 'codex', {
-            dbPath: path.join(tmpdir(), `elepha-missing-${Date.now()}.db`),
+            dbPath: path.join(withTempDir('elepha-missing-db-'), 'missing.db'),
         });
         expect(result).toEqual({ reason: 'database_unavailable' });
     });
 
     it('appends successful commands and failure reasons to the isolated hook log', async () => {
-        const logPath = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-user-prompt-log-')), 'hook.log');
+        const logPath = path.join(withTempDir('elepha-user-prompt-log-'), 'hook.log');
         const priorHookLogPath = process.env.ELEPHA_HOOK_LOG_PATH;
         process.env.ELEPHA_HOOK_LOG_PATH = logPath;
 
@@ -599,7 +603,7 @@ describe('D40 UserPromptSubmit command hook', () => {
             const { dbPath, cwd } = seededDb();
             const success = await runUserPromptSubmit(payload(cwd, 'elepha:list'), 'codex', { dbPath, now: () => NOW });
             const failure = await runUserPromptSubmit(payload(cwd, 'elepha:last'), 'codex', {
-                dbPath: path.join(tmpdir(), `elepha-missing-${Date.now()}.db`),
+                dbPath: path.join(withTempDir('elepha-missing-db-'), 'missing.db'),
             });
 
             expect('output' in success).toBe(true);

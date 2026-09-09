@@ -1,13 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { DURABLE_CAPTURE_MAX_BYTES } from '../../src/config/constants.js';
 import { DEFAULT_MEMORY_CONFIG, readMemoryConfig } from '../../src/config/memory-config.js';
 import { getSetting, listSettings, SETTING_KEYS, setSetting, unsetSetting } from '../../src/config/settings.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function configPath(): string {
-    return path.join(mkdtempSync(path.join(tmpdir(), 'elepha-settings-')), 'config.json');
+    return path.join(withTempDir('elepha-settings-'), 'config.json');
 }
 
 describe('settings', () => {

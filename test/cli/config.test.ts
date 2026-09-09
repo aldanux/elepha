@@ -1,5 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { Command } from 'commander';
@@ -7,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { registerConfig } from '../../src/cli/commands/config.js';
 import { type ConfigPrompts, runConfigWizard } from '../../src/cli/config-wizard.js';
 import { setSetting } from '../../src/config/settings.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const CANCELLED = Symbol('cancelled');
 
@@ -74,7 +74,7 @@ describe('elepha config', () => {
     });
 
     it('uses the displayed value vocabulary for get, set, and unset', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-config-commands-'));
+        const directory = withTempDir('elepha-config-commands-');
         const priorElephaHome = process.env.ELEPHA_HOME;
         const priorNoUpdateCheck = process.env.ELEPHA_NO_UPDATE_CHECK;
         const output: string[] = [];
@@ -126,7 +126,7 @@ describe('elepha config', () => {
     });
 
     it('lists settings, applies a change, and surfaces the last-capture refusal without writing', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-config-wizard-'));
+        const directory = withTempDir('elepha-config-wizard-');
         const configPath = path.join(directory, 'config.json');
         const output = ttyStream();
 

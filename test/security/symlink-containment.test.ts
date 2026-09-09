@@ -6,14 +6,14 @@
 // re-checks containment. This is adjacent to the subprocess cwd hardening
 // because both defend against attacker-controlled paths.
 
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 class StubSummarizer implements SummarizationProvider {
     async summarize(_input: SummarizationInput): Promise<SummarizationOutput> {
@@ -67,7 +67,7 @@ describe('symlink containment', () => {
     });
 
     it('binds symlink targets to the selected provider store while preserving same-store ingestion', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-symlink-'));
+        const root = withTempDir('elepha-symlink-');
         prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
         prevCodexHome = process.env.CODEX_HOME;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');

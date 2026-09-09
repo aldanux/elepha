@@ -1,15 +1,15 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const CODEX_FIXTURES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'codex');
 
 function writeRollout(lines: unknown[]): string {
-    const dir = mkdtempSync(path.join(tmpdir(), 'elepha-kind-'));
+    const dir = withTempDir('elepha-kind-');
     const file = path.join(dir, 'rollout-2026-08-11T16-28-05-019ff026-8bd5-7c71-8f9a-a92f63c85b27.jsonl');
     writeFileSync(file, `${lines.map((l) => JSON.stringify(l)).join('\n')}\n`);
     return file;

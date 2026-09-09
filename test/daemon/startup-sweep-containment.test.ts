@@ -1,11 +1,12 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { EmptySessionAnalysis, ParsedTurn, SessionAdapter, SessionClassification } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function turn(sourcePath: string, projectPath: string): ParsedTurn {
     return {
@@ -111,7 +112,7 @@ describe('startup sweep containment', () => {
     });
 
     it('continues past a zero-turn format alert, refused root, and unexpected throw, then summarizes every file skip', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-startup-sweep-'));
+        const root = withTempDir('elepha-startup-sweep-');
         const codexHome = path.join(root, '.codex');
         vi.stubEnv('CODEX_HOME', codexHome);
         const watchRoot = path.join(codexHome, 'sessions');
@@ -164,7 +165,7 @@ describe('startup sweep containment', () => {
     }, 15000);
 
     it('summarizes routine exclusions without per-file logs while retaining unreadable-file alerts', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-routine-skip-'));
+        const root = withTempDir('elepha-routine-skip-');
         const codexHome = path.join(root, '.codex');
         vi.stubEnv('CODEX_HOME', codexHome);
         const watchRoot = path.join(codexHome, 'sessions');

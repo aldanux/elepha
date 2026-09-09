@@ -1,5 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS, DAEMON_OUTPUT_MAX_CHARS } from '../../src/config/constants.js';
@@ -13,6 +12,7 @@ import {
     renderDaemonPlist,
 } from '../../src/install/launchd-backend.js';
 import { launcherHash } from '../../src/install/launcher.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const savedEnvironment = { ...process.env };
 
@@ -77,7 +77,7 @@ describe('daemon service ownership', () => {
     });
 
     it('accepts a heartbeat that appears late but before the 60-second deadline', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         let now = 0;
         const sleeps: number[] = [];
         const service = new LaunchdBackend(defaultLaunchdServicePaths(home), new FakeLaunchctl(), 501, {
@@ -95,7 +95,7 @@ describe('daemon service ownership', () => {
     });
 
     it('fails only after the complete 60-second heartbeat deadline', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         let now = 0;
         const sleeps: number[] = [];
         const service = new LaunchdBackend(defaultLaunchdServicePaths(home), new FakeLaunchctl(), 501, {
@@ -113,7 +113,7 @@ describe('daemon service ownership', () => {
     });
 
     it('uses the override label for every launchctl target and the LaunchAgents plist name', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         process.env.ELEPHA_SERVICE_LABEL = 'com.elepha.gate7test';
         const paths = defaultLaunchdServicePaths(home);
         const executor = new FakeLaunchctl();
@@ -129,7 +129,7 @@ describe('daemon service ownership', () => {
     });
 
     it('restarts by booting out before bootstrapping the service again', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         const executor = new FakeLaunchctl();
         executor.loaded = true;
         const service = new LaunchdBackend(defaultLaunchdServicePaths(home), executor, 501);
@@ -143,7 +143,7 @@ describe('daemon service ownership', () => {
     });
 
     it('waits for an asynchronous bootout to unload the service', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         let now = 0;
         let bootedOut = false;
         let printsAfterBootout = 0;
@@ -180,7 +180,7 @@ describe('daemon service ownership', () => {
     });
 
     it('fails when bootout does not unload the service before its deadline', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         let now = 0;
         const executor: LaunchctlExecutor = {
             run(args) {
@@ -200,7 +200,7 @@ describe('daemon service ownership', () => {
     });
 
     it('propagates only active isolation locations into the managed plist', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         const paths = defaultLaunchdServicePaths(home);
         const service = new LaunchdBackend(paths, new FakeLaunchctl(), 501);
         const environment = {
@@ -223,8 +223,8 @@ describe('daemon service ownership', () => {
     });
 
     it('renders an identical plist and manifest hash for equivalent install paths however the installing shell expressed them', () => {
-        const physical = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-service-')));
-        const aliasParent = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-service-alias-')));
+        const physical = realpathSync(withTempDir('elepha-service-'));
+        const aliasParent = realpathSync(withTempDir('elepha-service-alias-'));
         const alias = path.join(aliasParent, 'home-link');
         symlinkSync(physical, alias);
         mkdirSync(path.join(physical, 'claude'), { recursive: true });
@@ -252,7 +252,7 @@ describe('daemon service ownership', () => {
     });
 
     it('keeps the default label and plist environment unchanged when overrides are absent', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         delete process.env.ELEPHA_SERVICE_LABEL;
         const paths = defaultLaunchdServicePaths(home);
         const plist = renderDaemonPlist(paths, {});
@@ -266,7 +266,7 @@ describe('daemon service ownership', () => {
     });
 
     it('does not treat an absent target as proof that the service is disabled', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         const executor: LaunchctlExecutor = {
             run(args) {
                 if (args[0] === 'print') return { stdout: '', stderr: 'Could not find service', status: 3 };
@@ -282,7 +282,7 @@ describe('daemon service ownership', () => {
     });
 
     it('accepts disable only after print-disabled reports the label disabled', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         let disabled = false;
         const executor: LaunchctlExecutor = {
             run(args) {
@@ -307,7 +307,7 @@ describe('daemon service ownership', () => {
     });
 
     it('parses the real macOS print-disabled enabled and disabled output', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         let stdout = '\t\t"com.elepha.daemon" => enabled';
         const executor: LaunchctlExecutor = {
             run(args) {
@@ -330,7 +330,7 @@ describe('daemon service ownership', () => {
         ] as const;
 
         for (const testCase of cases) {
-            const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+            const home = withTempDir('elepha-service-');
             const omittedHead = `UNBOUNDED_${testCase.verb.toUpperCase()}_HEAD`;
             const outputTail = `${testCase.verb} output tail`;
             const errorTail = `${testCase.verb}\u0000 denied tail`;
@@ -387,7 +387,7 @@ describe('daemon service ownership', () => {
     });
 
     it('writes deterministic managed artifacts and leaves an inert service disabled and unloaded', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         const paths = defaultLaunchdServicePaths(home);
         const executor = new FakeLaunchctl();
         const service = new LaunchdBackend(paths, executor, 501);
@@ -400,7 +400,7 @@ describe('daemon service ownership', () => {
         expect(executor.loaded).toBe(false);
         expect(executor.disabled).toBe(true);
         expect(readFileSync(paths.plist, 'utf8')).toBe(renderDaemonPlist(paths));
-        // Rendered paths are physical because the tmpdir home is itself a symlink on macOS.
+        // Rendered paths use the physical launcher location.
         expect(readFileSync(paths.plist, 'utf8')).toContain(
             `<key>ProgramArguments</key><array><string>${realpathSync(paths.launcher)}</string><string>start</string>`,
         );
@@ -408,7 +408,7 @@ describe('daemon service ownership', () => {
     });
 
     it('refuses a modified managed artifact instead of classifying it as healthy ownership', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-service-'));
+        const home = withTempDir('elepha-service-');
         const paths = defaultLaunchdServicePaths(home);
         const service = new LaunchdBackend(paths, new FakeLaunchctl(), 501);
         service.install('#!/bin/sh\n', { kind: 'standalone', command: '/usr/local/bin/elepha', node: '/usr/local/bin/node' });

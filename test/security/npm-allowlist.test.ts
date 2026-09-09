@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { chmodSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -10,6 +10,7 @@ import {
     npmViewElephaLatest,
     npmViewElephaLatestAsync,
 } from '../../src/security/subprocess-allowlist.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 vi.mock('node:child_process', () => ({ execFile: vi.fn(), execFileSync: vi.fn() }));
 
@@ -44,7 +45,7 @@ function expectedBaseEnvironment(): NodeJS.ProcessEnv {
 }
 
 function standaloneBackend() {
-    const npmBin = mkdtempSync(path.join(tmpdir(), 'elepha-npm-bin-'));
+    const npmBin = withTempDir('elepha-npm-bin-');
     const npm = path.join(npmBin, 'npm');
     writeFileSync(npm, '#!/bin/sh\n');
     chmodSync(npm, 0o755);

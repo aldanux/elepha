@@ -1,12 +1,12 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { onTestFinished } from 'vitest';
 
-const testScratchRoot = path.resolve(import.meta.dirname, '..', '..', '.test-scratch');
+export const testScratchRoot = path.resolve(import.meta.dirname, '..', '..', '.test-scratch');
 
 export function withTempDir(prefix: string): string {
-    const directory = mkdtempSync(path.join(tmpdir(), prefix));
+    mkdirSync(testScratchRoot, { recursive: true });
+    const directory = mkdtempSync(path.join(testScratchRoot, prefix));
     onTestFinished(() => {
         rmSync(directory, { recursive: true, force: true });
     });

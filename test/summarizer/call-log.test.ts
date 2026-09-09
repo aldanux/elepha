@@ -1,9 +1,9 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SUMMARIZER_LOG_RETENTION_DAYS } from '../../src/config/constants.js';
 import { SummarizerCallLog, type SummarizerCallLogEntry } from '../../src/summarizer/call-log.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const TODAY = '2026-08-29';
 
@@ -29,7 +29,7 @@ function writeEntry(directory: string, filename: string, timestamp: string): voi
 
 describe('SummarizerCallLog', () => {
     it('opens only dated files that can contain entries since the threshold, while still reading malformed names', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-call-log-read-'));
+        const directory = withTempDir('elepha-call-log-read-');
         const readPaths: string[] = [];
         writeEntry(directory, 'summarizer-2026-07-01.log', '2026-07-01T12:00:00.000Z');
         writeEntry(directory, 'summarizer-2026-08-28.log', '2026-08-28T11:00:00.000Z');
@@ -52,7 +52,7 @@ describe('SummarizerCallLog', () => {
     });
 
     it('removes expired dated files on write and retains files inside the retention window', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-call-log-retention-'));
+        const directory = withTempDir('elepha-call-log-retention-');
         const expiredFile = path.join(directory, 'summarizer-2026-07-29.log');
         const retainedFile = path.join(directory, 'summarizer-2026-07-30.log');
         writeFileSync(expiredFile, 'expired\n');
@@ -66,7 +66,7 @@ describe('SummarizerCallLog', () => {
     });
 
     it('keeps a successful append successful when retention cleanup fails', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-call-log-retention-failure-'));
+        const directory = withTempDir('elepha-call-log-retention-failure-');
         const expiredFile = path.join(directory, 'summarizer-2026-07-29.log');
         writeFileSync(expiredFile, 'expired\n');
 

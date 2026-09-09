@@ -1,11 +1,11 @@
-import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { hookCommand, resolveInstalledElephaBin } from '../../src/install/binary.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function installedBin(name = 'prefix'): { root: string; shim: string; bin: string } {
-    const root = mkdtempSync(path.join(tmpdir(), 'elepha bin '));
+    const root = withTempDir('elepha bin ');
     const packageRoot = path.join(root, 'lib', 'node_modules', 'elepha');
     const bin = path.join(packageRoot, 'bin', 'elepha.js');
     mkdirSync(path.dirname(bin), { recursive: true });
@@ -35,7 +35,7 @@ describe('installed npm binary resolution', () => {
     });
 
     it('refuses a checkout executable and win32 before mutation', () => {
-        const checkout = mkdtempSync(path.join(tmpdir(), 'elepha checkout-'));
+        const checkout = withTempDir('elepha checkout-');
         const dist = path.join(checkout, 'dist', 'cli', 'index.js');
         mkdirSync(path.dirname(dist), { recursive: true });
         writeFileSync(dist, '');

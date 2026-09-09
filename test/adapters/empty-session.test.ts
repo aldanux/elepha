@@ -1,15 +1,15 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import type { EmptySessionAnalysis, SessionAdapter } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 type TranscriptShape = 'claude-code' | 'codex';
 
 function writeTranscript(shape: TranscriptShape, lines: unknown[]): string {
-    const dir = mkdtempSync(path.join(tmpdir(), `elepha-empty-${shape}-`));
+    const dir = withTempDir(`elepha-empty-${shape}-`);
     const file =
         shape === 'claude-code'
             ? path.join(dir, 'session.jsonl')

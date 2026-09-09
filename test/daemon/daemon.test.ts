@@ -1,16 +1,5 @@
-import {
-    appendFileSync,
-    existsSync,
-    mkdirSync,
-    mkdtempSync,
-    realpathSync,
-    statSync,
-    symlinkSync,
-    unlinkSync,
-    writeFileSync,
-} from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { realpath as fsRealpath } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -20,6 +9,7 @@ import { openProviderTranscript } from '../../src/security/provider-transcript.j
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SessionAdapter, SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 class StubSummarizer implements SummarizationProvider {
     calls: SummarizationInput[] = [];
@@ -104,7 +94,7 @@ describe('IngestionDaemon end-to-end', () => {
     });
 
     it('ingests an existing session on cold start, resumes cleanly across a restart without duplicating, and keeps tailing new turns', async () => {
-        root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-'));
+        root = withTempDir('elepha-daemon-');
         // The adapters resolve their roots through CLAUDE_CONFIG_DIR/CODEX_HOME,
         // so pointing the env var at the temp tree is what makes matches() (and
         // therefore the whole watch path) see these fixtures at all.
@@ -179,7 +169,7 @@ describe('IngestionDaemon end-to-end', () => {
     }, 15000);
 
     it('serializes two daemon writers by native turn and resumes from the final complete line after restart', async () => {
-        root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-concurrent-'));
+        root = withTempDir('elepha-daemon-concurrent-');
         prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
         const dbPath = path.join(root, 'elepha.db');
@@ -316,7 +306,7 @@ describe('IngestionDaemon end-to-end', () => {
     }, 15000);
 
     it('captures surface/kind on session creation from the first turn', async () => {
-        root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-'));
+        root = withTempDir('elepha-daemon-');
         prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
         const dbPath = path.join(root, 'elepha.db');
@@ -354,7 +344,7 @@ describe('IngestionDaemon end-to-end', () => {
     }, 15000);
 
     it.each(['SIGTERM', 'SIGINT'] as const)('clears its heartbeat during graceful %s shutdown', async (signal) => {
-        root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-signal-'));
+        root = withTempDir('elepha-daemon-signal-');
         const heartbeatPath = path.join(root, 'daemon.heartbeat.json');
         const daemon = new IngestionDaemon({
             store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
@@ -373,7 +363,7 @@ describe('IngestionDaemon end-to-end', () => {
     });
 
     it('rejects a parent symlink retargeted outside after the scan opens the transcript', async () => {
-        root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-opened-containment-'));
+        root = withTempDir('elepha-daemon-opened-containment-');
         prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
         const storeRoot = path.join(process.env.CLAUDE_CONFIG_DIR, 'projects');
@@ -424,7 +414,7 @@ describe('IngestionDaemon end-to-end', () => {
     it('re-arms an idle scan when a request collides with an in-flight scan', async () => {
         vi.useFakeTimers();
         try {
-            const root = mkdtempSync(path.join(tmpdir(), 'elepha-daemon-retry-'));
+            const root = withTempDir('elepha-daemon-retry-');
             prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
             process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
             const projectDir = path.join(root, '.claude', 'projects', 'demo-project');

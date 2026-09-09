@@ -1,12 +1,11 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { isRefusedProjectRoot } from '../../src/config/paths.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
@@ -132,7 +131,7 @@ function counts(dbPath: string): { sessions: number; turns: number } {
 
 describe('elepha consent grant/revoke', () => {
     it('grants the current directory and backfills its already-written transcript with --here', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-grant-here-'));
+        const directory = withTempDir('elepha-consent-grant-here-');
         const projectDirectory = withGrantableTestDir('consent-grant-here-');
         const dbPath = path.join(directory, 'elepha.db');
         const root = path.join(projectDirectory, 'project');
@@ -162,7 +161,7 @@ describe('elepha consent grant/revoke', () => {
     }, 15000);
 
     it('revokes the current directory while retaining captured session and turn counts', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-revoke-here-'));
+        const directory = withTempDir('elepha-consent-revoke-here-');
         const projectDirectory = withGrantableTestDir('consent-revoke-here-');
         const dbPath = path.join(directory, 'elepha.db');
         const root = path.join(projectDirectory, 'captured-root');
@@ -227,7 +226,7 @@ describe('elepha consent grant/revoke', () => {
     it.each(['grant', 'revoke'] as const)(
         'requires exactly one of path and --here for consent %s',
         (command) => {
-            const directory = mkdtempSync(path.join(tmpdir(), `elepha-consent-${command}-args-`));
+            const directory = withTempDir(`elepha-consent-${command}-args-`);
             const dbPath = path.join(directory, 'elepha.db');
             const root = path.join(directory, 'root');
             mkdirSync(root);
@@ -250,7 +249,7 @@ describe('elepha consent grant/revoke', () => {
 
 describe('elepha consent prune', () => {
     it('aborts without removing any selected root when a missing path returns before confirmation', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-prune-changed-'));
+        const directory = withTempDir('elepha-consent-prune-changed-');
         const dbPath = path.join(directory, 'elepha.db');
         const returnedRoot = path.join(directory, 'returned-root');
         const stillMissingRoot = path.join(directory, 'still-missing-root');
@@ -286,10 +285,10 @@ describe('elepha consent prune', () => {
     }, 15000);
 
     it('previews and removes missing and refused roots without touching live roots or memory', () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-consent-prune-'));
+        const directory = withTempDir('elepha-consent-prune-');
         const dbPath = path.join(directory, 'elepha.db');
         const missingRoot = path.join(directory, 'missing-root');
-        const liveRoot = realpathSync(repositoryRoot);
+        const liveRoot = withGrantableTestDir('elepha-consent-prune-live-');
         const refusedParent = ['/private/tmp', '/tmp'].find(
             (candidate) => existsSync(candidate) && isRefusedProjectRoot(path.join(candidate, 'elepha-consent-prune-refused')),
         );

@@ -4,8 +4,7 @@
 // says so out loud. IngestionDaemon.assertReadableJsonl makes this failure
 // distinguishable from an idle session.
 
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
@@ -15,6 +14,7 @@ import { ReadabilityGuard } from '../../src/daemon/readability-guard.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SummarizationInput, SummarizationOutput, SummarizationProvider } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 class StubSummarizer implements SummarizationProvider {
     async summarize(_input: SummarizationInput): Promise<SummarizationOutput> {
@@ -71,7 +71,7 @@ describe('file-level unreadable-file alert', () => {
     });
 
     it('checks content written after the file was first seen empty', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-unreadable-empty-first-'));
+        const root = withTempDir('elepha-unreadable-empty-first-');
         const transcript = path.join(root, 'session.jsonl');
         writeFileSync(transcript, '');
         const guard = new ReadabilityGuard();
@@ -86,7 +86,7 @@ describe('file-level unreadable-file alert', () => {
     });
 
     it('replaces skip reasons under one canonical key and clears the entry after a successful scan', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-skip-lifecycle-'));
+        const root = withTempDir('elepha-skip-lifecycle-');
         const claudeConfigDir = path.join(root, '.claude');
         const projectsRoot = path.join(claudeConfigDir, 'projects');
         const projectDir = path.join(projectsRoot, 'real-project');
@@ -136,7 +136,7 @@ describe('file-level unreadable-file alert', () => {
     });
 
     it('warns once per file for a compressed rollout, stays silent for a readable one, and does not stop the watcher', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-unreadable-'));
+        const root = withTempDir('elepha-unreadable-');
         prevConfigDir = process.env.CLAUDE_CONFIG_DIR;
         process.env.CLAUDE_CONFIG_DIR = path.join(root, '.claude');
         const projectDir = path.join(root, '.claude', 'projects', 'demo-project');
@@ -191,7 +191,7 @@ describe('file-level unreadable-file alert', () => {
     }, 15000);
 
     it('audibly skips a .zst Codex rollout at the readability guard without parsing it', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-unreadable-codex-zst-'));
+        const root = withTempDir('elepha-unreadable-codex-zst-');
         const codexHome = path.join(root, '.codex');
         const sessionsRoot = path.join(codexHome, 'sessions');
         const rollout = path.join(

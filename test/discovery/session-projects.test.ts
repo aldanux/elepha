@@ -1,11 +1,25 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { opencodeDbPath } from '../../src/config/paths.js';
 import { detectSessionTools, discoverFolderRepos, discoverSessionProjects } from '../../src/discovery/session-projects.js';
 import { addOpencodeSession, createOpencodeFixture } from '../fixtures/opencode-db.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
+
+// Hide only the host checkout's marker so non-Git and deleted fixtures retain
+// their original topology. Metadata within each fixture is still read from disk.
+vi.mock('node:fs/promises', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:fs/promises')>();
+    return {
+        ...actual,
+        lstat: (...args: Parameters<typeof actual.lstat>) => {
+            if (args[0] === path.resolve(import.meta.dirname, '..', '..', '.git')) {
+                return Promise.reject(Object.assign(new Error('No ancestor Git marker in fixture'), { code: 'ENOENT' }));
+            }
+            return actual.lstat(...args);
+        },
+    };
+});
 
 function session(cwd: string, timestamp: string, content: string): string {
     return `${JSON.stringify({ type: 'session_meta', timestamp, payload: { cwd, message: content } })}\n`;
@@ -35,7 +49,7 @@ describe('session-project discovery', () => {
         const sharedRoot = withGrantableTestDir('elepha-opencode-discovery-shared-');
         const opencodeOnlyRoot = withGrantableTestDir('elepha-opencode-discovery-only-');
         const refusedRoot = withGrantableTestDir('elepha-opencode-discovery-refused-');
-        const nonexistentRoot = path.join(tmpdir(), `elepha-opencode-missing-${path.basename(sourceRoot)}`);
+        const nonexistentRoot = path.join(withTempDir('elepha-opencode-missing-'), 'missing-project');
         vi.stubEnv('XDG_DATA_HOME', sourceRoot);
         mkdirSync(codexSessions, { recursive: true });
         createOpencodeFixture(opencodeDbPath(), sharedRoot);
@@ -93,7 +107,7 @@ describe('session-project discovery', () => {
     });
 
     it('finds bounded zero-session repos without descending into excluded or discovered trees', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-folder-repos-'));
+        const directory = withTempDir('elepha-folder-repos-');
         const root = path.join(directory, 'work');
         const repo = path.join(root, 'repo');
         const outerRepo = path.join(root, 'outer');
@@ -165,7 +179,7 @@ describe('session-project discovery', () => {
     });
 
     it('keeps live non-git and git-worktree projects while excluding deleted and refused roots', async () => {
-        const directory = mkdtempSync(path.join(tmpdir(), 'elepha-discovery-'));
+        const directory = withTempDir('elepha-discovery-');
         const claudeProjects = path.join(directory, 'claude', 'projects');
         const codexSessions = path.join(directory, 'codex', 'sessions');
         const sharedRoot = path.join(directory, 'work', 'shared');

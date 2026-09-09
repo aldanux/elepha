@@ -45,13 +45,20 @@ async function runInstall(): Promise<void> {
         service = serviceBackend();
         priorService = service.status();
         service.stop();
-        await migrateDatabaseForInstall(defaultDbPath());
-        const db = await openDb();
+        const progress = startCliProgress('Preparing database');
         let approvedRoots: number;
         try {
-            approvedRoots = new ConsentStore(db).countApproved();
-        } finally {
-            db.close();
+            await migrateDatabaseForInstall(defaultDbPath());
+            const db = await openDb();
+            try {
+                approvedRoots = new ConsentStore(db).countApproved();
+            } finally {
+                db.close();
+            }
+            progress.done();
+        } catch (error) {
+            progress.fail();
+            throw error;
         }
         const onPhase = createInstallProgressReporter();
         const runtime = {

@@ -1,5 +1,4 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IngestionDaemon } from '../../src/daemon/index.js';
@@ -8,6 +7,7 @@ import { ElephaMcpService, openMcpReadOnlyDatabase } from '../../src/mcp/server.
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const SOURCE_FIXTURE = path.join(
     __dirname,
@@ -58,7 +58,7 @@ describe('D53 purge tombstones', () => {
     });
 
     it('keeps a selectively purged, still-consented transcript absent after a restart sweep and across read surfaces', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-purge-tombstone-'));
+        const root = withTempDir('elepha-purge-tombstone-');
         const dbPath = path.join(root, 'elepha.db');
         const codexHome = path.join(root, '.codex');
         const sessionsRoot = path.join(codexHome, 'sessions');

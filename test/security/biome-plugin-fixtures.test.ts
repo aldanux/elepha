@@ -7,10 +7,10 @@
 // actually verified.
 
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { withTempDir } from '../helpers/tmp.js';
 
 const REPO_ROOT = path.resolve(__dirname, '../..');
 const UNSAFE_FIXTURE = path.join(REPO_ROOT, 'test/fixtures/biome-plugin/src/unsafe-subprocess-calls.ts');
@@ -28,16 +28,10 @@ interface BiomeCheckResult {
     diagnostics: BiomeDiagnostic[];
 }
 
-// Runs the real .biome-plugins/*.grit files (referenced by absolute path, not
-// copied - so this can never silently drift from what actually ships) against
-// one fixture, in an isolated scratch dir. Isolation is required, not just
-// tidy: this repo's own root biome.json is a "root" config, and running
-// biome anywhere under this repo's tree makes it refuse to apply a second,
-// different config ("Found a nested root configuration, but there's already
-// a root configuration") - the fixture would otherwise have to live under the
-// real project config, which is exactly what we don't want it silently doing.
+// Run the shipped plugins against isolated fixtures. An explicit config path
+// prevents discovery of the repository's root config and ignored scratch tree.
 function runBiomeCheck(fixturePath: string): BiomeCheckResult {
-    const scratchDir = mkdtempSync(path.join(tmpdir(), 'elepha-biome-plugin-fixture-'));
+    const scratchDir = withTempDir('elepha-biome-plugin-fixture-');
     try {
         const srcDir = path.join(scratchDir, 'src');
         mkdirSync(srcDir);
@@ -68,7 +62,7 @@ function runBiomeCheck(fixturePath: string): BiomeCheckResult {
 
         let stdout: string;
         try {
-            stdout = execFileSync(BIOME_BIN, ['check', '--reporter=json', `src/${fixtureName}`], {
+            stdout = execFileSync(BIOME_BIN, ['check', '--config-path', scratchDir, '--reporter=json', `src/${fixtureName}`], {
                 cwd: scratchDir,
                 stdio: ['ignore', 'pipe', 'ignore'],
             }).toString('utf8');

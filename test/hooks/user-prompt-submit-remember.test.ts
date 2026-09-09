@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -28,9 +27,11 @@ import { ProjectResolver, type ProjectSet } from '../../src/storage/project-reso
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { TestDatabase } from '../helpers/db.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { testScratchRoot, withTempDir } from '../helpers/tmp.js';
 
 const NOW = Date.parse('2026-08-22T12:00:00.000Z');
-const testCodexHome = mkdtempSync(path.join(tmpdir(), 'elepha-remember-codex-'));
+mkdirSync(testScratchRoot, { recursive: true });
+const testCodexHome = mkdtempSync(path.join(testScratchRoot, 'elepha-remember-codex-'));
 const priorCodexHome = process.env.CODEX_HOME;
 
 beforeAll(() => {
@@ -39,6 +40,8 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+    rmSync(testCodexHome, { recursive: true, force: true });
+
     if (priorCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = priorCodexHome;
 });
@@ -1071,7 +1074,7 @@ describe('UserPromptSubmit lexical recall', () => {
             turns: async () => ({ reason: 'must_not_parse' }),
         } as unknown as SessionReader;
         const query = tokenizeRecallQuery('alpha beta gamma');
-        const matchingConfig = path.join(mkdtempSync(path.join(tmpdir(), 'elepha-query-matching-')), 'config.json');
+        const matchingConfig = path.join(withTempDir('elepha-query-matching-'), 'config.json');
         expect(query).toBeDefined();
         if (!query) return;
 

@@ -1,5 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mcpResponseShaper } from '../../src/mcp/server.js';
@@ -7,6 +6,7 @@ import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { detectShellSyntax, escapeShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 class FixtureAdapter implements SessionAdapter {
     readonly tool: SessionAdapterTool = 'codex';
@@ -71,7 +71,7 @@ describe('MCP response shell-syntax net', () => {
     });
 
     it('neutralizes unsafe project display fields in text and structured list_projects output', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-project-sanitize-'));
+        const root = withTempDir('elepha-mcp-project-sanitize-');
         const projectPath = path.join(root, '$(project)');
         mkdirSync(projectPath);
         const db = openUnmanagedDb(':memory:');
@@ -94,7 +94,7 @@ describe('MCP response shell-syntax net', () => {
     });
 
     it('recursively neutralizes every structured string while preserving normal and non-string values', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-structured-sanitize-'));
+        const root = withTempDir('elepha-mcp-structured-sanitize-');
         const projectPath = path.join(root, 'project');
         mkdirSync(projectPath);
         const gitRemote = 'ssh://git@example.test/$(repo).git\x1b[31m';
@@ -152,7 +152,7 @@ describe('MCP response shell-syntax net', () => {
     });
 
     it('repairs an imported-style stored title at each plain response boundary without inspecting rendered Markdown', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-mcp-title-sanitize-'));
+        const root = withTempDir('elepha-mcp-title-sanitize-');
         previousCodexHome = process.env.CODEX_HOME;
         process.env.CODEX_HOME = root;
         const projectPath = path.join(root, 'project');

@@ -1,6 +1,5 @@
 import { spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -20,6 +19,7 @@ import type { ProjectRow } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { readProjectSessions } from '../../src/storage/session-read-model.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession, type TestDatabase } from '../helpers/db.js';
+import { testScratchRoot } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const tsxCli = path.join(repositoryRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
@@ -29,7 +29,8 @@ const previousCodexHome = process.env.CODEX_HOME;
 let testCodexHome = '';
 
 beforeAll(() => {
-    testCodexHome = mkdtempSync(path.join(tmpdir(), 'elepha-import-codex-home-'));
+    mkdirSync(testScratchRoot, { recursive: true });
+    testCodexHome = mkdtempSync(path.join(testScratchRoot, 'elepha-import-codex-home-'));
     process.env.CODEX_HOME = testCodexHome;
 });
 

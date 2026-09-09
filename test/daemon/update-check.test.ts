@@ -1,5 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -14,6 +13,7 @@ import { IngestionDaemon } from '../../src/daemon/index.js';
 import { readUpdateAvailable, runUpdateCheck, updateCheckEnabled } from '../../src/daemon/update-check.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 const { queryVersions } = vi.hoisted(() => ({ queryVersions: vi.fn() }));
 vi.mock('../../src/install/self-update.js', () => ({ installedAndLatestElephaVersionAsync: queryVersions }));
@@ -21,13 +21,13 @@ vi.mock('../../src/install/self-update.js', () => ({ installedAndLatestElephaVer
 const NOW = Date.parse('2026-08-19T00:00:00.000Z');
 
 function paths(): { statePath: string; markerPath: string } {
-    const root = mkdtempSync(path.join(tmpdir(), 'elepha-update-check-'));
+    const root = withTempDir('elepha-update-check-');
     return { statePath: path.join(root, 'update-check.json'), markerPath: path.join(root, 'update-available.json') };
 }
 
 describe('daemon update check', () => {
     it('resolves the persistent setting unless ELEPHA_NO_UPDATE_CHECK is set', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-update-config-'));
+        const root = withTempDir('elepha-update-config-');
         const configPath = path.join(root, 'config.json');
         writeFileSync(configPath, '{"update-check":false}\n');
 
@@ -117,7 +117,7 @@ describe('daemon update check', () => {
     });
 
     it('routes the daemon update check through the persistent setting', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-update-daemon-config-'));
+        const root = withTempDir('elepha-update-daemon-config-');
         const previousHome = process.env.ELEPHA_HOME;
         process.env.ELEPHA_HOME = root;
         queryVersions.mockResolvedValue({ installedVersion: '1.2.3', latestVersion: '1.2.4' });
@@ -257,7 +257,7 @@ describe('daemon update check', () => {
 
     it('writes heartbeats while an async update query remains pending', async () => {
         vi.useFakeTimers();
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-update-heartbeat-'));
+        const root = withTempDir('elepha-update-heartbeat-');
         let releaseQuery: (() => void) | undefined;
         const queryPending = new Promise<void>((resolve) => {
             releaseQuery = resolve;
@@ -288,7 +288,7 @@ describe('daemon update check', () => {
 
     it('stops cleanly after the installed package remains absent', async () => {
         vi.useFakeTimers();
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-missing-installation-'));
+        const root = withTempDir('elepha-missing-installation-');
         const heartbeatPath = path.join(root, 'daemon.heartbeat.json');
         const exit = vi.fn();
         const daemon = new IngestionDaemon({
@@ -316,7 +316,7 @@ describe('daemon update check', () => {
 
     it('keeps running when a transient package replacement recovers', async () => {
         vi.useFakeTimers();
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-transient-installation-'));
+        const root = withTempDir('elepha-transient-installation-');
         let checks = 0;
         const exit = vi.fn();
         const daemon = new IngestionDaemon({
@@ -343,7 +343,7 @@ describe('daemon update check', () => {
 
     it('restarts through the service manager when the installed version changes', async () => {
         vi.useFakeTimers();
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-replaced-installation-'));
+        const root = withTempDir('elepha-replaced-installation-');
         const exit = vi.fn();
         const daemon = new IngestionDaemon({
             store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),
@@ -368,7 +368,7 @@ describe('daemon update check', () => {
     });
 
     it('runs the update checker from the daemon periodic loop', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-update-daemon-'));
+        const root = withTempDir('elepha-update-daemon-');
         let calls = 0;
         const daemon = new IngestionDaemon({
             store: new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db'))),

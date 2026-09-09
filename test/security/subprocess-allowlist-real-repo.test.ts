@@ -4,16 +4,15 @@
 // checks the args are constructed correctly; this checks they still work.
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { gitRemoteGetUrlOrigin, gitRevParseShowToplevel } from '../../src/security/subprocess-allowlist.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function initRepo(): string {
-    // realpath: macOS's /tmp -> /private/tmp, and git itself resolves
-    // symlinks when reporting --show-toplevel - compare like for like.
-    const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'elepha-realrepo-')));
+    // Git resolves symlinks when reporting --show-toplevel; compare physical paths.
+    const dir = realpathSync(withTempDir('elepha-realrepo-'));
     execFileSync('git', ['init', '-q'], { cwd: dir });
     execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
     execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });

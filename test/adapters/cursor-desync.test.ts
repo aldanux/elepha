@@ -7,12 +7,12 @@
 // but nothing would catch it if that changes. The reader must distinguish this
 // failure from a legitimately idle session.
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 async function collect(iter: AsyncIterable<ParsedTurn>): Promise<ParsedTurn[]> {
     const out: ParsedTurn[] = [];
@@ -46,7 +46,7 @@ function turnLines(idx: number, cwd: string, sessionId: string, userText: string
 
 describe('cursor desync detection', () => {
     it('warns loudly and yields nothing when the file shrinks below the cursor', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-desync-'));
+        const root = withTempDir('elepha-desync-');
         const filePath = path.join(root, 'sess.jsonl');
         writeFileSync(filePath, turnLines(0, root, 'sess-1', 'first') + turnLines(1, root, 'sess-1', 'second'));
 
@@ -65,7 +65,7 @@ describe('cursor desync detection', () => {
     });
 
     it('warns loudly and yields nothing when the file is rewritten with different content at a larger size', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-desync-'));
+        const root = withTempDir('elepha-desync-');
         const filePath = path.join(root, 'sess.jsonl');
         writeFileSync(filePath, turnLines(0, root, 'sess-1', 'first'));
 
@@ -87,7 +87,7 @@ describe('cursor desync detection', () => {
     });
 
     it('does not false-positive on a legitimate append', async () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-desync-'));
+        const root = withTempDir('elepha-desync-');
         const filePath = path.join(root, 'sess.jsonl');
         writeFileSync(filePath, turnLines(0, root, 'sess-1', 'first'));
 

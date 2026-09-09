@@ -1,15 +1,15 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { MINIMUM_NODE_VERSION } from '../../src/config/constants.js';
 import { daemonHealth, managedLauncherHealth } from '../../src/install/health-checks.js';
 import { defaultLaunchdServicePaths, LaunchdBackend } from '../../src/install/launchd-backend.js';
 import { renderLauncher } from '../../src/install/launcher.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 describe('shared installation health checks', () => {
     it('maps missing, gone, stale, and live heartbeats for status and doctor', () => {
-        const root = mkdtempSync(path.join(tmpdir(), 'elepha-health-'));
+        const root = withTempDir('elepha-health-');
         const heartbeat = path.join(root, 'daemon.heartbeat.json');
 
         expect(daemonHealth(heartbeat, 0)).toEqual({ state: 'NOT RUNNING (no heartbeat file)', healthy: false });
@@ -62,7 +62,7 @@ describe('shared installation health checks', () => {
     });
 
     it('accepts only an unmodified managed launcher', () => {
-        const home = mkdtempSync(path.join(tmpdir(), 'elepha-launcher-health-'));
+        const home = withTempDir('elepha-launcher-health-');
         const paths = defaultLaunchdServicePaths(home);
         const service = new LaunchdBackend(paths, { run: () => ({ stdout: '', stderr: '', status: 0 }) }, 501);
         const backend = {
