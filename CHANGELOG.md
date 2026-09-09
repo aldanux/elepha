@@ -1,5 +1,9 @@
 # elepha
 
+## 0.6.2
+
+- Fix OpenCode in-chat `elepha:` commands, which did nothing before. The plugin now rewrites the user message with elepha's response instead of injecting into the system prompt (OpenCode's smaller models ignore late system entries), and `elepha install` registers the plugin in `opencode.json`'s `plugin` array so OpenCode actually loads it. Verified end to end against a running OpenCode: `elepha:info`/`elepha:list` render verbatim and `elepha:resume` recaps by [@aldanux](https://github.com/aldanux) in [#98](https://github.com/aldanux/elepha/pull/98)
+
 ## 0.6.1
 
 - Add `elepha stop` to stop the background daemon and confirm its process exits without disabling the service. Close the daemon's database handle before signal-driven exit so the managed lifecycle lease is released for the next startup. Use `elepha resume` to start capture again by [@aldanux](https://github.com/aldanux) in [#96](https://github.com/aldanux/elepha/pull/96)
