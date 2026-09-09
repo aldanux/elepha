@@ -1,6 +1,7 @@
 import { rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as cliProgress from '../../src/cli/progress.js';
 import { CAPTURE_PAUSE_DEADLINE_MS, DAEMON_HEALTH_CHECK_POLL_MS } from '../../src/config/constants.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
 import type { openUnmanagedDb } from '../../src/storage/db.js';
@@ -130,13 +131,17 @@ describe('withCapturePaused', () => {
     });
 
     afterEach(() => {
-        error.mockRestore();
-        log.mockRestore();
+        vi.restoreAllMocks();
         vi.useRealTimers();
+        process.exitCode = undefined;
     });
 
     it('pauses a healthy managed writer, runs the operation, and resumes it', async () => {
         const calls: string[] = [];
+        const progress = vi.spyOn(cliProgress, 'startCliProgress').mockImplementation(() => {
+            calls.push('progress');
+            return { done: () => calls.push('done'), fail: vi.fn() };
+        });
         serviceBackend.mockReturnValue(fakeService(calls));
         daemonHealth
             .mockReturnValueOnce({
@@ -173,11 +178,15 @@ describe('withCapturePaused', () => {
             ),
         ).resolves.toBe(true);
 
-        expect(calls).toEqual(['stop', 'disable', 'operation', 'release', 'enable', 'start']);
+        expect(calls).toEqual(['progress', 'stop', 'disable', 'done', 'operation', 'progress', 'release', 'enable', 'start', 'done']);
+        expect(progress).toHaveBeenCalledTimes(2);
     });
 
     it('does not resolve until capture resume completes', async () => {
         vi.useFakeTimers();
+        const pause = { done: vi.fn(), fail: vi.fn() };
+        const resume = { done: vi.fn(), fail: vi.fn() };
+        vi.spyOn(cliProgress, 'startCliProgress').mockReturnValueOnce(pause).mockReturnValueOnce(resume);
         const calls: string[] = [];
         serviceBackend.mockReturnValue(fakeService(calls));
         daemonHealth
@@ -216,11 +225,15 @@ describe('withCapturePaused', () => {
 
         await vi.advanceTimersByTimeAsync(0);
         expect(settled).toBe(false);
+        expect(pause.done).toHaveBeenCalledOnce();
+        expect(resume.done).not.toHaveBeenCalled();
         expect(calls).toEqual(['stop', 'disable', 'operation', 'enable', 'start']);
 
         await vi.advanceTimersByTimeAsync(DAEMON_HEALTH_CHECK_POLL_MS);
         await expect(result).resolves.toBe(true);
         expect(settled).toBe(true);
+        expect(resume.done).toHaveBeenCalledOnce();
+        expect(resume.fail).not.toHaveBeenCalled();
     });
 
     it('leaves capture paused when no healthy writer was running', async () => {
@@ -236,6 +249,8 @@ describe('withCapturePaused', () => {
 
     it('refuses without running or resuming when the daemon stays healthy', async () => {
         vi.useFakeTimers();
+        const progress = { done: vi.fn(), fail: vi.fn() };
+        vi.spyOn(cliProgress, 'startCliProgress').mockReturnValueOnce(progress);
         const calls: string[] = [];
         serviceBackend.mockReturnValue(fakeService(calls));
         daemonHealth.mockReturnValue({ state: 'RUNNING (pid 42, heartbeat 1s ago)', healthy: true });
@@ -248,6 +263,68 @@ describe('withCapturePaused', () => {
         expect(operation).not.toHaveBeenCalled();
         expect(calls).toEqual(['stop', 'disable']);
         expect(error).toHaveBeenCalledWith('Refusing purge: a running daemon could not be paused automatically. Stop it and retry.');
+        expect(process.exitCode).toBe(1);
+        expect(progress.fail).toHaveBeenCalledOnce();
+        expect(progress.done).not.toHaveBeenCalled();
+    });
+
+    it('keeps non-TTY transitions silent while still pausing and resuming', async () => {
+        const tty = Object.getOwnPropertyDescriptor(process.stdout, 'isTTY');
+        Object.defineProperty(process.stdout, 'isTTY', { configurable: true, value: false });
+        const write = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
+        const calls: string[] = [];
+        const service = fakeService(calls);
+        serviceBackend.mockReturnValue(service);
+        daemonHealth.mockImplementation(() => ({
+            healthy: service.status().loaded,
+            state: 'test service',
+            heartbeat: service.status().loaded ? { pid: 42, startedAt: '2026-08-28T00:00:00.000Z' } : undefined,
+        }));
+        try {
+            await expect(
+                withCapturePaused('purge', async () => {
+                    calls.push('operation');
+                }),
+            ).resolves.toBe(true);
+            expect(calls).toEqual(['stop', 'disable', 'operation', 'enable', 'start']);
+            expect(write).not.toHaveBeenCalled();
+            expect(log).not.toHaveBeenCalled();
+        } finally {
+            if (tty) {
+                Object.defineProperty(process.stdout, 'isTTY', tty);
+            } else {
+                Reflect.deleteProperty(process.stdout, 'isTTY');
+            }
+        }
+    });
+
+    it('fails resume progress and propagates a service failure with a failing exit code', async () => {
+        const calls: string[] = [];
+        const service = fakeService(calls);
+        const failure = new Error('service start failed');
+        service.start = () => {
+            throw failure;
+        };
+        serviceBackend.mockReturnValue(service);
+        daemonHealth.mockImplementation(() => ({
+            healthy: service.status().loaded,
+            state: 'test service',
+            heartbeat: service.status().loaded ? { pid: 42, startedAt: '2026-08-28T00:00:00.000Z' } : undefined,
+        }));
+        const pause = { done: vi.fn(), fail: vi.fn() };
+        const resume = { done: vi.fn(), fail: vi.fn() };
+        vi.spyOn(cliProgress, 'startCliProgress').mockReturnValueOnce(pause).mockReturnValueOnce(resume);
+
+        await expect(
+            withCapturePaused('purge', async () => {
+                calls.push('operation');
+            }),
+        ).rejects.toBe(failure);
+
+        expect(calls).toEqual(['stop', 'disable', 'operation', 'enable']);
+        expect(pause.done).toHaveBeenCalledOnce();
+        expect(resume.fail).toHaveBeenCalledOnce();
+        expect(resume.done).not.toHaveBeenCalled();
         expect(process.exitCode).toBe(1);
     });
 

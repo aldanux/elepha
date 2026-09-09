@@ -9,6 +9,7 @@ import { defaultDbPath } from '../storage/db.js';
 import type { PurgePlan } from '../storage/memory-store.js';
 import { errorMessage } from '../util/error.js';
 import { pauseCaptureService, resolveCaptureService, resumeCaptureService } from './capture-service.js';
+import { startCliProgress } from './progress.js';
 
 export interface CliOutputSink {
     error(message: string): void;
@@ -123,11 +124,19 @@ export async function withCapturePaused(
         return false;
     }
 
+    // Keep progress confined to service transitions so previews, confirmation and backup reports stay unobscured.
+    const pauseProgress = startCliProgress('Pausing capture');
     let pausedByUs = false;
     try {
         pauseCaptureService(service);
         pausedByUs = await waitForCaptureToStop();
+        if (pausedByUs) {
+            pauseProgress.done('Capture paused');
+        } else {
+            pauseProgress.fail('Could not pause capture');
+        }
     } catch (error) {
+        pauseProgress.fail('Could not pause capture');
         output.error(errorMessage(error));
     }
 
@@ -137,14 +146,27 @@ export async function withCapturePaused(
         return false;
     }
 
-    output.log('Paused capture…');
+    const resume = async (): Promise<void> => {
+        const resumeProgress = startCliProgress('Resuming capture');
+        try {
+            await releaseBeforeResume?.();
+            await resumeCaptureService(service);
+            resumeProgress.done('Capture resumed');
+        } catch (error) {
+            resumeProgress.fail('Could not resume capture');
+            setOutputExitCode(output, 1);
+            throw error;
+        }
+    };
+
     try {
         await fn();
         return true;
+    } catch (error) {
+        setOutputExitCode(output, 1);
+        throw error;
     } finally {
-        await releaseBeforeResume?.();
-        await resumeCaptureService(service);
-        output.log('Capture resumed.');
+        await resume();
     }
 }
 
