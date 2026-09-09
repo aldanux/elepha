@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { opencodeDbPath, opencodeStoreRoot } from '../../src/config/paths.js';
@@ -70,6 +71,52 @@ afterEach(() => {
 });
 
 describe('OpenCode daemon ingestion', () => {
+    it('drops an assistant echo injected after creation but before completion and retains the following turn', async () => {
+        const sourceRoot = withGrantableTestDir('elepha-opencode-quote-source-');
+        const projectPath = withGrantableTestDir('elepha-opencode-quote-project-');
+        vi.stubEnv('XDG_DATA_HOME', sourceRoot);
+        createOpencodeFixture(opencodeDbPath(), projectPath);
+        const body =
+            'The selected architecture keeps transcript capture passive and local across tools, with consent checked before serving.';
+        const provider = new Database(opencodeDbPath());
+        try {
+            provider
+                .prepare('UPDATE message SET data = ? WHERE id = ?')
+                .run(JSON.stringify({ role: 'assistant', time: { created: 1100, completed: 1800 } }), 'msg_2');
+            provider.prepare('UPDATE part SET data = ? WHERE id = ?').run(JSON.stringify({ type: 'text', text: body }), 'part_5');
+        } finally {
+            provider.close();
+        }
+        const fixture = createTestDb('elepha-opencode-quote-store-');
+        fixture.store.consent.grant(projectPath);
+        fixture.store.recordInjection({
+            tool: 'opencode',
+            nativeSessionId: 'ses_primary',
+            injectedAt: '1970-01-01T00:00:01.500Z',
+            injectionId: '01J00000000000000000000000',
+            body,
+        });
+        const logs: string[] = [];
+        const summarize = vi.fn(async () => ({ decisions: [], pending_items: [], status: 'ok' as const }));
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            readConfig: enabledConfig,
+            summarizer: { summarize },
+            log: (message) => logs.push(message),
+        });
+        const scan = daemonSeam(daemon);
+        await expect(scan.scanOpencodeDb(opencodeDbPath())).resolves.toMatchObject({ ingested: 1 });
+        expect(summarize).toHaveBeenCalledExactlyOnceWith({ userMessage: 'Second prompt', assistantText: 'Second answer' });
+        const session = fixture.store.findSession('opencode', 'ses_primary')!;
+        expect(fixture.store.listMemoriesForSession(session.id).map((memory) => memory.turn_index)).toEqual([1]);
+        expect(fixture.store.getSessionCursor('opencode', 'ses_primary')).toBe('2100|msg_4');
+        expect(
+            logs.filter((message) => message.includes('dropped turn 0 of ses_primary: self-injected content (quote-back)')),
+        ).toHaveLength(1);
+        await expect(scan.scanOpencodeDb(opencodeDbPath())).resolves.toMatchObject({ ingested: 0 });
+        expect(summarize).toHaveBeenCalledTimes(1);
+    });
+
     it('falls back from placeholder titles and refreshes a later AI title without new turns', async () => {
         const sourceRoot = withGrantableTestDir('elepha-opencode-title-source-');
         const projectPath = withGrantableTestDir('elepha-opencode-title-project-');

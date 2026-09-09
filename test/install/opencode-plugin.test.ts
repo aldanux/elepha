@@ -9,19 +9,16 @@ import { opencodePluginStatus, renderOpencodePlugin, transformOpencodePlugin } f
 import { installationStatus } from '../../src/install/status.js';
 import { transformOpencodeMcp } from '../../src/mcp/installer.js';
 import { OPENCODE_HOOK_ARGS } from '../../src/security/subprocess-allowlist.js';
-import {
-    DISPLAY_VERBATIM_INSTRUCTIONS,
-    OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS,
-    RESUME_RECAP_INSTRUCTIONS,
-} from '../../src/serving/instructions.js';
+import { DISPLAY_VERBATIM_INSTRUCTIONS, RESUME_RECAP_INSTRUCTIONS } from '../../src/serving/instructions.js';
 
 const launcher = '/opt/elepha with spaces/elepha';
 const directory = '/projects/current worktree';
 const response = (context: unknown) => JSON.stringify({ continue: true, hookSpecificOutput: { additionalContext: context } });
 
 type Part = { type: string; text?: string };
+type Message = { info: { role: string; sessionID: string }; parts: Part[] };
 interface Hooks {
-    'chat.message': (input: { sessionID: string }, output: { parts: Part[] }) => Promise<void>;
+    'experimental.chat.messages.transform': (input: object, output: { messages: Message[] }) => Promise<void>;
 }
 
 async function fixture(stdout = response('rendered context')) {
@@ -36,19 +33,59 @@ async function fixture(stdout = response('rendered context')) {
     return { execute, hooks: await plugin({ directory }) };
 }
 
-// Runs chat.message on a single text part and returns that part's resulting text.
+// Runs the model-view transform on a single user message.
 async function message(hooks: Hooks, prompt: string, sessionID = 'session-a'): Promise<string | undefined> {
     const parts: Part[] = [{ type: 'text', text: prompt }];
-    await hooks['chat.message']({ sessionID }, { parts });
+    await hooks['experimental.chat.messages.transform']({}, { messages: [{ info: { role: 'user', sessionID }, parts }] });
     return parts[0]?.text;
 }
 
 describe('generated OpenCode plugin', () => {
+    it('registers only the model-view hook', async () => {
+        const { hooks } = await fixture();
+        expect(Object.keys(hooks)).toEqual(['experimental.chat.messages.transform']);
+        expect(renderOpencodePlugin(launcher)).not.toContain("'chat.message':");
+    });
+
+    it('transforms only the last user message and is a no-op when fired again', async () => {
+        const { hooks, execute } = await fixture();
+        const messages: Message[] = [
+            { info: { role: 'user', sessionID: 'older' }, parts: [{ type: 'text', text: 'elepha:list' }] },
+            { info: { role: 'user', sessionID: 'latest' }, parts: [{ type: 'text', text: 'elepha:info' }] },
+            { info: { role: 'assistant', sessionID: 'latest' }, parts: [{ type: 'text', text: 'elepha:help' }] },
+        ];
+        await hooks['experimental.chat.messages.transform']({}, { messages });
+        await hooks['experimental.chat.messages.transform']({}, { messages });
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(execute.mock.calls[0]![2].input as string).session_id).toBe('latest');
+        expect(messages.map((entry) => entry.parts[0]?.text)).toEqual(['elepha:list', 'rendered context', 'elepha:help']);
+    });
+
+    it('does not replay older commands when the latest user message is ordinary text', async () => {
+        const { hooks, execute } = await fixture();
+        await hooks['experimental.chat.messages.transform']({}, { messages: [] });
+        await hooks['experimental.chat.messages.transform'](
+            {},
+            {
+                messages: [
+                    { info: { role: 'user', sessionID: 'same' }, parts: [{ type: 'text', text: 'elepha:list' }] },
+                    { info: { role: 'user', sessionID: 'same' }, parts: [{ type: 'text', text: 'continue' }] },
+                ],
+            },
+        );
+        expect(execute).not.toHaveBeenCalled();
+    });
+
     it('ignores ordinary text and non-text parts without invoking the binary', async () => {
         const { hooks, execute } = await fixture();
         expect(await message(hooks, 'please explain elepha:list')).toBe('please explain elepha:list');
         const fileOnly: { parts: Part[] } = { parts: [{ type: 'file', text: 'elepha:list' }] };
-        await hooks['chat.message']({ sessionID: 'session-a' }, fileOnly);
+        await hooks['experimental.chat.messages.transform'](
+            {},
+            {
+                messages: [{ info: { role: 'user', sessionID: 'session-a' }, parts: fileOnly.parts }],
+            },
+        );
         expect(execute).not.toHaveBeenCalled();
         expect(fileOnly.parts).toEqual([{ type: 'file', text: 'elepha:list' }]);
     });
@@ -70,12 +107,11 @@ describe('generated OpenCode plugin', () => {
         expect(rewritten).toBe('rendered context');
     });
 
-    it('strips the brief sentinel wrapper and replaces the leading verbatim instruction while keeping the payload', async () => {
+    it('strips only the brief sentinel wrapper and keeps the full verbatim instruction and payload', async () => {
         const context = `[[elepha:brief:01ABCDEF]]\n${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 status line\n[[/elepha]]`;
         const { hooks } = await fixture(response(context));
         const rewritten = await message(hooks, 'elepha:info');
-        expect(rewritten).toBe(`${OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 status line`);
-        expect(rewritten).not.toContain('Display everything below this line');
+        expect(rewritten).toBe(`${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 status line`);
     });
 
     it('keeps the resume recap instruction while stripping the brief sentinel wrapper', async () => {
@@ -84,14 +120,16 @@ describe('generated OpenCode plugin', () => {
         expect(await message(hooks, 'elepha:resume:1')).toBe(`${RESUME_RECAP_INSTRUCTIONS}\n# Session title\n\nSession turns`);
     });
 
-    it('joins text parts for the payload and rewrites only the first text part', async () => {
+    it('joins text parts for the payload and removes extra model-view text parts', async () => {
         const { hooks, execute } = await fixture();
-        const output: { parts: Part[] } = {
+        const output: Message = {
+            info: { role: 'user', sessionID: 'session-from-info' },
             parts: [{ type: 'text', text: 'elepha:query' }, { type: 'file' }, { type: 'text', text: 'topic' }],
         };
-        await hooks['chat.message']({ sessionID: 'session-a' }, output);
+        await hooks['experimental.chat.messages.transform']({}, { messages: [output] });
+        expect(JSON.parse(execute.mock.calls[0]![2].input as string).session_id).toBe('session-from-info');
         expect(JSON.parse(execute.mock.calls[0]![2].input as string).prompt).toBe('elepha:query\ntopic');
-        expect(output.parts).toEqual([{ type: 'text', text: 'rendered context' }, { type: 'file' }, { type: 'text', text: 'topic' }]);
+        expect(output.parts).toEqual([{ type: 'text', text: 'rendered context' }, { type: 'file' }]);
     });
 
     it.each(['', '{', 'null', '{}', response(null), response(123), response('')])(
@@ -126,7 +164,7 @@ describe('generated OpenCode plugin', () => {
             const script = `const { ElephaPlugin } = await import(${JSON.stringify(pathToFileURL(file).href)});
 const hooks = await ElephaPlugin({directory:${JSON.stringify(directory)}});
 const parts = [{type:'text',text:'elepha:list'}];
-await hooks['chat.message']({sessionID:'runtime'}, {parts});
+await hooks['experimental.chat.messages.transform']({}, {messages:[{info:{role:'user',sessionID:'runtime'},parts}]});
 console.log(parts[0].text);`;
             const rewritten = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', shell: false });
             expect(JSON.parse(rewritten)).toEqual({

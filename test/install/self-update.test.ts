@@ -1,9 +1,12 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
-import { updateAvailablePath } from '../../src/config/paths.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { opencodePluginPath, updateAvailablePath } from '../../src/config/paths.js';
+import { type IntegrationPaths, reconcileOwnedIntegrations } from '../../src/install/integrations.js';
+import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { type SelfUpdateRuntime, selfUpdate } from '../../src/install/self-update.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
+import { transformClaudeMcp, transformCodexMcp, transformOpencodeMcp } from '../../src/mcp/installer.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
 interface Scenario {
@@ -49,7 +52,13 @@ function runtimeFor(scenario: Scenario): { runtime: SelfUpdateRuntime; events: s
                     }
                 },
             },
+            report: () => {},
+            refreshIntegrations() {
+                events.push('refresh integrations');
+                return { refreshed: [], skipped: [], originals: [], installed: [] };
+            },
             service: {
+                launcherPath: '/managed/elepha',
                 stop() {
                     events.push('service stop');
                 },
@@ -74,6 +83,109 @@ function runtimeFor(scenario: Scenario): { runtime: SelfUpdateRuntime; events: s
 }
 
 describe('selfUpdate', () => {
+    beforeEach(() => {
+        vi.stubEnv('ELEPHA_HOME', withGrantableTestDir('self-update-home-'));
+    });
+    afterEach(() => vi.unstubAllEnvs());
+
+    function integrationFixture() {
+        const root = withGrantableTestDir('self-update-integrations-');
+        const paths: IntegrationPaths = {
+            claudeMcp: path.join(root, 'claude.json'),
+            codexConfig: path.join(root, 'codex.toml'),
+            opencodeConfig: path.join(root, 'opencode.json'),
+        };
+        const plugin = opencodePluginPath(paths.opencodeConfig);
+        mkdirSync(path.dirname(plugin), { recursive: true });
+        const { runtime, events } = runtimeFor({ latest: '1.2.4', reconciliation: ['active'] });
+        runtime.refreshIntegrations = (_installed, launcher) => {
+            expect(events).toContain('npm install elepha@latest');
+            return reconcileOwnedIntegrations(launcher, paths);
+        };
+        runtime.report = vi.fn();
+        return { paths, plugin, runtime, events };
+    }
+
+    it('refreshes stale owned MCP blocks and the plugin, reports paths, and is idempotent', async () => {
+        const { paths, plugin, runtime } = integrationFixture();
+        const launcher = runtime.service!.launcherPath;
+        writeFileSync(paths.claudeMcp, transformClaudeMcp('{"unrelated":true}', '/old/elepha'));
+        writeFileSync(paths.codexConfig, transformCodexMcp('model = "custom"', '/old/elepha'));
+        writeFileSync(paths.opencodeConfig, transformOpencodeMcp('{"plugin":["user-plugin"]}', '/old/elepha'));
+        writeFileSync(plugin, `${renderOpencodePlugin(launcher)}// stale build\n`);
+
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
+        expect(readFileSync(plugin, 'utf8')).toBe(renderOpencodePlugin(launcher));
+        expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(transformClaudeMcp('{"unrelated":true}', launcher));
+        expect(readFileSync(paths.codexConfig, 'utf8')).toBe(transformCodexMcp('model = "custom"', launcher));
+        expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
+            plugin: ['user-plugin'],
+            mcp: { elepha: { type: 'local', command: [launcher, 'mcp', 'serve'], enabled: true } },
+        });
+        for (const file of [...Object.values(paths), plugin]) {
+            expect(runtime.report).toHaveBeenCalledWith(expect.stringContaining(file));
+        }
+        expect(reconcileOwnedIntegrations(launcher, paths).refreshed).toEqual([]);
+    });
+
+    it('leaves user-owned conflicts intact and surfaces their statuses', async () => {
+        const { paths, plugin, runtime } = integrationFixture();
+        const originals = new Map([
+            [paths.claudeMcp, '{"mcpServers":{"elepha":{"command":"custom"}}}'],
+            [paths.codexConfig, '[mcp_servers.elepha]\ncommand = "custom"\nargs = ["mcp", "serve"]\n'],
+            [paths.opencodeConfig, '{"mcp":{"elepha":{"type":"remote","url":"https://example.test"}}}'],
+            [plugin, '// user-owned plugin\n'],
+        ]);
+        for (const [file, text] of originals) writeFileSync(file, text);
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
+        for (const [file, text] of originals) {
+            expect(readFileSync(file, 'utf8')).toBe(text);
+            expect(runtime.report).toHaveBeenCalledWith(expect.stringContaining(file));
+        }
+        expect(runtime.report).toHaveBeenCalledWith(expect.stringContaining('conflict'));
+    });
+
+    it('does not create absent integrations even when provider configs exist', async () => {
+        const { paths, plugin, runtime } = integrationFixture();
+        writeFileSync(paths.opencodeConfig, '{"plugin":["user-plugin"]}');
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
+        expect(existsSync(paths.claudeMcp)).toBe(false);
+        expect(existsSync(paths.codexConfig)).toBe(false);
+        expect(existsSync(plugin)).toBe(false);
+        expect(readFileSync(paths.opencodeConfig, 'utf8')).toBe('{"plugin":["user-plugin"]}');
+        expect(runtime.report).not.toHaveBeenCalled();
+    });
+
+    it('rolls back the package when refreshing fails before restarting capture', async () => {
+        const { runtime, events } = runtimeFor({ latest: '1.2.4', reconciliation: ['active'] });
+        runtime.refreshIntegrations = () => {
+            throw new Error('config write failed');
+        };
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'rolled-back', failure: 'config write failed' });
+        expect(events.indexOf('npm install elepha@1.2.3')).toBeLessThan(events.indexOf('service stop'));
+    });
+
+    it('restores exact integration bytes if subsequent service health fails', async () => {
+        const { paths, plugin, runtime } = integrationFixture();
+        const original = `${renderOpencodePlugin('/old/elepha')}// previous build\n`;
+        writeFileSync(plugin, original);
+        runtime.reconcile = vi.fn().mockRejectedValueOnce(new Error('heartbeat failed')).mockResolvedValueOnce('active');
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'rolled-back', failure: 'heartbeat failed' });
+        expect(readFileSync(plugin, 'utf8')).toBe(original);
+        expect(existsSync(paths.opencodeConfig)).toBe(false);
+    });
+
+    it('refuses rollback over an intervening user edit and directs recovery to doctor', async () => {
+        const { plugin, runtime } = integrationFixture();
+        writeFileSync(plugin, renderOpencodePlugin('/old/elepha'));
+        runtime.reconcile = () => {
+            writeFileSync(plugin, '// user edit\n');
+            throw new Error('heartbeat failed');
+        };
+        await expect(selfUpdate(runtime)).rejects.toThrow('integration restore failed: integration changed after refresh:');
+        expect(readFileSync(plugin, 'utf8')).toBe('// user edit\n');
+    });
+
     it('updates and restarts the injected service on Linux', async () => {
         const { runtime, events } = runtimeFor({ platform: 'linux', latest: '1.2.4', reconciliation: ['active'] });
 
@@ -96,6 +208,7 @@ describe('selfUpdate', () => {
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
+            'refresh integrations',
             'service stop',
             'database migration',
             'read approved roots',
@@ -110,6 +223,7 @@ describe('selfUpdate', () => {
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
+            'refresh integrations',
             'service stop',
             'database migration',
             'read approved roots',
@@ -166,6 +280,7 @@ describe('selfUpdate', () => {
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
+            'refresh integrations',
             'service stop',
             'database migration',
             'read approved roots',
@@ -191,6 +306,7 @@ describe('selfUpdate', () => {
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
+            'refresh integrations',
             'service stop',
             'database migration',
             'read approved roots',
@@ -221,6 +337,7 @@ describe('selfUpdate', () => {
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
+            'refresh integrations',
             'service stop',
             'database migration',
             'read approved roots',
@@ -255,6 +372,7 @@ describe('selfUpdate', () => {
         expect(events).toEqual([
             'npm view elepha@latest',
             'npm install elepha@latest',
+            'refresh integrations',
             'service stop',
             'database migration',
             'read approved roots',

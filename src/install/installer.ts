@@ -24,8 +24,9 @@ import {
     rememberInstallSnapshots,
     restoreInstallSnapshot,
 } from './config-file.js';
+import { planIntegrations } from './integrations.js';
 import { detectLauncherBackend, renderLauncher } from './launcher.js';
-import { ownsOpencodePlugin, readOpencodePlugin, transformOpencodePlugin } from './opencode-plugin.js';
+import { ownsOpencodePlugin, readOpencodePlugin } from './opencode-plugin.js';
 import { isSupportedPlatform, isWsl, linuxServiceManagerError } from './platform.js';
 import { detectPresentTools, type ToolConfigPaths } from './present-tools.js';
 import { reconcileCaptureService, type ServiceBackend, type ServiceStatus, serviceBackend } from './service-backend.js';
@@ -316,46 +317,20 @@ export function installElepha(
                           text: transformClaudeHook(before.claudeSettings, launcher),
                           validate: validateJson('Claude settings.json'),
                       },
-                      {
-                          kind: 'write' as const,
-                          file: inputPaths.claudeMcp,
-                          text: transformClaudeMcp(before.claudeMcp, launcher),
-                          validate: validateJson('Claude ~/.claude.json'),
-                      },
                   ]
                 : []),
-            ...(present.codex
-                ? [
-                      {
-                          kind: 'write' as const,
-                          file: inputPaths.codexConfig,
-                          text: transformCodexMcp(transformCodexHook(before.codex, launcher), launcher),
-                          validate: validateToml,
-                      },
-                  ]
-                : []),
-            // OpenCode has no hook config to prove presence, so never fabricate
-            // opencode.json unless its config directory or data store already exists.
-            ...(present.opencode
-                ? [
-                      {
-                          kind: 'write' as const,
-                          file: inputPaths.opencodeConfig,
-                          text: transformOpencodeMcp(before.opencode, launcher, false, opencodePluginPath(inputPaths.opencodeConfig)),
-                          validate: validateJson('OpenCode opencode.json'),
-                      },
-                      {
-                          kind: 'write' as const,
-                          file: opencodePluginPath(inputPaths.opencodeConfig),
-                          text: transformOpencodePlugin(before.opencodePlugin, launcher),
-                          validate: (value: string) => {
-                              if (value !== transformOpencodePlugin(value, launcher)) {
-                                  throw new Error('OpenCode plugin failed read-back verification');
-                              }
-                          },
-                      },
-                  ]
-                : []),
+            ...planIntegrations(
+                inputPaths,
+                {
+                    claudeMcp: before.claudeMcp,
+                    codexConfig: present.codex ? transformCodexHook(before.codex, launcher) : before.codex,
+                    opencodeConfig: before.opencode,
+                    opencodePlugin: before.opencodePlugin,
+                },
+                launcher,
+                'install',
+                present,
+            ).changes,
         ];
     } catch (error) {
         runtime.onPhase?.(preparingPhase, 'fail');

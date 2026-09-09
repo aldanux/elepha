@@ -154,6 +154,10 @@ function blockPattern(start: string, end: string): RegExp {
     return new RegExp(`${start}[\\s\\S]*?${end}\\n?`, 'g');
 }
 
+export function ownsCodexMcp(text: string): boolean {
+    return text.replace(blockPattern(CODEX_MCP_START, CODEX_MCP_END), '') !== text;
+}
+
 export function transformCodexMcp(text: string, bin: string, uninstall = false): string {
     try {
         parse(text);

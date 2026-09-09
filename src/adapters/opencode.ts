@@ -279,12 +279,23 @@ export class OpencodeAdapter implements SqliteSourceAdapter {
                 this.warnUnknownLine(`OpencodeAdapter: unrecognized message.data.role "${safeDiscriminator(data.role)}" in ${db.name}`);
                 continue;
             }
-            const time = isRecord(data.time) ? data.time.created : undefined;
+            const time = isRecord(data.time) ? data.time : undefined;
+            const createdAt = isoTimestamp(time?.created, row.time_created);
+            const completed = time?.completed;
+            // Injection fires mid-generation, after message creation; quote-back needs the assistant's completion time.
+            const timestamp =
+                data.role === 'assistant' &&
+                typeof completed === 'number' &&
+                Number.isFinite(completed) &&
+                completed >= Date.parse(createdAt) &&
+                !Number.isNaN(new Date(completed).getTime())
+                    ? new Date(completed).toISOString()
+                    : createdAt;
             messages.push({
                 id: row.id,
                 role: data.role,
                 timeCreated: row.time_created,
-                timestamp: isoTimestamp(time, row.time_created),
+                timestamp,
             });
         }
 

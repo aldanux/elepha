@@ -1,5 +1,6 @@
 import { mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../../src/adapters/opencode.js';
 import { opencodeDbPath } from '../../src/config/paths.js';
@@ -22,6 +23,53 @@ afterEach(() => {
 });
 
 describe('OpencodeAdapter', () => {
+    it.each([
+        ['later', '1800', '1970-01-01T00:00:01.800Z'],
+        ['equal', '1100', '1970-01-01T00:00:01.100Z'],
+        ['missing', undefined, '1970-01-01T00:00:01.100Z'],
+        ['null', 'null', '1970-01-01T00:00:01.100Z'],
+        ['string', '"1800"', '1970-01-01T00:00:01.100Z'],
+        ['object', '{}', '1970-01-01T00:00:01.100Z'],
+        ['nonfinite', '1e400', '1970-01-01T00:00:01.100Z'],
+        ['outside the date range', '1e20', '1970-01-01T00:00:01.100Z'],
+        ['earlier', '1099', '1970-01-01T00:00:01.100Z'],
+    ])('uses a valid assistant completion for turn end (%s) without moving boundaries or cursors', (_label, completed, endedAt) => {
+        const writable = new Database(opencodeDbPath());
+        try {
+            const time = completed === undefined ? '"created":1100' : `"created":1100,"completed":${completed}`;
+            writable.prepare('UPDATE message SET data = ? WHERE id = ?').run(`{"role":"assistant","time":{${time}}}`, 'msg_2');
+            writable
+                .prepare('UPDATE message SET data = ? WHERE id = ?')
+                .run(JSON.stringify({ role: 'user', time: { created: 1000, completed: 1900 } }), 'msg_1');
+        } finally {
+            writable.close();
+        }
+        const db = openOpencodeDbReadonly(opencodeDbPath());
+        try {
+            const adapter = new OpencodeAdapter(() => {});
+            const session = adapter.dirtySessions(db).find((row) => row.sessionId === 'ses_primary')!;
+            const closed = [...adapter.parseSessionTurns(db, session)];
+            expect(closed).toHaveLength(1);
+            expect(closed[0]).toMatchObject({
+                turnIndex: 0,
+                startedAt: '1970-01-01T00:00:01.000Z',
+                endedAt,
+                cursor: '1100|msg_2',
+            });
+            const resumed = [...adapter.parseSessionTurns(db, session, closed[0]?.cursor, { closeTrailingOnIdle: true })];
+            expect(resumed).toHaveLength(1);
+            expect(resumed[0]).toMatchObject({
+                turnIndex: 1,
+                startedAt: '1970-01-01T00:00:02.000Z',
+                userMessage: 'Second prompt',
+                assistantText: 'Second answer',
+                cursor: '2100|msg_4',
+            });
+        } finally {
+            db.close();
+        }
+    });
+
     it('treats OpenCode placeholder titles as absent', () => {
         expect(opencodeSessionAiTitle('New session - 2026-09-08T16:24:27.510Z')).toBeUndefined();
         expect(opencodeSessionAiTitle('Qué es Git')).toBe('Qué es Git');

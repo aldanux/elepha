@@ -1,50 +1,56 @@
 import { lstatSync, readFileSync } from 'node:fs';
+import { CLOSE, OPEN } from '../security/sentinel.js';
 import { renderOpencodeHookClient } from '../security/subprocess-allowlist.js';
-import { DISPLAY_VERBATIM_INSTRUCTIONS, OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS } from '../serving/instructions.js';
 import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 
 // OpenCode loads plugins listed in opencode.json's `plugin` array (the installer
 // registers this file there). PluginInput.directory is the working directory.
 // Keep this standalone so OpenCode needs no elepha package imports.
 //
-// The plugin runs elepha's hook and rewrites the user's message with the result.
-// Rewriting the user text part is the only channel OpenCode's model reliably
-// renders: system-prompt injection (experimental.chat.system.transform) is
-// ignored by smaller models, which is why the earlier version did nothing.
-// Verified against opencode 1.18.x with the default model.
+// Transform only the model's message view: chat.message persists edits into the
+// displayed user bubble and would duplicate the assistant's rendered response.
+// Title generation may also consume this view; the empty hook input does not
+// identify generation kind, so titles can reflect the payload on command sessions.
 export function renderOpencodePlugin(launcher: string): string {
     return `${OPENCODE_PLUGIN_MARKER}
 ${renderOpencodeHookClient(launcher)}
-const displayVerbatimInstructions = ${JSON.stringify(DISPLAY_VERBATIM_INSTRUCTIONS)};
-const opencodeDisplayVerbatimInstructions = ${JSON.stringify(OPENCODE_DISPLAY_VERBATIM_INSTRUCTIONS)};
+const briefOpen = ${JSON.stringify(`${OPEN}brief:`)};
+const briefClose = ${JSON.stringify(CLOSE)};
 export const ElephaPlugin = async ({ directory }) => ({
-    'chat.message': async (input, output) => {
+    'experimental.chat.messages.transform': async (_input, output) => {
         try {
-            const parts = (output && output.parts) || [];
+            const messages = (output && output.messages) || [];
+            let message;
+            for (let index = messages.length - 1; index >= 0; index--) {
+                if (messages[index].info.role === 'user') {
+                    message = messages[index];
+                    break;
+                }
+            }
+            if (!message) return;
+            const parts = message.parts;
             const textPart = parts.find((part) => part.type === 'text');
             if (!textPart) return;
             const prompt = parts.filter((part) => part.type === 'text').map((part) => part.text).join('\\n');
             if (!prompt.trim().startsWith('elepha:')) return;
             const stdout = runHook({
                 hook_event_name: 'UserPromptSubmit',
-                session_id: input.sessionID,
+                session_id: message.info.sessionID,
                 cwd: directory,
                 prompt,
             });
             if (!stdout.trim()) return;
             const context = JSON.parse(stdout)?.hookSpecificOutput?.additionalContext;
             if (typeof context !== 'string' || !context) return;
-            // OpenCode displays the rewritten model input as the user's bubble. Its
-            // default model ignores a bare payload, so replace the exact leading
-            // directive with the shortest verified compliant wording while preserving
-            // recap and data-safety instructions used by other commands. Rule 4 still
-            // holds: recorded injection quote-back drops the echoed content per session.
-            const bodyLines = context
+            // Keep the full model-facing instructions; recordHookOutput has already
+            // recorded this body for the per-session ingestion quote-back check.
+            const body = context
                 .split('\\n')
-                .filter((line) => !line.startsWith('[[elepha:brief:') && line.trim() !== '[[/elepha]]');
-            if (bodyLines[0]?.trimEnd() === displayVerbatimInstructions) bodyLines[0] = opencodeDisplayVerbatimInstructions;
-            const body = bodyLines.join('\\n').trim();
-            if (body) textPart.text = body;
+                .filter((line) => !line.startsWith(briefOpen) && line.trim() !== briefClose)
+                .join('\\n').trim();
+            if (!body) return;
+            textPart.text = body;
+            message.parts = parts.filter((part) => part.type !== 'text' || part === textPart);
         } catch {
             // Fail open without logging private prompt or context data.
         }
