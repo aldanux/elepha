@@ -1,5 +1,7 @@
 // Exact bytes owned by elepha's installed configuration and launcher formats.
 export const LAUNCHER_MARKER = '# elepha-managed-launcher: v1';
+export const OPENCODE_PLUGIN_MARKER = '// elepha-managed-opencode-plugin: v1';
+export const OPENCODE_PLUGIN_DROPPED_CONTEXT = '[elepha: dropped oldest pending command context at session limit.]';
 
 export const CODEX_SESSION_START_BEGIN = '# elepha-session-start: begin';
 export const CODEX_SESSION_START_END = '# elepha-session-start: end';

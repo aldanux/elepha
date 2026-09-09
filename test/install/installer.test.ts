@@ -15,6 +15,8 @@ import path from 'node:path';
 import { parse } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS } from '../../src/config/constants.js';
+import { opencodePluginPath } from '../../src/config/paths.js';
+import { integrationHealth } from '../../src/install/health-checks.js';
 import {
     type DaemonHealthCheckRuntime,
     defaultLaunchdServicePaths,
@@ -22,6 +24,7 @@ import {
     LaunchdBackend,
 } from '../../src/install/launchd-backend.js';
 import type { LauncherBackend } from '../../src/install/launcher.js';
+import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { defaultSystemdServicePaths, type SystemctlExecutor, SystemdBackend } from '../../src/install/systemd-backend.js';
 import { ELEPHA_MCP_ARGS, ELEPHA_MCP_SERVER_NAME } from '../../src/mcp/installer.js';
 
@@ -1072,6 +1075,12 @@ describe('installer transaction', () => {
             const installed = installElepha(paths, { home: root, approvedRoots: 1 });
 
             expect(installed.status.opencodeMcp).toBe('registered');
+            expect(installed.status.opencodePlugin).toBe('installed');
+            const pluginFile = opencodePluginPath(paths.opencodeConfig);
+            expect(readFileSync(pluginFile, 'utf8')).toBe(renderOpencodePlugin(bin));
+            expect(integrationHealth(paths).status.opencodePlugin).toBe('installed');
+            writeFileSync(path.join(path.dirname(pluginFile), 'user.js'), '// user plugin');
+            expect(installElepha(paths, { home: root, approvedRoots: 1 }).changed).toBe(false);
             expect(installed.status.ready).toBe(true);
             expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
                 mcp: {
@@ -1084,7 +1093,60 @@ describe('installer transaction', () => {
             const removed = uninstallElepha(paths, { home: root, approvedRoots: 1 });
 
             expect(removed.status.opencodeMcp).toBe('not installed');
+            expect(removed.status.opencodePlugin).toBe('not installed');
+            expect(existsSync(pluginFile)).toBe(false);
+            expect(integrationHealth(paths).status.opencodePlugin).toBe('not installed');
+            expect(readFileSync(path.join(path.dirname(pluginFile), 'user.js'), 'utf8')).toBe('// user plugin');
             expect(existsSync(paths.opencodeConfig)).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it.each(['', '// user-owned plugin'])('preserves a user-owned OpenCode plugin through install refusal and uninstall: %s', (source) => {
+        const scratch = path.resolve('.test-scratch');
+        mkdirSync(scratch, { recursive: true });
+        const root = mkdtempSync(path.join(scratch, 'opencode-plugin-conflict-'));
+        const paths = installPaths(root);
+        const pluginFile = opencodePluginPath(paths.opencodeConfig);
+        mkdirSync(path.dirname(pluginFile), { recursive: true });
+        mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
+        writeFileSync(pluginFile, source);
+        try {
+            expect(() => installElepha(paths, { home: root, approvedRoots: 1 })).toThrow('user-owned');
+            expect(readFileSync(pluginFile, 'utf8')).toBe(source);
+            expect(existsSync(paths.opencodeConfig)).toBe(false);
+            expect(existsSync(paths.claudeSettings)).toBe(false);
+            uninstallElepha(paths, { home: root, approvedRoots: 1 });
+            expect(readFileSync(pluginFile, 'utf8')).toBe(source);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('updates a stale plugin with the managed launcher and retains a user replacement on uninstall', () => {
+        const scratch = path.resolve('.test-scratch');
+        mkdirSync(scratch, { recursive: true });
+        const root = mkdtempSync(path.join(scratch, 'opencode-plugin-update-'));
+        const paths = installPaths(root);
+        const pluginFile = opencodePluginPath(paths.opencodeConfig);
+        mkdirSync(path.dirname(pluginFile), { recursive: true });
+        writeFileSync(pluginFile, renderOpencodePlugin('/old/bin'));
+        const service: LaunchctlExecutor = {
+            run(args) {
+                if (args[0] === 'print') return { stdout: '', stderr: '', status: 3 };
+                if (args[0] === 'print-disabled') return { stdout: '"com.elepha.daemon" => true', stderr: '', status: 0 };
+                return { stdout: '', stderr: '', status: 0 };
+            },
+        };
+        try {
+            const runtime = serviceRuntime(root, service, 0);
+            const installed = installElepha(paths, runtime);
+            expect(readFileSync(pluginFile, 'utf8')).toBe(renderOpencodePlugin(installed.launcher!));
+            expect(installed.status.opencodePlugin).toBe('installed');
+            writeFileSync(pluginFile, '// user replacement');
+            uninstallElepha(paths, runtime);
+            expect(readFileSync(pluginFile, 'utf8')).toBe('// user replacement');
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
@@ -1101,6 +1163,8 @@ describe('installer transaction', () => {
             const installed = installElepha(paths, { home: root, approvedRoots: 1 });
 
             expect(installed.status.opencodeMcp).toBe('not present');
+            expect(installed.status.opencodePlugin).toBe('not present');
+            expect(existsSync(path.dirname(opencodePluginPath(paths.opencodeConfig)))).toBe(false);
             expect(existsSync(paths.opencodeConfig)).toBe(false);
         } finally {
             rmSync(root, { recursive: true, force: true });

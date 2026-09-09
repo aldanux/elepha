@@ -1,6 +1,6 @@
 # Commands in AI chat
 
-Type these commands directly in Claude Code or Codex chat. For terminal commands, see [docs/commands-cli.md](commands-cli.md).
+Type these commands directly in Claude Code, Codex, or OpenCode chat. For terminal commands, see [docs/commands-cli.md](commands-cli.md).
 
 Recall commands are read-only: elepha injects the result into the same turn. Actions return a terminal handoff instead of running privileged work in chat.
 
@@ -41,8 +41,10 @@ past work, the model calls elepha's `recall` MCP tool, which returns the relevan
 (decisions, the reasoning, and open items) with its provenance (project, tool, session,
 date) so the model can answer in place. `recall` needs elepha's MCP tools connected; it is
 not typed as an `elepha:` command. `elepha install` connects those MCP tools automatically
-for detected Claude Code, Codex, and OpenCode installations. OpenCode does not yet support
-the separate in-chat `elepha:` command interception described on this page.
+for detected Claude Code, Codex, and OpenCode installations. For OpenCode it also installs
+`~/.config/opencode/plugins/elepha.js` (under `$XDG_CONFIG_HOME` when set). This plugin
+handles all the in-chat `elepha:` commands on this page and injects their results before
+model dispatch. Restart OpenCode after installation to load it.
 
 ## Maintenance
 

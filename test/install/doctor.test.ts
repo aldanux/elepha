@@ -13,6 +13,7 @@ const activeIntegrations: IntegrationHealth = {
         claudeMcp: 'registered',
         codexMcp: 'registered',
         opencodeMcp: 'registered',
+        opencodePlugin: 'installed',
         ready: true,
     },
     present: { claude: true, codex: true, opencode: true },
@@ -35,6 +36,23 @@ function runtime(overrides: Partial<DoctorRuntime> = {}): DoctorRuntime {
 }
 
 describe('elepha doctor', () => {
+    it.each(['not installed', 'stale binary', 'conflict', 'stale plugin'] as const)(
+        'reports an OpenCode plugin %s and provides the install handoff',
+        async (opencodePlugin) => {
+            const result = await runDoctor(
+                runtime({
+                    inspectIntegrations: () => ({
+                        ...activeIntegrations,
+                        status: { ...activeIntegrations.status, opencodePlugin, ready: false },
+                    }),
+                }),
+            );
+            expect(result.exitCode).toBe(1);
+            expect(result.lines).toContain(`✗ OpenCode plugin: ${opencodePlugin}`);
+            expect(result.nextSteps).toContain(terminalHandoff('install'));
+        },
+    );
+
     it('reports every healthy check and exits zero', async () => {
         const result = await runDoctor(runtime());
 

@@ -66,6 +66,10 @@ export function opencodeConfigPath(): string {
     return path.join(opencodeConfigDir(), 'opencode.json');
 }
 
+export function opencodePluginPath(configPath = opencodeConfigPath()): string {
+    return path.join(path.dirname(configPath), 'plugins', 'elepha.js');
+}
+
 export function claudeProjectsRoot(): string {
     return path.join(claudeConfigDir(), 'projects');
 }
