@@ -201,7 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_injections_session ON injections(tool, native_ses
 -- The ordered session ids behind elepha:resume:<n>. One row is the complete
 -- last list shown to one native chat, including an intentionally empty list.
 CREATE TABLE IF NOT EXISTS shown_session_lists (
-  tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
+  tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
   native_session_id TEXT NOT NULL,
   session_ids       TEXT NOT NULL,
   PRIMARY KEY (tool, native_session_id)
@@ -573,14 +573,14 @@ function migrateShownSessionListsToolConstraint(db: Database.Database): void {
     const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shown_session_lists'").get() as
         | { sql: string }
         | undefined;
-    if (schema?.sql.includes("'opencode'")) {
+    if (schema?.sql.includes("'kimi'")) {
         return;
     }
 
     const rebuild = db.transaction(() => {
         db.exec(`
           CREATE TABLE shown_session_lists_new (
-            tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
+            tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
             native_session_id TEXT NOT NULL,
             session_ids       TEXT NOT NULL,
             PRIMARY KEY (tool, native_session_id)

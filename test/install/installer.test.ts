@@ -14,7 +14,7 @@ import path from 'node:path';
 import { parse } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS } from '../../src/config/constants.js';
-import { opencodePluginPath } from '../../src/config/paths.js';
+import { kimiConfigTomlPath, opencodePluginPath } from '../../src/config/paths.js';
 import { integrationHealth } from '../../src/install/health-checks.js';
 import {
     type DaemonHealthCheckRuntime,
@@ -36,7 +36,8 @@ const launcherMock = vi.hoisted(() => ({
 
 // Vitest invokes these factories when the mocked modules are imported; the IDE cannot trace that use.
 //noinspection JSUnusedGlobalSymbols
-vi.mock('../../src/install/binary.js', () => ({
+vi.mock('../../src/install/binary.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../src/install/binary.js')>()),
     hookCommand: (command: string, tool: 'claude-code' | 'codex', hook = 'session-start') => `${command} hook ${hook} --tool ${tool}`,
     resolveInstalledElephaBin: () => ({ bin, packageRoot: '/opt/npm/lib/node_modules/elepha' }),
 }));
@@ -152,6 +153,7 @@ describe('installer transaction', () => {
         expect(uninstallElepha(paths, runtime).service).toBe('not installed');
         expect(existsSync(servicePaths.unit)).toBe(false);
         expect(existsSync(paths.kimiMcp)).toBe(false);
+        expect(existsSync(kimiConfigTomlPath(paths.kimiMcp))).toBe(false);
         expect(executor.calls).toContainEqual(['--user', 'daemon-reload']);
         expect(executor.calls).toContainEqual(['--user', 'disable', 'elepha.service']);
     });
@@ -1300,6 +1302,9 @@ describe('Kimi Code MCP installation', () => {
         writeFileSync(projectMcp, '{"mcpServers":{"elepha":{"command":"project-owned"}}}');
         const installed = installElepha(paths, runtime);
         expect(installed.status.kimiMcp).toBe('registered');
+        expect(installed.status.kimiHook).toBe('active');
+        expect(integrationHealth(paths).status.kimiHook).toBe('active');
+        const hookSource = readFileSync(kimiConfigTomlPath(paths.kimiMcp), 'utf8');
         expect(installed.status.ready).toBe(true);
         const expected = { mcpServers: { [ELEPHA_MCP_SERVER_NAME]: { command: bin, args: [...ELEPHA_MCP_ARGS] } } };
         const written = readFileSync(paths.kimiMcp, 'utf8');
@@ -1308,11 +1313,13 @@ describe('Kimi Code MCP installation', () => {
         expect(integrationHealth(paths).status.kimiMcp).toBe('registered');
         expect(installElepha(paths, runtime).changed).toBe(false);
         expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(written);
+        expect(readFileSync(kimiConfigTomlPath(paths.kimiMcp), 'utf8')).toBe(hookSource);
         expect(existsSync(paths.claudeSettings)).toBe(false);
         expect(existsSync(paths.codexConfig)).toBe(false);
         expect(existsSync(paths.opencodeConfig)).toBe(false);
         expect(uninstallElepha(paths, runtime).status.kimiMcp).toBe('not installed');
         expect(existsSync(paths.kimiMcp)).toBe(false);
+        expect(existsSync(kimiConfigTomlPath(paths.kimiMcp))).toBe(false);
         expect(readFileSync(projectMcp, 'utf8')).toBe('{"mcpServers":{"elepha":{"command":"project-owned"}}}');
     });
 
@@ -1347,6 +1354,37 @@ describe('Kimi Code MCP installation', () => {
         expect(() => uninstallElepha(paths, runtime)).toThrow('conflicting user-owned Kimi Code MCP');
         expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(source);
         expect(integrationHealth(paths).status.kimiMcp).toBe('conflict');
+    });
+
+    it('refuses a user-owned Kimi prompt hook before writing integrations', () => {
+        const root = withTempDir('kimi-hook-install-conflict-');
+        const paths = installPaths(root);
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
+        const file = kimiConfigTomlPath(paths.kimiMcp);
+        const source = '[[hooks]]\nevent="UserPromptSubmit"\nmatcher="^elepha:"\ncommand="user-wrapper"\n';
+        writeFileSync(file, source);
+        expect(() => installElepha(paths, { home: root, approvedRoots: 0 })).toThrow('conflicting user-owned elepha Kimi hook');
+        expect(existsSync(paths.kimiMcp)).toBe(false);
+        expect(readFileSync(file, 'utf8')).toBe(source);
+        expect(integrationHealth(paths).status.kimiHook).toBe('conflict');
+    });
+
+    it('preserves existing and later user hooks on uninstall', () => {
+        const root = withTempDir('kimi-hook-install-preserve-');
+        const paths = installPaths(root);
+        const runtime = { home: root, approvedRoots: 0 };
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
+        const file = kimiConfigTomlPath(paths.kimiMcp);
+        writeFileSync(file, '[[hooks]]\nevent="Stop"\ncommand="user"\n');
+        installElepha(paths, runtime);
+        writeFileSync(file, `${readFileSync(file, 'utf8')}\n[[hooks]]\nevent="SessionStart"\ncommand="later"\n`);
+        uninstallElepha(paths, runtime);
+        expect(parse(readFileSync(file, 'utf8'))).toEqual({
+            hooks: [
+                { event: 'Stop', command: 'user' },
+                { event: 'SessionStart', command: 'later' },
+            ],
+        });
     });
 
     it('does not create a Kimi home for an absent client', () => {

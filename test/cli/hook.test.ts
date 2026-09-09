@@ -17,13 +17,13 @@ describe('hook CLI tool validation', () => {
         hooks.runUserPromptSubmitCli.mockClear();
     });
 
-    it('passes opencode through to the UserPromptSubmit runtime', async () => {
+    it.each(['opencode', 'kimi'])('passes %s through to the UserPromptSubmit runtime', async (tool) => {
         const program = new Command();
         registerHook(program);
 
-        await program.parseAsync(['node', 'elepha', 'hook', 'user-prompt-submit', '--tool', 'opencode']);
+        await program.parseAsync(['node', 'elepha', 'hook', 'user-prompt-submit', '--tool', tool]);
 
-        expect(hooks.runUserPromptSubmitCli).toHaveBeenCalledExactlyOnceWith('opencode');
+        expect(hooks.runUserPromptSubmitCli).toHaveBeenCalledExactlyOnceWith(tool);
         expect(hooks.runSessionStartCli).not.toHaveBeenCalled();
     });
 });

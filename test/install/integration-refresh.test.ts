@@ -1,9 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { opencodePluginPath } from '../../src/config/paths.js';
+import { kimiConfigTomlPath, opencodePluginPath } from '../../src/config/paths.js';
 import { refreshInstalledIntegrations } from '../../src/install/integration-refresh.js';
 import { reconcileOwnedIntegrations, restoreRefreshedIntegrations } from '../../src/install/integrations.js';
+import { kimiHookStatus, transformKimiHook } from '../../src/install/kimi-hook.js';
 import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { ELEPHA_MCP_ARGS, transformKimiMcp } from '../../src/mcp/installer.js';
 import * as fileIO from '../../src/util/fs.js';
@@ -188,6 +189,48 @@ describe('Kimi Code owned integration refresh', () => {
         }
     });
 
+    it('refreshes owned Kimi hooks, skips absent hooks, and restores exact original bytes', () => {
+        const { paths } = fixture();
+        const file = kimiConfigTomlPath(paths.kimiMcp);
+        writeFileSync(paths.kimiMcp, transformKimiMcp('', '/managed/elepha'));
+        expect(reconcileOwnedIntegrations('/managed/elepha', paths).refreshed).toEqual([]);
+        expect(existsSync(file)).toBe(false);
+        const source = transformKimiHook('[[hooks]]\nevent="Stop"\ncommand="user"\n', '/old/elepha');
+        writeFileSync(file, source);
+        const refresh = reconcileOwnedIntegrations('/managed/elepha', paths);
+        expect(refresh.refreshed).toEqual([file]);
+        expect(kimiHookStatus(readFileSync(file, 'utf8'), '/managed/elepha')).toBe('active');
+        expect(reconcileOwnedIntegrations('/managed/elepha', paths).refreshed).toEqual([]);
+        restoreRefreshedIntegrations(refresh);
+        expect(readFileSync(file, 'utf8')).toBe(source);
+    });
+
+    it.each([
+        ['[', 'invalid'],
+        ['[[hooks]]\nevent="UserPromptSubmit"\nmatcher="^elepha:"\ncommand="user"', 'conflict'],
+    ])('preserves and reports invalid or conflicting Kimi hooks: %s', (source, status) => {
+        const { paths } = fixture();
+        const file = kimiConfigTomlPath(paths.kimiMcp);
+        writeFileSync(file, source);
+        const refresh = reconcileOwnedIntegrations('/managed/elepha', paths);
+        expect(refresh.refreshed).toEqual([]);
+        expect(refresh.skipped).toEqual([{ integration: 'Kimi Code hook', file, status }]);
+        expect(readFileSync(file, 'utf8')).toBe(source);
+    });
+
+    it('does not follow a Kimi config symlink during refresh', () => {
+        const { root, paths } = fixture();
+        const file = kimiConfigTomlPath(paths.kimiMcp);
+        const target = path.join(root, 'user.toml');
+        const source = transformKimiHook('', '/old/elepha');
+        writeFileSync(target, source);
+        symlinkSync(target, file);
+        expect(reconcileOwnedIntegrations('/managed/elepha', paths).skipped).toEqual([
+            { integration: 'Kimi Code hook', file, status: 'conflict' },
+        ]);
+        expect(readFileSync(target, 'utf8')).toBe(source);
+    });
+
     it('refreshes Kimi through the built installed-package worker using KIMI_CODE_HOME', async () => {
         const { root, paths } = fixture();
         vi.stubEnv('KIMI_CODE_HOME', path.dirname(paths.kimiMcp));
@@ -196,11 +239,14 @@ describe('Kimi Code owned integration refresh', () => {
         vi.stubEnv('XDG_CONFIG_HOME', path.join(root, 'xdg-config'));
         const source = transformKimiMcp('', '/old/elepha');
         writeFileSync(paths.kimiMcp, source);
+        const hookFile = kimiConfigTomlPath(paths.kimiMcp);
+        writeFileSync(hookFile, transformKimiHook('', '/old/elepha'));
         const result = await refreshInstalledIntegrations(
             { packageRoot: process.cwd(), bin: path.resolve('bin/elepha.js') },
             '/managed/elepha',
         );
-        expect(result.refreshed).toEqual([paths.kimiMcp]);
+        expect(result.refreshed).toEqual([paths.kimiMcp, hookFile]);
+        expect(kimiHookStatus(readFileSync(hookFile, 'utf8'), '/managed/elepha')).toBe('active');
         expect(result.skipped).toEqual([]);
         expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(transformKimiMcp(source, '/managed/elepha'));
     });

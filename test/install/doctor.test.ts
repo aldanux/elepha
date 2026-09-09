@@ -14,6 +14,7 @@ const activeIntegrations: IntegrationHealth = {
         codexMcp: 'registered',
         opencodeMcp: 'registered',
         kimiMcp: 'registered',
+        kimiHook: 'active',
         opencodePlugin: 'installed',
         ready: true,
     },
@@ -207,6 +208,20 @@ describe('elepha doctor', () => {
 
         expect(result.lines).toContain('✗ MCP: Claude, Codex, OpenCode, and Kimi Code must be registered where detected');
         expect(result.nextSteps).toEqual([terminalHandoff('install')]);
+        expect(result.exitCode).toBe(1);
+    });
+
+    it('requires the detected Kimi prompt hook even when its MCP is registered', async () => {
+        const result = await runDoctor(
+            runtime({
+                inspectIntegrations: () => ({
+                    ...activeIntegrations,
+                    status: { ...activeIntegrations.status, kimiHook: 'not installed', ready: false },
+                }),
+            }),
+        );
+        expect(result.lines.some((line) => line.includes('Kimi Code UserPromptSubmit hook') && line.includes('not installed'))).toBe(true);
+        expect(result.nextSteps).toContain(terminalHandoff('install'));
         expect(result.exitCode).toBe(1);
     });
 

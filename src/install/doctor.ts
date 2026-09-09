@@ -174,11 +174,12 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
                 : `${status.opencodePlugin === 'installed' ? '✓' : '✗'} OpenCode plugin: ${status.opencodePlugin}`,
         );
         lines.push(`${!present.kimi ? '⚠' : status.kimiMcp === 'registered' ? '✓' : '✗'} ${formatKimiMcpStatus(status.kimiMcp)}`);
+        lines.push(`${!present.kimi ? '⚠' : status.kimiHook === 'active' ? '✓' : '✗'} Kimi Code UserPromptSubmit hook: ${status.kimiHook}`);
         const needsInstall =
             (present.claude && (!claudeReady || status.claudeMcp !== 'registered')) ||
             (present.codex && ((!codexReady && !hasCodexApprovalIssue(status)) || status.codexMcp !== 'registered')) ||
             (present.opencode && (status.opencodeMcp !== 'registered' || status.opencodePlugin !== 'installed')) ||
-            (present.kimi && status.kimiMcp !== 'registered');
+            (present.kimi && (status.kimiMcp !== 'registered' || status.kimiHook !== 'active'));
         if (needsInstall) {
             addNextStep(nextSteps, terminalHandoff('install'));
         }
@@ -227,7 +228,7 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
                 integrations.status.codexMcp === 'registered')) &&
         (!integrations.present.opencode ||
             (integrations.status.opencodeMcp === 'registered' && integrations.status.opencodePlugin === 'installed')) &&
-        (!integrations.present.kimi || integrations.status.kimiMcp === 'registered');
+        (!integrations.present.kimi || (integrations.status.kimiMcp === 'registered' && integrations.status.kimiHook === 'active'));
     const healthy = daemonOk && approvedRoots !== undefined && approvedRoots > 0 && integrationsOk && launcherOk && installRecoveryOk;
     if (nextSteps.length > 0) {
         lines.push('Next steps:');

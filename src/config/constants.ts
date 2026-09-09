@@ -140,6 +140,7 @@ export const HOOK_PAYLOAD_MAX_CHARS = 64 * 1024;
 export const HOOK_LOG_LINE_MAX_CHARS = 500;
 export const HOOK_LOG_MAX_BYTES = 5 * 1024 * 1024;
 export const INSTALLED_HOOK_TIMEOUT_SECONDS = 5;
+export const KIMI_HOOK_OUTPUT_MAX_BYTES = 1024 * 1024;
 export const OPENCODE_PLUGIN_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 // Synthesis

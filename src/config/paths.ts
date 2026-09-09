@@ -49,6 +49,10 @@ export function kimiConfigDir(): string {
     return override ? path.resolve(override) : path.join(homedir(), '.kimi-code');
 }
 
+export function kimiConfigTomlPath(mcpPath = kimiMcpPath()): string {
+    return path.join(path.dirname(mcpPath), 'config.toml');
+}
+
 // Only the user registry is managed here; project .kimi-code/mcp.json entries
 // override same-named user servers inside Kimi Code.
 export function kimiMcpPath(): string {

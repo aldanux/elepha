@@ -1,8 +1,16 @@
 # Commands in AI chat
 
-Type these commands directly in Claude Code, Codex, or OpenCode chat. For terminal commands, see [docs/commands-cli.md](commands-cli.md).
+Type these commands directly in Claude Code, Codex, OpenCode, or Kimi Code chat. For terminal commands, see [docs/commands-cli.md](commands-cli.md).
 
-Recall commands are read-only: elepha injects the result into the same turn. Actions return a terminal handoff instead of running privileged work in chat.
+Recall commands are read-only: elepha serves the result in the same turn. Actions return a terminal handoff instead of running privileged work in chat.
+
+Kimi Code displays `info`, `list`, `help`, `update`, and `query` results directly as
+hook results and skips the model turn. Its UI labels these results
+“UserPromptSubmit hook blocked.” `resume` and `last` inject historical context for
+the model; `resume` requests a recap. Run `elepha install` to register the hook in
+`~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`), then start a new Kimi
+session. Self-update refreshes an already owned hook. Kimi transcript capture is
+not implemented yet.
 
 ## Recall and navigation
 

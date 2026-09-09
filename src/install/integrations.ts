@@ -1,6 +1,13 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { parse } from 'smol-toml';
-import { claudeMcpPath, codexConfigPath, kimiMcpPath, opencodeConfigPath, opencodePluginPath } from '../config/paths.js';
+import {
+    claudeMcpPath,
+    codexConfigPath,
+    kimiConfigTomlPath,
+    kimiMcpPath,
+    opencodeConfigPath,
+    opencodePluginPath,
+} from '../config/paths.js';
 import {
     hasClaudeMcp,
     hasCodexMcp,
@@ -13,6 +20,7 @@ import {
     transformOpencodeMcp,
 } from '../mcp/installer.js';
 import { applyConfigTransaction, type ConfigChange, type ConfigOriginal } from './config-file.js';
+import { kimiHookStatus, transformKimiHook } from './kimi-hook.js';
 import { opencodePluginStatus, transformOpencodePlugin } from './opencode-plugin.js';
 
 export interface IntegrationPaths {
@@ -27,6 +35,7 @@ export interface IntegrationSources {
     codexConfig?: string;
     opencodeConfig?: string;
     kimiMcp?: string;
+    kimiConfig?: string;
     opencodePlugin?: string;
 }
 
@@ -112,6 +121,15 @@ export function planIntegrations(
             render: (source: string | undefined) => transformKimiMcp(source ?? '', launcher),
             validate: JSON.parse,
         },
+        {
+            selected: selected.kimi,
+            integration: 'Kimi Code hook',
+            file: kimiConfigTomlPath(paths.kimiMcp),
+            source: sources.kimiConfig,
+            status: () => kimiHookStatus(sources.kimiConfig ?? '', launcher),
+            render: (source: string | undefined) => transformKimiHook(source ?? '', launcher),
+            validate: parse,
+        },
     ];
     const changes: ConfigChange[] = [];
     const skipped: IntegrationNotice[] = [];
@@ -155,6 +173,7 @@ export function reconcileOwnedIntegrations(launcher: string, paths: IntegrationP
     };
     const sources = {
         kimiMcp: read(paths.kimiMcp, 'Kimi Code MCP'),
+        kimiConfig: read(kimiConfigTomlPath(paths.kimiMcp), 'Kimi Code hook'),
         claudeMcp: read(paths.claudeMcp, 'Claude MCP'),
         codexConfig: read(paths.codexConfig, 'Codex MCP'),
         opencodeConfig: read(paths.opencodeConfig, 'OpenCode MCP'),

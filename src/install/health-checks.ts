@@ -6,6 +6,7 @@ import {
     codexConfigPath,
     daemonHeartbeatPath,
     elephaLauncherPath,
+    kimiConfigTomlPath,
     kimiMcpPath,
     opencodeConfigPath,
     opencodePluginPath,
@@ -104,6 +105,7 @@ export function integrationHealth(
             present,
             readOpencodePlugin(opencodePluginPath(paths.opencodeConfig)),
             text(paths.kimiMcp, ''),
+            text(kimiConfigTomlPath(paths.kimiMcp), ''),
         ),
     };
 }

@@ -575,3 +575,36 @@ describe('migration idempotency and reversibility', () => {
         migrated.close();
     });
 });
+
+describe('Kimi shown-list bookkeeping migration', () => {
+    it('preserves phase-1 OpenCode and Claude lists, admits Kimi, and reopens idempotently', () => {
+        const directory = withGrantableTestDir('kimi-shown-list-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const legacy = openUnmanagedDb(dbPath);
+        legacy.exec(`
+            DROP TABLE shown_session_lists;
+            CREATE TABLE shown_session_lists (
+                tool TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode')),
+                native_session_id TEXT NOT NULL,
+                session_ids TEXT NOT NULL,
+                PRIMARY KEY (tool, native_session_id)
+            );
+            INSERT INTO shown_session_lists VALUES ('opencode', 'same-chat', '[9]'), ('claude-code', 'same-chat', '[7]');
+        `);
+        legacy.close();
+        const migrated = openUnmanagedDb(dbPath);
+        migrated.prepare('INSERT INTO shown_session_lists VALUES (?, ?, ?)').run('kimi', 'same-chat', '[11]');
+        const expected = [
+            { tool: 'claude-code', native_session_id: 'same-chat', session_ids: '[7]' },
+            { tool: 'kimi', native_session_id: 'same-chat', session_ids: '[11]' },
+            { tool: 'opencode', native_session_id: 'same-chat', session_ids: '[9]' },
+        ];
+        expect(migrated.prepare('SELECT * FROM shown_session_lists ORDER BY tool').all()).toEqual(expected);
+        const schema = migrated.prepare("SELECT sql FROM sqlite_master WHERE name = 'shown_session_lists'").get();
+        migrated.close();
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT * FROM shown_session_lists ORDER BY tool').all()).toEqual(expected);
+        expect(reopened.prepare("SELECT sql FROM sqlite_master WHERE name = 'shown_session_lists'").get()).toEqual(schema);
+        reopened.close();
+    });
+});
