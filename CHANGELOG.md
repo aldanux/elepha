@@ -1,5 +1,14 @@
 # elepha
 
+## 0.7.0
+
+- Capture Kimi Code sessions with consent-bound event reduction, model provenance, and retraction-aware reconciliation for undo, repair, resume rewrites, and forks. Completes Kimi recall and in-chat command support for the 0.7.0 release by [@aldanux](https://github.com/aldanux) in [#108](https://github.com/aldanux/elepha/pull/108)
+
+- Use “serve” in user-facing recall help and guides when describing delivery of historical context by [@aldanux](https://github.com/aldanux) in [#108](https://github.com/aldanux/elepha/pull/108)
+- List Kimi Code support in the README and user documentation by [@aldanux](https://github.com/aldanux) in [#109](https://github.com/aldanux/elepha/pull/109)
+- Add Kimi Code in-chat commands through its native UserPromptSubmit hook, with direct command displays, model-driven resume context, ownership-guarded installation and refresh, and doctor/status diagnostics. Hide sentinel wrappers and model-facing framing in direct command displays while preserving full model-driven context, injection and quote-back accounting. Kimi 0.42.0 still queues subsequent interactive prompts after either supported hook denial form; release requires an upstream termination fix by [@aldanux](https://github.com/aldanux) in [#108](https://github.com/aldanux/elepha/pull/108)
+- Add Kimi Code recall support through user-level MCP registration, including install/uninstall, owned-integration refresh, and doctor/status diagnostics. Honor `KIMI_CODE_HOME` and explain project-level MCP overrides by [@aldanux](https://github.com/aldanux) in [#108](https://github.com/aldanux/elepha/pull/108)
+
 ## 0.6.5
 
 - Show progress while pausing and resuming capture for maintenance operations, keeping destructive previews, confirmation prompts, backup locations, and failures visible by [@aldanux](https://github.com/aldanux) in [#106](https://github.com/aldanux/elepha/pull/106)
