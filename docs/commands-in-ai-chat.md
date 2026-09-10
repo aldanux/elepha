@@ -54,8 +54,8 @@ past work, the model calls elepha's `recall` MCP tool, which returns the relevan
 (decisions, the reasoning, and open items) with its provenance (project, tool, session,
 date) so the model can answer in place. `recall` needs elepha's MCP tools connected; it is
 not typed as an `elepha:` command. `elepha install` connects those MCP tools automatically
-for detected Claude Code, Codex, and OpenCode installations. The `elepha:` commands on this
-page work in all three.
+for detected Claude Code, Codex, OpenCode, and Kimi Code installations. The `elepha:` commands on this
+page work in all four.
 
 ## Maintenance
 

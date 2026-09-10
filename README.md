@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>Local memory for Claude Code, Codex, and OpenCode.</b></p>
+<p align="center"><b>Local memory for Claude Code, Codex, OpenCode, and Kimi Code.</b></p>
 <p align="center">Reads existing transcripts and serves context via MCP.</p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 ## Overview
 
-elepha reads eligible Claude Code and Codex session files, plus the local OpenCode session database,
+elepha reads eligible Claude Code, Codex, and Kimi Code session files, plus the local OpenCode session database,
 indexes sessions from approved projects in one encrypted SQLite database, and exposes
 past context through a read-only MCP server and `elepha:` commands in AI chat.
 
@@ -51,6 +51,7 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 - Claude Code CLI & desktop
 - Codex CLI & desktop
 - OpenCode
+- Kimi Code
 
 All supported tools use the same local memory database.
 
@@ -76,14 +77,14 @@ project and session it came from.
 
 > do you remember why we moved the purchase button into a modal?
 
-To find and reopen a session, the `elepha:` commands work in Claude Code and Codex chat. Full
+To find and reopen a session, the `elepha:` commands work in Claude Code, Codex, OpenCode, and Kimi Code chat. Full
 guide: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
 
 | Command                    | What it does                                                                       |
 |----------------------------|------------------------------------------------------------------------------------|
 | `elepha:query <text>`      | Find sessions from plain text across all approved projects.                        |
 | `elepha:query:here <text>` | Same, current project only.                                                        |
-| `elepha:last`              | Serve the newest turns from the most recent session.                              |
+| `elepha:last`              | Serve the newest turns from the most recent session.                               |
 | `elepha:list[:<n>]`        | List recent sessions, numbered (up to 100).                                        |
 | `elepha:resume:<n>`        | Load a session to continue it; the model presents a recap.                         |
 | `elepha:info`              | Show status: sessions, capture, last session, and when a new version is available. |
