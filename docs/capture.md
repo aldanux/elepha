@@ -5,6 +5,25 @@ service stops all new ingestion without changing which projects have consent or
 deleting anything already remembered. When capture resumes, only approved roots are
 eligible.
 
+## Kimi Code
+
+Kimi capture watches `~/.kimi-code/sessions` (or `$KIMI_CODE_HOME/sessions`). The
+literal `state.json.cwd`, with the session index as fallback, binds each session to
+its consented project. Only `agents/main/wire.jsonl` is captured. Completed answer
+text is reduced across steps; reasoning, failed empty turns, injection-origin
+messages, and inherited fork history are excluded.
+
+Normal appends resume from an identity-checked byte cursor. Undo, repair, and atomic
+resume rewrites trigger reconciliation: unchanged turns keep their stored identities;
+changed or removed turns and their derived rollups and durable copies are invalidated
+transactionally. New summaries then fill the changed suffix. An interrupted rebuild
+can temporarily leave less memory; the next scan resumes without duplicating turns.
+Model aliases and protocol version are captured per turn. The unrecorded CLI build
+version stays `unknown`.
+
+Disable this provider with `elepha config set capture-kimi off`, then restart the
+capture service. See [Kimi capture verification](kimi-capture-verification.md).
+
 ## Durable capture
 
 Durable capture is opt-in and off by default. Enable it through the supported config

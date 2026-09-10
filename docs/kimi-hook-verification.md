@@ -1,7 +1,8 @@
 # Kimi hook verification and release notes
 
-Kimi Code in-chat commands use the native `UserPromptSubmit` hook. This change does
-not implement transcript capture. It extends the existing recall-only integration.
+This document records phase-2 verification of the native `UserPromptSubmit` hook.
+Phase 3 adds transcript capture; current capture evidence and remaining live UX
+limits are recorded in [Kimi capture verification](kimi-capture-verification.md).
 
 ## Verified upstream protocol
 
@@ -54,9 +55,9 @@ Kimi MCP is registered, and the prompt hook is active. Its overall exit was 1
 because the fixture intentionally had no capture service, consent, or managed
 launcher manifest; this is not a live daemon-health verification.
 
-## Pre-publish blocker
+## Phase-2 live UX gap
 
-Kimi is not installed in this environment. Source inspection, generated-client
+Kimi was not installed during the phase-2 verification. Source inspection, generated-client
 execution, unit tests, and an isolated built-launcher smoke do not establish live
 Kimi UX. Before publishing, Dani must install Kimi, run `elepha install`, start a
 fresh Kimi session, and verify:

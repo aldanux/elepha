@@ -8,6 +8,7 @@ import type { ParsedTurn, SummarizationOutput, ToolName, TurnDecision } from '..
 import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 import type { SessionStore } from './session-store.js';
+import { sourceTurnDigest } from './source-turn-digest.js';
 
 // Rule 3 for a per-turn decision. Both fields take the ESCAPE policy, not
 // strip: a decision may legitimately need to name the syntax it ruled out.
@@ -198,6 +199,21 @@ export class TurnStore {
             summarizer_status: summary.status,
             has_external_content: turn.hasExternalContent ? 1 : 0,
         });
+        if (info.changes > 0 && turn.sourceKey !== undefined) {
+            this.db.prepare('UPDATE memories SET source_digest = ?, provenance = ? WHERE id = ?').run(
+                sourceTurnDigest(turn),
+                JSON.stringify(
+                    turn.provenance
+                        ? {
+                              protocolVersion: stripShellSyntax(turn.provenance.protocolVersion),
+                              producerVersion: stripShellSyntax(turn.provenance.producerVersion),
+                              modelAliases: turn.provenance.modelAliases.map(stripShellSyntax),
+                          }
+                        : null,
+                ),
+                info.lastInsertRowid,
+            );
+        }
         if (info.changes > 0 && durableCapture) {
             this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now, durableCaptureMaxBytes, evictionPlan);
         }

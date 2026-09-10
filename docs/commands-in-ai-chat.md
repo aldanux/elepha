@@ -9,8 +9,8 @@ hook results and skips the model turn. Its UI labels these results
 “UserPromptSubmit hook blocked.” `resume` and `last` inject historical context for
 the model; `resume` requests a recap. Run `elepha install` to register the hook in
 `~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`), then start a new Kimi
-session. Self-update refreshes an already owned hook. Kimi transcript capture is
-not implemented yet.
+session. Self-update refreshes an already owned hook. Kimi capture reads completed
+main-agent turns from the local session store in consented projects.
 
 ## Recall and navigation
 

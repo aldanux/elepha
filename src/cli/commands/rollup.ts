@@ -1,8 +1,6 @@
 import { stat as statFile } from 'node:fs/promises';
 import type { Command } from 'commander';
-import { ClaudeCodeAdapter } from '../../adapters/claude-code.js';
-import { CodexAdapter } from '../../adapters/codex.js';
-import { sessionAdapterFor } from '../../adapters/index.js';
+import { defaultAdapters, sessionAdapterFor } from '../../adapters/index.js';
 import { CHARS_PER_TOKEN } from '../../config/constants.js';
 import { isReadableProviderSource } from '../../config/paths.js';
 import { RollupService } from '../../daemon/rollup-service.js';
@@ -93,10 +91,7 @@ export function registerRollup(program: Command): void {
                         provider: providers.rollupMerge,
                         log: output.log,
                     });
-                    const adapters: SessionAdapterMap = {
-                        'claude-code': new ClaudeCodeAdapter(),
-                        codex: new CodexAdapter(),
-                    };
+                    const adapters: SessionAdapterMap = defaultAdapters();
 
                     const limit = Number(opts.limit) || 0;
                     const runStart = new Date().toISOString();

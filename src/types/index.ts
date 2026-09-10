@@ -5,13 +5,14 @@ export const TOOL_METADATA = {
     'claude-code': { displayName: 'Claude Code' },
     codex: { displayName: 'Codex' },
     opencode: { displayName: 'OpenCode' },
+    kimi: { displayName: 'Kimi Code' },
 } as const;
 
 export type ToolName = keyof typeof TOOL_METADATA;
 export type SessionAdapterTool = Exclude<ToolName, 'opencode'>;
 
 export const SUPPORTED_TOOLS = Object.keys(TOOL_METADATA) as ToolName[];
-export const SESSION_ADAPTER_TOOLS = ['claude-code', 'codex'] as const satisfies readonly SessionAdapterTool[];
+export const SESSION_ADAPTER_TOOLS = ['claude-code', 'codex', 'kimi'] as const satisfies readonly SessionAdapterTool[];
 
 export function isToolName(value: unknown): value is ToolName {
     return SUPPORTED_TOOLS.includes(value as ToolName);
@@ -73,7 +74,11 @@ export interface ParsedTurn {
     // marker line's own payload is classified as skipped plumbing and never ingested.
     resumeMarkerBefore: boolean;
     // Present only for a complete turn the adapter withheld from persistence.
-    droppedReason?: 'sentinel';
+    droppedReason?: 'sentinel' | 'empty';
+    sourceKey?: string;
+    provenance?: { protocolVersion: string; producerVersion: string; modelAliases: string[] };
+    // Validated synchronously again inside the ingestion transaction.
+    validateSource?: () => boolean;
 }
 
 export interface ParseTurnsOptions {
@@ -141,6 +146,20 @@ export interface SessionAdapter {
     readonly tool: SessionAdapterTool;
     // Glob pattern(s) this adapter watches, relative to the tool's home dir.
     readonly watchGlobs: string[];
+    // Reconcile current logical history before advancing this source. Pi can share this boundary.
+    readonly retractable?: boolean;
+    needsReconciliation?(filePath: string, cursor: string | undefined, handle: FileHandle): Promise<boolean>;
+    readSourceMetadata?(filePath: string): Promise<
+        | {
+              cwd: string;
+              timestamp: string;
+              title?: string;
+              customTitle?: string;
+              validate: () => boolean;
+          }
+        | undefined
+    >;
+    eventSourcePath?(filePath: string): string | undefined;
     // True if this adapter owns the given absolute file path.
     matches(filePath: string): boolean;
     // Classifies a session file before its turns are parsed, so non-ingestable
@@ -165,7 +184,7 @@ export interface SessionAdapter {
     parseTurns(filePath: string, sinceCursor?: string, options?: ParseTurnsOptions): AsyncIterable<ParsedTurn>;
 }
 
-export type SessionAdapterMap = Record<SessionAdapterTool, SessionAdapter>;
+export type SessionAdapterMap = Record<Exclude<SessionAdapterTool, 'kimi'>, SessionAdapter> & Partial<Record<'kimi', SessionAdapter>>;
 
 export interface OpenedSessionRow {
     sessionId: string;

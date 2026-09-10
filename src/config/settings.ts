@@ -11,6 +11,7 @@ export const SETTING_KEYS = [
     'capture-claude-code',
     'capture-codex',
     'capture-opencode',
+    'capture-kimi',
     'durable-capture',
     'query-matching',
 ] as const;
@@ -37,6 +38,7 @@ export const SETTING_SCHEMA = {
     'capture-claude-code': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-codex': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-opencode': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
+    'capture-kimi': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'durable-capture': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
     'query-matching': { kind: 'enum', values: ['strict', 'lax'], default: 'strict' },
 } as const satisfies Record<SettingKey, SettingSchema>;
@@ -132,7 +134,7 @@ function configuredSetting<K extends SettingKey>(key: K, value: unknown): Settin
         | undefined;
 }
 
-const CAPTURE_SETTING_KEYS = ['capture-claude-code', 'capture-codex', 'capture-opencode'] as const;
+const CAPTURE_SETTING_KEYS = ['capture-claude-code', 'capture-codex', 'capture-opencode', 'capture-kimi'] as const;
 type CaptureSettingKey = (typeof CAPTURE_SETTING_KEYS)[number];
 
 function captureEnabled(config: ConfigObject, key: CaptureSettingKey): boolean {

@@ -78,7 +78,7 @@ function seedStoredSession(
 }
 
 describe('Kimi UserPromptSubmit', () => {
-    it('normalizes snake_case text parts without enabling capture or SessionStart', () => {
+    it('normalizes snake_case text parts with capture registered and SessionStart excluded', () => {
         const raw = {
             session_id: 'chat',
             cwd: process.cwd(),
@@ -97,8 +97,8 @@ describe('Kimi UserPromptSubmit', () => {
         });
         expect(parsePayload(JSON.stringify(raw), 'kimi', 'SessionStart')).toBeUndefined();
         expect(isHookTool('kimi')).toBe(true);
-        expect(SUPPORTED_TOOLS).not.toContain('kimi');
-        expect(SESSION_ADAPTER_TOOLS).not.toContain('kimi');
+        expect(SUPPORTED_TOOLS).toContain('kimi');
+        expect(SESSION_ADAPTER_TOOLS).toContain('kimi');
         for (const prompt of ['elepha:help', null, [{ type: 'text', text: 1 }], [null]]) {
             expect(parsePayload(JSON.stringify({ ...raw, prompt }), 'kimi', 'UserPromptSubmit')).toBeUndefined();
         }

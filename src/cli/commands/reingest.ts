@@ -1,7 +1,5 @@
 import type { Command } from 'commander';
-import { ClaudeCodeAdapter } from '../../adapters/claude-code.js';
-import { CodexAdapter } from '../../adapters/codex.js';
-import { sessionAdapterFor } from '../../adapters/index.js';
+import { defaultAdapters, sessionAdapterFor } from '../../adapters/index.js';
 import { isWithinProviderStore } from '../../config/paths.js';
 import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
@@ -35,10 +33,7 @@ export function registerReingest(program: Command): void {
                 return;
             }
 
-            const adapters: SessionAdapterMap = {
-                'claude-code': new ClaudeCodeAdapter(),
-                codex: new CodexAdapter(),
-            };
+            const adapters: SessionAdapterMap = defaultAdapters();
             const callLog = new SummarizerCallLog();
             const summarizer = providers.turnExtraction;
 

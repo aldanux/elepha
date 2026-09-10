@@ -49,6 +49,26 @@ export function kimiConfigDir(): string {
     return override ? path.resolve(override) : path.join(homedir(), '.kimi-code');
 }
 
+export function kimiSessionsRoot(): string {
+    return path.join(kimiConfigDir(), 'sessions');
+}
+
+export function kimiSessionDir(wirePath: string): string {
+    return path.dirname(path.dirname(path.dirname(wirePath)));
+}
+
+export function kimiSessionStatePath(wirePath: string): string {
+    return path.join(kimiSessionDir(wirePath), 'state.json');
+}
+
+export function kimiSessionWirePath(sessionDir: string): string {
+    return path.join(sessionDir, 'agents', 'main', 'wire.jsonl');
+}
+
+export function kimiSessionIndexPath(): string {
+    return path.join(kimiConfigDir(), 'session_index.jsonl');
+}
+
 export function kimiConfigTomlPath(mcpPath = kimiMcpPath()): string {
     return path.join(path.dirname(mcpPath), 'config.toml');
 }
@@ -99,6 +119,9 @@ export function providerStoreRoot(tool: ToolName): string {
     }
     if (tool === 'codex') {
         return codexSessionsRoot();
+    }
+    if (tool === 'kimi') {
+        return kimiConfigDir();
     }
     if (tool === 'opencode') {
         return opencodeStoreRoot();

@@ -1,6 +1,6 @@
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { opencodeDbPath } from '../../src/config/paths.js';
 import { detectSessionTools, discoverFolderRepos, discoverSessionProjects } from '../../src/discovery/session-projects.js';
 import { addOpencodeSession, createOpencodeFixture } from '../fixtures/opencode-db.js';
@@ -26,6 +26,7 @@ function session(cwd: string, timestamp: string, content: string): string {
 }
 
 describe('session-project discovery', () => {
+    beforeEach(() => vi.stubEnv('KIMI_CODE_HOME', withTempDir('discovery-kimi-home-')));
     afterEach(() => {
         vi.unstubAllEnvs();
     });

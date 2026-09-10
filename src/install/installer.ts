@@ -276,7 +276,7 @@ export function installElepha(
     replayRollbackJournal(recoveryService);
     const present = detectPresentTools(inputPaths);
     if (!present.claude && !present.codex && !present.opencode && !present.kimi) {
-        const choices = [...SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName), 'Kimi Code'].join(' or ');
+        const choices = SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName).join(' or ');
         throw new Error(`no supported tool found; install ${choices} first`);
     }
     const resolved = resolveInstalledElephaBin();
