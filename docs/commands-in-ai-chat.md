@@ -12,6 +12,11 @@ the model; `resume` requests a recap. Run `elepha install` to register the hook 
 session. Self-update refreshes an already owned hook. Kimi capture reads completed
 main-agent turns from the local session store in consented projects.
 
+Known Kimi caveat: after a displayed `elepha:` result, the Kimi TUI can stay pending
+until you press Ctrl-S ("steer immediately") to continue. This is an upstream Kimi bug
+(the blocked-hook turn never finalizes), not an elepha issue — tracked at
+[MoonshotAI/kimi-code#3699](https://github.com/MoonshotAI/kimi-code/issues/3699).
+
 ## Recall and navigation
 
 This page is the full guide for in-chat recall commands.
