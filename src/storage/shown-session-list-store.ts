@@ -1,5 +1,5 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
-import type { ToolName } from '../types/index.js';
+import type { HookTool } from '../hooks/common.js';
 
 interface ShownSessionListRow {
     session_ids: string;
@@ -19,12 +19,12 @@ export class ShownSessionListStore {
     }
 
     // Replaces the complete ordered list so one chat can only open what it was most recently shown.
-    replace(tool: ToolName, nativeSessionId: string, sessionIds: readonly number[]): void {
+    replace(tool: HookTool, nativeSessionId: string, sessionIds: readonly number[]): void {
         this.replaceList.run(tool, nativeSessionId, JSON.stringify(sessionIds));
     }
 
     // Undefined means no list has ever been shown; an empty array is a shown list with no rows.
-    forChat(tool: ToolName, nativeSessionId: string): number[] | undefined {
+    forChat(tool: HookTool, nativeSessionId: string): number[] | undefined {
         const row = this.listForChat.get(tool, nativeSessionId) as ShownSessionListRow | undefined;
         if (row === undefined) {
             return undefined;

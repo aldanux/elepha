@@ -13,7 +13,7 @@ export interface BinaryResolutionOptions {
     platform?: NodeJS.Platform;
 }
 
-function quotePosix(value: string): string {
+export function quotePosix(value: string): string {
     return `'${value.replaceAll("'", "'\\''")}'`;
 }
 

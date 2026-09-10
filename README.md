@@ -83,7 +83,7 @@ guide: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
 |----------------------------|------------------------------------------------------------------------------------|
 | `elepha:query <text>`      | Find sessions from plain text across all approved projects.                        |
 | `elepha:query:here <text>` | Same, current project only.                                                        |
-| `elepha:last`              | Inject the newest turns from the most recent session.                              |
+| `elepha:last`              | Serve the newest turns from the most recent session.                              |
 | `elepha:list[:<n>]`        | List recent sessions, numbered (up to 100).                                        |
 | `elepha:resume:<n>`        | Load a session to continue it; the model presents a recap.                         |
 | `elepha:info`              | Show status: sessions, capture, last session, and when a new version is available. |

@@ -22,6 +22,7 @@ import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { sessionAdapterFor } from '../adapters/index.js';
+import { KimiCodeAdapter } from '../adapters/kimi-code.js';
 import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
@@ -48,6 +49,7 @@ import {
     isReadableProviderSource,
     isRefusedProjectRoot,
     isWithin,
+    kimiSessionsRoot,
     opencodeDbPath,
     opencodeStoreRoot,
     samePath,
@@ -67,6 +69,7 @@ import { isMemoryLocked } from '../storage/paranoid-gate.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
+import { SourceReconciliation, sourceSnapshotValidator } from '../storage/source-reconciliation.js';
 import type {
     EmptySessionKind,
     ParsedTurn,
@@ -148,6 +151,9 @@ export function deduplicateDaemonUnknownLineWarnings(
 // whatever the environment looked like at import time.
 export function watchRoots(): string[] {
     const roots = [claudeProjectsRoot(), codexSessionsRoot()];
+    if (existsSync(kimiSessionsRoot())) {
+        roots.push(kimiSessionsRoot());
+    }
     const opencodeRoot = opencodeStoreRoot();
     if (existsSync(opencodeRoot)) {
         roots.push(opencodeRoot);
@@ -232,6 +238,7 @@ export class IngestionDaemon {
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
     private readonly captureOpencode: boolean;
+    private readonly captureKimi: boolean;
     private readonly durableCapture: boolean;
     private readonly durableCaptureMaxBytes: number;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
@@ -285,6 +292,7 @@ export class IngestionDaemon {
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
         this.captureOpencode = configResult.config.captureOpencode ?? true;
+        this.captureKimi = configResult.config.captureKimi ?? true;
         this.durableCapture = configResult.config.durableCapture ?? false;
         this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
         this.store = options.store;
@@ -292,7 +300,11 @@ export class IngestionDaemon {
         this.summarizer = options.summarizer;
         const warnUnknownLine = deduplicateDaemonUnknownLineWarnings(this.log);
         this.warnDeduplicated = warnUnknownLine;
-        this.adapters = options.adapters ?? [new ClaudeCodeAdapter(warnUnknownLine), new CodexAdapter(warnUnknownLine)];
+        this.adapters = options.adapters ?? [
+            new ClaudeCodeAdapter(warnUnknownLine),
+            new CodexAdapter(warnUnknownLine),
+            new KimiCodeAdapter(warnUnknownLine),
+        ];
         this.opencodeAdapter = new OpencodeAdapter(warnUnknownLine);
         this.idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
         this.workQueue = new WorkQueue(options.maxConcurrentSummaries ?? DEFAULT_MAX_CONCURRENT, this.log, this.logError);
@@ -574,7 +586,7 @@ export class IngestionDaemon {
                         if (!work.missingTurnIndexes.has(turn.turnIndex)) {
                             continue;
                         }
-                        if (turn.droppedReason === 'sentinel') {
+                        if (turn.droppedReason !== undefined) {
                             continue;
                         }
                         if (this.store.isInjectionQuoteBack(turn)) {
@@ -738,7 +750,8 @@ export class IngestionDaemon {
         if (!adapter) {
             return undefined;
         }
-        const enabled = adapter.tool === 'claude-code' ? this.captureClaudeCode : this.captureCodex;
+        const enabled =
+            adapter.tool === 'kimi' ? this.captureKimi : adapter.tool === 'claude-code' ? this.captureClaudeCode : this.captureCodex;
         if (!enabled) {
             const skipped = this.recordSkippedFile(
                 filePath,
@@ -755,6 +768,13 @@ export class IngestionDaemon {
     }
 
     private onFileEvent(filePath: string): void {
+        for (const adapter of this.adapters) {
+            const source = adapter.eventSourcePath?.(filePath);
+            if (source) {
+                filePath = source;
+                break;
+            }
+        }
         const opencodeDatabase = this.opencodeDatabaseForEvent(filePath);
         if (opencodeDatabase) {
             this.scheduleOpencodeScan(opencodeDatabase);
@@ -1115,7 +1135,7 @@ export class IngestionDaemon {
                             this.store.recordIncognitoTranscript(turn.tool, turn.sessionId);
                             break;
                         }
-                        if (turn.droppedReason === 'sentinel') {
+                        if (turn.droppedReason !== undefined) {
                             await this.advanceDroppedTurn(turn, undefined, classification);
                             if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
                                 break;
@@ -1362,18 +1382,41 @@ export class IngestionDaemon {
 
             // custom-title is standalone Claude Code UI metadata. Reading it
             // separately keeps the turn parser and rendered output byte-neutral.
-            const customTitle = await this.readCustomTitle(adapter, real);
-            const cursor = this.store.getSessionCursor(adapter.tool, nativeId);
+            const sourceMetadata = await adapter.readSourceMetadata?.(real);
+            const customTitle = sourceMetadata?.customTitle ?? (await this.readCustomTitle(adapter, real));
+            let validateSource: (() => boolean) | undefined;
+            let retracted = 0;
+            const storedCursor = this.store.getSessionCursor(adapter.tool, nativeId);
+            let reconcile = false;
+            if (adapter.retractable) {
+                const validateWire = sourceSnapshotValidator(adapter.tool, filePath, opened);
+                validateSource = () => validateWire() && sourceMetadata?.validate() === true && sourceMetadata.cwd === metadata.cwd;
+                reconcile = (await adapter.needsReconciliation?.(real, storedCursor, handle)) ?? true;
+                if (reconcile) {
+                    const reconciliation = new SourceReconciliation(this.store, adapter.tool, nativeId, metadata.cwd, validateSource);
+                    for await (const turn of adapter.parseTurns(real, undefined, { handle })) {
+                        reconciliation.observe(turn);
+                    }
+                    retracted = reconciliation.commit();
+                    if (retracted > 0) {
+                        this.log(
+                            formatDaemonLog(`[elepha] reconciled source: removed ${retracted} changed or retracted turns`, logContext),
+                        );
+                    }
+                }
+            }
+            const cursor = reconcile ? undefined : storedCursor;
             let ingested = 0;
             let parsedTurns = 0;
             for await (const turn of adapter.parseTurns(real, cursor, { closeTrailingOnIdle, handle })) {
                 parsedTurns++;
+                turn.validateSource = validateSource;
                 const consentState = this.consentStateForTurn(turn);
                 if (consentState === 'denied') {
                     this.store.recordIncognitoTranscript(turn.tool, turn.sessionId);
                     break;
                 }
-                if (turn.droppedReason === 'sentinel') {
+                if (turn.droppedReason !== undefined) {
                     await this.advanceDroppedTurn(turn, customTitle);
                     if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
                         break;
@@ -1392,8 +1435,14 @@ export class IngestionDaemon {
             // wedge - so the rollup refreshes as each batch lands, not only at
             // the end. Incremental by construction, so this
             // costs one small merge per batch rather than a full re-summary.
-            if (ingested > 0) {
+            if (ingested > 0 || retracted > 0) {
                 await this.refreshRollup(adapter, real, nativeId, 'live');
+            }
+            if (sourceMetadata && validateSource?.() && this.store.consent.consentState(sourceMetadata.cwd) === 'approved') {
+                const stored = this.store.findSession(adapter.tool, nativeId);
+                if (stored) {
+                    this.store.updateSessionTitle(stored.id, { aiTitle: sourceMetadata.title, userMessage: '' });
+                }
             }
             this.skippedFiles.delete(real);
             // A non-empty transcript that parses successfully yet emits no
@@ -1548,6 +1597,9 @@ export class IngestionDaemon {
         // It deliberately runs after the boundary comparison (soft-final's
         // required ordering) and contributes no evidence to that comparison.
         if (this.store.hasMemoryForNativeTurn(turn.tool, turn.sessionId, turn.turnIndex)) {
+            if (turn.sourceKey !== undefined) {
+                this.store.refreshExistingSourceTurn(turn);
+            }
             return false;
         }
 

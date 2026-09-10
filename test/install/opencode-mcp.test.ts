@@ -14,6 +14,7 @@ function toolPaths(root: string) {
         claudeMcp: path.join(root, '.claude.json'),
         codexConfig: path.join(root, '.codex', 'config.toml'),
         opencodeConfig: path.join(root, '.config', 'opencode', 'opencode.json'),
+        kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         opencodeStore: path.join(root, '.local', 'share', 'opencode'),
     };
 }
@@ -35,7 +36,7 @@ describe('OpenCode installation status', () => {
     });
 
     it('requires a registered MCP alongside the plugin only for a detected OpenCode installation', () => {
-        const present = { claude: false, codex: false, opencode: true };
+        const present = { claude: false, codex: false, opencode: true, kimi: false };
         const registeredConfig = JSON.stringify({
             mcp: {
                 [ELEPHA_MCP_SERVER_NAME]: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true },

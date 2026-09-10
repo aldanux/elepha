@@ -94,6 +94,7 @@ export interface SessionRollupRow {
 }
 
 export interface RollupWrite {
+    expectedSourceGeneration?: number;
     sessionId: number;
     projectId: number;
     tool: string;
@@ -271,6 +272,15 @@ export class RollupStore {
         };
 
         const run = this.db.transaction(() => {
+            if (w.expectedSourceGeneration !== undefined) {
+                const row = this.db
+                    .prepare(`SELECT COALESCE(g.generation, 0) AS generation FROM sessions s
+                    LEFT JOIN source_generations g ON g.tool = s.tool AND g.native_id = s.native_id WHERE s.id = ?`)
+                    .get(w.sessionId) as { generation: number } | undefined;
+                if (!row || row.generation !== w.expectedSourceGeneration) {
+                    return false;
+                }
+            }
             if (expectedThroughTurnIndex === undefined) {
                 this.stmts.insert.run(params);
                 return true;

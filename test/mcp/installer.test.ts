@@ -4,9 +4,11 @@ import {
     ELEPHA_MCP_SERVER_NAME,
     hasClaudeMcp,
     hasCodexMcp,
+    hasKimiMcp,
     hasOpencodeMcp,
     transformClaudeMcp,
     transformCodexMcp,
+    transformKimiMcp,
     transformOpencodeMcp,
 } from '../../src/mcp/installer.js';
 
@@ -135,5 +137,68 @@ describe('global MCP transforms', () => {
         expect(hasOpencodeMcp(entry([bin, ...ELEPHA_MCP_ARGS], false), bin)).toBe('disabled');
         expect(hasOpencodeMcp(entry(['/old/bin/elepha', ...ELEPHA_MCP_ARGS]), bin)).toBe('stale binary');
         expect(hasOpencodeMcp(entry([bin, 'other']), bin)).toBe('invalid');
+    });
+});
+
+describe('Kimi Code user MCP transform', () => {
+    it('renders the documented stdio shape and preserves equivalent reordered bytes', () => {
+        const expected = { mcpServers: { [ELEPHA_MCP_SERVER_NAME]: { command: bin, args: [...ELEPHA_MCP_ARGS] } } };
+        const installed = transformKimiMcp('', bin);
+        expect(installed).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+        expect(JSON.parse(installed)).toEqual(expected);
+        expect(transformKimiMcp(installed, bin)).toBe(installed);
+        const reordered = `  ${JSON.stringify({ mcpServers: { [ELEPHA_MCP_SERVER_NAME]: { args: [...ELEPHA_MCP_ARGS], command: bin } } })}\n`;
+        expect(transformKimiMcp(reordered, bin)).toBe(reordered);
+    });
+
+    it('preserves other servers and settings through install and uninstall', () => {
+        const original = { custom: true, mcpServers: { docs: { url: 'https://example.test/mcp' } } };
+        const installed = transformKimiMcp(JSON.stringify(original), bin);
+        expect(JSON.parse(installed)).toEqual({
+            ...original,
+            mcpServers: { ...original.mcpServers, [ELEPHA_MCP_SERVER_NAME]: { command: bin, args: [...ELEPHA_MCP_ARGS] } },
+        });
+        const removed = transformKimiMcp(installed, bin, true);
+        expect(JSON.parse(removed)).toEqual(original);
+        expect(hasKimiMcp(removed, bin)).toBe('not installed');
+        for (const absent of ['', '  ', JSON.stringify(original)]) {
+            expect(transformKimiMcp(absent, bin, true)).toBe(absent);
+        }
+    });
+
+    it('refreshes a stale owned launcher to the canonical enabled entry', () => {
+        const stale = JSON.stringify({ mcpServers: { elepha: { command: '/old/elepha', args: [...ELEPHA_MCP_ARGS], enabled: false } } });
+        const installed = transformKimiMcp(stale, bin);
+        expect(hasKimiMcp(installed, bin)).toBe('registered');
+        expect(installed).toBe(transformKimiMcp('', bin));
+    });
+
+    it.each([null, { command: 'other' }, { command: 'other', args: ['serve'] }, { url: 'https://example.test' }])(
+        'refuses a user-owned entry on install and uninstall: %j',
+        (entry) => {
+            const source = JSON.stringify({ mcpServers: { elepha: entry } });
+            expect(hasKimiMcp(source, bin)).toBe('conflict');
+            expect(() => transformKimiMcp(source, bin)).toThrow('conflicting user-owned Kimi Code MCP');
+            expect(() => transformKimiMcp(source, bin, true)).toThrow('conflicting user-owned Kimi Code MCP');
+        },
+    );
+
+    it.each(['{', 'null', '[]', 'true', '{"mcpServers":[]}', '{"mcpServers":null}', '{"mcpServers":"user data"}'])(
+        'refuses malformed config without replacing it: %s',
+        (source) => {
+            expect(() => transformKimiMcp(source, bin)).toThrow('Kimi Code mcp.json is malformed');
+            expect(() => transformKimiMcp(source, bin, true)).toThrow('Kimi Code mcp.json is malformed');
+            expect(hasKimiMcp(source, bin)).toBe('invalid');
+        },
+    );
+
+    it('reports absent, registered, disabled, and stale registrations', () => {
+        expect(hasKimiMcp('', bin)).toBe('not installed');
+        expect(hasKimiMcp('{}', bin)).toBe('not installed');
+        expect(hasKimiMcp(transformKimiMcp('', bin), bin)).toBe('registered');
+        expect(hasKimiMcp(transformKimiMcp('', '/old/elepha'), bin)).toBe('stale binary');
+        expect(
+            hasKimiMcp(JSON.stringify({ mcpServers: { elepha: { command: bin, args: [...ELEPHA_MCP_ARGS], enabled: false } } }), bin),
+        ).toBe('disabled');
     });
 });

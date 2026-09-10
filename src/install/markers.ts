@@ -1,6 +1,7 @@
 // Exact bytes owned by elepha's installed configuration and launcher formats.
 export const LAUNCHER_MARKER = '# elepha-managed-launcher: v1';
 export const OPENCODE_PLUGIN_MARKER = '// elepha-managed-opencode-plugin: v1';
+export const KIMI_HOOK_MARKER = '// elepha-managed-kimi-hook: v1';
 
 export const CODEX_SESSION_START_BEGIN = '# elepha-session-start: begin';
 export const CODEX_SESSION_START_END = '# elepha-session-start: end';

@@ -44,6 +44,41 @@ export function codexHome(): string {
     return override ? path.resolve(override) : path.join(homedir(), '.codex');
 }
 
+export function kimiConfigDir(): string {
+    const override = process.env.KIMI_CODE_HOME?.trim();
+    return override ? path.resolve(override) : path.join(homedir(), '.kimi-code');
+}
+
+export function kimiSessionsRoot(): string {
+    return path.join(kimiConfigDir(), 'sessions');
+}
+
+export function kimiSessionDir(wirePath: string): string {
+    return path.dirname(path.dirname(path.dirname(wirePath)));
+}
+
+export function kimiSessionStatePath(wirePath: string): string {
+    return path.join(kimiSessionDir(wirePath), 'state.json');
+}
+
+export function kimiSessionWirePath(sessionDir: string): string {
+    return path.join(sessionDir, 'agents', 'main', 'wire.jsonl');
+}
+
+export function kimiSessionIndexPath(): string {
+    return path.join(kimiConfigDir(), 'session_index.jsonl');
+}
+
+export function kimiConfigTomlPath(mcpPath = kimiMcpPath()): string {
+    return path.join(path.dirname(mcpPath), 'config.toml');
+}
+
+// Only the user registry is managed here; project .kimi-code/mcp.json entries
+// override same-named user servers inside Kimi Code.
+export function kimiMcpPath(): string {
+    return path.join(kimiConfigDir(), 'mcp.json');
+}
+
 // OpenCode follows the XDG data-directory convention on every supported platform.
 export function opencodeStoreRoot(): string {
     const xdgDataHome = process.env.XDG_DATA_HOME?.trim();
@@ -84,6 +119,9 @@ export function providerStoreRoot(tool: ToolName): string {
     }
     if (tool === 'codex') {
         return codexSessionsRoot();
+    }
+    if (tool === 'kimi') {
+        return kimiConfigDir();
     }
     if (tool === 'opencode') {
         return opencodeStoreRoot();

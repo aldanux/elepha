@@ -6,7 +6,7 @@ import { type IntegrationPaths, reconcileOwnedIntegrations } from '../../src/ins
 import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { type SelfUpdateRuntime, selfUpdate } from '../../src/install/self-update.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
-import { transformClaudeMcp, transformCodexMcp, transformOpencodeMcp } from '../../src/mcp/installer.js';
+import { transformClaudeMcp, transformCodexMcp, transformKimiMcp, transformOpencodeMcp } from '../../src/mcp/installer.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
 interface Scenario {
@@ -94,7 +94,9 @@ describe('selfUpdate', () => {
             claudeMcp: path.join(root, 'claude.json'),
             codexConfig: path.join(root, 'codex.toml'),
             opencodeConfig: path.join(root, 'opencode.json'),
+            kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         };
+        mkdirSync(path.dirname(paths.kimiMcp), { recursive: true });
         const plugin = opencodePluginPath(paths.opencodeConfig);
         mkdirSync(path.dirname(plugin), { recursive: true });
         const { runtime, events } = runtimeFor({ latest: '1.2.4', reconciliation: ['active'] });
@@ -109,12 +111,14 @@ describe('selfUpdate', () => {
     it('refreshes stale owned MCP blocks and the plugin, reports paths, and is idempotent', async () => {
         const { paths, plugin, runtime } = integrationFixture();
         const launcher = runtime.service!.launcherPath;
+        writeFileSync(paths.kimiMcp, transformKimiMcp('{}', '/old/elepha'));
         writeFileSync(paths.claudeMcp, transformClaudeMcp('{"unrelated":true}', '/old/elepha'));
         writeFileSync(paths.codexConfig, transformCodexMcp('model = "custom"', '/old/elepha'));
         writeFileSync(paths.opencodeConfig, transformOpencodeMcp('{"plugin":["user-plugin"]}', '/old/elepha'));
         writeFileSync(plugin, `${renderOpencodePlugin(launcher)}// stale build\n`);
 
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
+        expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(transformKimiMcp('{}', launcher));
         expect(readFileSync(plugin, 'utf8')).toBe(renderOpencodePlugin(launcher));
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(transformClaudeMcp('{"unrelated":true}', launcher));
         expect(readFileSync(paths.codexConfig, 'utf8')).toBe(transformCodexMcp('model = "custom"', launcher));
@@ -135,6 +139,7 @@ describe('selfUpdate', () => {
             [paths.codexConfig, '[mcp_servers.elepha]\ncommand = "custom"\nargs = ["mcp", "serve"]\n'],
             [paths.opencodeConfig, '{"mcp":{"elepha":{"type":"remote","url":"https://example.test"}}}'],
             [plugin, '// user-owned plugin\n'],
+            [paths.kimiMcp, '{"mcpServers":{"elepha":{"command":"custom"}}}'],
         ]);
         for (const [file, text] of originals) writeFileSync(file, text);
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
@@ -149,6 +154,7 @@ describe('selfUpdate', () => {
         const { paths, plugin, runtime } = integrationFixture();
         writeFileSync(paths.opencodeConfig, '{"plugin":["user-plugin"]}');
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
+        expect(existsSync(paths.kimiMcp)).toBe(false);
         expect(existsSync(paths.claudeMcp)).toBe(false);
         expect(existsSync(paths.codexConfig)).toBe(false);
         expect(existsSync(plugin)).toBe(false);

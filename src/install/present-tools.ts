@@ -6,6 +6,7 @@ export interface ToolConfigPaths {
     claudeMcp: string;
     codexConfig: string;
     opencodeConfig: string;
+    kimiMcp: string;
     opencodeStore?: string;
 }
 
@@ -13,6 +14,7 @@ export interface PresentTools {
     claude: boolean;
     codex: boolean;
     opencode: boolean;
+    kimi: boolean;
 }
 
 function isDirectory(file: string): boolean {
@@ -24,6 +26,7 @@ function isDirectory(file: string): boolean {
 export function detectPresentTools(paths: ToolConfigPaths): PresentTools {
     return {
         claude: isDirectory(path.dirname(paths.claudeSettings)) || existsSync(paths.claudeMcp),
+        kimi: isDirectory(path.dirname(paths.kimiMcp)),
         codex: isDirectory(path.dirname(paths.codexConfig)),
         opencode:
             isDirectory(path.dirname(paths.opencodeConfig)) || (paths.opencodeStore !== undefined && isDirectory(paths.opencodeStore)),

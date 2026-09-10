@@ -4,9 +4,17 @@
 
 import { lstat, open, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { readKimiMetadata } from '../adapters/kimi-metadata.js';
 import { openOpencodeDbReadonly } from '../adapters/opencode.js';
 import { MAX_METADATA_SCAN_BYTES, MAX_METADATA_SCAN_LINES, READABILITY_READ_CHUNK_BYTES } from '../config/constants.js';
-import { claudeProjectsRoot, codexSessionsRoot, isRefusedProjectRoot, normalizeForCompare, opencodeDbPath } from '../config/paths.js';
+import {
+    claudeProjectsRoot,
+    codexSessionsRoot,
+    isRefusedProjectRoot,
+    kimiSessionsRoot,
+    normalizeForCompare,
+    opencodeDbPath,
+} from '../config/paths.js';
 import type { ToolName } from '../types/index.js';
 
 export interface DiscoveredProject {
@@ -26,6 +34,7 @@ export interface DiscoveryResult {
 export interface DiscoveryPaths {
     claudeProjects?: string;
     codexSessions?: string;
+    kimiSessions?: string;
     opencodeDatabase?: string;
     isRefusedRoot?: (root: string) => boolean;
 }
@@ -50,6 +59,11 @@ function discoveryStores(paths: DiscoveryPaths): Array<{ root: string; tool: Too
     return [
         { root: paths.claudeProjects ?? claudeProjectsRoot(), tool: 'claude-code', matches: isClaudeSession },
         { root: paths.codexSessions ?? codexSessionsRoot(), tool: 'codex', matches: isCodexSession },
+        {
+            root: paths.kimiSessions ?? kimiSessionsRoot(),
+            tool: 'kimi',
+            matches: (relative) => relative.split(path.sep).length === 5 && relative.endsWith(path.join('agents', 'main', 'wire.jsonl')),
+        },
     ];
 }
 
@@ -73,6 +87,9 @@ async function regularFileExists(filePath: string): Promise<boolean> {
 // The parsed `message`/turn payload, if present on that same line, is never
 // examined or retained. The reader stops at the first cwd line.
 export async function readSessionMetadata(filePath: string): Promise<SessionMetadata | undefined> {
+    if (filePath.endsWith(path.join('agents', 'main', 'wire.jsonl'))) {
+        return readKimiMetadata(filePath);
+    }
     const handle = await open(filePath, 'r');
     let fileSize: number;
     try {

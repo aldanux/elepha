@@ -1,7 +1,6 @@
 import type Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
-import { ClaudeCodeAdapter } from '../../adapters/claude-code.js';
-import { CodexAdapter } from '../../adapters/codex.js';
+import { defaultAdapters } from '../../adapters/index.js';
 import { openDb } from '../../storage/db.js';
 import {
     applyManualMerge,
@@ -38,10 +37,7 @@ export function registerSegment(program: Command): void {
             }
 
             const db = await openDb();
-            const adapters: SessionAdapterMap = {
-                'claude-code': new ClaudeCodeAdapter(),
-                codex: new CodexAdapter(),
-            };
+            const adapters: SessionAdapterMap = defaultAdapters();
 
             if (opts.resegment) {
                 const preview = await planResegmentation(db, adapters);

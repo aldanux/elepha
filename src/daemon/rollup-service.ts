@@ -1,3 +1,4 @@
+import { sourceGeneration } from '../storage/source-reconciliation.js';
 // Decides WHEN a session rolls up, and drives the incremental merge.
 //
 // Close detection is a heuristic and is treated as one everywhere: a session
@@ -119,6 +120,7 @@ export class RollupService {
         generation: AuthenticatedReadGeneration,
         progress: { wrote: boolean },
     ): Promise<RollupOutcome> {
+        const sourceRevision = sourceGeneration(this.store, session.tool, session.native_id);
         const all = this.store.listMemoriesForSession(session.id);
         if (all.length === 0) {
             return { wrote: false, complete: true };
@@ -250,6 +252,7 @@ export class RollupService {
 
             const wrote = this.rollups.write(
                 {
+                    expectedSourceGeneration: sourceRevision,
                     sessionId: session.id,
                     projectId: session.project_id,
                     tool: session.tool,

@@ -12,6 +12,7 @@ import { type InjectionRow, InjectionStore, type RecordInjectionInput } from './
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
+import { sourceTurnDigest } from './source-turn-digest.js';
 import { SqliteSourceWatermarkStore } from './sqlite-source-watermark-store.js';
 import { minMedianMax, type ProjectCount, type Stats, type StatusCount, type ToolCount, type ToolZeroPaths } from './stats.js';
 import { type MemoryRow, TurnStore } from './turn-store.js';
@@ -268,7 +269,7 @@ export class MemoryStore {
     ): { project: ProjectRow; session: SessionRow; inserted: boolean } | undefined {
         const resolved = preparation ?? this.resolveTurnGitValues(turn, startNextSegment);
         const write = this.db.transaction(() => {
-            if (this.recordIncognitoIfWriteBlocked(turn)) {
+            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
                 return undefined;
             }
             if (this.turns.hasMemoryForNativeTurn(turn.tool, turn.sessionId, turn.turnIndex)) {
@@ -303,6 +304,24 @@ export class MemoryStore {
         return write();
     }
 
+    // Refresh a verified logical prefix after atomic source replacement without creating memories.
+    refreshExistingSourceTurn(turn: ParsedTurn): void {
+        this.db.transaction(() => {
+            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
+                return;
+            }
+            const memory = this.db
+                .prepare(`SELECT m.session_id, m.source_digest FROM memories m
+                JOIN sessions s ON s.id = m.session_id WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ?`)
+                .get(turn.tool, turn.sessionId, turn.turnIndex) as { session_id: number; source_digest: string } | undefined;
+            if (memory?.source_digest !== sourceTurnDigest(turn)) {
+                return;
+            }
+            this.sessions.advanceSessionCursor(memory.session_id, turn.cursor);
+            this.sessions.updateTrailingState(memory.session_id, turn);
+        })();
+    }
+
     prepareIngestedTurnWrite(turn: ParsedTurn, startNextSegment: boolean): IngestedTurnWritePreparation {
         return this.resolveTurnGitValues(turn, startNextSegment);
     }
@@ -313,7 +332,7 @@ export class MemoryStore {
     ): boolean {
         const resolved = this.resolveTurnGitValues(turn, false);
         const write = this.db.transaction(() => {
-            if (this.recordIncognitoIfWriteBlocked(turn)) {
+            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
                 return false;
             }
             const project = this.projects.upsertProject(turn.projectPath, resolved.projectIdentity);
