@@ -6,7 +6,7 @@ Recall commands are read-only: elepha serves the result in the same turn. Action
 
 Kimi Code displays `info`, `list`, `help`, `update`, and `query` results directly as
 hook results and skips the model turn. Its UI labels these results
-“UserPromptSubmit hook blocked.” `resume` and `last` inject historical context for
+“UserPromptSubmit hook blocked.” `resume` and `last` serve historical context for
 the model; `resume` requests a recap. Run `elepha install` to register the hook in
 `~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`), then start a new Kimi
 session. Self-update refreshes an already owned hook. Kimi capture reads completed
@@ -18,7 +18,7 @@ This page is the full guide for in-chat recall commands.
 
 | Command                                            | Description                                                                                                                               |
 |----------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha:last`                                      | Inject the newest available turns from the most recent session.                                                                           |
+| `elepha:last`                                      | Serve the newest available turns from the most recent session.                                                                           |
 | `elepha:query <q>`                                 | Search all consented projects and return a numbered list of matching sessions. `<q>` is free text: plain phrases work, not just keywords. |
 | `elepha:query:here <q>`                            | Same as `elepha:query`, but only the current project.                                                                                     |
 | `elepha:list`                                      | List the five most recent session titles, numbered for selection.                                                                         |
