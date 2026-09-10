@@ -1,6 +1,6 @@
 # CLI commands
 
-Run these commands in a terminal. For commands typed inside Claude Code or Codex chat, see [docs/commands-in-ai-chat.md](commands-in-ai-chat.md).
+Run these commands in a terminal. For commands typed inside Claude Code, Codex, OpenCode, or Kimi Code chat, see [docs/commands-in-ai-chat.md](commands-in-ai-chat.md).
 
 Run `elepha <command> -h` for every flag. `purge`, `rekey-projects`, `sanitize`,
 `segment`, every `backfill-*` command, and `rollup --rebuild` preview without writing

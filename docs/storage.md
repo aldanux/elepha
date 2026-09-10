@@ -129,10 +129,10 @@ backup's version. Both modes preview the number of new, matching, and skipped se
 and save a pre-import snapshot before applying the merge in one transaction.
 
 Import does not treat backup metadata as permission. It imports a session only when
-its local source is inside the expected Claude Code, Codex, or OpenCode store and its
-current project root is approved. Sessions already purged, marked incognito, outside a
-provider store, or not currently consented are skipped. Imported display and summary
-fields are sanitized before storage.
+its local source is inside the expected Claude Code, Codex, or Kimi Code transcript
+store or the expected OpenCode database store, and its current project root is approved.
+Sessions already purged, marked incognito, outside a provider store, or not currently
+consented are skipped. Imported display and summary fields are sanitized before storage.
 
 Interactive confirmation is required unless you pass `--skip-confirmation`. After a
 restore or import, return to [Controlling capture](capture.md) to start the background
