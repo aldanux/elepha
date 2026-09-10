@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { DURABLE_CAPTURE_FILTER_VERSION, HOOK_PAYLOAD_MAX_CHARS } from '../../src/config/constants.js';
 import { isHookTool, parsePayload } from '../../src/hooks/common.js';
+import { kimiOutput } from '../../src/hooks/kimi.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { CLOSE, containsSentinel, OPEN, wrap } from '../../src/security/sentinel.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
+    dataBlockClose,
     dataBlockOpen,
     HELP,
     RESUME_RECAP_INSTRUCTIONS,
+    SERVER_INSTRUCTIONS,
     servedContextInstructions,
 } from '../../src/serving/instructions.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -78,6 +81,30 @@ function seedStoredSession(
 }
 
 describe('Kimi UserPromptSubmit', () => {
+    it.each(['8d88e717-7188-4418-9633-5ee5f143a94b', '2cc58f4d-f1e0-4de8-9462-50431ea14875'])(
+        'strips query display framing while preserving the full model message for nonce %s',
+        (nonce) => {
+            const payload = 'Recall hits for “git” (1 shown of 1):\n1. Git workflow';
+            const framed = wrap(
+                'brief',
+                'query-display',
+                [
+                    servedContextInstructions(nonce),
+                    DISPLAY_VERBATIM_INSTRUCTIONS,
+                    '',
+                    dataBlockOpen(nonce),
+                    payload,
+                    dataBlockClose(nonce),
+                ].join('\n'),
+            );
+            expect(kimiOutput(framed, { kind: 'query', query: 'git', scope: 'global' })).toEqual({
+                hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: payload },
+            });
+            expect(kimiOutput(framed, { kind: 'resume', index: 1 })).toEqual({ message: framed });
+            expect(kimiOutput(framed, { kind: 'last' })).toEqual({ message: framed });
+        },
+    );
+
     it('normalizes snake_case text parts with capture registered and SessionStart excluded', () => {
         const raw = {
             session_id: 'chat',
@@ -158,8 +185,17 @@ describe('Kimi UserPromptSubmit', () => {
         const dependencies = { dbPath: fixture.dbPath, now: () => NOW };
         const recall = blockedBody(await runUserPromptSubmit(payload(fixture.directory, 'elepha:query Zebra'), 'kimi', dependencies));
         expect(recall).toContain('Zebra older');
+        expect(recall).not.toContain(SERVER_INSTRUCTIONS);
+        expect(recall).not.toContain(DISPLAY_VERBATIM_INSTRUCTIONS);
+        expect(recall).not.toContain(dataBlockOpen('').slice(0, -2));
+        expect(recall).not.toContain(dataBlockClose('').slice(0, -2));
         const db = openUnmanagedDb(fixture.dbPath);
         try {
+            const recorded = new InjectionStore(db).injectionsForSession('kimi', 'kimi-chat', new Date(NOW).toISOString());
+            expect(recorded).toHaveLength(1);
+            const nonce = recorded[0].body.split(dataBlockOpen('').slice(0, -2))[1]?.split(']]')[0];
+            expect(nonce).toBeDefined();
+            expect(recorded[0].body).toBe(`${servedContextInstructions(nonce!)}\n${DISPLAY_VERBATIM_INSTRUCTIONS}\n\n${recall}`);
             expect(new ShownSessionListStore(db).forChat('kimi', 'kimi-chat')).toEqual([older.id]);
             expect(new ShownSessionListStore(db).forChat('codex', 'kimi-chat')).toBeUndefined();
         } finally {
@@ -175,6 +211,7 @@ describe('Kimi UserPromptSubmit', () => {
         expect(nonce).toBeDefined();
         expect(context).toContain(servedContextInstructions(nonce!));
         expect(context).toContain(dataBlockOpen(nonce!));
+        expect(context).toContain(dataBlockClose(nonce!));
         const last = output(await runUserPromptSubmit(payload(fixture.directory, 'elepha:last'), 'kimi', dependencies));
         expect(last.message).toContain('# Newer session');
         expect(last).not.toHaveProperty('hookSpecificOutput');

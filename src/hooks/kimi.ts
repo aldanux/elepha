@@ -1,8 +1,10 @@
 import { CLOSE, OPEN } from '../security/sentinel.js';
-import { DISPLAY_VERBATIM_INSTRUCTIONS } from '../serving/instructions.js';
+import { DISPLAY_VERBATIM_INSTRUCTIONS, dataBlockClose, dataBlockOpen, SERVER_INSTRUCTIONS } from '../serving/instructions.js';
 import type { UserPromptCommand } from './user-prompt-submit.js';
 
 const briefOpen = `${OPEN}brief:`;
+const dataOpen = dataBlockOpen('').slice(0, -2);
+const dataClose = dataBlockClose('').slice(0, -2);
 
 // Kimi passes ContentPart[] on stdin. Non-text parts cannot form a command;
 // a malformed text part refuses the payload instead of dispatching partial text.
@@ -36,8 +38,8 @@ export function kimiCommandBody(body: string, command: UserPromptCommand | undef
     return !modelDriven(command) && body.startsWith(directive) ? body.slice(directive.length) : body;
 }
 
-// Kimi persists and displays the same hook result. Its adapter excludes context
-// messages; recordHookOutput already recorded the body for later quote-backs.
+// Strip framing only from the direct display; recordHookOutput already recorded
+// the body for later quote-backs, and model-driven messages need the full framing.
 // Both structured denial at exit 0 and stderr at exit 2 select Kimi's block path.
 export function kimiOutput(body: string, command: UserPromptCommand | undefined): Record<string, unknown> {
     return modelDriven(command)
@@ -47,8 +49,16 @@ export function kimiOutput(body: string, command: UserPromptCommand | undefined)
                   permissionDecision: 'deny',
                   permissionDecisionReason: body
                       .split('\n')
-                      .filter((line) => !line.startsWith(briefOpen) && line.trim() !== CLOSE)
-                      .join('\n'),
+                      .filter(
+                          (line) =>
+                              !line.startsWith(briefOpen) &&
+                              line.trim() !== CLOSE &&
+                              !line.startsWith(SERVER_INSTRUCTIONS) &&
+                              line !== DISPLAY_VERBATIM_INSTRUCTIONS &&
+                              !((line.startsWith(dataOpen) || line.startsWith(dataClose)) && line.endsWith(']]')),
+                      )
+                      .join('\n')
+                      .trim(),
               },
           };
 }
