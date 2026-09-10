@@ -6,7 +6,9 @@ import { runInNewContext } from 'node:vm';
 import { parse, stringify } from 'smol-toml';
 import { describe, expect, it, vi } from 'vitest';
 import { HOOK_PAYLOAD_MAX_CHARS, INSTALLED_HOOK_TIMEOUT_SECONDS, KIMI_HOOK_OUTPUT_MAX_BYTES } from '../../src/config/constants.js';
+import { kimiOutput } from '../../src/hooks/kimi.js';
 import { KIMI_HOOK_EVENT, KIMI_HOOK_MATCHER, kimiHookStatus, transformKimiHook } from '../../src/install/kimi-hook.js';
+import { CLOSE, OPEN, wrap } from '../../src/security/sentinel.js';
 import { KIMI_HOOK_ARGS, renderKimiHookClient, renderKimiHookCommand } from '../../src/security/subprocess-allowlist.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -73,6 +75,26 @@ async function client(input: string, execute = vi.fn(() => 'response')) {
 }
 
 describe('Kimi allowlisted client', () => {
+    it('exits successfully with structured denial and forwards only the recorded display body', () => {
+        const root = withGrantableTestDir('kimi-client-denial-');
+        const stub = path.join(root, 'launcher');
+        const output = kimiOutput(wrap('brief', '01J00000000000000000000000', 'Recorded command payload'), { kind: 'info' });
+        writeFileSync(stub, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(output))});\n`, { mode: 0o700 });
+        // execFileSync throws on nonzero exit; the outer client must preserve the
+        // exit-0 structured denial that Kimi maps to block without a model call.
+        const stdout = execFileSync('/bin/sh', ['-c', renderKimiHookCommand(stub)], {
+            shell: false,
+            cwd: root,
+            input: '{}',
+            encoding: 'utf8',
+        });
+        expect(JSON.parse(stdout)).toEqual({
+            hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'Recorded command payload' },
+        });
+        expect(stdout).not.toContain(OPEN);
+        expect(stdout).not.toContain(CLOSE);
+    });
+
     it('uses fixed argv, shell false, bounded execution, and stdin-only event data', async () => {
         const input = JSON.stringify({
             session_id: '$(inert)',

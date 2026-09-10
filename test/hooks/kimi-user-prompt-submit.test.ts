@@ -119,7 +119,9 @@ describe('Kimi UserPromptSubmit', () => {
                     readUpdateAvailable: () => undefined,
                 }),
             );
-            const displayed = body(context);
+            const displayed = context;
+            expect(displayed).not.toContain(OPEN);
+            expect(displayed).not.toContain(CLOSE);
             expect(displayed).not.toContain(DISPLAY_VERBATIM_INSTRUCTIONS);
             if (command === 'elepha:help') expect(displayed).toBe(HELP);
             if (command === 'elepha:update') expect(displayed).toContain('elepha self-update');

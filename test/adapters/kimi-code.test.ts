@@ -90,6 +90,35 @@ describe('Kimi event reduction', () => {
         expect(await collect(wire)).toMatchObject([{ turnIndex: 0, userMessage: 'Prompt 1', assistantText: 'Answer 1' }]);
     });
 
+    it('excludes unwrapped blocked hook context and keeps the following model response', async () => {
+        const { wire } = fixture([
+            {
+                type: 'context.append_message',
+                agentId: 'main',
+                message: {
+                    role: 'assistant',
+                    origin: { kind: 'hook_result', event: 'UserPromptSubmit', blocked: true },
+                    content: [{ type: 'text', text: '<hook_result hook_event="UserPromptSubmit">\nCommand payload\n</hook_result>' }],
+                },
+                time: 900,
+            },
+            {
+                type: 'context.append_message',
+                agentId: 'main',
+                message: {
+                    role: 'user',
+                    origin: { kind: 'user' },
+                    content: [{ type: 'text', text: 'elepha:info' }],
+                    id: 'blocked-prompt',
+                },
+                time: 901,
+            },
+            { type: 'prompt.completed', agentId: 'main', promptId: 'blocked-prompt', reason: 'blocked', time: 902 },
+            ...kimiTurn(1),
+        ]);
+        expect(await collect(wire)).toMatchObject([{ userMessage: 'Prompt 1', assistantText: 'Answer 1' }]);
+    });
+
     it('leaves an incomplete prompt open and accepts a later completion', async () => {
         const events = kimiTurn(0);
         const { wire } = fixture(events.slice(0, -2));
