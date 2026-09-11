@@ -2,11 +2,18 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { opencodePluginPath, updateAvailablePath } from '../../src/config/paths.js';
+import { deepSeekHooksPath, renderDeepSeekHooks, transformDeepSeekHooksPatch } from '../../src/install/deepseek-hooks.js';
 import { type IntegrationPaths, reconcileOwnedIntegrations } from '../../src/install/integrations.js';
 import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { type SelfUpdateRuntime, selfUpdate } from '../../src/install/self-update.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
-import { transformClaudeMcp, transformCodexMcp, transformKimiMcp, transformOpencodeMcp } from '../../src/mcp/installer.js';
+import {
+    transformClaudeMcp,
+    transformCodexMcp,
+    transformDeepSeekMcp,
+    transformKimiMcp,
+    transformOpencodeMcp,
+} from '../../src/mcp/installer.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
 interface Scenario {
@@ -93,6 +100,7 @@ describe('selfUpdate', () => {
         const paths: IntegrationPaths = {
             claudeMcp: path.join(root, 'claude.json'),
             codexConfig: path.join(root, 'codex.toml'),
+            deepseekMcp: path.join(root, '.dsh', 'cordis.patch.yml'),
             opencodeConfig: path.join(root, 'opencode.json'),
             kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         };
@@ -108,12 +116,14 @@ describe('selfUpdate', () => {
         return { paths, plugin, runtime, events };
     }
 
-    it('refreshes stale owned MCP blocks and the plugin, reports paths, and is idempotent', async () => {
+    it('refreshes stale owned MCP blocks and DeepSeek hooks, reports paths, and is idempotent', async () => {
         const { paths, plugin, runtime } = integrationFixture();
         const launcher = runtime.service!.launcherPath;
         writeFileSync(paths.kimiMcp, transformKimiMcp('{}', '/old/elepha'));
         writeFileSync(paths.claudeMcp, transformClaudeMcp('{"unrelated":true}', '/old/elepha'));
         writeFileSync(paths.codexConfig, transformCodexMcp('model = "custom"', '/old/elepha'));
+        mkdirSync(path.dirname(paths.deepseekMcp), { recursive: true });
+        writeFileSync(paths.deepseekMcp, transformDeepSeekMcp('[]\n', '/old/elepha'));
         writeFileSync(paths.opencodeConfig, transformOpencodeMcp('{"plugin":["user-plugin"]}', '/old/elepha'));
         writeFileSync(plugin, `${renderOpencodePlugin(launcher)}// stale build\n`);
 
@@ -122,11 +132,16 @@ describe('selfUpdate', () => {
         expect(readFileSync(plugin, 'utf8')).toBe(renderOpencodePlugin(launcher));
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(transformClaudeMcp('{"unrelated":true}', launcher));
         expect(readFileSync(paths.codexConfig, 'utf8')).toBe(transformCodexMcp('model = "custom"', launcher));
+        const deepseekHooks = deepSeekHooksPath(paths.deepseekMcp);
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe(
+            transformDeepSeekHooksPatch(transformDeepSeekMcp('[]\n', launcher), deepseekHooks),
+        );
+        expect(readFileSync(deepseekHooks, 'utf8')).toBe(renderDeepSeekHooks(launcher));
         expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
             plugin: ['user-plugin'],
             mcp: { elepha: { type: 'local', command: [launcher, 'mcp', 'serve'], enabled: true } },
         });
-        for (const file of [...Object.values(paths), plugin]) {
+        for (const file of [...Object.values(paths), plugin, deepseekHooks]) {
             expect(runtime.report).toHaveBeenCalledWith(expect.stringContaining(file));
         }
         expect(reconcileOwnedIntegrations(launcher, paths).refreshed).toEqual([]);
@@ -134,12 +149,14 @@ describe('selfUpdate', () => {
 
     it('leaves user-owned conflicts intact and surfaces their statuses', async () => {
         const { paths, plugin, runtime } = integrationFixture();
+        mkdirSync(path.dirname(paths.deepseekMcp), { recursive: true });
         const originals = new Map([
             [paths.claudeMcp, '{"mcpServers":{"elepha":{"command":"custom"}}}'],
             [paths.codexConfig, '[mcp_servers.elepha]\ncommand = "custom"\nargs = ["mcp", "serve"]\n'],
             [paths.opencodeConfig, '{"mcp":{"elepha":{"type":"remote","url":"https://example.test"}}}'],
             [plugin, '// user-owned plugin\n'],
             [paths.kimiMcp, '{"mcpServers":{"elepha":{"command":"custom"}}}'],
+            [paths.deepseekMcp, '- insert:\n    - id: user\n      config:\n        serverName: elepha\n'],
         ]);
         for (const [file, text] of originals) writeFileSync(file, text);
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
@@ -157,6 +174,7 @@ describe('selfUpdate', () => {
         expect(existsSync(paths.kimiMcp)).toBe(false);
         expect(existsSync(paths.claudeMcp)).toBe(false);
         expect(existsSync(paths.codexConfig)).toBe(false);
+        expect(existsSync(paths.deepseekMcp)).toBe(false);
         expect(existsSync(plugin)).toBe(false);
         expect(readFileSync(paths.opencodeConfig, 'utf8')).toBe('{"plugin":["user-plugin"]}');
         expect(runtime.report).not.toHaveBeenCalled();

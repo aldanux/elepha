@@ -1,6 +1,7 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
+import { stripShellSyntax } from '../security/sanitize.js';
 import { gitRevListCountHead } from '../security/subprocess-allowlist.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
 import type { ProjectRow } from './project-store.js';
@@ -87,11 +88,12 @@ export class SessionStore {
         meta?: SessionMetadata,
         gitCommitCount?: number | null,
     ): SessionRow {
+        const customTitle = meta?.customTitle === undefined ? undefined : stripShellSyntax(meta.customTitle);
         const existing = this.stmts.findSession.get(tool, nativeId) as Record<string, unknown> | undefined;
         if (existing) {
-            if (meta?.customTitle !== undefined) {
-                this.updateCustomTitle(tool, nativeId, meta.customTitle);
-                return { ...hydrateSessionRow(existing), custom_title: meta.customTitle };
+            if (customTitle !== undefined) {
+                this.updateCustomTitle(tool, nativeId, customTitle);
+                return { ...hydrateSessionRow(existing), custom_title: customTitle };
             }
             return hydrateSessionRow(existing);
         }
@@ -107,7 +109,7 @@ export class SessionStore {
             surface: meta?.surface ?? null,
             git_branch: meta?.gitBranch ?? null,
             kind: meta?.kind ?? null,
-            custom_title: meta?.customTitle ?? null,
+            custom_title: customTitle ?? null,
             git_commit_count:
                 gitCommitCount !== undefined
                     ? gitCommitCount
@@ -126,8 +128,9 @@ export class SessionStore {
     }
 
     // User-set custom titles remain native-transcript metadata; list_sessions uses the per-segment title field.
-    updateCustomTitle(tool: ToolName, nativeId: string, customTitle: string): void {
-        this.db.prepare('UPDATE sessions SET custom_title = ? WHERE tool = ? AND native_id = ?').run(customTitle, tool, nativeId);
+    updateCustomTitle(tool: ToolName, nativeId: string, customTitle: string | null): void {
+        const sanitized = customTitle === null ? null : stripShellSyntax(customTitle);
+        this.db.prepare('UPDATE sessions SET custom_title = ? WHERE tool = ? AND native_id = ?').run(sanitized, tool, nativeId);
     }
 
     // Opens the segment immediately after `previous`. Its trailing window and
@@ -141,6 +144,7 @@ export class SessionStore {
         meta?: SessionMetadata,
         gitCommitCount?: number | null,
     ): SessionRow {
+        const customTitle = meta?.customTitle === undefined ? previous.custom_title : stripShellSyntax(meta.customTitle);
         const segmentIndex = previous.segment_index + 1;
         const existing = this.stmts.findSessionSegment.get(previous.tool, previous.native_id, segmentIndex) as
             | Record<string, unknown>
@@ -161,7 +165,7 @@ export class SessionStore {
             surface: meta?.surface ?? null,
             git_branch: meta?.gitBranch ?? null,
             kind: meta?.kind ?? null,
-            custom_title: meta?.customTitle ?? previous.custom_title,
+            custom_title: customTitle,
             git_commit_count:
                 gitCommitCount !== undefined
                     ? gitCommitCount

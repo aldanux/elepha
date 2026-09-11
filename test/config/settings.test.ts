@@ -24,6 +24,7 @@ describe('settings', () => {
             { key: 'capture-codex', value: true, source: 'default' },
             { key: 'capture-opencode', value: true, source: 'default' },
             { key: 'capture-kimi', value: true, source: 'default' },
+            { key: 'capture-deepseek', value: true, source: 'default' },
             { key: 'durable-capture', value: false, source: 'default' },
             { key: 'query-matching', value: 'strict', source: 'default' },
         ]);
@@ -67,6 +68,7 @@ describe('settings', () => {
             expect(listSettings({ ELEPHA_NO_UPDATE_CHECK: '1' }, configPath())).toEqual([
                 { key: 'query-matching', value: 'strict', source: 'default' },
                 { key: 'durable-capture', value: false, source: 'default' },
+                { key: 'capture-deepseek', value: true, source: 'default' },
                 { key: 'capture-kimi', value: true, source: 'default' },
                 { key: 'capture-opencode', value: true, source: 'default' },
                 { key: 'capture-codex', value: true, source: 'default' },
@@ -82,6 +84,8 @@ describe('settings', () => {
         ['capture-claude-code', false],
         ['capture-codex', true],
         ['capture-opencode', true],
+        ['capture-kimi', true],
+        ['capture-deepseek', true],
     ] as const)('does not apply the update-check environment override to %s', (key, configuredValue) => {
         const file = configPath();
         writeFileSync(file, `${JSON.stringify({ [key]: configuredValue })}\n`);
@@ -97,6 +101,8 @@ describe('settings', () => {
         ['capture-claude-code', true],
         ['capture-codex', true],
         ['capture-opencode', true],
+        ['capture-kimi', true],
+        ['capture-deepseek', true],
     ] as const)('preserves the default for %s when the update-check environment override is set', (key, defaultValue) => {
         const file = configPath();
 
@@ -133,7 +139,15 @@ describe('settings', () => {
         ['0', false],
         ['off', false],
     ])('accepts %s as %s for each boolean setting', (input, expected) => {
-        for (const key of ['update-check', 'capture-claude-code', 'capture-codex', 'capture-opencode', 'durable-capture'] as const) {
+        for (const key of [
+            'update-check',
+            'capture-claude-code',
+            'capture-codex',
+            'capture-opencode',
+            'capture-kimi',
+            'capture-deepseek',
+            'durable-capture',
+        ] as const) {
             const file = configPath();
             setSetting(key, input, file);
             expect(getSetting(key, {}, file).value).toBe(expected);
@@ -146,10 +160,14 @@ describe('settings', () => {
         expect(getSetting('capture-claude-code', {}, file).value).toBe(true);
         expect(getSetting('capture-codex', {}, file).value).toBe(true);
         expect(getSetting('capture-opencode', {}, file).value).toBe(true);
+        expect(getSetting('capture-kimi', {}, file).value).toBe(true);
+        expect(getSetting('capture-deepseek', {}, file).value).toBe(true);
         expect(getSetting('durable-capture', {}, file).value).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.captureClaudeCode).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.captureCodex).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.captureOpencode).toBe(true);
+        expect(DEFAULT_MEMORY_CONFIG.captureKimi).toBe(true);
+        expect(DEFAULT_MEMORY_CONFIG.captureDeepSeek).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.durableCapture).toBe(false);
         expect(DEFAULT_MEMORY_CONFIG.durableCaptureMaxBytes).toBe(DURABLE_CAPTURE_MAX_BYTES);
         expect(readMemoryConfig(file)).toEqual({ config: DEFAULT_MEMORY_CONFIG });
@@ -169,6 +187,13 @@ describe('settings', () => {
         expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, captureOpencode: false } });
     });
 
+    it('loads the DeepSeek capture setting into daemon memory config', () => {
+        const file = configPath();
+        writeFileSync(file, '{"capture-deepseek":false}\n');
+
+        expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, captureDeepSeek: false } });
+    });
+
     it('loads a positive integer durable capture byte cap into daemon memory config', () => {
         const file = configPath();
         writeFileSync(file, '{"durable-capture-max-bytes":4096}\n');
@@ -176,11 +201,12 @@ describe('settings', () => {
         expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, durableCaptureMaxBytes: 4096 } });
     });
 
-    it('rejects disabling all four capture tools without changing the final config write', () => {
+    it('rejects disabling all five capture tools without changing the final config write', () => {
         const file = configPath();
         setSetting('capture-claude-code', 'off', file);
         setSetting('capture-codex', 'off', file);
         setSetting('capture-kimi', 'off', file);
+        setSetting('capture-deepseek', 'off', file);
         const before = readFileSync(file, 'utf8');
 
         expect(() => setSetting('capture-opencode', 'off', file)).toThrow('at least one capture tool must remain enabled');
@@ -199,7 +225,7 @@ describe('settings', () => {
         const file = configPath();
 
         expect(() => setSetting('auto-update', 'true', file)).toThrow(
-            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, capture-kimi, durable-capture, query-matching',
+            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, capture-kimi, capture-deepseek, durable-capture, query-matching',
         );
         expect(() => setSetting('update-check', 'yes', file)).toThrow('update-check must be true, false, 1, 0, on, or off');
         expect(() => setSetting('query-matching', 'loose', file)).toThrow('query-matching must be strict or lax');

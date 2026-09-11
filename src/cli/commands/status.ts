@@ -1,6 +1,6 @@
 import type { Command } from 'commander';
 import { daemonHealth, integrationHealth } from '../../install/health-checks.js';
-import { formatKimiMcpStatus } from '../../install/status.js';
+import { formatDeepSeekCommandsStatus, formatDeepSeekMcpStatus, formatKimiMcpStatus } from '../../install/status.js';
 import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { parseSince } from '../../storage/stats.js';
@@ -49,6 +49,8 @@ export function registerStatus(program: Command): void {
                 console.log(`Codex UserPromptSubmit hook: ${install.codexUserPromptSubmitHook}`);
                 console.log(`Claude MCP: ${install.claudeMcp}`);
                 console.log(`Codex MCP: ${install.codexMcp}`);
+                console.log(formatDeepSeekMcpStatus(install.deepseekMcp));
+                console.log(formatDeepSeekCommandsStatus(install.deepseekCommands));
                 console.log(formatKimiMcpStatus(install.kimiMcp));
                 console.log(`Kimi Code UserPromptSubmit hook: ${install.kimiHook}`);
                 console.log(`OpenCode MCP: ${install.opencodeMcp}`);

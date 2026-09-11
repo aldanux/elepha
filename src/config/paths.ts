@@ -1,10 +1,8 @@
 // Where the watched CLIs keep their session transcripts.
 //
-// Both tools support relocating their config/state directory via an env var.
-// Hardcoding ~/.claude and ~/.codex makes every user with a non-default setup
-// silently invisible to elepha - the daemon watches a directory that never
-// receives writes and reports RUNNING forever. Every path into either tool
-// must resolve through here.
+// Provider roots are centralized here so env and XDG overrides cannot leave
+// discovery, watching, consent checks, and integration management pointing at
+// different stores.
 //
 // Case handling follows supported-platform filesystem defaults: macOS is
 // case-insensitive, while Linux is case-sensitive. Compare with
@@ -47,6 +45,19 @@ export function codexHome(): string {
 export function kimiConfigDir(): string {
     const override = process.env.KIMI_CODE_HOME?.trim();
     return override ? path.resolve(override) : path.join(homedir(), '.kimi-code');
+}
+
+export function dshConfigDir(): string {
+    const override = process.env.DSH_HOME?.trim();
+    return override ? path.resolve(expandUserPath(override)) : path.join(homedir(), '.dsh');
+}
+
+export function dshCordisPatchPath(): string {
+    return path.join(dshConfigDir(), 'cordis.patch.yml');
+}
+
+export function dshSessionsRoot(): string {
+    return path.join(dshConfigDir(), 'sessions');
 }
 
 export function kimiSessionsRoot(): string {
@@ -122,6 +133,9 @@ export function providerStoreRoot(tool: ToolName): string {
     }
     if (tool === 'kimi') {
         return kimiConfigDir();
+    }
+    if (tool === 'deepseek') {
+        return dshSessionsRoot();
     }
     if (tool === 'opencode') {
         return opencodeStoreRoot();
@@ -327,6 +341,7 @@ interface RefusedRootInputs {
     xdgConfigHome: string | undefined;
     claudeConfigRoot: string;
     codexConfigRoot: string;
+    deepseekConfigRoot: string;
 }
 
 interface RefusedRootSet {
@@ -407,7 +422,8 @@ function sameRefusedRootInputs(left: RefusedRootInputs, right: RefusedRootInputs
         left.home === right.home &&
         left.xdgConfigHome === right.xdgConfigHome &&
         left.claudeConfigRoot === right.claudeConfigRoot &&
-        left.codexConfigRoot === right.codexConfigRoot
+        left.codexConfigRoot === right.codexConfigRoot &&
+        left.deepseekConfigRoot === right.deepseekConfigRoot
     );
 }
 
@@ -434,7 +450,7 @@ function refusedRootSet(inputs: RefusedRootInputs): RefusedRootSet {
             ...REFUSED_ABSOLUTE_PROJECT_ROOTS,
         ]),
         temporary: withCanonicalForms(TEMPORARY_PROJECT_ROOTS),
-        toolConfig: withCanonicalForms([inputs.claudeConfigRoot, inputs.codexConfigRoot]),
+        toolConfig: withCanonicalForms([inputs.claudeConfigRoot, inputs.codexConfigRoot, inputs.deepseekConfigRoot]),
     };
     return cachedRefusedRootSet;
 }
@@ -475,6 +491,7 @@ export function isRefusedProjectRoot(projectPath: string): boolean {
         xdgConfigHome: process.env.XDG_CONFIG_HOME,
         claudeConfigRoot: claudeConfigDir(),
         codexConfigRoot: codexHome(),
+        deepseekConfigRoot: dshConfigDir(),
     });
     // Temporary trees are never durable project roots. Unlike the user-facing
     // document directories above, refusing only their own root would let a

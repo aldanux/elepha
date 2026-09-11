@@ -13,7 +13,7 @@ import {
     managedLauncherHealth,
 } from './health-checks.js';
 import { reconcileCaptureServiceAsync, type ServiceBackend, serviceBackend } from './service-backend.js';
-import { formatKimiMcpStatus } from './status.js';
+import { formatDeepSeekCommandsStatus, formatDeepSeekMcpStatus, formatKimiMcpStatus } from './status.js';
 
 export interface DoctorRuntime {
     approvedRoots: number;
@@ -143,6 +143,7 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
         const mcpReady =
             (!present.claude || status.claudeMcp === 'registered') &&
             (!present.codex || status.codexMcp === 'registered') &&
+            (!present.deepseek || status.deepseekMcp === 'registered') &&
             (!present.opencode || status.opencodeMcp === 'registered') &&
             (!present.kimi || status.kimiMcp === 'registered');
         const claudeDisplayName = TOOL_METADATA['claude-code'].displayName;
@@ -165,8 +166,8 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
         );
         lines.push(
             mcpReady
-                ? '✓ MCP: Claude, Codex, OpenCode, and Kimi Code registered where detected'
-                : '✗ MCP: Claude, Codex, OpenCode, and Kimi Code must be registered where detected',
+                ? '✓ MCP: Claude, Codex, OpenCode, Kimi Code, and DeepSeek Harness registered where detected'
+                : '✗ MCP: Claude, Codex, OpenCode, Kimi Code, and DeepSeek Harness must be registered where detected',
         );
         lines.push(
             !present.opencode
@@ -174,10 +175,17 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
                 : `${status.opencodePlugin === 'installed' ? '✓' : '✗'} OpenCode plugin: ${status.opencodePlugin}`,
         );
         lines.push(`${!present.kimi ? '⚠' : status.kimiMcp === 'registered' ? '✓' : '✗'} ${formatKimiMcpStatus(status.kimiMcp)}`);
+        lines.push(
+            `${!present.deepseek ? '⚠' : status.deepseekMcp === 'registered' ? '✓' : '✗'} ${formatDeepSeekMcpStatus(status.deepseekMcp)}`,
+        );
+        lines.push(
+            `${!present.deepseek ? '⚠' : status.deepseekCommands === 'active' ? '✓' : '✗'} ${formatDeepSeekCommandsStatus(status.deepseekCommands)}`,
+        );
         lines.push(`${!present.kimi ? '⚠' : status.kimiHook === 'active' ? '✓' : '✗'} Kimi Code UserPromptSubmit hook: ${status.kimiHook}`);
         const needsInstall =
             (present.claude && (!claudeReady || status.claudeMcp !== 'registered')) ||
             (present.codex && ((!codexReady && !hasCodexApprovalIssue(status)) || status.codexMcp !== 'registered')) ||
+            (present.deepseek && (status.deepseekMcp !== 'registered' || status.deepseekCommands !== 'active')) ||
             (present.opencode && (status.opencodeMcp !== 'registered' || status.opencodePlugin !== 'installed')) ||
             (present.kimi && (status.kimiMcp !== 'registered' || status.kimiHook !== 'active'));
         if (needsInstall) {
@@ -226,6 +234,8 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
             (integrations.status.codexHook === 'active' &&
                 integrations.status.codexUserPromptSubmitHook === 'active' &&
                 integrations.status.codexMcp === 'registered')) &&
+        (!integrations.present.deepseek ||
+            (integrations.status.deepseekMcp === 'registered' && integrations.status.deepseekCommands === 'active')) &&
         (!integrations.present.opencode ||
             (integrations.status.opencodeMcp === 'registered' && integrations.status.opencodePlugin === 'installed')) &&
         (!integrations.present.kimi || (integrations.status.kimiMcp === 'registered' && integrations.status.kimiHook === 'active'));

@@ -46,7 +46,7 @@ export function handleWatchdogTimeout(
 function envelope(tool: HookTool, body: string, channel: 'additionalContext' | 'systemMessage'): Record<string, unknown> {
     const hookSpecificOutput =
         channel === 'additionalContext' ? { hookEventName: 'SessionStart', additionalContext: body } : { hookEventName: 'SessionStart' };
-    return tool === 'claude-code'
+    return tool === 'claude-code' || tool === 'deepseek'
         ? channel === 'systemMessage'
             ? { hookSpecificOutput, systemMessage: body }
             : { hookSpecificOutput }

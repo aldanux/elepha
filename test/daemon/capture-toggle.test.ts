@@ -2,10 +2,12 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
+import { dshSessionsRoot } from '../../src/config/paths.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
-import { withTempDir } from '../helpers/tmp.js';
+import { createDeepSeekFixture, deepSeekHeader, deepSeekTurn } from '../fixtures/deepseek-session.js';
+import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 function claudeTranscript(cwd: string, sessionId: string): string {
     return `${JSON.stringify({
@@ -58,6 +60,7 @@ describe('per-tool capture toggle', () => {
     let daemon: IngestionDaemon | undefined;
     let previousClaudeConfigDir: string | undefined;
     let previousCodexHome: string | undefined;
+    let previousDshHome: string | undefined;
 
     afterEach(async () => {
         await daemon?.stop();
@@ -65,6 +68,8 @@ describe('per-tool capture toggle', () => {
         else process.env.CLAUDE_CONFIG_DIR = previousClaudeConfigDir;
         if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
         else process.env.CODEX_HOME = previousCodexHome;
+        if (previousDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = previousDshHome;
     });
 
     it('skips Codex-store files while continuing to ingest Claude Code when Codex capture is disabled', async () => {
@@ -110,6 +115,32 @@ describe('per-tool capture toggle', () => {
         expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
         expect(store.database.prepare('SELECT state FROM durable_capture_status').get()).toEqual({ state: 'complete' });
         expect(logs).not.toContain(`[elepha] skipped ${codexFile}: capture is disabled for codex`);
+        expect(logs.some((message) => message.includes('capture disabled: 1'))).toBe(true);
+    });
+
+    it('counts DeepSeek files as disabled without parsing or storing them', async () => {
+        const root = withTempDir('elepha-deepseek-toggle-');
+        const project = withGrantableTestDir('elepha-deepseek-toggle-project-');
+        previousDshHome = process.env.DSH_HOME;
+        process.env.DSH_HOME = path.join(root, '.dsh');
+        createDeepSeekFixture(project, [[deepSeekHeader(project)], deepSeekTurn(0)]);
+
+        const logs: string[] = [];
+        const store = new MemoryStore(openUnmanagedDb(path.join(root, 'elepha.db')));
+        store.consent.grant(project);
+        daemon = new IngestionDaemon({
+            store,
+            watchRoots: [dshSessionsRoot()],
+            heartbeatPath: path.join(root, 'daemon.heartbeat.json'),
+            watcherUsePolling: true,
+            log: (message) => logs.push(message),
+            readConfig: () => ({ config: { ...DEFAULT_MEMORY_CONFIG, captureDeepSeek: false } }),
+        });
+        daemon.start();
+
+        await waitFor(() => logs.some((message) => message.startsWith('[elepha] startup sweep:')));
+
+        expect(store.findSession('deepseek', 'session-main')).toBeUndefined();
         expect(logs.some((message) => message.includes('capture disabled: 1'))).toBe(true);
     });
 });

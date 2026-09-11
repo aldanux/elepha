@@ -2,11 +2,17 @@ import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { kimiConfigTomlPath, opencodePluginPath } from '../../src/config/paths.js';
+import {
+    deepSeekCommandsStatus,
+    deepSeekHooksPath,
+    renderDeepSeekHooks,
+    transformDeepSeekHooksPatch,
+} from '../../src/install/deepseek-hooks.js';
 import { refreshInstalledIntegrations } from '../../src/install/integration-refresh.js';
 import { reconcileOwnedIntegrations, restoreRefreshedIntegrations } from '../../src/install/integrations.js';
 import { kimiHookStatus, transformKimiHook } from '../../src/install/kimi-hook.js';
 import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
-import { ELEPHA_MCP_ARGS, transformKimiMcp } from '../../src/mcp/installer.js';
+import { ELEPHA_MCP_ARGS, transformDeepSeekMcp, transformKimiMcp } from '../../src/mcp/installer.js';
 import * as fileIO from '../../src/util/fs.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
@@ -42,6 +48,7 @@ parentPort.postMessage({ refreshed: [render(workerData.launcher)], skipped: [], 
         const paths = {
             claudeMcp: path.join(root, 'claude.json'),
             codexConfig: path.join(root, 'codex.toml'),
+            deepseekMcp: path.join(root, '.dsh', 'cordis.patch.yml'),
             opencodeConfig: path.join(root, 'opencode.json'),
             kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         };
@@ -72,6 +79,7 @@ parentPort.postMessage({ refreshed: [render(workerData.launcher)], skipped: [], 
         const paths = {
             claudeMcp: path.join(root, 'claude.json'),
             codexConfig: path.join(root, 'codex.toml'),
+            deepseekMcp: path.join(root, '.dsh', 'cordis.patch.yml'),
             opencodeConfig: path.join(root, 'opencode.json'),
             kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         };
@@ -106,6 +114,7 @@ describe('Kimi Code owned integration refresh', () => {
         const paths = {
             claudeMcp: path.join(root, 'claude.json'),
             codexConfig: path.join(root, 'codex.toml'),
+            deepseekMcp: path.join(root, '.dsh', 'cordis.patch.yml'),
             opencodeConfig: path.join(root, 'opencode.json'),
             kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         };
@@ -237,6 +246,7 @@ describe('Kimi Code owned integration refresh', () => {
         vi.stubEnv('ELEPHA_CLAUDE_MCP_PATH', paths.claudeMcp);
         vi.stubEnv('CODEX_HOME', path.join(root, 'codex-home'));
         vi.stubEnv('XDG_CONFIG_HOME', path.join(root, 'xdg-config'));
+        vi.stubEnv('DSH_HOME', path.join(root, 'dsh-home'));
         const source = transformKimiMcp('', '/old/elepha');
         writeFileSync(paths.kimiMcp, source);
         const hookFile = kimiConfigTomlPath(paths.kimiMcp);
@@ -249,5 +259,106 @@ describe('Kimi Code owned integration refresh', () => {
         expect(kimiHookStatus(readFileSync(hookFile, 'utf8'), '/managed/elepha')).toBe('active');
         expect(result.skipped).toEqual([]);
         expect(readFileSync(paths.kimiMcp, 'utf8')).toBe(transformKimiMcp(source, '/managed/elepha'));
+    });
+});
+
+describe('DeepSeek Harness owned integration refresh', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    function fixture() {
+        const root = withGrantableTestDir('deepseek-refresh-');
+        const paths = {
+            claudeMcp: path.join(root, 'claude.json'),
+            codexConfig: path.join(root, 'codex.toml'),
+            deepseekMcp: path.join(root, '.dsh', 'cordis.patch.yml'),
+            opencodeConfig: path.join(root, 'opencode.json'),
+            kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
+        };
+        mkdirSync(path.dirname(paths.deepseekMcp), { recursive: true });
+        return { root, paths };
+    }
+
+    it('refreshes an owned patch, is byte-idempotent, and restores exact original bytes', () => {
+        const { paths } = fixture();
+        const original = transformDeepSeekMcp("- insert:\n    - id: docs\n      name: 'user-docs'\n", '/old/elepha');
+        writeFileSync(paths.deepseekMcp, original);
+        const hooksFile = deepSeekHooksPath(paths.deepseekMcp);
+
+        const result = reconcileOwnedIntegrations('/managed/elepha', paths);
+        expect(result.refreshed).toEqual([paths.deepseekMcp, hooksFile]);
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe(
+            transformDeepSeekHooksPatch(transformDeepSeekMcp(original, '/managed/elepha'), hooksFile),
+        );
+        expect(
+            deepSeekCommandsStatus(
+                readFileSync(paths.deepseekMcp, 'utf8'),
+                paths.deepseekMcp,
+                '/managed/elepha',
+                readFileSync(hooksFile, 'utf8'),
+            ),
+        ).toBe('active');
+        expect(reconcileOwnedIntegrations('/managed/elepha', paths).refreshed).toEqual([]);
+        restoreRefreshedIntegrations(result);
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe(original);
+        expect(existsSync(hooksFile)).toBe(false);
+    });
+
+    it.each([
+        ['[', 'invalid'],
+        ['- insert:\n    - id: user\n      config:\n        serverName: elepha\n', 'conflict'],
+    ])('preserves and reports an unowned or malformed patch: %s', (source, status) => {
+        const { paths } = fixture();
+        writeFileSync(paths.deepseekMcp, source);
+        const result = reconcileOwnedIntegrations('/managed/elepha', paths);
+        expect(result.refreshed).toEqual([]);
+        expect(result.skipped).toEqual([{ integration: 'DeepSeek Harness MCP', file: paths.deepseekMcp, status }]);
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe(source);
+    });
+
+    it('does not register command hooks over a user-owned hooks file', () => {
+        const { paths } = fixture();
+        const source = transformDeepSeekMcp('[]\n', '/old/elepha');
+        const hooksFile = deepSeekHooksPath(paths.deepseekMcp);
+        mkdirSync(path.dirname(hooksFile), { recursive: true });
+        writeFileSync(paths.deepseekMcp, source);
+        writeFileSync(hooksFile, '{}\n');
+
+        const result = reconcileOwnedIntegrations('/managed/elepha', paths);
+
+        expect(result.refreshed).toEqual([]);
+        expect(result.skipped).toEqual([
+            { integration: 'DeepSeek Harness MCP', file: paths.deepseekMcp, status: 'conflict' },
+            { integration: 'DeepSeek Harness commands', file: hooksFile, status: 'conflict' },
+        ]);
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe(source);
+        expect(readFileSync(hooksFile, 'utf8')).toBe('{}\n');
+    });
+
+    it('refreshes DeepSeek through the built installed-package worker using DSH_HOME', async () => {
+        const { root, paths } = fixture();
+        vi.stubEnv('DSH_HOME', path.dirname(paths.deepseekMcp));
+        vi.stubEnv('KIMI_CODE_HOME', path.join(root, 'kimi-home'));
+        vi.stubEnv('ELEPHA_CLAUDE_MCP_PATH', paths.claudeMcp);
+        vi.stubEnv('CODEX_HOME', path.join(root, 'codex-home'));
+        vi.stubEnv('XDG_CONFIG_HOME', path.join(root, 'xdg-config'));
+        const source = transformDeepSeekMcp('[]\n', '/old/elepha');
+        writeFileSync(paths.deepseekMcp, source);
+
+        const result = await refreshInstalledIntegrations(
+            { packageRoot: process.cwd(), bin: path.resolve('bin/elepha.js') },
+            '/managed/elepha',
+        );
+        const hooksFile = deepSeekHooksPath(paths.deepseekMcp);
+        expect(result.refreshed).toEqual([paths.deepseekMcp, hooksFile]);
+        expect(result.skipped).toEqual([]);
+        expect(
+            deepSeekCommandsStatus(
+                readFileSync(paths.deepseekMcp, 'utf8'),
+                paths.deepseekMcp,
+                '/managed/elepha',
+                readFileSync(hooksFile, 'utf8'),
+            ),
+        ).toBe('active');
+        expect(readFileSync(hooksFile, 'utf8')).toBe(renderDeepSeekHooks('/managed/elepha'));
     });
 });

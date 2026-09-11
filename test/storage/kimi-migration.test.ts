@@ -11,8 +11,8 @@ function insertSession(db: Database.Database, tool: string, nativeId: string) {
         VALUES (?, ?, 1, '/provider/session', ?, ?)`).run(tool, nativeId, NOW, NOW);
 }
 
-describe('Kimi capture schema migration', () => {
-    it.each([false, true])('admits Kimi, preserves prior rows and reopens idempotently (legacy=%s)', (legacy) => {
+describe('session tool schema migration', () => {
+    it.each([false, true])('admits Kimi and DeepSeek, preserves prior rows and reopens idempotently (legacy=%s)', (legacy) => {
         const dbPath = path.join(withTempDir('kimi-migration-'), 'memory.db');
         const initial = legacy ? new Database(dbPath) : openUnmanagedDb(dbPath);
         if (legacy) {
@@ -26,13 +26,16 @@ describe('Kimi capture schema migration', () => {
             .run(NOW, NOW);
         if (legacy) {
             expect(() => insertSession(initial, 'kimi', 'rejected')).toThrow(/CHECK/);
+            expect(() => insertSession(initial, 'deepseek', 'rejected')).toThrow(/CHECK/);
         }
         initial.close();
         const migrated = openUnmanagedDb(dbPath);
         insertSession(migrated, 'kimi', 'kimi-capture');
+        insertSession(migrated, 'deepseek', 'deepseek-capture');
         expect(migrated.prepare('SELECT id, tool, native_id FROM sessions ORDER BY id').all()).toEqual([
             { id: 1, tool: 'opencode', native_id: 'prior-opencode' },
             { id: 2, tool: 'kimi', native_id: 'kimi-capture' },
+            { id: 3, tool: 'deepseek', native_id: 'deepseek-capture' },
         ]);
         expect(migrated.prepare('SELECT session_id, source_digest, provenance FROM memories').get()).toEqual({
             session_id: 1,

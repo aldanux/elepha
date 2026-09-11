@@ -141,6 +141,7 @@ export const HOOK_LOG_LINE_MAX_CHARS = 500;
 export const HOOK_LOG_MAX_BYTES = 5 * 1024 * 1024;
 export const INSTALLED_HOOK_TIMEOUT_SECONDS = 5;
 export const KIMI_HOOK_OUTPUT_MAX_BYTES = 1024 * 1024;
+export const DEEPSEEK_HOOK_OUTPUT_MAX_BYTES = 1024 * 1024;
 export const OPENCODE_PLUGIN_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 // Synthesis
@@ -172,7 +173,8 @@ export const TEMPORARY_PROJECT_ROOTS = ['/tmp', '/private/tmp', '/var/folders', 
 export const PRIVATE_FILE_MODE = 0o600;
 export const PRIVATE_DIR_MODE = 0o700;
 export const PRIVATE_UMASK_MASK = 0o077;
-export const MINIMUM_NODE_VERSION = '22.12.0';
+export const MINIMUM_NODE_VERSION = '22.15.0';
+export const DEEPSEEK_MAX_SESSION_GENERATION = 3;
 export const DEFAULT_ELEPHA_SERVICE_LABEL = 'com.elepha.daemon';
 export const PLIST_THROTTLE_INTERVAL_SECONDS = 30;
 export const PLIST_UMASK = 63;

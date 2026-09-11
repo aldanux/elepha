@@ -17,7 +17,7 @@ describe('hook CLI tool validation', () => {
         hooks.runUserPromptSubmitCli.mockClear();
     });
 
-    it.each(['opencode', 'kimi'])('passes %s through to the UserPromptSubmit runtime', async (tool) => {
+    it.each(['opencode', 'kimi', 'deepseek'])('passes %s through to the UserPromptSubmit runtime', async (tool) => {
         const program = new Command();
         registerHook(program);
 

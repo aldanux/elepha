@@ -202,7 +202,7 @@ describe('OpenCode plugin ownership and health', () => {
                 '/config.toml',
                 mcp,
                 launcher,
-                { claude: false, codex: false, opencode: present, kimi: false },
+                { claude: false, codex: false, deepseek: false, opencode: present, kimi: false },
                 source,
             );
         expect(status(undefined).ready).toBe(false);

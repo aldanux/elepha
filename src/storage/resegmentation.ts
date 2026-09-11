@@ -518,7 +518,7 @@ function ensureCorrectionsTable(db: Database): void {
       CREATE TABLE IF NOT EXISTS segment_corrections (
         id                INTEGER PRIMARY KEY,
         ulid              TEXT NOT NULL UNIQUE,
-        tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex')),
+        tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi','deepseek')),
         native_id         TEXT NOT NULL,
         direction         TEXT NOT NULL CHECK (direction IN ('split','merge')),
         first_session_id  INTEGER NOT NULL,

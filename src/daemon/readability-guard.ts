@@ -45,7 +45,7 @@ export class ReadabilityGuard {
     // and zero rows - indistinguishable from an idle session. Codex has
     // shipped compressed rollouts before; if that returns, this is what says
     // so out loud instead of the watcher going quietly empty.
-    async assertReadableJsonl(filePath: string): Promise<FileSkip | undefined> {
+    async assertReadableJsonl(filePath: string, allowZstd = false): Promise<FileSkip | undefined> {
         if (this.readabilityChecked.has(filePath)) {
             return;
         }
@@ -80,6 +80,11 @@ export class ReadabilityGuard {
             }
             this.readabilityChecked.add(filePath);
 
+            const prefix = Buffer.concat(chunks, bytesReadTotal);
+            if (allowZstd && looksCompressed(prefix)) {
+                return;
+            }
+
             if (firstNewline === -1 && bytesReadTotal === READABILITY_FIRST_LINE_CAP_BYTES) {
                 return {
                     category: 'unreadable content',
@@ -89,7 +94,6 @@ export class ReadabilityGuard {
                 };
             }
 
-            const prefix = Buffer.concat(chunks, bytesReadTotal);
             const firstLine = prefix.subarray(0, firstNewline === -1 ? bytesReadTotal : firstNewline);
             const compressed = looksCompressed(firstLine);
             if (compressed || containsBinaryBytes(firstLine)) {

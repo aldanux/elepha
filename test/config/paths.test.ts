@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
     claudeMcpPath,
     daemonHeartbeatPath,
+    dshConfigDir,
+    dshCordisPatchPath,
+    dshSessionsRoot,
     elephaHome,
     elephaPaths,
     isRefusedProjectRoot,
@@ -115,12 +118,14 @@ describe('provider transcript stores', () => {
     it('keeps tool config homes out of project roots without blocking provider transcript reads', () => {
         process.env.CLAUDE_CONFIG_DIR = '/Users/test/.claude-custom';
         process.env.CODEX_HOME = '/Users/test/.codex-custom';
+        process.env.DSH_HOME = '/Users/test/.dsh-custom';
 
         expect(providerStoreRoot('claude-code')).toBe('/Users/test/.claude-custom/projects');
         expect(providerStoreRoot('codex')).toBe('/Users/test/.codex-custom/sessions');
         expect(providerStoreRoot('opencode')).toBe(path.join(homedir(), '.local', 'share', 'opencode'));
         expect(isRefusedProjectRoot('/Users/test/.claude-custom/memories')).toBe(true);
         expect(isRefusedProjectRoot('/Users/test/.codex-custom/memories')).toBe(true);
+        expect(isRefusedProjectRoot('/Users/test/.dsh-custom/sessions')).toBe(true);
         expect(isWithinProviderStore('codex', '/Users/test/.codex-custom/sessions/rollout.jsonl')).toBe(true);
         expect(isWithinProviderStore('codex', '/tmp/evil.jsonl')).toBe(false);
         expect(isWithinProviderStore('future-tool' as ToolName, '/Users/test/.codex-custom/sessions/rollout.jsonl')).toBe(false);
@@ -163,5 +168,26 @@ describe('Kimi Code configuration paths', () => {
         process.env.KIMI_CODE_HOME = '.test-scratch/kimi-user';
         expect(kimiConfigDir()).toBe(path.resolve('.test-scratch/kimi-user'));
         expect(kimiMcpPath()).toBe(path.resolve('.test-scratch/kimi-user/mcp.json'));
+    });
+});
+
+describe('DeepSeek Harness configuration paths', () => {
+    it('uses the documented user home by default and for an empty override', () => {
+        delete process.env.DSH_HOME;
+        expect(dshConfigDir()).toBe(path.join(homedir(), '.dsh'));
+        expect(dshCordisPatchPath()).toBe(path.join(homedir(), '.dsh', 'cordis.patch.yml'));
+        expect(dshSessionsRoot()).toBe(path.join(homedir(), '.dsh', 'sessions'));
+        expect(providerStoreRoot('deepseek')).toBe(path.join(homedir(), '.dsh', 'sessions'));
+        process.env.DSH_HOME = '  ';
+        expect(dshConfigDir()).toBe(path.join(homedir(), '.dsh'));
+    });
+
+    it('resolves an overridden home and expands a leading tilde', () => {
+        process.env.DSH_HOME = '.test-scratch/deepseek-user';
+        expect(dshConfigDir()).toBe(path.resolve('.test-scratch/deepseek-user'));
+        expect(dshCordisPatchPath()).toBe(path.resolve('.test-scratch/deepseek-user/cordis.patch.yml'));
+        expect(dshSessionsRoot()).toBe(path.resolve('.test-scratch/deepseek-user/sessions'));
+        process.env.DSH_HOME = '~/deepseek-user';
+        expect(dshConfigDir()).toBe(path.join(homedir(), 'deepseek-user'));
     });
 });

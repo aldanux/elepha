@@ -15,6 +15,7 @@ import { parse } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS } from '../../src/config/constants.js';
 import { kimiConfigTomlPath, opencodePluginPath } from '../../src/config/paths.js';
+import { deepSeekHooksPath } from '../../src/install/deepseek-hooks.js';
 import { integrationHealth } from '../../src/install/health-checks.js';
 import {
     type DaemonHealthCheckRuntime,
@@ -80,6 +81,7 @@ function installPaths(root: string) {
         claudeSettings: path.join(root, '.claude', 'settings.json'),
         claudeMcp: path.join(root, '.claude.json'),
         codexConfig: path.join(root, '.codex', 'config.toml'),
+        deepseekMcp: path.join(root, '.dsh', 'cordis.patch.yml'),
         opencodeConfig: path.join(root, '.config', 'opencode', 'opencode.json'),
         kimiMcp: path.join(root, '.kimi-code', 'mcp.json'),
         opencodeStore: path.join(root, '.local', 'share', 'opencode'),
@@ -1192,7 +1194,7 @@ describe('installer transaction', () => {
         const paths = installPaths(root);
 
         expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow(
-            'no supported tool found; install Claude Code or Codex or OpenCode or Kimi Code first',
+            'no supported tool found; install Claude Code or Codex or OpenCode or Kimi Code or DeepSeek Harness first',
         );
         expect(existsSync(paths.claudeSettings)).toBe(false);
         expect(existsSync(paths.claudeMcp)).toBe(false);
@@ -1394,5 +1396,49 @@ describe('Kimi Code MCP installation', () => {
         const installed = installElepha(paths, { home: root, approvedRoots: 0 });
         expect(installed.status.kimiMcp).toBe('not present');
         expect(existsSync(path.dirname(paths.kimiMcp))).toBe(false);
+    });
+});
+
+describe('DeepSeek Harness integration installation', () => {
+    it('installs MCP and bridge hook config, repeats byte-idempotently, and removes only owned files', () => {
+        const root = withTempDir('deepseek-installer-');
+        const paths = installPaths(root);
+        const runtime = { home: root, approvedRoots: 0 };
+        mkdirSync(path.dirname(paths.deepseekMcp), { recursive: true });
+        writeFileSync(paths.deepseekMcp, '[]\n');
+
+        const installed = installElepha(paths, runtime);
+        const written = readFileSync(paths.deepseekMcp, 'utf8');
+        const hooksFile = deepSeekHooksPath(paths.deepseekMcp);
+        expect(installed.status.deepseekMcp).toBe('registered');
+        expect(installed.status.deepseekCommands).toBe('active');
+        expect(installed.status.ready).toBe(true);
+        expect(written).toContain("name: '@deepseek-ai/dsh-mcp-client'");
+        expect(written).toContain(`command: ${JSON.stringify(bin)}`);
+        expect(integrationHealth(paths).status.deepseekMcp).toBe('registered');
+        expect(integrationHealth(paths).status.deepseekCommands).toBe('active');
+        expect(existsSync(hooksFile)).toBe(true);
+        expect(installElepha(paths, runtime).changed).toBe(false);
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe(written);
+        expect(existsSync(paths.claudeSettings)).toBe(false);
+        expect(existsSync(paths.codexConfig)).toBe(false);
+        expect(existsSync(paths.kimiMcp)).toBe(false);
+        expect(existsSync(paths.opencodeConfig)).toBe(false);
+
+        const uninstalled = uninstallElepha(paths, runtime);
+        expect(uninstalled.status.deepseekMcp).toBe('not installed');
+        expect(uninstalled.status.deepseekCommands).toBe('not installed');
+        expect(readFileSync(paths.deepseekMcp, 'utf8')).toBe('[]\n');
+        expect(existsSync(hooksFile)).toBe(false);
+    });
+
+    it('does not create a DeepSeek home for an absent client', () => {
+        const root = withTempDir('deepseek-installer-absent-');
+        const paths = installPaths(root);
+        createConfigDirectories(paths);
+
+        const installed = installElepha(paths, { home: root, approvedRoots: 0 });
+        expect(installed.status.deepseekMcp).toBe('not present');
+        expect(existsSync(path.dirname(paths.deepseekMcp))).toBe(false);
     });
 });

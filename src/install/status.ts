@@ -1,6 +1,7 @@
 import { type CodexTrustState, codexTrustStatus } from '../hooks/codex-trust.js';
-import { hasClaudeMcp, hasCodexMcp, hasKimiMcp, hasOpencodeMcp } from '../mcp/installer.js';
+import { hasClaudeMcp, hasCodexMcp, hasDeepSeekMcp, hasKimiMcp, hasOpencodeMcp } from '../mcp/installer.js';
 import { type HookCommandName, hookCommand } from './binary.js';
+import { deepSeekCommandsStatus } from './deepseek-hooks.js';
 import { kimiHookStatus } from './kimi-hook.js';
 import { opencodePluginStatus } from './opencode-plugin.js';
 import type { PresentTools } from './present-tools.js';
@@ -8,6 +9,7 @@ import type { PresentTools } from './present-tools.js';
 export type ClaudeHookStatus = 'active' | 'not present' | 'not installed' | 'invalid' | 'stale binary';
 type ClaudeMcpStatus = ReturnType<typeof hasClaudeMcp> | 'not present';
 type CodexMcpStatus = ReturnType<typeof hasCodexMcp> | 'not present';
+type DeepSeekMcpStatus = ReturnType<typeof hasDeepSeekMcp> | 'not present';
 type OpencodeMcpStatus = ReturnType<typeof hasOpencodeMcp> | 'not present';
 type CodexHookStatus = CodexTrustState | 'not present';
 
@@ -50,6 +52,8 @@ export interface InstallStatus {
     codexUserPromptSubmitHook: CodexHookStatus;
     claudeMcp: ClaudeMcpStatus;
     codexMcp: CodexMcpStatus;
+    deepseekMcp: DeepSeekMcpStatus;
+    deepseekCommands: ReturnType<typeof deepSeekCommandsStatus> | 'not present';
     opencodeMcp: OpencodeMcpStatus;
     kimiMcp: ReturnType<typeof hasKimiMcp> | 'not present';
     kimiHook: ReturnType<typeof kimiHookStatus> | 'not present';
@@ -64,10 +68,13 @@ export function installationStatus(
     codexPath: string,
     opencodeConfig: string,
     bin: string,
-    present: PresentTools = { claude: true, codex: true, opencode: true, kimi: true },
+    present: PresentTools = { claude: true, codex: true, deepseek: true, opencode: true, kimi: true },
     opencodePlugin?: string,
     kimiMcp = '',
     kimiConfig = '',
+    deepseekMcp = '',
+    deepseekMcpPath = '',
+    deepseekHooks?: string,
 ): InstallStatus {
     const claudeHook = present.claude ? claudeHookStatus(claudeSettings, bin) : 'not present';
     const claudeUserPromptSubmitHook = present.claude ? claudeHookStatus(claudeSettings, bin, 'user-prompt-submit') : 'not present';
@@ -82,6 +89,8 @@ export function installationStatus(
         codexUserPromptSubmitHook,
         claudeMcp: present.claude ? hasClaudeMcp(claudeMcp, bin) : 'not present',
         codexMcp: present.codex ? hasCodexMcp(codexConfig, bin) : 'not present',
+        deepseekMcp: present.deepseek ? hasDeepSeekMcp(deepseekMcp, bin) : 'not present',
+        deepseekCommands: present.deepseek ? deepSeekCommandsStatus(deepseekMcp, deepseekMcpPath, bin, deepseekHooks) : 'not present',
         opencodeMcp: present.opencode ? hasOpencodeMcp(opencodeConfig, bin) : 'not present',
         kimiMcp: present.kimi ? hasKimiMcp(kimiMcp, bin) : 'not present',
         kimiHook: present.kimi ? kimiHookStatus(kimiConfig, bin) : 'not present',
@@ -93,6 +102,7 @@ export function installationStatus(
             (result.claudeHook === 'active' && result.claudeUserPromptSubmitHook === 'active' && result.claudeMcp === 'registered')) &&
         (!present.codex ||
             (result.codexHook === 'active' && result.codexUserPromptSubmitHook === 'active' && result.codexMcp === 'registered')) &&
+        (!present.deepseek || (result.deepseekMcp === 'registered' && result.deepseekCommands === 'active')) &&
         (!present.opencode || (result.opencodeMcp === 'registered' && result.opencodePlugin === 'installed')) &&
         (!present.kimi || (result.kimiMcp === 'registered' && result.kimiHook === 'active'));
     return result;
@@ -100,4 +110,12 @@ export function installationStatus(
 
 export function formatKimiMcpStatus(status: InstallStatus['kimiMcp']): string {
     return `Kimi Code MCP (user): ${status} (project .kimi-code/mcp.json can override elepha)`;
+}
+
+export function formatDeepSeekMcpStatus(status: InstallStatus['deepseekMcp']): string {
+    return `DeepSeek Harness MCP: ${status}`;
+}
+
+export function formatDeepSeekCommandsStatus(status: InstallStatus['deepseekCommands']): string {
+    return `DeepSeek Harness in-chat commands: ${status}`;
 }
