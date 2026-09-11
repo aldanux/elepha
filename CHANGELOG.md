@@ -1,5 +1,9 @@
 # elepha
 
+## 0.7.1
+
+- Internal groundwork for an upcoming coding-CLI adapter. No user-facing changes by [@aldanux](https://github.com/aldanux) in [#111](https://github.com/aldanux/elepha/pull/111)
+
 ## 0.7.0
 
 - Capture Kimi Code sessions with consent-bound event reduction, model provenance, and retraction-aware reconciliation for undo, repair, resume rewrites, and forks. Completes Kimi recall and in-chat command support for the 0.7.0 release by [@aldanux](https://github.com/aldanux) in [#108](https://github.com/aldanux/elepha/pull/108)
