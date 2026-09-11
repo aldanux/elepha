@@ -34,7 +34,7 @@ function sessionStartPayload(source: 'startup' | 'clear' | 'resume' | 'compact' 
     });
 }
 
-function hookText(result: Awaited<ReturnType<typeof runSessionStart>>, tool: 'claude-code' | 'codex'): string | undefined {
+function hookText(result: Awaited<ReturnType<typeof runSessionStart>>, tool: 'claude-code' | 'codex' | 'deepseek'): string | undefined {
     if (!('output' in result)) return undefined;
     const hookOutput = result.output.hookSpecificOutput as Record<string, unknown>;
     const value = tool === 'claude-code' ? result.output.systemMessage : hookOutput.additionalContext;
@@ -66,6 +66,9 @@ describe('SessionStart operational notices', () => {
         }
         expect(parsePayload('{}', 'claude-code')).toBeUndefined();
         expect(envelope('claude-code', 'body', 'additionalContext')).toEqual({
+            hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'body' },
+        });
+        expect(envelope('deepseek', 'body', 'additionalContext')).toEqual({
             hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'body' },
         });
         expect(envelope('codex', 'body', 'additionalContext')).toEqual({
@@ -138,7 +141,7 @@ describe('SessionStart operational notices', () => {
     });
 
     it('emits only the update notice through the tool-specific notify channel and records its exact body', async () => {
-        for (const tool of ['claude-code', 'codex'] as const) {
+        for (const tool of ['claude-code', 'codex', 'deepseek'] as const) {
             const dbPath = emptyDbPath();
             const result = await runSessionStart(sessionStartPayload('startup', `native-${tool}`), tool, {
                 dbPath,

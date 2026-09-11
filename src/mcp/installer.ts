@@ -1,9 +1,179 @@
+import { lstatSync } from 'node:fs';
+import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parse } from 'smol-toml';
-import { CODEX_MCP_END, CODEX_MCP_START } from '../install/markers.js';
+import { parseDocument } from 'yaml';
+import { CODEX_MCP_END, CODEX_MCP_START, DEEPSEEK_MCP_END, DEEPSEEK_MCP_START } from '../install/markers.js';
 
 export const ELEPHA_MCP_SERVER_NAME = 'elepha';
 export const ELEPHA_MCP_ARGS = ['mcp', 'serve'] as const;
+const DEEPSEEK_MCP_CLIENT = '@deepseek-ai/dsh-mcp-client';
+
+type DeepSeekPatchEntry = Record<string, unknown>;
+
+const inertJsTag = {
+    tag: 'tag:yaml.org,2002:js',
+    resolve(value: string): string {
+        return value;
+    },
+};
+
+export function deepSeekPatch(text: string): unknown[] {
+    const document = parseDocument(text.trim() ? text : '[]\n', { customTags: [inertJsTag] });
+    if (document.errors.length > 0) {
+        throw new Error('DeepSeek Harness cordis.patch.yml is malformed');
+    }
+    if (document.contents === null) {
+        return [];
+    }
+    const value: unknown = document.toJS();
+    if (!Array.isArray(value)) {
+        throw new Error('DeepSeek Harness cordis.patch.yml is malformed');
+    }
+    return value;
+}
+
+export function deepSeekPatchRecord(value: unknown): DeepSeekPatchEntry | undefined {
+    return value && typeof value === 'object' && !Array.isArray(value) ? (value as DeepSeekPatchEntry) : undefined;
+}
+
+export function deepSeekInsertedEntries(patch: unknown[]): DeepSeekPatchEntry[] {
+    const entries: DeepSeekPatchEntry[] = [];
+    for (const operation of patch) {
+        const insert = deepSeekPatchRecord(operation)?.insert;
+        if (!Array.isArray(insert)) {
+            continue;
+        }
+        for (const value of insert) {
+            const entry = deepSeekPatchRecord(value);
+            if (entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    return entries;
+}
+
+function hasDeepSeekUserConflict(patch: unknown[]): boolean {
+    return (
+        patch.some((operation) => {
+            const entry = deepSeekPatchRecord(operation);
+            return entry?.id === ELEPHA_MCP_SERVER_NAME || deepSeekPatchRecord(entry?.config)?.serverName === ELEPHA_MCP_SERVER_NAME;
+        }) ||
+        deepSeekInsertedEntries(patch).some((entry) => {
+            const config = deepSeekPatchRecord(entry.config);
+            return entry.id === ELEPHA_MCP_SERVER_NAME || config?.serverName === ELEPHA_MCP_SERVER_NAME;
+        })
+    );
+}
+
+function markerRange(text: string): { start: number; end: number } | undefined {
+    const startToken = `${DEEPSEEK_MCP_START}\n`;
+    const endToken = `${DEEPSEEK_MCP_END}\n`;
+    const starts = text.split(DEEPSEEK_MCP_START).length - 1;
+    const ends = text.split(DEEPSEEK_MCP_END).length - 1;
+    if (starts === 0 && ends === 0) {
+        return undefined;
+    }
+    if (starts !== 1 || ends !== 1) {
+        throw new Error('DeepSeek Harness MCP ownership markers are malformed');
+    }
+    const start = text.indexOf(startToken);
+    const markerEnd = text.indexOf(DEEPSEEK_MCP_END);
+    if (start < 0 || markerEnd < start) {
+        throw new Error('DeepSeek Harness MCP ownership markers are malformed');
+    }
+    const end = text.startsWith(endToken, markerEnd) ? markerEnd + endToken.length : markerEnd + DEEPSEEK_MCP_END.length;
+    return { start, end };
+}
+
+function deepSeekOwnedBlock(launcher: string): string {
+    return `${DEEPSEEK_MCP_START}\n- insert:\n    - id: ${ELEPHA_MCP_SERVER_NAME}\n      name: '${DEEPSEEK_MCP_CLIENT}'\n      config:\n        serverName: ${ELEPHA_MCP_SERVER_NAME}\n        transport: stdio\n        command: ${JSON.stringify(launcher)}\n        args: ['mcp', 'serve']\n        env: {}\n${DEEPSEEK_MCP_END}\n`;
+}
+
+function validateDeepSeekLauncher(launcher: string): void {
+    if (!path.isAbsolute(launcher)) {
+        throw new Error('DeepSeek Harness MCP launcher must be an absolute path');
+    }
+    if (lstatSync(launcher, { throwIfNoEntry: false })?.isSymbolicLink()) {
+        throw new Error('DeepSeek Harness MCP launcher must not be a symbolic link');
+    }
+}
+
+function deepSeekOwnedEntry(text: string, range: { start: number; end: number }): DeepSeekPatchEntry | undefined {
+    const entries = deepSeekInsertedEntries(deepSeekPatch(text.slice(range.start, range.end)));
+    return entries.length === 1 ? entries[0] : undefined;
+}
+
+export function isElephaDeepSeekMcp(value: unknown): boolean {
+    const entry = deepSeekPatchRecord(value);
+    const config = deepSeekPatchRecord(entry?.config);
+    return (
+        entry?.id === ELEPHA_MCP_SERVER_NAME &&
+        entry.name === DEEPSEEK_MCP_CLIENT &&
+        config?.serverName === ELEPHA_MCP_SERVER_NAME &&
+        config.transport === 'stdio' &&
+        typeof config.command === 'string' &&
+        isDeepStrictEqual(config.args, [...ELEPHA_MCP_ARGS]) &&
+        isDeepStrictEqual(config.env, {})
+    );
+}
+
+export function transformDeepSeekMcp(text: string, launcher: string, uninstall = false): string {
+    validateDeepSeekLauncher(launcher);
+    deepSeekPatch(text);
+    const range = markerRange(text);
+    const withoutOwned = range ? `${text.slice(0, range.start)}${text.slice(range.end)}` : text;
+    const unmanagedPatch = deepSeekPatch(withoutOwned);
+    if (hasDeepSeekUserConflict(unmanagedPatch)) {
+        throw new Error('conflicting user-owned DeepSeek Harness MCP server named elepha; adopt it manually');
+    }
+    if (uninstall) {
+        if (!range) {
+            return text;
+        }
+        const rendered = unmanagedPatch.length === 0 ? `${withoutOwned.trim() ? `${withoutOwned.trimEnd()}\n` : ''}[]\n` : withoutOwned;
+        deepSeekPatch(rendered);
+        return rendered;
+    }
+    const block = deepSeekOwnedBlock(launcher);
+    let rendered: string;
+    if (range) {
+        rendered = `${text.slice(0, range.start)}${block}${text.slice(range.end)}`;
+    } else if (deepSeekPatch(text).length === 0 && /^\s*\[\]\s*$/.test(text)) {
+        rendered = block;
+    } else {
+        rendered = `${text}${text.length > 0 && !text.endsWith('\n') ? '\n' : ''}${block}`;
+    }
+    deepSeekPatch(rendered);
+    return rendered === text ? text : rendered;
+}
+
+export function hasDeepSeekMcp(
+    text: string,
+    launcher: string,
+): 'registered' | 'disabled' | 'conflict' | 'invalid' | 'not installed' | 'stale binary' {
+    try {
+        const range = markerRange(text);
+        const patch = deepSeekPatch(range ? `${text.slice(0, range.start)}${text.slice(range.end)}` : text);
+        if (hasDeepSeekUserConflict(patch)) {
+            return 'conflict';
+        }
+        if (!range) {
+            return 'not installed';
+        }
+        const entry = deepSeekOwnedEntry(text, range);
+        if (!isElephaDeepSeekMcp(entry)) {
+            return 'invalid';
+        }
+        if (entry?.disabled === true) {
+            return 'disabled';
+        }
+        return deepSeekPatchRecord(entry?.config)?.command === launcher ? 'registered' : 'stale binary';
+    } catch {
+        return 'invalid';
+    }
+}
 
 function kimiMcpConfig(text: string): Record<string, unknown> {
     try {

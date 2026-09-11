@@ -27,7 +27,7 @@ export function normalizeKimiPrompt(prompt: unknown): string | undefined {
     return parts.join('\n');
 }
 
-function modelDriven(command: UserPromptCommand | undefined): boolean {
+export function modelDrivenCommand(command: UserPromptCommand | undefined): boolean {
     return command?.kind === 'resume' || command?.kind === 'last';
 }
 
@@ -35,30 +35,29 @@ function modelDriven(command: UserPromptCommand | undefined): boolean {
 // Remove only the display directive before recording the body actually served.
 export function kimiCommandBody(body: string, command: UserPromptCommand | undefined): string {
     const directive = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n`;
-    return !modelDriven(command) && body.startsWith(directive) ? body.slice(directive.length) : body;
+    return !modelDrivenCommand(command) && body.startsWith(directive) ? body.slice(directive.length) : body;
 }
 
-// Strip framing only from the direct display; recordHookOutput already recorded
-// the body for later quote-backs, and model-driven messages need the full framing.
+// Direct-display surfaces receive only the command body. Model and sentinel
+// framing remains in the recorded injection used by model-driven commands.
+export function directDisplayBody(body: string): string {
+    return body
+        .split('\n')
+        .filter(
+            (line) =>
+                !line.startsWith(briefOpen) &&
+                line.trim() !== CLOSE &&
+                !line.startsWith(SERVER_INSTRUCTIONS) &&
+                line !== DISPLAY_VERBATIM_INSTRUCTIONS &&
+                !((line.startsWith(dataOpen) || line.startsWith(dataClose)) && line.endsWith(']]')),
+        )
+        .join('\n')
+        .trim();
+}
+
 // Both structured denial at exit 0 and stderr at exit 2 select Kimi's block path.
 export function kimiOutput(body: string, command: UserPromptCommand | undefined): Record<string, unknown> {
-    return modelDriven(command)
+    return modelDrivenCommand(command)
         ? { message: body }
-        : {
-              hookSpecificOutput: {
-                  permissionDecision: 'deny',
-                  permissionDecisionReason: body
-                      .split('\n')
-                      .filter(
-                          (line) =>
-                              !line.startsWith(briefOpen) &&
-                              line.trim() !== CLOSE &&
-                              !line.startsWith(SERVER_INSTRUCTIONS) &&
-                              line !== DISPLAY_VERBATIM_INSTRUCTIONS &&
-                              !((line.startsWith(dataOpen) || line.startsWith(dataClose)) && line.endsWith(']]')),
-                      )
-                      .join('\n')
-                      .trim(),
-              },
-          };
+        : { hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: directDisplayBody(body) } };
 }

@@ -1,12 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
-import type { HookTool } from '../hooks/common.js';
 import { isNearVerbatim, normalizeForNearVerbatim, turnText } from '../security/self-ingestion.js';
-import type { ParsedTurn } from '../types/index.js';
+import type { ParsedTurn, ToolName } from '../types/index.js';
 
 export interface InjectionRow {
     id: number;
-    tool: HookTool;
+    tool: ToolName;
     native_session_id: string;
     injected_at: string;
     injection_id: string;
@@ -15,7 +14,7 @@ export interface InjectionRow {
 }
 
 export interface RecordInjectionInput {
-    tool: HookTool;
+    tool: ToolName;
     nativeSessionId: string;
     injectedAt: string;
     injectionId: string;
@@ -61,12 +60,12 @@ export class InjectionStore {
         );
     }
 
-    injectionsForSession(tool: HookTool, nativeSessionId: string, atOrBefore: string): InjectionRow[] {
+    injectionsForSession(tool: ToolName, nativeSessionId: string, atOrBefore: string): InjectionRow[] {
         return this.stmts.injectionsForSession.all(tool, nativeSessionId, atOrBefore) as InjectionRow[];
     }
 
     isQuoteBack(
-        turn: Pick<ParsedTurn, 'sessionId' | 'endedAt' | 'userMessage' | 'assistantText' | 'toolCalls'> & { tool: HookTool },
+        turn: Pick<ParsedTurn, 'sessionId' | 'endedAt' | 'userMessage' | 'assistantText' | 'toolCalls'> & { tool: ToolName },
     ): boolean {
         const completeTurn = turnText(turn);
         // A hook can emit after the turn begins, but a later injection cannot

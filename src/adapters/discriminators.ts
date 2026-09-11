@@ -39,6 +39,9 @@ export function sessionSurface(tool: ToolName, raw: string | undefined): Session
     if (tool === 'kimi') {
         return 'cli';
     }
+    if (tool === 'deepseek') {
+        return 'cli';
+    }
     if (tool === 'opencode') {
         // Slice 1 has no reliable OpenCode surface discriminator and is not wired into ingestion.
         return null;

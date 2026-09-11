@@ -12,13 +12,15 @@ const activeIntegrations: IntegrationHealth = {
         codexUserPromptSubmitHook: 'active',
         claudeMcp: 'registered',
         codexMcp: 'registered',
+        deepseekMcp: 'registered',
+        deepseekCommands: 'active',
         opencodeMcp: 'registered',
         kimiMcp: 'registered',
         kimiHook: 'active',
         opencodePlugin: 'installed',
         ready: true,
     },
-    present: { claude: true, codex: true, opencode: true, kimi: true },
+    present: { claude: true, codex: true, deepseek: true, opencode: true, kimi: true },
 };
 
 function daemon(healthy: boolean): DaemonHealth {
@@ -59,6 +61,27 @@ describe('elepha doctor', () => {
         },
     );
 
+    it.each(['active', 'not installed', 'stale bridge', 'stale hooks', 'conflict', 'invalid', 'disabled', 'not present'] as const)(
+        'reports DeepSeek Harness in-chat command registration %s',
+        async (deepseekCommands) => {
+            const result = await runDoctor(
+                runtime({
+                    inspectIntegrations: () => ({
+                        ...activeIntegrations,
+                        present: { ...activeIntegrations.present, deepseek: deepseekCommands !== 'not present' },
+                        status: { ...activeIntegrations.status, deepseekCommands },
+                    }),
+                }),
+            );
+            expect(result.lines).toContain(
+                `${deepseekCommands === 'active' ? '✓' : deepseekCommands === 'not present' ? '⚠' : '✗'} DeepSeek Harness in-chat commands: ${deepseekCommands}`,
+            );
+            const ready = deepseekCommands === 'active' || deepseekCommands === 'not present';
+            expect(result.exitCode).toBe(ready ? 0 : 1);
+            expect(result.nextSteps).toEqual(ready ? [] : [terminalHandoff('install')]);
+        },
+    );
+
     it.each(['not installed', 'stale binary', 'conflict', 'stale plugin'] as const)(
         'reports an OpenCode plugin %s and provides the install handoff',
         async (opencodePlugin) => {
@@ -76,6 +99,27 @@ describe('elepha doctor', () => {
         },
     );
 
+    it.each(['registered', 'not installed', 'stale binary', 'conflict', 'invalid', 'disabled', 'not present'] as const)(
+        'reports DeepSeek Harness MCP registration %s',
+        async (deepseekMcp) => {
+            const result = await runDoctor(
+                runtime({
+                    inspectIntegrations: () => ({
+                        ...activeIntegrations,
+                        present: { ...activeIntegrations.present, deepseek: deepseekMcp !== 'not present' },
+                        status: { ...activeIntegrations.status, deepseekMcp },
+                    }),
+                }),
+            );
+            expect(result.lines).toContain(
+                `${deepseekMcp === 'registered' ? '✓' : deepseekMcp === 'not present' ? '⚠' : '✗'} DeepSeek Harness MCP: ${deepseekMcp}`,
+            );
+            const ready = deepseekMcp === 'registered' || deepseekMcp === 'not present';
+            expect(result.exitCode).toBe(ready ? 0 : 1);
+            expect(result.nextSteps).toEqual(ready ? [] : [terminalHandoff('install')]);
+        },
+    );
+
     it('reports every healthy check and exits zero', async () => {
         const result = await runDoctor(runtime());
 
@@ -85,7 +129,7 @@ describe('elepha doctor', () => {
                 '✓ Daemon: RUNNING (pid 123, heartbeat 1s ago)',
                 '✓ Claude Code hooks: SessionStart + UserPromptSubmit installed',
                 '✓ Codex hooks: SessionStart + UserPromptSubmit installed and approved',
-                '✓ MCP: Claude, Codex, OpenCode, and Kimi Code registered where detected',
+                '✓ MCP: Claude, Codex, OpenCode, Kimi Code, and DeepSeek Harness registered where detected',
                 '✓ Database: opens and migrations apply',
                 '✓ Consent: 1 approved root',
                 '✓ Launcher: managed launcher is valid',
@@ -206,7 +250,7 @@ describe('elepha doctor', () => {
             }),
         );
 
-        expect(result.lines).toContain('✗ MCP: Claude, Codex, OpenCode, and Kimi Code must be registered where detected');
+        expect(result.lines).toContain('✗ MCP: Claude, Codex, OpenCode, Kimi Code, and DeepSeek Harness must be registered where detected');
         expect(result.nextSteps).toEqual([terminalHandoff('install')]);
         expect(result.exitCode).toBe(1);
     });

@@ -3,6 +3,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { opencodeDbPath } from '../../src/config/paths.js';
 import { detectSessionTools, discoverFolderRepos, discoverSessionProjects } from '../../src/discovery/session-projects.js';
+import { createDeepSeekFixture, deepSeekHeader } from '../fixtures/deepseek-session.js';
 import { addOpencodeSession, createOpencodeFixture } from '../fixtures/opencode-db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
@@ -26,7 +27,10 @@ function session(cwd: string, timestamp: string, content: string): string {
 }
 
 describe('session-project discovery', () => {
-    beforeEach(() => vi.stubEnv('KIMI_CODE_HOME', withTempDir('discovery-kimi-home-')));
+    beforeEach(() => {
+        vi.stubEnv('KIMI_CODE_HOME', withTempDir('discovery-kimi-home-'));
+        vi.stubEnv('DSH_HOME', withTempDir('discovery-deepseek-home-'));
+    });
     afterEach(() => {
         vi.unstubAllEnvs();
     });
@@ -41,6 +45,41 @@ describe('session-project discovery', () => {
         createOpencodeFixture(databasePath, withGrantableTestDir('elepha-opencode-detection-project-'));
 
         await expect(detectSessionTools({ opencodeDatabase: databasePath })).resolves.toContain('opencode');
+    });
+
+    it('detects DeepSeek and discovers its literal header cwd without counting older generations', async () => {
+        const project = withGrantableTestDir('deepseek-discovery-project-');
+        const sourceRoot = path.join(process.env.DSH_HOME!, 'sessions');
+        createDeepSeekFixture(project, [[deepSeekHeader(project, 'session-discovery', 2)]], {
+            sessionId: 'session-discovery',
+            generation: 2,
+        });
+        createDeepSeekFixture(project, [[deepSeekHeader(project, 'session-discovery', 3)]], {
+            sessionId: 'session-discovery',
+            generation: 3,
+        });
+
+        await expect(
+            discoverSessionProjects({
+                claudeProjects: path.join(process.env.DSH_HOME!, 'missing-claude'),
+                codexSessions: path.join(process.env.DSH_HOME!, 'missing-codex'),
+                kimiSessions: path.join(process.env.DSH_HOME!, 'missing-kimi'),
+                deepseekSessions: sourceRoot,
+                opencodeDatabase: path.join(process.env.DSH_HOME!, 'missing-opencode.db'),
+            }),
+        ).resolves.toEqual({
+            detectedTools: ['deepseek'],
+            projects: [
+                {
+                    root: project,
+                    displayName: path.basename(project),
+                    tools: ['deepseek'],
+                    sessionCount: 1,
+                    earliestSessionAt: '2026-09-11T00:00:00.000Z',
+                    latestSessionAt: '2026-09-11T00:00:00.000Z',
+                },
+            ],
+        });
     });
 
     it('discovers OpenCode session directories, excludes ineligible roots, and merges shared JSONL projects', async () => {

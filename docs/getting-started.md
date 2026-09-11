@@ -7,7 +7,7 @@ registering elepha with the tools you use, and choosing which projects it may re
 
 ## Requirements
 
-You need Node.js 22.12.0 or newer. elepha supports macOS and Linux, including Windows
+You need Node.js 22.15.0 or newer. elepha supports macOS and Linux, including Windows
 through WSL; native Windows is not supported. Linux requires glibc 2.35 or newer and
 systemd. The encrypted database driver ships as a prebuilt binary, so no compiler is
 needed. WSL users may need to enable systemd as described in [WSL](#wsl).

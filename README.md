@@ -55,7 +55,7 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 
 All supported tools use the same local memory database.
 
-It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
+It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.15+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 
 ## How it works
 

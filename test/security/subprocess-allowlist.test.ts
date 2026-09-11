@@ -1,6 +1,7 @@
-// Security Rule 2: only fixed git, service-manager, Elepha npm calls, and
-// bounded read-only macOS process inspection for legacy MCP retirement are
-// permitted. This test is the allowlist half of "both required" - the
+// Security Rule 2: only fixed git, service-manager, Elepha npm calls,
+// generated fixed-argv hook clients, and bounded read-only macOS process
+// inspection for legacy MCP retirement are permitted. This test is the
+// allowlist half of "both required" - the
 // Biome GritQL plugin (.biome-plugins/no-raw-subprocess.grit) is the other
 // half, structurally banning child_process calls anywhere else in src/. This
 // test exists independently of that plugin so a misconfigured or disabled
@@ -42,6 +43,11 @@ describe('subprocess allowlist', () => {
         expect(source).not.toMatch(/shell\s*:\s*true/);
         expect(source).not.toMatch(/\.\.\.\s*process\.env/);
         expect(source).toMatch(/execFileSync\(/);
+        expect(source).toContain("DEEPSEEK_SESSION_START_HOOK_ARGS = ['hook', 'session-start', '--tool', 'deepseek']");
+        expect(source).toContain("DEEPSEEK_USER_PROMPT_SUBMIT_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'deepseek']");
+        expect(source).toContain('const result = spawnSync(');
+        expect(source).toContain('deepSeekHookArgs(event)');
+        expect(source).toContain('shell: false');
         expect(source).toMatch(/function runMacosProcessInspection\(executable: '\/usr\/sbin\/lsof' \| '\/bin\/ps'/);
         expect([...source.matchAll(/runMacosProcessInspection\('([^']+)'/g)].map((match) => match[1])).toEqual([
             '/usr/sbin/lsof',

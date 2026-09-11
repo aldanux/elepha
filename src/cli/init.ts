@@ -90,6 +90,7 @@ const CAPTURE_SETTING_FOR_TOOL = {
     codex: 'capture-codex',
     opencode: 'capture-opencode',
     kimi: 'capture-kimi',
+    deepseek: 'capture-deepseek',
 } as const satisfies Record<ToolName, SettingKey>;
 
 function clackPrompts(input: InitInput, output: InitOutput): InitPrompts {

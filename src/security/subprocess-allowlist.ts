@@ -3,7 +3,7 @@
 // (.biome-plugins/no-raw-subprocess.grit) bans exec/execSync/spawn/spawnSync
 // calls and the shell option everywhere else, and
 // test/security/subprocess-allowlist.test.ts asserts this file's actual call
-// sites match the fixed git, service, npm, and macOS inspection wrappers here.
+// sites match the fixed hook, git, service, npm, and macOS inspection wrappers here.
 //
 // Git uses fixed subcommands and a canonicalized, consent-checked project
 // cwd. Service and npm wrappers use fixed lifecycle/package-management verbs
@@ -17,6 +17,7 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
+    DEEPSEEK_HOOK_OUTPUT_MAX_BYTES,
     HOOK_PAYLOAD_MAX_CHARS,
     INSTALLED_HOOK_TIMEOUT_SECONDS,
     KIMI_HOOK_OUTPUT_MAX_BYTES,
@@ -28,12 +29,52 @@ import {
     SYSTEMD_SERVICE_NAME,
 } from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
-import { quotePosix } from '../install/binary.js';
+import { type HookCommandName, quotePosix } from '../install/binary.js';
 import type { LauncherBackend } from '../install/launcher.js';
 import { KIMI_HOOK_MARKER } from '../install/markers.js';
 
 export const OPENCODE_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'opencode'] as const;
 export const KIMI_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'kimi'] as const;
+export const DEEPSEEK_SESSION_START_HOOK_ARGS = ['hook', 'session-start', '--tool', 'deepseek'] as const;
+export const DEEPSEEK_USER_PROMPT_SUBMIT_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'deepseek'] as const;
+
+function deepSeekHookArgs(event: HookCommandName): readonly string[] {
+    return event === 'session-start' ? DEEPSEEK_SESSION_START_HOOK_ARGS : DEEPSEEK_USER_PROMPT_SUBMIT_HOOK_ARGS;
+}
+
+// DSH's Claude bridge accepts a shell-form command. This generated client keeps
+// all event data on stdin, then invokes only the installed launcher with fixed
+// argv and shell:false. It preserves stdout, stderr, and exit status so the
+// bridge receives the original Claude Code hook protocol outcome verbatim.
+export function renderDeepSeekHookClient(launcher: string, event: HookCommandName): string {
+    if (!path.isAbsolute(launcher)) {
+        throw new Error('DeepSeek hook launcher must be an absolute path');
+    }
+    return `import { spawnSync } from 'node:child_process';
+let input = '';
+process.stdin.setEncoding('utf8');
+for await (const chunk of process.stdin) {
+    if (input.length + chunk.length > ${HOOK_PAYLOAD_MAX_CHARS}) process.exit(0);
+    input += chunk;
+}
+const result = spawnSync(${JSON.stringify(launcher)}, ${JSON.stringify(deepSeekHookArgs(event))}, {
+    shell: false,
+    input,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
+    killSignal: 'SIGKILL',
+    maxBuffer: ${DEEPSEEK_HOOK_OUTPUT_MAX_BYTES},
+});
+if (typeof result.stdout === 'string') process.stdout.write(result.stdout);
+if (typeof result.stderr === 'string') process.stderr.write(result.stderr);
+if (result.error === undefined && typeof result.status === 'number') process.exitCode = result.status;
+`;
+}
+
+export function renderDeepSeekHookCommand(launcher: string, event: HookCommandName): string {
+    return `${quotePosix(process.execPath)} --input-type=module -e ${quotePosix(renderDeepSeekHookClient(launcher, event))}`;
+}
 
 // Kimi's config command is a shell string. Only this fixed, quoted client and
 // installation paths enter it; all event data crosses the child boundary on stdin.

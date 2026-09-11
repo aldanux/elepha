@@ -28,7 +28,7 @@ import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookTool, parsePayload, readStdin, type UserPromptSubmitPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
-import { kimiCommandBody, kimiOutput } from './kimi.js';
+import { directDisplayBody, kimiCommandBody, kimiOutput, modelDrivenCommand } from './kimi.js';
 import { recordHookOutput } from './output.js';
 import { withDaemonHealthWarning, withUpdateNotice } from './session-start.js';
 
@@ -53,7 +53,7 @@ export interface UserPromptSubmitDependencies {
     writeInjection?: (store: MemoryStore, input: Parameters<MemoryStore['recordInjection']>[0]) => boolean;
 }
 
-export type UserPromptSubmitResult = { output: Record<string, unknown> } | { reason: string };
+export type UserPromptSubmitResult = { output: Record<string, unknown>; block?: string } | { reason: string };
 type ProjectCommand = Exclude<UserPromptCommand, { kind: 'query' }>;
 interface CommandBodyResult {
     body: string;
@@ -117,7 +117,7 @@ export function parseUserPromptCommand(prompt: string): UserPromptCommand | unde
     if (resume?.[1]) {
         return { kind: 'resume', index: Number(resume[1]) };
     }
-    const list = /^elepha:list(?::([1-9]\d*))?(?::(codex|claude|opencode))?$/.exec(command);
+    const list = /^elepha:list(?::([1-9]\d*))?(?::(codex|claude|opencode|kimi|deepseek))?$/.exec(command);
     if (list) {
         const count = list[1] === undefined ? ELEPHA_LIST_DEFAULT_LIMIT : Number(list[1]);
         if (count >= 1 && count <= ELEPHA_LIST_MAX_LIMIT) {
@@ -252,6 +252,9 @@ export async function runUserPromptSubmit(
         const store = new MemoryStore(db);
         const clock = dependencies.now ?? Date.now;
         const emit = (body: string): UserPromptSubmitResult => {
+            if (tool === 'deepseek' && !modelDrivenCommand(command)) {
+                return { output: {}, block: directDisplayBody(body) };
+            }
             const output = recordHookOutput({
                 store,
                 tool,
@@ -265,11 +268,13 @@ export async function runUserPromptSubmit(
                 log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
                 return { reason: 'injection_record_failed' };
             }
-            return { output: tool === 'kimi' ? kimiOutput(output, command) : envelope(output) };
+            return {
+                output: tool === 'kimi' ? kimiOutput(output, command) : envelope(output),
+            };
         };
         const locked = (): UserPromptSubmitResult => {
             const result = emit(LOCKED_MEMORY_MESSAGE);
-            if ('output' in result) {
+            if (!('reason' in result)) {
                 log(promptLogLine(tool, payload, 'served locked'));
             }
             return result;
@@ -380,7 +385,10 @@ export async function runUserPromptSubmitCli(tool: HookTool): Promise<void> {
     try {
         const input = await readStdin();
         const result = await runUserPromptSubmit(input, tool);
-        if ('output' in result) {
+        if ('output' in result && result.block !== undefined) {
+            process.stderr.write(result.block);
+            process.exitCode = 2;
+        } else if ('output' in result) {
             process.stdout.write(JSON.stringify(result.output));
         }
     } catch {

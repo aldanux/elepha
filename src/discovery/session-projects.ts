@@ -2,14 +2,16 @@
 // not use an adapter: adapters assemble turns and therefore read transcript
 // content, which is forbidden before a root has been approved.
 
-import { lstat, open, readdir, stat } from 'node:fs/promises';
+import { type FileHandle, lstat, open, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { deepSeekEventSource, readDeepSeekSessionHeader } from '../adapters/deepseek-harness.js';
 import { readKimiMetadata } from '../adapters/kimi-metadata.js';
 import { openOpencodeDbReadonly } from '../adapters/opencode.js';
 import { MAX_METADATA_SCAN_BYTES, MAX_METADATA_SCAN_LINES, READABILITY_READ_CHUNK_BYTES } from '../config/constants.js';
 import {
     claudeProjectsRoot,
     codexSessionsRoot,
+    dshSessionsRoot,
     isRefusedProjectRoot,
     kimiSessionsRoot,
     normalizeForCompare,
@@ -35,6 +37,7 @@ export interface DiscoveryPaths {
     claudeProjects?: string;
     codexSessions?: string;
     kimiSessions?: string;
+    deepseekSessions?: string;
     opencodeDatabase?: string;
     isRefusedRoot?: (root: string) => boolean;
 }
@@ -56,6 +59,7 @@ const MAX_DEPTH = 6;
 const NEWLINE_BYTE = 0x0a;
 
 function discoveryStores(paths: DiscoveryPaths): Array<{ root: string; tool: ToolName; matches: (relativePath: string) => boolean }> {
+    const deepseekRoot = paths.deepseekSessions ?? dshSessionsRoot();
     return [
         { root: paths.claudeProjects ?? claudeProjectsRoot(), tool: 'claude-code', matches: isClaudeSession },
         { root: paths.codexSessions ?? codexSessionsRoot(), tool: 'codex', matches: isCodexSession },
@@ -63,6 +67,11 @@ function discoveryStores(paths: DiscoveryPaths): Array<{ root: string; tool: Too
             root: paths.kimiSessions ?? kimiSessionsRoot(),
             tool: 'kimi',
             matches: (relative) => relative.split(path.sep).length === 5 && relative.endsWith(path.join('agents', 'main', 'wire.jsonl')),
+        },
+        {
+            root: deepseekRoot,
+            tool: 'deepseek',
+            matches: (relative) => deepSeekEventSource(path.join(deepseekRoot, relative)) === path.join(deepseekRoot, relative),
         },
     ];
 }
@@ -86,16 +95,21 @@ async function regularFileExists(filePath: string): Promise<boolean> {
 // Reads only enough JSONL metadata to find the session cwd and its timestamp.
 // The parsed `message`/turn payload, if present on that same line, is never
 // examined or retained. The reader stops at the first cwd line.
-export async function readSessionMetadata(filePath: string): Promise<SessionMetadata | undefined> {
+export async function readSessionMetadata(filePath: string, handle?: FileHandle): Promise<SessionMetadata | undefined> {
+    if (deepSeekEventSource(filePath) === filePath) {
+        return readDeepSeekSessionHeader(filePath, handle);
+    }
     if (filePath.endsWith(path.join('agents', 'main', 'wire.jsonl'))) {
         return readKimiMetadata(filePath);
     }
-    const handle = await open(filePath, 'r');
+    const opened = handle ?? (await open(filePath, 'r'));
     let fileSize: number;
     try {
-        fileSize = (await handle.stat()).size;
+        fileSize = (await opened.stat()).size;
     } catch (error) {
-        await handle.close();
+        if (!handle) {
+            await opened.close();
+        }
         throw error;
     }
     let offset = 0;
@@ -117,7 +131,7 @@ export async function readSessionMetadata(filePath: string): Promise<SessionMeta
     try {
         while (offset < fileSize && offset < MAX_METADATA_SCAN_BYTES && scannedLines < MAX_METADATA_SCAN_LINES) {
             const buffer = Buffer.alloc(Math.min(READABILITY_READ_CHUNK_BYTES, fileSize - offset, MAX_METADATA_SCAN_BYTES - offset));
-            const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+            const { bytesRead } = await opened.read(buffer, 0, buffer.length, offset);
             if (bytesRead === 0) {
                 break;
             }
@@ -167,7 +181,9 @@ export async function readSessionMetadata(filePath: string): Promise<SessionMeta
             return metadataFrom(Buffer.concat(pendingChunks, pendingBytes));
         }
     } finally {
-        await handle.close();
+        if (!handle) {
+            await opened.close();
+        }
     }
     return undefined;
 }
