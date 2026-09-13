@@ -30,7 +30,7 @@ describe('elepha rekey-projects --apply', () => {
         const repo = path.join(directory, 'repo');
         const subdirectory = path.join(repo, 'packages', 'app');
         mkdirSync(subdirectory, { recursive: true });
-        const gitInit = spawnSync('git', ['init', '--quiet', repo], { encoding: 'utf8' });
+        const gitInit = spawnSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '--quiet', repo], { encoding: 'utf8' });
         expect(gitInit.status).toBe(0);
         const gitRoot = spawnSync('git', ['-C', repo, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim();
 
@@ -88,7 +88,7 @@ describe('elepha rekey-projects --apply', () => {
         const repo = path.join(directory, 'repo');
         const subdirectory = path.join(repo, 'packages', 'app');
         mkdirSync(subdirectory, { recursive: true });
-        expect(spawnSync('git', ['init', '--quiet', repo], { encoding: 'utf8' }).status).toBe(0);
+        expect(spawnSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '--quiet', repo], { encoding: 'utf8' }).status).toBe(0);
 
         const db = openUnmanagedDb(dbPath);
         const now = new Date().toISOString();
@@ -120,7 +120,7 @@ describe('elepha rekey-projects --apply', () => {
         const repo = path.join(directory, 'repo');
         const subdirectory = path.join(repo, 'packages', 'app');
         mkdirSync(subdirectory, { recursive: true });
-        expect(spawnSync('git', ['init', '--quiet', repo], { encoding: 'utf8' }).status).toBe(0);
+        expect(spawnSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '--quiet', repo], { encoding: 'utf8' }).status).toBe(0);
 
         const db = openUnmanagedDb(dbPath);
         const now = new Date().toISOString();

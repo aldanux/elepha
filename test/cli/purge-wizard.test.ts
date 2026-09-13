@@ -120,7 +120,7 @@ describe('elepha purge wizard', () => {
         const selectedPath = path.join(withTempDir('elepha-purge-selected-'), 'elepha');
         const fragmentPath = path.join(selectedPath, 'src');
         mkdirSync(fragmentPath, { recursive: true });
-        execFileSync('git', ['init', '-q', selectedPath]);
+        execFileSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '-q', selectedPath]);
         const retainedPath = path.join(directory, 'non-live-project');
         const selectedProject = store.upsertProject(selectedPath);
         const fragmentProjectId = Number(
