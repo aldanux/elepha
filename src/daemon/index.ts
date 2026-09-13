@@ -20,10 +20,8 @@ import chokidar, { type FSWatcher } from 'chokidar';
 import { OversizedTranscriptRecordError } from '../adapters/base.js';
 import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
-import { DeepSeekHarnessAdapter } from '../adapters/deepseek-harness.js';
 import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { sessionAdapterFor } from '../adapters/index.js';
-import { KimiCodeAdapter } from '../adapters/kimi-code.js';
 import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
@@ -47,11 +45,9 @@ import {
     codexSessionsRoot,
     daemonStderrLogPath,
     daemonStdoutLogPath,
-    dshSessionsRoot,
     isReadableProviderSource,
     isRefusedProjectRoot,
     isWithin,
-    kimiSessionsRoot,
     opencodeDbPath,
     opencodeStoreRoot,
     samePath,
@@ -153,12 +149,6 @@ export function deduplicateDaemonUnknownLineWarnings(
 // whatever the environment looked like at import time.
 export function watchRoots(): string[] {
     const roots = [claudeProjectsRoot(), codexSessionsRoot()];
-    if (existsSync(kimiSessionsRoot())) {
-        roots.push(kimiSessionsRoot());
-    }
-    if (existsSync(dshSessionsRoot())) {
-        roots.push(dshSessionsRoot());
-    }
     const opencodeRoot = opencodeStoreRoot();
     if (existsSync(opencodeRoot)) {
         roots.push(opencodeRoot);
@@ -243,8 +233,6 @@ export class IngestionDaemon {
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
     private readonly captureOpencode: boolean;
-    private readonly captureKimi: boolean;
-    private readonly captureDeepSeek: boolean;
     private readonly durableCapture: boolean;
     private readonly durableCaptureMaxBytes: number;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
@@ -298,8 +286,6 @@ export class IngestionDaemon {
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
         this.captureOpencode = configResult.config.captureOpencode ?? true;
-        this.captureKimi = configResult.config.captureKimi ?? true;
-        this.captureDeepSeek = configResult.config.captureDeepSeek ?? true;
         this.durableCapture = configResult.config.durableCapture ?? false;
         this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
         this.store = options.store;
@@ -307,12 +293,7 @@ export class IngestionDaemon {
         this.summarizer = options.summarizer;
         const warnUnknownLine = deduplicateDaemonUnknownLineWarnings(this.log);
         this.warnDeduplicated = warnUnknownLine;
-        this.adapters = options.adapters ?? [
-            new ClaudeCodeAdapter(warnUnknownLine),
-            new CodexAdapter(warnUnknownLine),
-            new KimiCodeAdapter(warnUnknownLine),
-            new DeepSeekHarnessAdapter(warnUnknownLine),
-        ];
+        this.adapters = options.adapters ?? [new ClaudeCodeAdapter(warnUnknownLine), new CodexAdapter(warnUnknownLine)];
         this.opencodeAdapter = new OpencodeAdapter(warnUnknownLine);
         this.idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
         this.workQueue = new WorkQueue(options.maxConcurrentSummaries ?? DEFAULT_MAX_CONCURRENT, this.log, this.logError);
@@ -758,14 +739,7 @@ export class IngestionDaemon {
         if (!adapter) {
             return undefined;
         }
-        const enabled =
-            adapter.tool === 'kimi'
-                ? this.captureKimi
-                : adapter.tool === 'deepseek'
-                  ? this.captureDeepSeek
-                  : adapter.tool === 'claude-code'
-                    ? this.captureClaudeCode
-                    : this.captureCodex;
+        const enabled = adapter.tool === 'claude-code' ? this.captureClaudeCode : this.captureCodex;
         if (!enabled) {
             const skipped = this.recordSkippedFile(
                 filePath,
@@ -1253,7 +1227,7 @@ export class IngestionDaemon {
                 }
             }
 
-            const unreadable = await this.readabilityGuard.assertReadableJsonl(real, adapter.tool === 'deepseek');
+            const unreadable = await this.readabilityGuard.assertReadableJsonl(real);
             if (unreadable) {
                 return { ingested: 0, skipped: this.recordSkippedFile(real, unreadable, logContext) };
             }
@@ -1261,7 +1235,7 @@ export class IngestionDaemon {
             // Consent is a file boundary, not a persistence-only check. Read
             // only the first cwd-bearing metadata line, then reject before an
             // adapter can parse a turn, title, or any transcript body.
-            const metadata = await readSessionMetadata(real, handle);
+            const metadata = await readSessionMetadata(real);
             if (!metadata) {
                 return {
                     ingested: 0,
@@ -1402,13 +1376,9 @@ export class IngestionDaemon {
             let retracted = 0;
             const storedCursor = this.store.getSessionCursor(adapter.tool, nativeId);
             let reconcile = false;
-            if (sourceMetadata) {
-                validateSource = () => sourceMetadata.validate() && sourceMetadata.cwd === metadata.cwd;
-            }
             if (adapter.retractable) {
                 const validateWire = sourceSnapshotValidator(adapter.tool, filePath, opened);
-                const validateMetadata = validateSource;
-                validateSource = () => validateWire() && (validateMetadata?.() ?? true);
+                validateSource = () => validateWire() && sourceMetadata?.validate() === true && sourceMetadata.cwd === metadata.cwd;
                 reconcile = (await adapter.needsReconciliation?.(real, storedCursor, handle)) ?? true;
                 if (reconcile) {
                     const reconciliation = new SourceReconciliation(this.store, adapter.tool, nativeId, metadata.cwd, validateSource);
@@ -1460,9 +1430,6 @@ export class IngestionDaemon {
                 const stored = this.store.findSession(adapter.tool, nativeId);
                 if (stored) {
                     this.store.updateSessionTitle(stored.id, { aiTitle: sourceMetadata.title, userMessage: '' });
-                    if (sourceMetadata.titleKind) {
-                        this.store.updateCustomTitle(adapter.tool, nativeId, sourceMetadata.customTitle ?? null);
-                    }
                 }
             }
             this.skippedFiles.delete(real);

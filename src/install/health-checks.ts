@@ -5,10 +5,7 @@ import {
     claudeSettingsPath,
     codexConfigPath,
     daemonHeartbeatPath,
-    dshCordisPatchPath,
     elephaLauncherPath,
-    kimiConfigTomlPath,
-    kimiMcpPath,
     opencodeConfigPath,
     opencodePluginPath,
     opencodeStoreRoot,
@@ -17,7 +14,6 @@ import { HEARTBEAT_STALE_MS, type Heartbeat, isPidAlive, readHeartbeat } from '.
 import { errorMessage } from '../util/error.js';
 import { readJson } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
-import { readDeepSeekHooks } from './deepseek-hooks.js';
 import { launcherHash } from './launcher.js';
 import { LAUNCHER_MARKER } from './markers.js';
 import { readOpencodePlugin } from './opencode-plugin.js';
@@ -87,9 +83,7 @@ export function integrationHealth(
         claudeSettings: claudeSettingsPath(),
         claudeMcp: claudeMcpPath(),
         codexConfig: codexConfigPath(),
-        deepseekMcp: dshCordisPatchPath(),
         opencodeConfig: opencodeConfigPath(),
-        kimiMcp: kimiMcpPath(),
         opencodeStore: opencodeStoreRoot(),
     },
 ): IntegrationHealth {
@@ -107,11 +101,6 @@ export function integrationHealth(
             bin,
             present,
             readOpencodePlugin(opencodePluginPath(paths.opencodeConfig)),
-            text(paths.kimiMcp, ''),
-            text(kimiConfigTomlPath(paths.kimiMcp), ''),
-            text(paths.deepseekMcp, ''),
-            paths.deepseekMcp,
-            readDeepSeekHooks(paths.deepseekMcp),
         ),
     };
 }

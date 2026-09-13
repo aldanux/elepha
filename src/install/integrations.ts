@@ -1,57 +1,29 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { parse } from 'smol-toml';
-import {
-    claudeMcpPath,
-    codexConfigPath,
-    dshCordisPatchPath,
-    kimiConfigTomlPath,
-    kimiMcpPath,
-    opencodeConfigPath,
-    opencodePluginPath,
-} from '../config/paths.js';
+import { claudeMcpPath, codexConfigPath, opencodeConfigPath, opencodePluginPath } from '../config/paths.js';
 import {
     hasClaudeMcp,
     hasCodexMcp,
-    hasDeepSeekMcp,
-    hasKimiMcp,
     hasOpencodeMcp,
     ownsCodexMcp,
     transformClaudeMcp,
     transformCodexMcp,
-    transformDeepSeekMcp,
-    transformKimiMcp,
     transformOpencodeMcp,
 } from '../mcp/installer.js';
 import { applyConfigTransaction, type ConfigChange, type ConfigOriginal } from './config-file.js';
-import {
-    deepSeekCommandsStatus,
-    deepSeekHooksPatchStatus,
-    deepSeekHooksPath,
-    ownsDeepSeekHooks,
-    readDeepSeekHooks,
-    renderDeepSeekHooks,
-    transformDeepSeekHooksPatch,
-} from './deepseek-hooks.js';
-import { kimiHookStatus, transformKimiHook } from './kimi-hook.js';
 import { opencodePluginStatus, transformOpencodePlugin } from './opencode-plugin.js';
 
 export interface IntegrationPaths {
     claudeMcp: string;
     codexConfig: string;
-    deepseekMcp: string;
     opencodeConfig: string;
-    kimiMcp: string;
 }
 
 export interface IntegrationSources {
     claudeMcp?: string;
     codexConfig?: string;
-    deepseekMcp?: string;
     opencodeConfig?: string;
-    kimiMcp?: string;
-    kimiConfig?: string;
     opencodePlugin?: string;
-    deepseekHooks?: string;
 }
 
 export interface IntegrationNotice {
@@ -68,13 +40,7 @@ export interface IntegrationRefresh {
 }
 
 export function integrationPaths(): IntegrationPaths {
-    return {
-        claudeMcp: claudeMcpPath(),
-        codexConfig: codexConfigPath(),
-        deepseekMcp: dshCordisPatchPath(),
-        opencodeConfig: opencodeConfigPath(),
-        kimiMcp: kimiMcpPath(),
-    };
+    return { claudeMcp: claudeMcpPath(), codexConfig: codexConfigPath(), opencodeConfig: opencodeConfigPath() };
 }
 
 // Installation and refresh share rendering and validation. Refresh only admits
@@ -84,35 +50,9 @@ export function planIntegrations(
     sources: IntegrationSources,
     launcher: string,
     mode: 'install' | 'refresh',
-    selected = { claude: true, codex: true, deepseek: true, opencode: true, kimi: true },
+    selected = { claude: true, codex: true, opencode: true },
 ): { changes: ConfigChange[]; skipped: IntegrationNotice[] } {
     const pluginPath = opencodePluginPath(paths.opencodeConfig);
-    const deepseekHooks = renderDeepSeekHooks(launcher);
-    const deepseekHooksFile = deepSeekHooksPath(paths.deepseekMcp);
-    const deepseekStatus = () => {
-        const mcp = hasDeepSeekMcp(sources.deepseekMcp ?? '', launcher);
-        const commands = deepSeekCommandsStatus(sources.deepseekMcp ?? '', paths.deepseekMcp, launcher, sources.deepseekHooks);
-        return commands === 'not installed' && mcp !== 'not installed' && mcp !== 'invalid' && mcp !== 'conflict'
-            ? 'stale bridge'
-            : commands;
-    };
-    const deepseekPatchStatus = () => {
-        const mcp = hasDeepSeekMcp(sources.deepseekMcp ?? '', launcher);
-        const commands = deepseekStatus();
-        if (commands === 'conflict') {
-            return 'conflict';
-        }
-        if (mcp === 'conflict') {
-            return 'conflict';
-        }
-        if (mcp === 'invalid' || commands === 'invalid') {
-            return 'invalid';
-        }
-        if (mcp === 'not installed' && commands === 'not installed') {
-            return 'not installed';
-        }
-        return mcp === 'registered' && commands === 'active' ? 'active' : 'stale bridge';
-    };
     const entries = [
         {
             selected: selected.claude,
@@ -134,39 +74,6 @@ export function planIntegrations(
             },
             render: (source: string | undefined) => transformCodexMcp(source ?? '', launcher),
             validate: parse,
-        },
-        {
-            selected: selected.deepseek,
-            integration: 'DeepSeek Harness MCP',
-            file: paths.deepseekMcp,
-            source: sources.deepseekMcp,
-            status: deepseekPatchStatus,
-            render: (source: string | undefined) =>
-                transformDeepSeekHooksPatch(transformDeepSeekMcp(source ?? '', launcher), deepseekHooksFile),
-            validate: (value: string) => {
-                if (hasDeepSeekMcp(value, launcher) !== 'registered' || deepSeekHooksPatchStatus(value, deepseekHooksFile) !== 'active') {
-                    throw new Error('DeepSeek Harness cordis.patch.yml failed read-back verification');
-                }
-            },
-        },
-        {
-            selected: selected.deepseek,
-            integration: 'DeepSeek Harness commands',
-            file: deepseekHooksFile,
-            source: sources.deepseekHooks,
-            status: deepseekStatus,
-            refreshWhenMissing: () => (deepseekStatus() === 'stale bridge' ? 'stale bridge' : 'not installed'),
-            render: (source: string | undefined) => {
-                if (source !== undefined && !ownsDeepSeekHooks(source)) {
-                    throw new Error('DeepSeek Harness hooks.json is user-owned; refusing to overwrite it');
-                }
-                return deepseekHooks;
-            },
-            validate: (value: string) => {
-                if (value !== deepseekHooks) {
-                    throw new Error('DeepSeek Harness hooks.json failed read-back verification');
-                }
-            },
         },
         {
             selected: selected.opencode,
@@ -192,24 +99,6 @@ export function planIntegrations(
                 }
             },
         },
-        {
-            selected: selected.kimi,
-            integration: 'Kimi Code MCP',
-            file: paths.kimiMcp,
-            source: sources.kimiMcp,
-            status: () => hasKimiMcp(sources.kimiMcp ?? '', launcher),
-            render: (source: string | undefined) => transformKimiMcp(source ?? '', launcher),
-            validate: JSON.parse,
-        },
-        {
-            selected: selected.kimi,
-            integration: 'Kimi Code hook',
-            file: kimiConfigTomlPath(paths.kimiMcp),
-            source: sources.kimiConfig,
-            status: () => kimiHookStatus(sources.kimiConfig ?? '', launcher),
-            render: (source: string | undefined) => transformKimiHook(source ?? '', launcher),
-            validate: parse,
-        },
     ];
     const changes: ConfigChange[] = [];
     const skipped: IntegrationNotice[] = [];
@@ -218,10 +107,7 @@ export function planIntegrations(
             continue;
         }
         if (mode === 'refresh') {
-            if (
-                entry.source === undefined &&
-                !('refreshWhenMissing' in entry && entry.refreshWhenMissing !== undefined && entry.refreshWhenMissing() !== 'not installed')
-            ) {
+            if (entry.source === undefined) {
                 continue;
             }
             const status = entry.status();
@@ -255,14 +141,10 @@ export function reconcileOwnedIntegrations(launcher: string, paths: IntegrationP
         return readFileSync(file, 'utf8');
     };
     const sources = {
-        deepseekMcp: read(paths.deepseekMcp, 'DeepSeek Harness MCP'),
-        kimiMcp: read(paths.kimiMcp, 'Kimi Code MCP'),
-        kimiConfig: read(kimiConfigTomlPath(paths.kimiMcp), 'Kimi Code hook'),
         claudeMcp: read(paths.claudeMcp, 'Claude MCP'),
         codexConfig: read(paths.codexConfig, 'Codex MCP'),
         opencodeConfig: read(paths.opencodeConfig, 'OpenCode MCP'),
         opencodePlugin: read(opencodePluginPath(paths.opencodeConfig), 'OpenCode plugin'),
-        deepseekHooks: readDeepSeekHooks(paths.deepseekMcp),
     };
     const plan = planIntegrations(paths, sources, launcher, 'refresh');
     const transaction = applyConfigTransaction(plan.changes);
@@ -284,15 +166,11 @@ export function restoreRefreshedIntegrations(refresh: IntegrationRefresh): void 
         }
     }
     applyConfigTransaction(
-        refresh.originals.map((original) =>
-            original.exists
-                ? {
-                      kind: 'write' as const,
-                      file: original.file,
-                      text: original.text,
-                      validate: () => {},
-                  }
-                : { kind: 'delete' as const, file: original.file },
-        ),
+        refresh.originals.map((original) => ({
+            kind: 'write',
+            file: original.file,
+            text: original.text,
+            validate: () => {},
+        })),
     );
 }

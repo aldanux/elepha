@@ -39,7 +39,7 @@ import {
     type ServedSession,
 } from '../storage/session-read-model.js';
 import { UNTITLED_EPISODE } from '../storage/session-title.js';
-import { type ParsedTurn, type SessionAdapterMap, TOOL_METADATA, type ToolName } from '../types/index.js';
+import { type ParsedTurn, type SessionAdapterMap, SUPPORTED_TOOLS, TOOL_METADATA, type ToolName } from '../types/index.js';
 import { dataBlockClose, dataBlockOpen } from './instructions.js';
 
 export type { ServedSession } from '../storage/session-read-model.js';
@@ -472,9 +472,11 @@ export class SessionReader {
         return this.withReadGeneration(
             () => new Map(),
             () => {
-                const rows = this.db.prepare('SELECT project_id, title, custom_title FROM sessions').all() as Array<
-                    Pick<ServedSession, 'project_id' | 'title' | 'custom_title'>
-                >;
+                const rows = this.db
+                    .prepare(
+                        `SELECT project_id, title, custom_title FROM sessions WHERE tool IN (${SUPPORTED_TOOLS.map(() => '?').join(',')})`,
+                    )
+                    .all(...SUPPORTED_TOOLS) as Array<Pick<ServedSession, 'project_id' | 'title' | 'custom_title'>>;
                 const counts = new Map<number, number>();
                 for (const session of rows.filter(hasRealContent)) {
                     counts.set(session.project_id, (counts.get(session.project_id) ?? 0) + 1);

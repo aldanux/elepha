@@ -556,6 +556,25 @@ describe('session metadata capture', () => {
         expect(withoutMeta.custom_title).toBeNull();
         db.close();
     });
+
+    it('sanitizes transcript-derived custom titles inside the session store', () => {
+        const db = openUnmanagedDb(':memory:');
+        const store = new MemoryStore(db);
+        const project = store.upsertProject('/tmp/proj');
+        const initialTitle = '`whoami` $(touch nope)';
+        const updatedTitle = '$' + '{HOME}; still inert';
+
+        const created = store.upsertSession('claude-code', 'native-title', project.id, '/tmp/title.jsonl', {
+            customTitle: initialTitle,
+        });
+        expect(created.custom_title).toBe(stripShellSyntax(initialTitle));
+
+        const updated = store.upsertSession('claude-code', 'native-title', project.id, '/tmp/title.jsonl', {
+            customTitle: updatedTitle,
+        });
+        expect(updated.custom_title).toBe(stripShellSyntax(updatedTitle));
+        db.close();
+    });
 });
 
 describe('trailing state', () => {
