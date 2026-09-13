@@ -1,8 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
-import { readProjectSessions, readSessionById } from '../../src/storage/session-read-model.js';
-import { createTestDb, seedProject, seedSession } from '../helpers/db.js';
+import { isSubstantive, readProjectSessions, readSessionById } from '../../src/storage/session-read-model.js';
+import { createTestDb, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 describe('session read model', () => {
+    it('exposes instructions through both readers and treats an instruction-only rollup as substantive', () => {
+        const fixture = createTestDb('elepha-instruction-read-');
+        const project = seedProject(fixture, { path: fixture.directory });
+        const session = seedSession(fixture, { project });
+        seedRollup(fixture, { project, session, instructions: [{ what: 'Always run tests' }] });
+        const direct = readSessionById(fixture.db, session.id)!;
+        expect(JSON.parse(direct.rollup_instructions!)).toEqual([{ what: 'Always run tests' }]);
+        expect(readProjectSessions(fixture.db, [project.id])[0].rollup_instructions).toBe(direct.rollup_instructions);
+        expect(isSubstantive(direct)).toBe(true);
+    });
+
     it('degrades malformed trailing files without breaking project reads and warns once per session', () => {
         const fixture = createTestDb('elepha-read-model-');
         const project = seedProject(fixture, { path: fixture.directory });

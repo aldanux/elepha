@@ -32,6 +32,7 @@ function baseWrite(overrides: Partial<RollupWrite> = {}): RollupWrite {
         title: 'Fix the thing',
         summary: 'Fixed the thing.',
         decisions: [{ what: 'used SQLite', why: 'local single-user tool' }],
+        instructions: [],
         pendingItems: ['write tests'],
         filesTouched: ['/repo/a.ts'],
         turnCount: 3,
@@ -83,6 +84,7 @@ describe('Rule 3 choke points', () => {
                 title: 'Fix `date` handling',
                 summary: 'Removed $(date) from the template.',
                 decisions: [{ what: 'rejected `$(date)`', why: 'it re-evaluates on ${EVERY} render' }],
+                instructions: [],
                 pendingItems: ['audit <<EOF blocks'],
             }),
             undefined,
@@ -123,13 +125,26 @@ describe('Rule 3 choke points', () => {
         expect(store.listMemoriesForSession(1)[0].decisions).toEqual([{ what: 're-derived \\`x\\`', why: null }]);
     });
 
+    it('sanitizes instructions in both the live store and the historical backfill', () => {
+        rollups.write(baseWrite({ instructions: [{ what: 'Never use `$(unsafe)`', why: 'Avoid ${execution}' }] }), undefined);
+        expect(verifySanitize(db)).toEqual([]);
+        db.prepare('UPDATE session_rollups SET instructions = ? WHERE session_id = 1').run(
+            JSON.stringify([{ what: 'Never use `$(unsafe)`', turnIndex: 2 }]),
+        );
+        expect(planSanitize(db).changes).toContainEqual(expect.objectContaining({ field: 'instructions', rowId: 1 }));
+        applySanitize(db);
+        expect(verifySanitize(db)).toEqual([]);
+        expect(rollups.get(1)!.instructions[0].turnIndex).toBe(2);
+        expect(rollups.get(1)!.instructions[0].why).toBeUndefined();
+    });
+
     it('keeps the merge dedupe working across the sanitize boundary', () => {
         // `previous` comes back from the store already escaped; `incoming` is
         // raw summarizer output. Keying on the raw text would treat these as
         // two different decisions and duplicate them on every merge.
         const merged = mergeRollupContent(
-            { decisions: [{ what: 'rejected $\\(date)', why: 'stale' }], pendingItems: [], filesTouched: [] },
-            { decisions: [{ what: 'rejected $(date)', why: 'stale' }], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'rejected $\\(date)', why: 'stale' }], instructions: [], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'rejected $(date)', why: 'stale' }], instructions: [], pendingItems: [], filesTouched: [] },
         );
         expect(merged.decisions).toHaveLength(1);
     });
@@ -141,6 +156,7 @@ describe('Rule 3 choke points', () => {
                 title: tainted('title'),
                 summary: tainted('summary'),
                 decisions: [{ what: tainted('rollup what'), why: tainted('rollup why') }],
+                instructions: [],
                 pendingItems: [tainted('rollup pending')],
             }),
             undefined,

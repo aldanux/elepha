@@ -172,6 +172,7 @@ CREATE TABLE IF NOT EXISTS session_rollups (
   title                        TEXT    NOT NULL,
   summary                      TEXT    NOT NULL,
   decisions                    TEXT    NOT NULL,  -- JSON [{what, why}]
+  instructions                 TEXT    NOT NULL DEFAULT '[]',  -- JSON [{what, why?}]
   pending_items                TEXT    NOT NULL,  -- JSON string[]
   files_touched                TEXT    NOT NULL,  -- JSON string[], case-insensitively deduped
   turn_count                   INTEGER NOT NULL,
@@ -341,6 +342,9 @@ function migrate(db: Database.Database): void {
     // Substantiveness is computed at read time. Older databases retain this
     // inert NOT NULL column until their next open; fresh databases never get it.
     const rollupColumns = (db.pragma('table_info(session_rollups)') as Array<{ name: string }>).map((c) => c.name);
+    if (!rollupColumns.includes('instructions')) {
+        db.exec("ALTER TABLE session_rollups ADD COLUMN instructions TEXT NOT NULL DEFAULT '[]'");
+    }
     if (rollupColumns.includes('substantive')) {
         db.exec('ALTER TABLE session_rollups DROP COLUMN substantive');
     }

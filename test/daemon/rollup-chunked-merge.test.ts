@@ -43,7 +43,18 @@ class CountingProvider implements RollupProvider {
     private next(turns: RollupTurnInput[]): RollupResult {
         this.callCount++;
         if (this.failAtCall !== null && this.callCount === this.failAtCall) {
-            return { status: 'parse_error', output: { title: '', summary: '', decisions: [], pending_items: [], droppedDecisions: 0 } };
+            return {
+                status: 'parse_error',
+                output: {
+                    title: '',
+                    summary: '',
+                    decisions: [],
+                    pending_items: [],
+                    instructions: [],
+                    droppedInstructions: 0,
+                    droppedDecisions: 0,
+                },
+            };
         }
         return {
             status: 'ok',
@@ -53,6 +64,8 @@ class CountingProvider implements RollupProvider {
                 // One decision per turn seen, so coverage is checkable.
                 decisions: turns.map((t) => ({ what: `from turn ${t.turnIndex}`, why: 'reason' })),
                 pending_items: [`p${this.callCount}`],
+                instructions: [],
+                droppedInstructions: 0,
                 droppedDecisions: 0,
             },
         };

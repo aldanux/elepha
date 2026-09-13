@@ -177,7 +177,7 @@ const REQUIRED_COLUMNS: Record<ImportedTable, readonly string[]> = {
 
 const SESSION_WRITE_COLUMNS = [...REQUIRED_COLUMNS.sessions.filter((column) => column !== 'id'), 'first_prompt_search'];
 const MEMORY_WRITE_COLUMNS = REQUIRED_COLUMNS.memories.filter((column) => column !== 'id');
-const ROLLUP_WRITE_COLUMNS = REQUIRED_COLUMNS.session_rollups;
+const ROLLUP_WRITE_COLUMNS = [...REQUIRED_COLUMNS.session_rollups, 'instructions'];
 
 function tableNames(db: Database.Database): Set<string> {
     return new Set(
@@ -642,6 +642,7 @@ function applyMerge(db: Database.Database, candidate: Database.Database, plan: I
                 title: sanitizedImportedRollupText(backupRollup.title),
                 summary: sanitizedImportedRollupText(backupRollup.summary),
                 decisions: sanitizedImportedRollupDecisions(backupRollup.decisions),
+                instructions: sanitizedImportedRollupDecisions(backupRollup.instructions ?? '[]'),
                 pending_items: sanitizedImportedRollupPendingItems(backupRollup.pending_items),
             });
         }

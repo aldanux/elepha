@@ -14,7 +14,7 @@ import type { MemoryRow, MemoryStore, SessionRow } from '../storage/memory-store
 import { type AuthenticatedReadGeneration, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { mergeRollupContent, ROLLUP_VERSION, type RollupDecision, type RollupStore } from '../storage/rollup-store.js';
 import { chunkTurns, type RollupTurnInput } from '../summarizer/rollup-prompt.js';
-import { attributeDecisions, type RollupProvider } from '../summarizer/rollup-provider.js';
+import { attributeDecisions, attributeInstructions, type RollupProvider } from '../summarizer/rollup-provider.js';
 import type { SessionKind } from '../types/index.js';
 
 // Result of one `rollupSession` call. `wrote` is true if any batch landed;
@@ -160,12 +160,20 @@ export class RollupService {
         // discarding the whole session's work, and the next pass resumes from
         // there.
         let carry:
-            | { title: string; summary: string; decisions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] }
+            | {
+                  title: string;
+                  summary: string;
+                  decisions: RollupDecision[];
+                  instructions: RollupDecision[];
+                  pendingItems: string[];
+                  filesTouched: string[];
+              }
             | undefined = existing
             ? {
                   title: existing.title,
                   summary: existing.summary,
                   decisions: existing.decisions,
+                  instructions: existing.instructions,
                   pendingItems: existing.pending_items,
                   filesTouched: existing.files_touched,
               }
@@ -201,7 +209,13 @@ export class RollupService {
                 () =>
                     carry
                         ? this.provider.merge(
-                              { title: carry.title, summary: carry.summary, decisions: carry.decisions, pendingItems: carry.pendingItems },
+                              {
+                                  title: carry.title,
+                                  summary: carry.summary,
+                                  decisions: carry.decisions,
+                                  instructions: carry.instructions,
+                                  pendingItems: carry.pendingItems,
+                              },
                               batch.turns,
                           )
                         : this.provider.rollup(batch.turns),
@@ -230,6 +244,12 @@ export class RollupService {
                 );
             }
 
+            if (result.output.droppedInstructions > 0) {
+                this.log(
+                    `[elepha] session ${session.id} batch ${index + 1}/${batches.length}: dropped ${result.output.droppedInstructions} instruction(s) with no usable what`,
+                );
+            }
+
             const batchHighWater = Math.max(...batch.turns.map((t) => t.turnIndex));
             const incoming = {
                 // Provenance assigned HERE, in code. The prompt asks the model
@@ -238,6 +258,7 @@ export class RollupService {
                 // so its answer is a hint, checked against the batch, with a
                 // deterministic fallback.
                 decisions: attributeDecisions(result.output.decisions, batch.turns) as RollupDecision[],
+                instructions: attributeInstructions(result.output.instructions, batch.turns),
                 pendingItems: result.output.pending_items,
                 // From the stored rows, not from the rendered batch: an
                 // oversized turn has its file list dropped for rendering only.
@@ -245,7 +266,12 @@ export class RollupService {
             };
             const merged = carry
                 ? mergeRollupContent(
-                      { decisions: carry.decisions, pendingItems: carry.pendingItems, filesTouched: carry.filesTouched },
+                      {
+                          decisions: carry.decisions,
+                          instructions: carry.instructions,
+                          pendingItems: carry.pendingItems,
+                          filesTouched: carry.filesTouched,
+                      },
                       incoming,
                   )
                 : incoming;
@@ -259,6 +285,7 @@ export class RollupService {
                     title: result.output.title,
                     summary: result.output.summary,
                     decisions: merged.decisions,
+                    instructions: merged.instructions,
                     pendingItems: merged.pendingItems,
                     filesTouched: merged.filesTouched,
                     turnCount: all.length,
@@ -299,6 +326,7 @@ export class RollupService {
                 // copy forward would make the next merge's dedupe key differ
                 // from the stored one.
                 decisions: this.rollups.get(session.id)?.decisions ?? merged.decisions,
+                instructions: this.rollups.get(session.id)?.instructions ?? merged.instructions,
                 pendingItems: merged.pendingItems,
                 filesTouched: merged.filesTouched,
             };
@@ -322,6 +350,7 @@ export class RollupService {
             title: existing.title,
             summary: existing.summary,
             decisions: existing.decisions,
+            instructions: existing.instructions,
             pendingItems: existing.pending_items,
             filesTouched: existing.files_touched,
             turnCount: all.length,
