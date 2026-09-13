@@ -1,5 +1,11 @@
 # elepha
 
+## 0.8.1
+
+- Add a one-command tarball-based development install and standardize contributor Node setup on 24 without changing the supported runtime floor.
+
+Make uninstall independent of database access and installed-package validity, attempt all independent cleanup steps, and report failures after cleanup. Broken service teardown no longer prevents hook/config/launcher removal or restores a partially removed installation on the next run. Memory databases and encryption metadata remain untouched.
+
 ## 0.8.0
 
 - Remove the Kimi Code and DeepSeek Harness integrations. Existing databases that captured sessions from either tool continue to open; those rows are retained but neither tool is installed, captured, or served going forward by [@aldanux](https://github.com/aldanux) in [#113](https://github.com/aldanux/elepha/pull/113)
