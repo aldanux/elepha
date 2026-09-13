@@ -167,7 +167,7 @@ describe('elepha install progress', () => {
 });
 
 describe('installation database lifetime', () => {
-    it.each(['install', 'uninstall'])('closes the consent reader before %s changes the service', async (command) => {
+    it.each(['install'])('closes the consent reader before %s changes the service', async (command) => {
         const operation = command === 'install' ? mocks.installElepha : mocks.uninstallElepha;
         operation.mockImplementationOnce(() => {
             expect(mocks.db.open).toBe(false);
@@ -180,6 +180,24 @@ describe('installation database lifetime', () => {
         expect(mocks.db.close).toHaveBeenCalledOnce();
         expect(mocks.db.open).toBe(false);
         expect(process.exitCode).toBeUndefined();
+    });
+
+    it('uninstalls without opening the database and reports all cleanup failures', async () => {
+        mocks.openDb.mockRejectedValue(new Error('database unavailable'));
+        mocks.uninstallElepha.mockReturnValueOnce({
+            ...installationResult(),
+            warnings: ['broken global'],
+            failures: ['stop failed', 'config failed'],
+        });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        await installProgram().parseAsync(['node', 'elepha', 'uninstall']);
+        expect(mocks.openDb).not.toHaveBeenCalled();
+        expect(mocks.countApproved).not.toHaveBeenCalled();
+        expect(mocks.uninstallElepha).toHaveBeenCalledWith(undefined, { approvedRoots: 0 });
+        expect(warn).toHaveBeenCalledWith('broken global');
+        expect(error.mock.calls).toEqual([['stop failed'], ['config failed']]);
+        expect(process.exitCode).toBe(1);
     });
 
     it('closes the consent reader before restoring the service after a failed read', async () => {

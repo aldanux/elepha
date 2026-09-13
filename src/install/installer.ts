@@ -14,6 +14,7 @@ import {
 import { transformClaudeHook, transformCodexHook } from '../hooks/installer.js';
 import { transformClaudeMcp, transformCodexMcp, transformOpencodeMcp } from '../mcp/installer.js';
 import { SUPPORTED_TOOLS, TOOL_METADATA } from '../types/index.js';
+import { attemptCleanup } from '../util/error.js';
 import { atomicWrite } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
 import {
@@ -424,101 +425,130 @@ export function serviceArtifactsMatchOrWrite(service: ServiceBackend, renderedLa
     return service.installationMatches(renderedLauncher);
 }
 
-export function uninstallElepha(inputPaths: InstallPaths | undefined, runtime: InstallRuntime): InstallationResult;
+export interface UninstallationResult extends InstallationResult {
+    warnings: string[];
+    failures: string[];
+}
+
+export function uninstallElepha(inputPaths: InstallPaths | undefined, runtime: InstallRuntime): UninstallationResult;
 export function uninstallElepha(
     inputPaths: InstallPaths = paths(),
     runtime: InstallRuntime = missingApprovedRoots('uninstallElepha'),
-): InstallationResult {
+): UninstallationResult {
     const platform = runtime.platform ?? process.platform;
     if (!isSupportedPlatform(platform)) {
         throw new Error('elepha uninstall is supported on macOS and Linux.');
     }
-    const resolved = resolveInstalledElephaBin();
+    const warnings: string[] = [];
+    const failures: string[] = [];
+    const resolved = attemptCleanup(warnings, 'Installed binary unavailable; continuing cleanup', resolveInstalledElephaBin);
     const manageService = isDefaultPaths(inputPaths) || runtime.service !== undefined;
-    const service = manageService ? (runtime.service ?? serviceBackend({ platform, home: runtime.home })) : undefined;
+    const service = manageService
+        ? attemptCleanup(failures, 'Locate service', () => runtime.service ?? serviceBackend({ platform, home: runtime.home }))
+        : undefined;
+    const launcher =
+        service?.launcherPath ??
+        resolved?.bin ??
+        path.join(runtime.home ? path.join(runtime.home, '.elepha') : elephaHome(), 'bin', 'elepha');
     if (service) {
-        replayRollbackJournal(service);
+        // Recover interrupted install files without restarting a possibly broken daemon.
+        const journal = attemptCleanup(failures, 'Read install recovery journal', () => readRollbackJournal(service.transactionPath));
+        for (const snapshot of journal?.files ?? []) {
+            attemptCleanup(failures, `Recover ${snapshot.file}`, () => writeSnapshotFile(snapshot));
+        }
+        attemptCleanup(failures, 'Remove install recovery journal', () => removeRollbackJournal(service.transactionPath));
     }
-    const launcher = service?.launcherPath ?? resolved.bin;
-    const before = {
-        claudeSettings: text(inputPaths.claudeSettings),
-        claudeMcp: text(inputPaths.claudeMcp),
-        codex: text(inputPaths.codexConfig),
-        opencode: text(inputPaths.opencodeConfig),
-        opencodePlugin: readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
-    };
     const snapshots = installSnapshotsDirectory(runtime);
     const uninstallConfigs = [
         {
             file: inputPaths.claudeSettings,
-            current: before.claudeSettings,
             validate: validateJson('Claude settings.json'),
             remove: (current: string) => transformClaudeHook(current, launcher, true),
         },
         {
             file: inputPaths.claudeMcp,
-            current: before.claudeMcp,
             validate: validateJson('Claude ~/.claude.json'),
             remove: (current: string) => transformClaudeMcp(current, launcher, true),
         },
         {
             file: inputPaths.codexConfig,
-            current: before.codex,
             validate: validateToml,
             remove: (current: string) =>
                 transformCodexMcp(transformCodexHook(current, launcher, true, inputPaths.codexConfig), launcher, true),
         },
         {
             file: inputPaths.opencodeConfig,
-            current: before.opencode,
             validate: validateJson('OpenCode opencode.json'),
             remove: (current: string) => transformOpencodeMcp(current, launcher, true, opencodePluginPath(inputPaths.opencodeConfig)),
         },
     ];
-    const changes = uninstallConfigs.flatMap<ConfigChange>(({ file, current, validate, remove }) => {
-        if (!existsSync(file) && !hasInstallSnapshot(file, snapshots)) {
-            return [];
-        }
-        const restore = restoreInstallSnapshot(file, current, snapshots);
-        if (restore?.kind === 'delete') {
-            return [{ kind: 'delete' as const, file }];
-        }
-        const restored = restore?.kind === 'text' ? restore.text : current;
-        return [{ kind: 'write' as const, file, text: remove(restored), validate }];
-    });
-    if (ownsOpencodePlugin(before.opencodePlugin)) {
-        changes.push({ kind: 'delete', file: opencodePluginPath(inputPaths.opencodeConfig) });
-    }
-    if (service) {
-        writeRollbackJournal(service.transactionPath, {
-            version: 1,
-            files: snapshotFiles([...changes.map((change) => change.file), ...service.artifactPaths]),
-            service: service.status(),
+    const changes: ConfigChange[] = [];
+    for (const { file, validate, remove } of uninstallConfigs) {
+        attemptCleanup(failures, `Prepare ${file}`, () => {
+            if (!existsSync(file) && !hasInstallSnapshot(file, snapshots)) {
+                return;
+            }
+            const current = text(file);
+            const restore = restoreInstallSnapshot(file, current, snapshots);
+            changes.push(
+                restore?.kind === 'delete'
+                    ? { kind: 'delete', file }
+                    : { kind: 'write', file, text: remove(restore?.kind === 'text' ? restore.text : current), validate },
+            );
         });
     }
-    const transaction = applyConfigTransaction(changes);
-    const changed = transaction !== false;
+    const plugin = opencodePluginPath(inputPaths.opencodeConfig);
+    attemptCleanup(failures, `Inspect ${plugin}`, () => {
+        if (ownsOpencodePlugin(readOpencodePlugin(plugin))) {
+            changes.push({ kind: 'delete', file: plugin });
+        }
+    });
     if (service) {
-        service.stop();
-        service.disable();
-        service.uninstall();
+        attemptCleanup(failures, 'Back up uninstall configuration', () =>
+            writeRollbackJournal(service.transactionPath, {
+                version: 1,
+                files: snapshotFiles([...changes.map((change) => change.file), ...service.artifactPaths]),
+                service: service.status(),
+            }),
+        );
+        attemptCleanup(failures, 'Stop daemon', () => service.stop());
+        attemptCleanup(failures, 'Disable daemon', () => service.disable());
     }
-    deleteInstallSnapshots(
-        changes.map((change) => change.file),
-        snapshots,
-    );
+    let changed = false;
+    for (const change of changes) {
+        attemptCleanup(failures, `Clean ${change.file}`, () => {
+            changed = applyConfigTransaction([change]) !== false || changed;
+            deleteInstallSnapshots([change.file], snapshots);
+        });
+    }
+    let serviceRemoved = false;
     if (service) {
-        removeRollbackJournal(service.transactionPath);
+        serviceRemoved =
+            attemptCleanup(failures, 'Remove service artifacts', () => {
+                service.uninstall();
+                return true;
+            }) === true;
+        // Partial teardown must never be replayed as a request to reinstall hooks or restart capture.
+        attemptCleanup(failures, 'Remove uninstall journal', () => removeRollbackJournal(service.transactionPath));
     }
+    const read = (file: string) => attemptCleanup(failures, `Inspect ${file}`, () => text(file)) ?? '';
     const after = installationStatus(
-        text(inputPaths.claudeSettings),
-        text(inputPaths.claudeMcp),
-        text(inputPaths.codexConfig),
+        read(inputPaths.claudeSettings),
+        read(inputPaths.claudeMcp),
+        read(inputPaths.codexConfig),
         inputPaths.codexConfig,
-        text(inputPaths.opencodeConfig),
+        read(inputPaths.opencodeConfig),
         launcher,
-        detectPresentTools(inputPaths),
-        readOpencodePlugin(opencodePluginPath(inputPaths.opencodeConfig)),
+        attemptCleanup(failures, 'Inspect installed tools', () => detectPresentTools(inputPaths)),
+        attemptCleanup(failures, `Inspect ${plugin}`, () => readOpencodePlugin(plugin)),
     );
-    return { bin: resolved.bin, launcher: service?.launcherPath, changed, status: after, service: service ? 'not installed' : undefined };
+    return {
+        bin: resolved?.bin ?? launcher,
+        launcher: service?.launcherPath,
+        changed,
+        status: after,
+        service: serviceRemoved ? 'not installed' : undefined,
+        warnings,
+        failures,
+    };
 }

@@ -1,7 +1,5 @@
 import type { Command } from 'commander';
 import { uninstallElepha } from '../../install/installer.js';
-import { ConsentStore } from '../../storage/consent-store.js';
-import { openDb } from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
 import { printInstallation } from '../shared.js';
 
@@ -15,16 +13,20 @@ export function registerUninstall(program: Command): void {
     hook.command('uninstall').action(runUninstall);
 }
 
-async function runUninstall(): Promise<void> {
+function runUninstall(): void {
     try {
-        const db = await openDb();
-        let approvedRoots: number;
-        try {
-            approvedRoots = new ConsentStore(db).countApproved();
-        } finally {
-            db.close();
+        // Teardown never starts capture and must work even when the database cannot open.
+        const result = uninstallElepha(undefined, { approvedRoots: 0 });
+        printInstallation(result, 'uninstall');
+        for (const warning of result.warnings) {
+            console.warn(warning);
         }
-        printInstallation(uninstallElepha(undefined, { approvedRoots }), 'uninstall');
+        for (const failure of result.failures) {
+            console.error(failure);
+        }
+        if (result.failures.length > 0) {
+            process.exitCode = 1;
+        }
     } catch (error) {
         console.error(errorMessage(error));
         process.exitCode = 1;

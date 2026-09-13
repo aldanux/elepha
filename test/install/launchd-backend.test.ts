@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS, DAEMON_OUTPUT_MAX_CHARS } from '../../src/config/constants.js';
@@ -43,6 +43,19 @@ class FakeLaunchctl implements LaunchctlExecutor {
 }
 
 describe('daemon service ownership', () => {
+    it('removes the other artifacts even when one artifact cannot be unlinked', () => {
+        const home = withTempDir('elepha-launchd-cleanup-');
+        const paths = defaultLaunchdServicePaths(home);
+        const service = new LaunchdBackend(paths, new FakeLaunchctl());
+        service.install('#!/bin/sh\n', { kind: 'standalone', command: '/usr/bin/elepha', node: '/usr/bin/node' });
+        // A directory at the launcher path makes unlink fail without platform-specific permission tricks.
+        unlinkSync(paths.launcher);
+        mkdirSync(paths.launcher);
+        expect(() => service.uninstall()).toThrow(`Remove ${paths.launcher}`);
+        expect(existsSync(paths.state)).toBe(false);
+        expect(existsSync(paths.plist)).toBe(false);
+    });
+
     it('requires an explicit launchctl executor at construction', () => {
         const constructWithoutExecutor = () => {
             // @ts-expect-error The real launchctl executor must never be an implicit test fallback.

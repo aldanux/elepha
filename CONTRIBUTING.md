@@ -41,6 +41,8 @@ cd elepha
 npm install
 ```
 
+See [DEVELOPMENT.md](DEVELOPMENT.md) for Node setup and the one-command global dev install.
+
 ## Reporting bugs
 
 Search GitHub Issues before filing a report so you do not duplicate an existing issue.

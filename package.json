@@ -48,6 +48,7 @@
         "prepublishOnly": "npm run build",
         "build": "tsc -p tsconfig.json",
         "dev": "tsx watch src/cli/index.ts",
+        "dev:install": "node scripts/dev-install.mjs",
         "start": "node dist/cli/index.js",
         "test": "vitest run",
         "typecheck": "tsc --noEmit",
