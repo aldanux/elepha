@@ -155,7 +155,7 @@ export async function main() {
     if (backend.kind === 'asdf') await run(backend.command, ['reshim', 'nodejs']);
     // Prefer the package just installed even if PATH still contains an older launcher or global.
     await run(globalBin, ['install']);
-    await run(globalBin, ['doctor']);
+    await run(globalBin, ['doctor'], { allowFailure: true });
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === script) {
