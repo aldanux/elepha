@@ -1,41 +1,28 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { parse } from 'smol-toml';
-import {
-    claudeMcpPath,
-    codexConfigPath,
-    kimiConfigTomlPath,
-    kimiMcpPath,
-    opencodeConfigPath,
-    opencodePluginPath,
-} from '../config/paths.js';
+import { claudeMcpPath, codexConfigPath, opencodeConfigPath, opencodePluginPath } from '../config/paths.js';
 import {
     hasClaudeMcp,
     hasCodexMcp,
-    hasKimiMcp,
     hasOpencodeMcp,
     ownsCodexMcp,
     transformClaudeMcp,
     transformCodexMcp,
-    transformKimiMcp,
     transformOpencodeMcp,
 } from '../mcp/installer.js';
 import { applyConfigTransaction, type ConfigChange, type ConfigOriginal } from './config-file.js';
-import { kimiHookStatus, transformKimiHook } from './kimi-hook.js';
 import { opencodePluginStatus, transformOpencodePlugin } from './opencode-plugin.js';
 
 export interface IntegrationPaths {
     claudeMcp: string;
     codexConfig: string;
     opencodeConfig: string;
-    kimiMcp: string;
 }
 
 export interface IntegrationSources {
     claudeMcp?: string;
     codexConfig?: string;
     opencodeConfig?: string;
-    kimiMcp?: string;
-    kimiConfig?: string;
     opencodePlugin?: string;
 }
 
@@ -53,7 +40,7 @@ export interface IntegrationRefresh {
 }
 
 export function integrationPaths(): IntegrationPaths {
-    return { claudeMcp: claudeMcpPath(), codexConfig: codexConfigPath(), opencodeConfig: opencodeConfigPath(), kimiMcp: kimiMcpPath() };
+    return { claudeMcp: claudeMcpPath(), codexConfig: codexConfigPath(), opencodeConfig: opencodeConfigPath() };
 }
 
 // Installation and refresh share rendering and validation. Refresh only admits
@@ -63,7 +50,7 @@ export function planIntegrations(
     sources: IntegrationSources,
     launcher: string,
     mode: 'install' | 'refresh',
-    selected = { claude: true, codex: true, opencode: true, kimi: true },
+    selected = { claude: true, codex: true, opencode: true },
 ): { changes: ConfigChange[]; skipped: IntegrationNotice[] } {
     const pluginPath = opencodePluginPath(paths.opencodeConfig);
     const entries = [
@@ -112,24 +99,6 @@ export function planIntegrations(
                 }
             },
         },
-        {
-            selected: selected.kimi,
-            integration: 'Kimi Code MCP',
-            file: paths.kimiMcp,
-            source: sources.kimiMcp,
-            status: () => hasKimiMcp(sources.kimiMcp ?? '', launcher),
-            render: (source: string | undefined) => transformKimiMcp(source ?? '', launcher),
-            validate: JSON.parse,
-        },
-        {
-            selected: selected.kimi,
-            integration: 'Kimi Code hook',
-            file: kimiConfigTomlPath(paths.kimiMcp),
-            source: sources.kimiConfig,
-            status: () => kimiHookStatus(sources.kimiConfig ?? '', launcher),
-            render: (source: string | undefined) => transformKimiHook(source ?? '', launcher),
-            validate: parse,
-        },
     ];
     const changes: ConfigChange[] = [];
     const skipped: IntegrationNotice[] = [];
@@ -172,8 +141,6 @@ export function reconcileOwnedIntegrations(launcher: string, paths: IntegrationP
         return readFileSync(file, 'utf8');
     };
     const sources = {
-        kimiMcp: read(paths.kimiMcp, 'Kimi Code MCP'),
-        kimiConfig: read(kimiConfigTomlPath(paths.kimiMcp), 'Kimi Code hook'),
         claudeMcp: read(paths.claudeMcp, 'Claude MCP'),
         codexConfig: read(paths.codexConfig, 'Codex MCP'),
         opencodeConfig: read(paths.opencodeConfig, 'OpenCode MCP'),

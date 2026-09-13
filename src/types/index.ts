@@ -5,14 +5,13 @@ export const TOOL_METADATA = {
     'claude-code': { displayName: 'Claude Code' },
     codex: { displayName: 'Codex' },
     opencode: { displayName: 'OpenCode' },
-    kimi: { displayName: 'Kimi Code' },
 } as const;
 
 export type ToolName = keyof typeof TOOL_METADATA;
 export type SessionAdapterTool = Exclude<ToolName, 'opencode'>;
 
 export const SUPPORTED_TOOLS = Object.keys(TOOL_METADATA) as ToolName[];
-export const SESSION_ADAPTER_TOOLS = ['claude-code', 'codex', 'kimi'] as const satisfies readonly SessionAdapterTool[];
+export const SESSION_ADAPTER_TOOLS = ['claude-code', 'codex'] as const satisfies readonly SessionAdapterTool[];
 
 export function isToolName(value: unknown): value is ToolName {
     return SUPPORTED_TOOLS.includes(value as ToolName);
@@ -184,7 +183,7 @@ export interface SessionAdapter {
     parseTurns(filePath: string, sinceCursor?: string, options?: ParseTurnsOptions): AsyncIterable<ParsedTurn>;
 }
 
-export type SessionAdapterMap = Record<Exclude<SessionAdapterTool, 'kimi'>, SessionAdapter> & Partial<Record<'kimi', SessionAdapter>>;
+export type SessionAdapterMap = Record<SessionAdapterTool, SessionAdapter>;
 
 export interface OpenedSessionRow {
     sessionId: string;

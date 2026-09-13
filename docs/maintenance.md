@@ -21,8 +21,8 @@ presented as a successful update.
 Because `elepha self-update` reinstalls the hooks, Codex requires approval again. Open
 Codex, run `/hooks`, and approve both elepha hooks; until then, `elepha doctor` reports
 `Codex hooks: approval is required` and Codex sessions are not captured. This is
-expected Codex security behavior, not a failed update. Claude Code and Kimi Code
-reactivate their hooks automatically.
+expected Codex security behavior, not a failed update. Claude Code reactivates its hooks
+automatically.
 
 ## Advanced operator commands
 

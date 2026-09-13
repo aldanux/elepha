@@ -9,9 +9,8 @@ import { HOOK_PAYLOAD_MAX_CHARS } from '../config/constants.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import type { SessionAdapterTool } from '../types/index.js';
-import { normalizeKimiPrompt } from './kimi.js';
 
-export type HookTool = SessionAdapterTool | 'opencode' | 'kimi';
+export type HookTool = SessionAdapterTool | 'opencode';
 export type HookSource = 'startup' | 'clear' | 'resume' | 'compact';
 
 interface CommonHookPayload {
@@ -35,7 +34,7 @@ export interface UserPromptSubmitPayload extends CommonHookPayload {
 export type HookPayload = SessionStartPayload | UserPromptSubmitPayload;
 
 export function isHookTool(value: unknown): value is HookTool {
-    return value === 'claude-code' || value === 'codex' || value === 'opencode' || value === 'kimi';
+    return value === 'claude-code' || value === 'codex' || value === 'opencode';
 }
 
 export function parsePayload(raw: string, tool: HookTool, event: 'SessionStart'): SessionStartPayload | undefined;
@@ -55,13 +54,6 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
         return undefined;
     }
     const payload = value as Record<string, unknown>;
-    if (tool === 'kimi') {
-        if (event === 'SessionStart' || (payload.hook_event_name !== undefined && payload.hook_event_name !== 'UserPromptSubmit')) {
-            return undefined;
-        }
-        payload.prompt = normalizeKimiPrompt(payload.prompt);
-        payload.hook_event_name = 'UserPromptSubmit';
-    }
     if (
         typeof payload.session_id !== 'string' ||
         payload.session_id.length === 0 ||

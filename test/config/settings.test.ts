@@ -23,7 +23,6 @@ describe('settings', () => {
             { key: 'capture-claude-code', value: true, source: 'default' },
             { key: 'capture-codex', value: true, source: 'default' },
             { key: 'capture-opencode', value: true, source: 'default' },
-            { key: 'capture-kimi', value: true, source: 'default' },
             { key: 'durable-capture', value: false, source: 'default' },
             { key: 'query-matching', value: 'strict', source: 'default' },
         ]);
@@ -67,7 +66,6 @@ describe('settings', () => {
             expect(listSettings({ ELEPHA_NO_UPDATE_CHECK: '1' }, configPath())).toEqual([
                 { key: 'query-matching', value: 'strict', source: 'default' },
                 { key: 'durable-capture', value: false, source: 'default' },
-                { key: 'capture-kimi', value: true, source: 'default' },
                 { key: 'capture-opencode', value: true, source: 'default' },
                 { key: 'capture-codex', value: true, source: 'default' },
                 { key: 'capture-claude-code', value: true, source: 'default' },
@@ -176,11 +174,10 @@ describe('settings', () => {
         expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, durableCaptureMaxBytes: 4096 } });
     });
 
-    it('rejects disabling all four capture tools without changing the final config write', () => {
+    it('rejects disabling all three capture tools without changing the final config write', () => {
         const file = configPath();
         setSetting('capture-claude-code', 'off', file);
         setSetting('capture-codex', 'off', file);
-        setSetting('capture-kimi', 'off', file);
         const before = readFileSync(file, 'utf8');
 
         expect(() => setSetting('capture-opencode', 'off', file)).toThrow('at least one capture tool must remain enabled');
@@ -199,7 +196,7 @@ describe('settings', () => {
         const file = configPath();
 
         expect(() => setSetting('auto-update', 'true', file)).toThrow(
-            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, capture-kimi, durable-capture, query-matching',
+            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, durable-capture, query-matching',
         );
         expect(() => setSetting('update-check', 'yes', file)).toThrow('update-check must be true, false, 1, 0, on, or off');
         expect(() => setSetting('query-matching', 'loose', file)).toThrow('query-matching must be strict or lax');

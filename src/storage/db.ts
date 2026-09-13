@@ -6,6 +6,7 @@ import Database from 'better-sqlite3-multiple-ciphers';
 import { DATABASE_HEADER_BYTES, DURABLE_CAPTURE_STATES } from '../config/constants.js';
 import { elephaHome, samePath } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
+import { SUPPORTED_TOOLS } from '../types/index.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from './consent-store.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from './database-encryption.js';
 import {
@@ -32,6 +33,26 @@ export const SQLITE_SOURCE_WATERMARK_SCHEMA = {
     watermark: 'watermark',
 } as const;
 
+type ToolCheckedTable = 'sessions' | 'shown_session_lists';
+
+function sqlTextLiteral(value: string): string {
+    return `'${value.replaceAll("'", "''")}'`;
+}
+
+function toolCheckClause(tools: readonly string[]): string {
+    return `CHECK (tool IN (${tools.map(sqlTextLiteral).join(',')}))`;
+}
+
+function allowedToolsForTable(db: Database.Database, table: ToolCheckedTable): string[] {
+    const supported = new Set<string>(SUPPORTED_TOOLS);
+    const existing = (db.prepare(`SELECT DISTINCT tool FROM ${table} ORDER BY tool`).all() as Array<{ tool: string }>).map(
+        ({ tool }) => tool,
+    );
+    return [...SUPPORTED_TOOLS, ...existing.filter((tool) => !supported.has(tool))];
+}
+
+const SUPPORTED_TOOL_CHECK = toolCheckClause(SUPPORTED_TOOLS);
+
 const PARANOID_AUTHORITY_SCHEMA = `
 CREATE TABLE IF NOT EXISTS paranoid_authority (
   id             INTEGER PRIMARY KEY CHECK (id = 1),
@@ -57,7 +78,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS sessions (
   id               INTEGER PRIMARY KEY,
-  tool             TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
+  tool             TEXT NOT NULL ${SUPPORTED_TOOL_CHECK},
   native_id        TEXT NOT NULL,
   segment_index    INTEGER NOT NULL DEFAULT 0,
   project_id       INTEGER NOT NULL REFERENCES projects(id),
@@ -201,7 +222,7 @@ CREATE INDEX IF NOT EXISTS idx_injections_session ON injections(tool, native_ses
 -- The ordered session ids behind elepha:resume:<n>. One row is the complete
 -- last list shown to one native chat, including an intentionally empty list.
 CREATE TABLE IF NOT EXISTS shown_session_lists (
-  tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
+  tool              TEXT NOT NULL ${SUPPORTED_TOOL_CHECK},
   native_session_id TEXT NOT NULL,
   session_ids       TEXT NOT NULL,
   PRIMARY KEY (tool, native_session_id)
@@ -479,12 +500,13 @@ function migrateSessionsTable(db: Database.Database): void {
         return; // already migrated (or a fresh DB that got the final SCHEMA directly)
     }
 
+    const toolCheck = toolCheckClause(allowedToolsForTable(db, 'sessions'));
     db.pragma('foreign_keys = OFF');
     const rebuild = db.transaction(() => {
         db.exec(`
       CREATE TABLE sessions_new (
         id               INTEGER PRIMARY KEY,
-        tool             TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
+        tool             TEXT NOT NULL ${toolCheck},
         native_id        TEXT NOT NULL,
         segment_index    INTEGER NOT NULL DEFAULT 0,
         project_id       INTEGER NOT NULL REFERENCES projects(id),
@@ -526,7 +548,8 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
     const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get() as
         | { sql: string }
         | undefined;
-    if (schema?.sql.includes("'kimi'")) {
+    const toolCheck = toolCheckClause(allowedToolsForTable(db, 'sessions'));
+    if (schema?.sql.includes(toolCheck)) {
         return;
     }
 
@@ -535,7 +558,7 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
         db.exec(`
           CREATE TABLE sessions_new (
             id                  INTEGER PRIMARY KEY,
-            tool                TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
+            tool                TEXT NOT NULL ${toolCheck},
             native_id           TEXT NOT NULL,
             segment_index       INTEGER NOT NULL DEFAULT 0,
             project_id          INTEGER NOT NULL REFERENCES projects(id),
@@ -583,14 +606,15 @@ function migrateShownSessionListsToolConstraint(db: Database.Database): void {
     const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shown_session_lists'").get() as
         | { sql: string }
         | undefined;
-    if (schema?.sql.includes("'kimi'")) {
+    const toolCheck = toolCheckClause(allowedToolsForTable(db, 'shown_session_lists'));
+    if (schema?.sql.includes(toolCheck)) {
         return;
     }
 
     const rebuild = db.transaction(() => {
         db.exec(`
           CREATE TABLE shown_session_lists_new (
-            tool              TEXT NOT NULL CHECK (tool IN ('claude-code','codex','opencode','kimi')),
+            tool              TEXT NOT NULL ${toolCheck},
             native_session_id TEXT NOT NULL,
             session_ids       TEXT NOT NULL,
             PRIMARY KEY (tool, native_session_id)
@@ -790,7 +814,7 @@ async function openManagedDatabaseAtPinnedPath(dbPath: string, options: ManagedD
     if (dbPath === ':memory:') {
         return new Database(dbPath);
     }
-    const sharedLease = options.lifecycle === undefined ? acquireSharedDatabaseLifecycle(dbPath) : undefined;
+    const sharedLease = options.lifecycle === undefined ? acquireSharedDatabaseLifecycle(dbPath, true) : undefined;
     let leaseAttached = false;
     let db: Database.Database | undefined;
     let key: Buffer | undefined;
@@ -831,6 +855,7 @@ async function openManagedDatabaseAtPinnedPath(dbPath: string, options: ManagedD
         }
         db.prepare('SELECT name FROM sqlite_master LIMIT 1').get();
         requireManagedDatabaseCheckpointOnClose(db);
+        sharedLease?.completeDeadOwnerRecovery(db);
         if (key === undefined) {
             return db;
         }

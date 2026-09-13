@@ -4,7 +4,6 @@ import type Database from 'better-sqlite3-multiple-ciphers';
 import { CAPTURE_PAUSE_DEADLINE_MS, CAPTURE_PAUSE_POLL_MS } from '../config/constants.js';
 import { daemonHealth } from '../install/health-checks.js';
 import type { installElepha } from '../install/installer.js';
-import { formatKimiMcpStatus } from '../install/status.js';
 import { backupDatabaseAndReport } from '../storage/backup.js';
 import { defaultDbPath } from '../storage/db.js';
 import type { PurgePlan } from '../storage/memory-store.js';
@@ -44,8 +43,6 @@ export function printInstallation(result: ReturnType<typeof installElepha>, acti
     console.log(`Codex hook: ${result.status.codexHook}`);
     console.log(`Codex UserPromptSubmit hook: ${result.status.codexUserPromptSubmitHook}`);
     console.log(`Codex MCP: ${result.status.codexMcp}`);
-    console.log(formatKimiMcpStatus(result.status.kimiMcp));
-    console.log(`Kimi Code UserPromptSubmit hook: ${result.status.kimiHook}`);
     console.log(`OpenCode MCP: ${result.status.opencodeMcp}`);
     console.log(`OpenCode plugin: ${result.status.opencodePlugin}`);
     if (

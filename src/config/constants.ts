@@ -140,7 +140,6 @@ export const HOOK_PAYLOAD_MAX_CHARS = 64 * 1024;
 export const HOOK_LOG_LINE_MAX_CHARS = 500;
 export const HOOK_LOG_MAX_BYTES = 5 * 1024 * 1024;
 export const INSTALLED_HOOK_TIMEOUT_SECONDS = 5;
-export const KIMI_HOOK_OUTPUT_MAX_BYTES = 1024 * 1024;
 export const OPENCODE_PLUGIN_OUTPUT_MAX_BYTES = 1024 * 1024;
 
 // Synthesis
@@ -180,8 +179,3 @@ export const PLIST_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 export const SYSTEMD_SERVICE_NAME = 'elepha.service';
 export const SYSTEMD_RESTART_SECONDS = 30;
 export const SYSTEMD_UMASK = '0077';
-
-// Retain the newest text while reducing a multi-step provider turn.
-export const KIMI_TURN_TEXT_CHARS = 2 * 1024 * 1024;
-export const KIMI_OMITTED_TEXT = '[elepha: oldest turn text omitted at the capture limit]';
-export const KIMI_MAX_MODEL_ALIASES = 64;

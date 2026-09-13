@@ -195,16 +195,7 @@ describe('OpenCode plugin ownership and health', () => {
     it('requires the plugin only when OpenCode is present', () => {
         const mcp = transformOpencodeMcp('', launcher);
         const status = (source: string | undefined, present = true) =>
-            installationStatus(
-                '',
-                '',
-                '',
-                '/config.toml',
-                mcp,
-                launcher,
-                { claude: false, codex: false, opencode: present, kimi: false },
-                source,
-            );
+            installationStatus('', '', '', '/config.toml', mcp, launcher, { claude: false, codex: false, opencode: present }, source);
         expect(status(undefined).ready).toBe(false);
         expect(status(renderOpencodePlugin('/old/bin')).ready).toBe(false);
         expect(status(renderOpencodePlugin(launcher)).ready).toBe(true);

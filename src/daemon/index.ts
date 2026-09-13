@@ -22,7 +22,6 @@ import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
 import { sessionAdapterFor } from '../adapters/index.js';
-import { KimiCodeAdapter } from '../adapters/kimi-code.js';
 import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
@@ -49,7 +48,6 @@ import {
     isReadableProviderSource,
     isRefusedProjectRoot,
     isWithin,
-    kimiSessionsRoot,
     opencodeDbPath,
     opencodeStoreRoot,
     samePath,
@@ -151,9 +149,6 @@ export function deduplicateDaemonUnknownLineWarnings(
 // whatever the environment looked like at import time.
 export function watchRoots(): string[] {
     const roots = [claudeProjectsRoot(), codexSessionsRoot()];
-    if (existsSync(kimiSessionsRoot())) {
-        roots.push(kimiSessionsRoot());
-    }
     const opencodeRoot = opencodeStoreRoot();
     if (existsSync(opencodeRoot)) {
         roots.push(opencodeRoot);
@@ -238,7 +233,6 @@ export class IngestionDaemon {
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
     private readonly captureOpencode: boolean;
-    private readonly captureKimi: boolean;
     private readonly durableCapture: boolean;
     private readonly durableCaptureMaxBytes: number;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
@@ -292,7 +286,6 @@ export class IngestionDaemon {
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
         this.captureOpencode = configResult.config.captureOpencode ?? true;
-        this.captureKimi = configResult.config.captureKimi ?? true;
         this.durableCapture = configResult.config.durableCapture ?? false;
         this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
         this.store = options.store;
@@ -300,11 +293,7 @@ export class IngestionDaemon {
         this.summarizer = options.summarizer;
         const warnUnknownLine = deduplicateDaemonUnknownLineWarnings(this.log);
         this.warnDeduplicated = warnUnknownLine;
-        this.adapters = options.adapters ?? [
-            new ClaudeCodeAdapter(warnUnknownLine),
-            new CodexAdapter(warnUnknownLine),
-            new KimiCodeAdapter(warnUnknownLine),
-        ];
+        this.adapters = options.adapters ?? [new ClaudeCodeAdapter(warnUnknownLine), new CodexAdapter(warnUnknownLine)];
         this.opencodeAdapter = new OpencodeAdapter(warnUnknownLine);
         this.idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
         this.workQueue = new WorkQueue(options.maxConcurrentSummaries ?? DEFAULT_MAX_CONCURRENT, this.log, this.logError);
@@ -750,8 +739,7 @@ export class IngestionDaemon {
         if (!adapter) {
             return undefined;
         }
-        const enabled =
-            adapter.tool === 'kimi' ? this.captureKimi : adapter.tool === 'claude-code' ? this.captureClaudeCode : this.captureCodex;
+        const enabled = adapter.tool === 'claude-code' ? this.captureClaudeCode : this.captureCodex;
         if (!enabled) {
             const skipped = this.recordSkippedFile(
                 filePath,

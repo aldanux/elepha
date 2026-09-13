@@ -630,6 +630,115 @@ setInterval(() => void database, 1000);`;
         }
     });
 
+    it('recovers committed encrypted WAL data before reclaiming a killed shared owner', async () => {
+        const directory = withGrantableTestDir('elepha-database-lifecycle-killed-shared-wal-recovery-');
+        const databasePath = path.join(directory, 'elepha.db');
+        const keyPath = path.join(directory, 'database.key');
+        const key = Buffer.alloc(32, 7);
+        const runtime: DatabaseEncryptionRuntime = {
+            platform: 'linux',
+            env: { CI: '1' },
+            keyFilePath: () => keyPath,
+            randomBytes: () => Buffer.from(key),
+            randomUUID: () => '55555555-5555-4555-8555-555555555555',
+        };
+        const seeded = await openDb(databasePath, { encryption: runtime });
+        seeded.close();
+        const source = `import { statSync } from 'node:fs';
+const { openManagedDatabase } = await import(${JSON.stringify(dbModule)});
+const database = await openManagedDatabase(${JSON.stringify(databasePath)}, {
+    fileMustExist: true,
+    encryption: { platform: 'linux', env: { CI: '1' }, keyFilePath: () => ${JSON.stringify(keyPath)} },
+});
+database.pragma('wal_autocheckpoint = 0');
+const changes = database.prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)')
+    .run('codex', 'committed-before-sigkill', '2026-09-12T00:00:00.000Z').changes;
+process.send?.({ type: 'held', changes, walBytes: statSync(${JSON.stringify(`${databasePath}-wal`)}).size });
+setInterval(() => void database, 1000);`;
+        const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', source], {
+            cwd: repositoryRoot,
+            env: process.env,
+            stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+        });
+        let stderr = '';
+        child.stderr?.setEncoding('utf8');
+        child.stderr?.on('data', (chunk: string) => {
+            stderr += chunk;
+        });
+        const observed = { child, stderr: () => stderr };
+
+        try {
+            const write = await receiveChildMessage<{ type: 'held'; changes: number; walBytes: number }>(observed);
+            expect(write.changes).toBe(1);
+            expect(write.walBytes).toBeGreaterThan(0);
+            await killOwner(child);
+
+            const recovered = await openManagedDatabase(databasePath, { fileMustExist: true, encryption: runtime });
+            expect(
+                recovered.prepare("SELECT native_id FROM purged_transcripts WHERE native_id = 'committed-before-sigkill'").get(),
+            ).toEqual({ native_id: 'committed-before-sigkill' });
+            expect(readdirSync(databaseLifecyclePaths(databasePath).leases)).toHaveLength(1);
+            expect(statSync(`${databasePath}-wal`).size).toBe(0);
+            recovered.close();
+            expect(readdirSync(databaseLifecyclePaths(databasePath).leases)).toEqual([]);
+
+            const verified = openKeyedDatabase(databasePath, key, { readonly: true, fileMustExist: true });
+            try {
+                expect(
+                    verified.prepare("SELECT native_id FROM purged_transcripts WHERE native_id = 'committed-before-sigkill'").get(),
+                ).toEqual({ native_id: 'committed-before-sigkill' });
+            } finally {
+                verified.close();
+            }
+        } finally {
+            await killOwner(child);
+        }
+    });
+
+    it.each(['symlink', 'inode-change'] as const)('rejects a %s WAL companion from a killed shared owner', async (change) => {
+        const fixture = createTestDb(`elepha-database-lifecycle-killed-shared-${change}-`);
+        fixture.close();
+        const walPath = `${fixture.dbPath}-wal`;
+        const substitute = path.join(fixture.directory, 'substitute-wal');
+        const child = await spawnOwner(fixture.dbPath, 'shared');
+        const paths = databaseLifecyclePaths(fixture.dbPath);
+        await killOwner(child);
+        writeFileSync(substitute, 'not a SQLite WAL');
+
+        const mutableFs = createRequire(import.meta.url)('node:fs') as typeof import('node:fs');
+        const originalLstatSync = mutableFs.lstatSync;
+        let substituted = false;
+        if (change === 'symlink') {
+            if (existsSync(walPath)) {
+                unlinkSync(walPath);
+            }
+            symlinkSync(substitute, walPath);
+        } else {
+            mutableFs.lstatSync = ((file, options) => {
+                if (!substituted && file === walPath) {
+                    renameSync(substitute, walPath);
+                    substituted = true;
+                }
+                return originalLstatSync(file, options as never);
+            }) as typeof import('node:fs').lstatSync;
+            syncBuiltinESMExports();
+        }
+
+        try {
+            await expect(openManagedDatabase(fixture.dbPath, { fileMustExist: true })).rejects.toThrow(
+                `${DATABASE_LIFECYCLE_AMBIGUOUS}: killed shared database companion`,
+            );
+            expect(readdirSync(paths.leases)).toHaveLength(1);
+        } finally {
+            mutableFs.lstatSync = originalLstatSync;
+            syncBuiltinESMExports();
+            await killOwner(child);
+            for (const owner of readdirSync(paths.leases)) {
+                unlinkSync(path.join(paths.leases, owner));
+            }
+        }
+    });
+
     it.each(['shared', 'exclusive'] as const)('inspects the physical WAL after a killed %s symlink opener', async (kind) => {
         const fixture = createTestDb('elepha-database-lifecycle-killed-symlink-wal-');
         const replacement = createTestDb('elepha-database-lifecycle-killed-symlink-wal-replacement-');

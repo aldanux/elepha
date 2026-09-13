@@ -10,8 +10,6 @@ import {
     isRefusedProjectRoot,
     isWithin,
     isWithinProviderStore,
-    kimiConfigDir,
-    kimiMcpPath,
     opencodeConfigDir,
     opencodeConfigPath,
     opencodeDbPath,
@@ -147,21 +145,5 @@ describe('provider transcript stores', () => {
 
         expect(opencodeConfigDir()).toBe(path.join(homedir(), '.config', 'opencode'));
         expect(opencodeConfigPath()).toBe(path.join(homedir(), '.config', 'opencode', 'opencode.json'));
-    });
-});
-
-describe('Kimi Code configuration paths', () => {
-    it('uses the documented user home by default and for an empty override', () => {
-        delete process.env.KIMI_CODE_HOME;
-        expect(kimiConfigDir()).toBe(path.join(homedir(), '.kimi-code'));
-        expect(kimiMcpPath()).toBe(path.join(homedir(), '.kimi-code', 'mcp.json'));
-        process.env.KIMI_CODE_HOME = '';
-        expect(kimiConfigDir()).toBe(path.join(homedir(), '.kimi-code'));
-    });
-
-    it('resolves an overridden home without using the project registry', () => {
-        process.env.KIMI_CODE_HOME = '.test-scratch/kimi-user';
-        expect(kimiConfigDir()).toBe(path.resolve('.test-scratch/kimi-user'));
-        expect(kimiMcpPath()).toBe(path.resolve('.test-scratch/kimi-user/mcp.json'));
     });
 });

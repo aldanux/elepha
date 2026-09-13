@@ -17,9 +17,7 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
-    HOOK_PAYLOAD_MAX_CHARS,
     INSTALLED_HOOK_TIMEOUT_SECONDS,
-    KIMI_HOOK_OUTPUT_MAX_BYTES,
     LEGACY_MCP_INSPECTION_MAX_BYTES,
     LEGACY_MCP_INSPECTION_TIMEOUT_MS,
     NPM_INSTALL_TIMEOUT_MS,
@@ -28,47 +26,9 @@ import {
     SYSTEMD_SERVICE_NAME,
 } from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
-import { quotePosix } from '../install/binary.js';
 import type { LauncherBackend } from '../install/launcher.js';
-import { KIMI_HOOK_MARKER } from '../install/markers.js';
 
 export const OPENCODE_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'opencode'] as const;
-export const KIMI_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'kimi'] as const;
-
-// Kimi's config command is a shell string. Only this fixed, quoted client and
-// installation paths enter it; all event data crosses the child boundary on stdin.
-export function renderKimiHookClient(launcher: string): string {
-    if (!path.isAbsolute(launcher)) {
-        throw new Error('Kimi hook launcher must be an absolute path');
-    }
-    return `${KIMI_HOOK_MARKER}
-import { execFileSync } from 'node:child_process';
-const launcher = ${JSON.stringify(launcher)};
-async function runHook() {
-    let input = '';
-    process.stdin.setEncoding('utf8');
-    for await (const chunk of process.stdin) {
-        if (input.length + chunk.length > ${HOOK_PAYLOAD_MAX_CHARS}) return;
-        input += chunk;
-    }
-    const output = execFileSync(launcher, ${JSON.stringify(KIMI_HOOK_ARGS)}, {
-        shell: false,
-        input,
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
-        killSignal: 'SIGKILL',
-        maxBuffer: ${KIMI_HOOK_OUTPUT_MAX_BYTES},
-    });
-    process.stdout.write(output);
-}
-await runHook().catch(() => {});
-`;
-}
-
-export function renderKimiHookCommand(launcher: string): string {
-    return `${quotePosix(process.execPath)} --input-type=module -e ${quotePosix(renderKimiHookClient(launcher))}`;
-}
 
 // This client runs inside OpenCode. Only the trusted installed launcher is
 // baked into its code; project directory, session ID, and prompt stay on stdin.

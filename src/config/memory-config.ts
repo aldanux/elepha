@@ -9,7 +9,6 @@ export interface MemoryConfig {
     captureClaudeCode?: boolean;
     captureCodex?: boolean;
     captureOpencode?: boolean;
-    captureKimi?: boolean;
     durableCapture?: boolean;
     durableCaptureMaxBytes?: number;
 }
@@ -18,7 +17,6 @@ export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
     captureClaudeCode: true,
     captureCodex: true,
     captureOpencode: true,
-    captureKimi: true,
     durableCapture: false,
     durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };
@@ -52,9 +50,6 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
     }
     if (typeof settings['capture-opencode'] === 'boolean') {
         output.captureOpencode = settings['capture-opencode'];
-    }
-    if (typeof settings['capture-kimi'] === 'boolean') {
-        output.captureKimi = settings['capture-kimi'];
     }
     if (typeof settings['durable-capture'] === 'boolean') {
         output.durableCapture = settings['durable-capture'];

@@ -28,7 +28,6 @@ import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookTool, parsePayload, readStdin, type UserPromptSubmitPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
-import { kimiCommandBody, kimiOutput } from './kimi.js';
 import { recordHookOutput } from './output.js';
 import { withDaemonHealthWarning, withUpdateNotice } from './session-start.js';
 
@@ -257,7 +256,7 @@ export async function runUserPromptSubmit(
                 tool,
                 nativeSessionId: payload.session_id,
                 injectedAt: new Date(clock()).toISOString(),
-                body: tool === 'kimi' ? kimiCommandBody(body, command) : body,
+                body,
                 kind: 'brief',
                 writeInjection: dependencies.writeInjection,
             });
@@ -265,7 +264,7 @@ export async function runUserPromptSubmit(
                 log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
                 return { reason: 'injection_record_failed' };
             }
-            return { output: tool === 'kimi' ? kimiOutput(output, command) : envelope(output) };
+            return { output: envelope(output) };
         };
         const locked = (): UserPromptSubmitResult => {
             const result = emit(LOCKED_MEMORY_MESSAGE);

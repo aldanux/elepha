@@ -3,16 +3,15 @@ import { isToolName, SESSION_ADAPTER_TOOLS, SUPPORTED_TOOLS, TOOL_METADATA } fro
 
 describe('tool metadata', () => {
     it('derives the supported tool ids and display names from one registry', () => {
-        expect(SUPPORTED_TOOLS).toEqual(['claude-code', 'codex', 'opencode', 'kimi']);
-        expect(SESSION_ADAPTER_TOOLS).toEqual(['claude-code', 'codex', 'kimi']);
-        expect(SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName)).toEqual(['Claude Code', 'Codex', 'OpenCode', 'Kimi Code']);
+        expect(SUPPORTED_TOOLS).toEqual(['claude-code', 'codex', 'opencode']);
+        expect(SESSION_ADAPTER_TOOLS).toEqual(['claude-code', 'codex']);
+        expect(SUPPORTED_TOOLS.map((tool) => TOOL_METADATA[tool].displayName)).toEqual(['Claude Code', 'Codex', 'OpenCode']);
     });
 
     it('recognizes supported tool ids and rejects an unknown value', () => {
         expect(isToolName('claude-code')).toBe(true);
         expect(isToolName('codex')).toBe(true);
         expect(isToolName('opencode')).toBe(true);
-        expect(isToolName('kimi')).toBe(true);
         expect(isToolName('future-tool')).toBe(false);
     });
 });

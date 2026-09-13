@@ -6,8 +6,6 @@ import {
     codexConfigPath,
     daemonHeartbeatPath,
     elephaLauncherPath,
-    kimiConfigTomlPath,
-    kimiMcpPath,
     opencodeConfigPath,
     opencodePluginPath,
     opencodeStoreRoot,
@@ -86,7 +84,6 @@ export function integrationHealth(
         claudeMcp: claudeMcpPath(),
         codexConfig: codexConfigPath(),
         opencodeConfig: opencodeConfigPath(),
-        kimiMcp: kimiMcpPath(),
         opencodeStore: opencodeStoreRoot(),
     },
 ): IntegrationHealth {
@@ -104,8 +101,6 @@ export function integrationHealth(
             bin,
             present,
             readOpencodePlugin(opencodePluginPath(paths.opencodeConfig)),
-            text(paths.kimiMcp, ''),
-            text(kimiConfigTomlPath(paths.kimiMcp), ''),
         ),
     };
 }
