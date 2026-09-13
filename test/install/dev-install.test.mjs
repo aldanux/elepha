@@ -9,13 +9,14 @@ vi.mock('node:fs', async (original) => {
     const fs = await original();
     return { ...fs, realpathSync: (file) => (file === process.execPath ? mock.execPath : fs.realpathSync(file)) };
 });
+// noinspection JSUnusedGlobalSymbols
 vi.mock('tsx/esm/api', () => ({
     tsImport: async (specifier) =>
         specifier.includes('launcher.ts') ? { detectLauncherBackend: mock.detect } : { elephaLauncherPath: () => mock.launcher },
 }));
 vi.mock('node:child_process', () => ({
     spawn: (command, args, options) => {
-        mock.calls.push({ command, args, env: { ...options.env } });
+        mock.calls.push({ command, args, env: { ...options.env }, stdio: options.stdio });
         const child = new EventEmitter();
         child.stdout = new EventEmitter();
         child.stdout.setEncoding = () => {};
@@ -99,21 +100,32 @@ describe('maintainer dev install', () => {
         expect(mock.calls.at(-1).args).toEqual(['doctor']);
     });
 
-    it.each(['build', 'global install', 'doctor', 'checkout uninstall'])('stops and reports failure at %s', async (failed) => {
+    it('completes when the final doctor reports action required and keeps its output visible', async () => {
+        const bin = existingBinary();
+        const respond = mock.respond;
+        mock.respond = (command, args) => (args[0] === 'doctor' ? { status: 1 } : respond(command, args));
+        await expect(main()).resolves.toBeUndefined();
+        expect(mock.calls.at(-1)).toMatchObject({
+            command: bin,
+            args: ['doctor'],
+            stdio: ['inherit', 'inherit', 'inherit'],
+        });
+    });
+
+    it.each(['build', 'global install', 'checkout uninstall'])('stops and reports failure at %s', async (failed) => {
         existingBinary();
         const respond = mock.respond;
         mock.respond = (command, args) => {
             if (
                 (failed === 'build' && args[1] === 'build') ||
                 (failed === 'global install' && args[1] === '-g' && args[0] === 'install') ||
-                (failed === 'doctor' && args[0] === 'doctor') ||
                 (failed === 'checkout uninstall' && (args[0] === '--version' || args[1] === 'uninstall'))
             )
                 return { status: 1 };
             return respond(command, args);
         };
         await expect(main()).rejects.toThrow('failed');
-        if (failed !== 'doctor') expect(mock.calls.some(({ args }) => args[0] === 'doctor')).toBe(false);
+        expect(mock.calls.some(({ args }) => args[0] === 'doctor')).toBe(false);
     });
 
     it('reruns a mismatched nvm shell through nvm-exec with the default alias and a recursion guard', async () => {
