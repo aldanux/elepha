@@ -1,5 +1,9 @@
 # elepha
 
+## 0.8.0
+
+- Remove the Kimi Code and DeepSeek Harness integrations. Existing databases that captured sessions from either tool continue to open; those rows are retained but neither tool is installed, captured, or served going forward by [@aldanux](https://github.com/aldanux) in [#113](https://github.com/aldanux/elepha/pull/113)
+
 ## 0.7.1
 
 - Internal groundwork for an upcoming coding-CLI adapter. No user-facing changes by [@aldanux](https://github.com/aldanux) in [#111](https://github.com/aldanux/elepha/pull/111)
