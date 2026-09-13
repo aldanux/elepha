@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>Local memory for Claude Code, Codex, OpenCode, and Kimi Code.</b></p>
+<p align="center"><b>Local memory for Claude Code, Codex, and OpenCode.</b></p>
 <p align="center">Reads existing transcripts and serves context via MCP.</p>
 
 <p align="center">
@@ -16,7 +16,7 @@
 
 ## Overview
 
-elepha reads eligible Claude Code, Codex, and Kimi Code session files, plus the local OpenCode session database,
+elepha reads eligible Claude Code and Codex session files, plus the local OpenCode session database,
 indexes sessions from approved projects in one encrypted SQLite database, and exposes
 past context through a read-only MCP server and `elepha:` commands in AI chat.
 
@@ -51,11 +51,10 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 - Claude Code CLI & desktop
 - Codex CLI & desktop
 - OpenCode
-- Kimi Code
 
 All supported tools use the same local memory database.
 
-It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.15+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
+It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 
 ## How it works
 
@@ -77,7 +76,7 @@ project and session it came from.
 
 > do you remember why we moved the purchase button into a modal?
 
-To find and reopen a session, the `elepha:` commands work in Claude Code, Codex, OpenCode, and Kimi Code chat. Full
+To find and reopen a session, the `elepha:` commands work in Claude Code, Codex, and OpenCode chat. Full
 guide: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
 
 | Command                    | What it does                                                                       |

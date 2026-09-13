@@ -128,9 +128,10 @@ export class SessionStore {
     }
 
     // User-set custom titles remain native-transcript metadata; list_sessions uses the per-segment title field.
-    updateCustomTitle(tool: ToolName, nativeId: string, customTitle: string | null): void {
-        const sanitized = customTitle === null ? null : stripShellSyntax(customTitle);
-        this.db.prepare('UPDATE sessions SET custom_title = ? WHERE tool = ? AND native_id = ?').run(sanitized, tool, nativeId);
+    updateCustomTitle(tool: ToolName, nativeId: string, customTitle: string): void {
+        this.db
+            .prepare('UPDATE sessions SET custom_title = ? WHERE tool = ? AND native_id = ?')
+            .run(stripShellSyntax(customTitle), tool, nativeId);
     }
 
     // Opens the segment immediately after `previous`. Its trailing window and

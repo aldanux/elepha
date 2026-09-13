@@ -2,7 +2,7 @@
 // here so serving consumers share one shape instead of re-declaring row types.
 
 import type Database from 'better-sqlite3-multiple-ciphers';
-import type { SessionRowSurface, ToolName } from '../types/index.js';
+import { type SessionRowSurface, SUPPORTED_TOOLS, type ToolName } from '../types/index.js';
 
 export interface ServedSession {
     id: number;
@@ -117,16 +117,18 @@ const SERVED_SESSION_SELECT = `SELECT s.*, r.title AS rollup_title, r.summary AS
         MAX(CASE WHEN m.has_external_content = 1 THEN 1 ELSE 0 END) AS has_external_content
  FROM sessions s LEFT JOIN session_rollups r ON r.session_id = s.id LEFT JOIN memories m ON m.session_id = s.id`;
 
+const SUPPORTED_TOOL_PLACEHOLDERS = SUPPORTED_TOOLS.map(() => '?').join(',');
+
 // The single project-session query used by serving readers, newest activity first.
 export function readProjectSessions(db: Database.Database, projectIds: readonly number[]): ServedSession[] {
     const placeholders = projectIds.map(() => '?').join(',');
     const rows = db
         .prepare(
             `${SERVED_SESSION_SELECT}
-             WHERE s.project_id IN (${placeholders}) GROUP BY s.id
+             WHERE s.project_id IN (${placeholders}) AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS}) GROUP BY s.id
              ORDER BY COALESCE(s.last_turn_at, s.last_ingested_at, s.started_at) DESC, s.id DESC`,
         )
-        .all(...projectIds) as RawServedSession[];
+        .all(...projectIds, ...SUPPORTED_TOOLS) as RawServedSession[];
     return rows.map((row) => hydrateServedSession(db, row));
 }
 
@@ -146,7 +148,7 @@ export function readProjectSessionAggregates(db: Database.Database, projectIds: 
                             ORDER BY COALESCE(s.last_turn_at, s.last_ingested_at, s.started_at) DESC, s.id DESC
                         ) AS activity_rank
                  FROM sessions s
-                 WHERE s.project_id IN (${placeholders})
+                 WHERE s.project_id IN (${placeholders}) AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
              )
              SELECT project_id, tool, surface, MAX(last_ingested_at) AS last_ingested_at,
                     COUNT(*) AS work_episodes,
@@ -156,7 +158,7 @@ export function readProjectSessionAggregates(db: Database.Database, projectIds: 
              GROUP BY project_id, tool, surface
              ORDER BY newest_activity DESC, newest_id DESC`,
         )
-        .all(...projectIds) as Array<ProjectSessionAggregate & { newest_activity: string; newest_id: number }>;
+        .all(...projectIds, ...SUPPORTED_TOOLS) as Array<ProjectSessionAggregate & { newest_activity: string; newest_id: number }>;
     return rows.map(({ project_id, tool, surface, last_ingested_at, work_episodes }) => ({
         project_id,
         tool,
@@ -168,7 +170,9 @@ export function readProjectSessionAggregates(db: Database.Database, projectIds: 
 
 // Indexed session-id lookup sharing the exact hydrated shape used by project reads.
 export function readSessionById(db: Database.Database, id: number): ServedSession | undefined {
-    const row = db.prepare(`${SERVED_SESSION_SELECT} WHERE s.id = ? GROUP BY s.id`).get(id) as RawServedSession | undefined;
+    const row = db
+        .prepare(`${SERVED_SESSION_SELECT} WHERE s.id = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS}) GROUP BY s.id`)
+        .get(id, ...SUPPORTED_TOOLS) as RawServedSession | undefined;
     return row === undefined ? undefined : hydrateServedSession(db, row);
 }
 
@@ -180,7 +184,9 @@ export function readSessionByNaturalKey(
     key: { tool: ToolName; nativeId: string; segmentIndex: number },
 ): ServedSession | undefined {
     const row = db
-        .prepare(`${SERVED_SESSION_SELECT} WHERE s.tool = ? AND s.native_id = ? AND s.segment_index = ? GROUP BY s.id`)
-        .get(key.tool, key.nativeId, key.segmentIndex) as RawServedSession | undefined;
+        .prepare(
+            `${SERVED_SESSION_SELECT} WHERE s.tool = ? AND s.native_id = ? AND s.segment_index = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS}) GROUP BY s.id`,
+        )
+        .get(key.tool, key.nativeId, key.segmentIndex, ...SUPPORTED_TOOLS) as RawServedSession | undefined;
     return row === undefined ? undefined : hydrateServedSession(db, row);
 }

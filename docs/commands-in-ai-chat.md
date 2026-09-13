@@ -1,21 +1,8 @@
 # Commands in AI chat
 
-Type these commands directly in Claude Code, Codex, OpenCode, or Kimi Code chat. For terminal commands, see [docs/commands-cli.md](commands-cli.md).
+Type these commands directly in Claude Code, Codex, or OpenCode chat. For terminal commands, see [docs/commands-cli.md](commands-cli.md).
 
 Recall commands are read-only: elepha serves the result in the same turn. Actions return a terminal handoff instead of running privileged work in chat.
-
-Kimi Code displays `info`, `list`, `help`, `update`, and `query` results directly as
-hook results and skips the model turn. Its UI labels these results
-“UserPromptSubmit hook blocked.” `resume` and `last` serve historical context for
-the model; `resume` requests a recap. Run `elepha install` to register the hook in
-`~/.kimi-code/config.toml` (or `$KIMI_CODE_HOME/config.toml`), then start a new Kimi
-session. Self-update refreshes an already owned hook. Kimi capture reads completed
-main-agent turns from the local session store in consented projects.
-
-Known Kimi caveat: after a displayed `elepha:` result, the Kimi TUI can stay pending
-until you press Ctrl-S ("steer immediately") to continue. This is an upstream Kimi bug
-(the blocked-hook turn never finalizes), not an elepha issue — tracked at
-[MoonshotAI/kimi-code#3699](https://github.com/MoonshotAI/kimi-code/issues/3699).
 
 ## Recall and navigation
 
@@ -54,8 +41,8 @@ past work, the model calls elepha's `recall` MCP tool, which returns the relevan
 (decisions, the reasoning, and open items) with its provenance (project, tool, session,
 date) so the model can answer in place. `recall` needs elepha's MCP tools connected; it is
 not typed as an `elepha:` command. `elepha install` connects those MCP tools automatically
-for detected Claude Code, Codex, OpenCode, and Kimi Code installations. The `elepha:` commands on this
-page work in all four.
+for detected Claude Code, Codex, and OpenCode installations. The `elepha:` commands on this
+page work in all three.
 
 ## Maintenance
 

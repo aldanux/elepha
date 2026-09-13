@@ -116,6 +116,7 @@ export interface SharedDatabaseLifecycleLease {
     readonly kind: 'shared';
     readonly databasePath: string;
     captureDatabaseIdentity(): DatabaseLifecycleIdentity;
+    completeDeadOwnerRecovery(database: Database.Database): void;
     release(): void;
 }
 
@@ -1540,10 +1541,18 @@ function inspectDatabaseCompanion(file: string, ownerKind: OwnerKind): number | 
     }
 }
 
-function assertNoAmbiguousDatabaseCompanions(databasePath: string, ownerKind: OwnerKind): void {
+function inspectStableDatabaseCompanions(
+    databasePath: string,
+    ownerKind: OwnerKind,
+): { walBytes: number | undefined; journalBytes: number | undefined } {
     const walBytes = inspectDatabaseCompanion(`${databasePath}-wal`, ownerKind);
     inspectDatabaseCompanion(`${databasePath}-shm`, ownerKind);
     const journalBytes = inspectDatabaseCompanion(`${databasePath}-journal`, ownerKind);
+    return { walBytes, journalBytes };
+}
+
+function assertNoAmbiguousDatabaseCompanions(databasePath: string, ownerKind: OwnerKind): void {
+    const { walBytes, journalBytes } = inspectStableDatabaseCompanions(databasePath, ownerKind);
     if ((walBytes ?? 0) > 0 || (journalBytes ?? 0) > 0) {
         throw lifecycleError(
             DATABASE_LIFECYCLE_AMBIGUOUS,
@@ -1552,7 +1561,7 @@ function assertNoAmbiguousDatabaseCompanions(databasePath: string, ownerKind: Ow
     }
 }
 
-function reclaimDeadSharedOwner(owner: HeldOwner): void {
+function assertRecoverableDeadSharedOwner(owner: HeldOwner): string {
     const recordedIdentity = owner.record.databaseIdentity;
     const databaseFilename = owner.record.databaseFilename;
     if (
@@ -1566,8 +1575,36 @@ function reclaimDeadSharedOwner(owner: HeldOwner): void {
         );
     }
     assertRecordedDatabaseFilename(databaseFilename, recordedIdentity, 'shared');
+    inspectStableDatabaseCompanions(databaseFilename, 'shared');
+    return databaseFilename;
+}
+
+function reclaimDeadSharedOwner(owner: HeldOwner): void {
+    const databaseFilename = assertRecoverableDeadSharedOwner(owner);
     assertNoAmbiguousDatabaseCompanions(databaseFilename, 'shared');
     releaseHeldOwner(owner);
+}
+
+function checkpointRecoveredSharedDatabase(database: Database.Database, databasePath: string): void {
+    if (database.readonly) {
+        return;
+    }
+    const rows = database.pragma('main.wal_checkpoint(TRUNCATE)') as Array<{
+        busy?: unknown;
+        log?: unknown;
+        checkpointed?: unknown;
+    }>;
+    const result = rows[0];
+    if (
+        rows.length !== 1 ||
+        result?.busy !== 0 ||
+        typeof result.log !== 'number' ||
+        !Number.isInteger(result.log) ||
+        result.log < -1 ||
+        result.checkpointed !== result.log
+    ) {
+        throw lifecycleError(DATABASE_LIFECYCLE_BUSY, `post-crash managed database checkpoint did not complete for ${databasePath}`);
+    }
 }
 
 function exclusiveOwners(paths: DatabaseLifecyclePaths, databasePath: string): HeldOwner[] {
@@ -1715,12 +1752,13 @@ function newOwnerRecord(kind: OwnerKind, databasePath: string): OwnerRecord {
     };
 }
 
-export function acquireSharedDatabaseLifecycle(databasePath: string): SharedDatabaseLifecycleLease {
+export function acquireSharedDatabaseLifecycle(databasePath: string, deferDeadOwnerRecovery = false): SharedDatabaseLifecycleLease {
     supportedDatabaseLifecyclePlatform();
     const canonical = path.resolve(databasePath);
     const paths = databaseLifecyclePaths(canonical);
     prepareState(paths);
-    countLiveSharedOwners(paths, canonical);
+    const deferredDeadOwners: HeldOwner[] | undefined = deferDeadOwnerRecovery ? [] : undefined;
+    countLiveSharedOwners(paths, canonical, deferredDeadOwners);
     assertNoExclusiveOwner(paths, canonical);
     const record = newOwnerRecord('shared', canonical);
     let held = publishOwner(path.join(paths.leases, `lease-${record.ownerId}`), record, paths.directory);
@@ -1786,6 +1824,36 @@ export function acquireSharedDatabaseLifecycle(databasePath: string): SharedData
                 },
             );
         },
+        completeDeadOwnerRecovery: (database) => {
+            if (released) {
+                throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `shared lifecycle lease is no longer held for ${canonical}`);
+            }
+            if (deferredDeadOwners === undefined || deferredDeadOwners.length === 0 || database.readonly) {
+                return;
+            }
+            // db.ts calls this only after the pinned managed connection has
+            // applied its key and completed a real SQLite read. Checkpoint the
+            // recovered frames before removing the dead owner's durable guard.
+            checkpointRecoveredSharedDatabase(database, canonical);
+            for (const deferred of deferredDeadOwners ?? []) {
+                const beforeLiveness = revalidateDeadOwner(deferred, 'shared');
+                if (beforeLiveness === undefined) {
+                    continue;
+                }
+                if (ownerLiveness(beforeLiveness) !== 'dead') {
+                    throw lifecycleError(
+                        DATABASE_LIFECYCLE_AMBIGUOUS,
+                        `deferred shared database lifecycle owner is no longer provably dead for ${canonical}`,
+                    );
+                }
+                const current = revalidateDeadOwner(beforeLiveness, 'shared');
+                if (current !== undefined) {
+                    assertRecoverableDeadSharedOwner(current);
+                    releaseHeldOwner(current);
+                }
+            }
+            deferredDeadOwners?.splice(0);
+        },
         release: () => {
             if (!released) {
                 if (closeUnproven) {
@@ -1814,7 +1882,7 @@ function publishExclusiveOwner(paths: DatabaseLifecyclePaths, databasePath: stri
     throw lifecycleError(DATABASE_LIFECYCLE_BUSY, `could not publish exclusive database lifecycle intent for ${databasePath}`);
 }
 
-function countLiveSharedOwners(paths: DatabaseLifecyclePaths, databasePath: string): number {
+function countLiveSharedOwners(paths: DatabaseLifecyclePaths, databasePath: string, deferredDeadOwners?: HeldOwner[]): number {
     const entries = (() => {
         try {
             return readdirSync(paths.leases, { withFileTypes: true, encoding: 'utf8' });
@@ -1837,7 +1905,12 @@ function countLiveSharedOwners(paths: DatabaseLifecyclePaths, databasePath: stri
         if (ownerLiveness(owner) === 'dead') {
             const current = revalidateDeadOwner(owner, 'shared');
             if (current !== undefined) {
-                reclaimDeadSharedOwner(current);
+                if (deferredDeadOwners === undefined) {
+                    reclaimDeadSharedOwner(current);
+                } else {
+                    assertRecoverableDeadSharedOwner(current);
+                    deferredDeadOwners.push(current);
+                }
             }
         } else {
             live++;

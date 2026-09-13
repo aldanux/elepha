@@ -17,7 +17,7 @@ controls in [Controlling capture](capture.md) when you want to change that state
 ## Deep health check and repair
 
 `elepha doctor` checks the daemon, Claude Code and Codex SessionStart and UserPromptSubmit
-hooks, Kimi Code's UserPromptSubmit hook, Claude Code, Codex, OpenCode, and Kimi Code MCP
+hooks, Claude Code, Codex, and OpenCode MCP
 registrations, the OpenCode plugin where those tools are detected, database and migrations,
 consent roots, managed launcher, and any interrupted installation state. It exits
 successfully only when every required check passes.
