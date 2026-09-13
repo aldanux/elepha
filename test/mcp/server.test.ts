@@ -97,6 +97,37 @@ describe('elepha MCP server surface', () => {
         else process.env.CODEX_HOME = previousCodexHome;
     });
 
+    it('filters list_sessions by tool without changing unfiltered results', () => {
+        const fixture = createTestDb('elepha-mcp-list-tool-');
+        const projectPath = path.join(fixture.directory, 'project');
+        const project = seedProject(fixture, { path: projectPath });
+        seedConsentRoot(fixture, { path: projectPath });
+        seedSession(fixture, {
+            project,
+            tool: 'codex',
+            nativeId: 'codex-session',
+            title: 'Codex session',
+            lastIngestedAt: '2026-09-14T02:00:00.000Z',
+        });
+        seedSession(fixture, {
+            project,
+            tool: 'claude-code',
+            nativeId: 'claude-session',
+            title: 'Claude session',
+            lastIngestedAt: '2026-09-14T01:00:00.000Z',
+        });
+        const service = new ElephaMcpService(fixture.db);
+
+        const unfiltered = service.listSessions({ project: projectPath, include_all: true });
+        const claudeOnly = service.listSessions({ project: projectPath, tool: 'claude-code', include_all: true });
+
+        expect(unfiltered.structuredContent?.sessions).toEqual([
+            expect.objectContaining({ title: 'Codex session', tool: 'codex' }),
+            expect.objectContaining({ title: 'Claude session', tool: 'claude-code' }),
+        ]);
+        expect(claudeOnly.structuredContent?.sessions).toEqual([expect.objectContaining({ title: 'Claude session', tool: 'claude-code' })]);
+    });
+
     it('rejects a pagination cursor issued for another consented project', () => {
         const fixture = createTestDb('elepha-mcp-cross-project-cursor-');
         const firstPath = path.join(fixture.directory, 'first');
@@ -306,6 +337,21 @@ describe('elepha MCP server surface', () => {
 
         expect(schema.safeParse(MAX_GET_SESSION_LAST_N).success).toBe(true);
         expect(schema.safeParse(MAX_GET_SESSION_LAST_N + 1).success).toBe(false);
+    });
+
+    it('accepts recognized list_sessions tools and rejects unrecognized ones at the MCP schema', () => {
+        const definitions = mcpToolDefinitions({
+            listProjects: () => ({ content: [{ type: 'text', text: '' }] }),
+            listSessions: () => ({ content: [{ type: 'text', text: '' }] }),
+            getSession: async () => ({ content: [{ type: 'text', text: '' }] }),
+            recall: async () => ({ content: [{ type: 'text', text: '' }] }),
+        });
+        const schema = definitions.listSessions.configuration.inputSchema.tool;
+
+        expect(schema.safeParse('claude-code').success).toBe(true);
+        expect(schema.safeParse('codex').success).toBe(true);
+        expect(schema.safeParse('opencode').success).toBe(true);
+        expect(schema.safeParse('future-tool').success).toBe(false);
     });
 
     it('returns rollup material, durable snippets, and provenance from the existing consented recall index', async () => {
@@ -562,14 +608,21 @@ describe('elepha MCP server surface', () => {
         await server.connect(serverTransport);
         await client.connect(clientTransport);
         expect(client.getServerVersion()).toMatchObject({ name: 'elepha', version: PACKAGE_VERSION });
+        const listedTools = await client.listTools();
+        expect(listedTools.tools.find((tool) => tool.name === 'list_sessions')?.inputSchema.properties).toHaveProperty('tool');
         const mcpEpisode = await client.callTool({ name: 'get_session', arguments: { id: servedId } });
         const mcpRecall = await client.callTool({ name: 'recall', arguments: { query: 'resume implementation' } });
         const rejectedLastN = await client.callTool({
             name: 'get_session',
             arguments: { id: servedId, last_n: MAX_GET_SESSION_LAST_N + 1 },
         });
+        const rejectedTool = await client.callTool({
+            name: 'list_sessions',
+            arguments: { project: known, tool: 'future-tool' },
+        });
         expect(rejectedLastN).toMatchObject({ isError: true });
         expect(text(rejectedLastN)).toContain(`expected number to be <=${MAX_GET_SESSION_LAST_N}`);
+        expect(rejectedTool).toMatchObject({ isError: true });
         await client.close();
         await server.close();
         expect(mcpEpisode.content).toEqual(
