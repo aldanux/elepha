@@ -15,6 +15,7 @@ import { parse } from 'smol-toml';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_HEALTH_CHECK_DEADLINE_MS } from '../../src/config/constants.js';
 import { opencodePluginPath } from '../../src/config/paths.js';
+import { resolveInstalledElephaBin } from '../../src/install/binary.js';
 import { integrationHealth } from '../../src/install/health-checks.js';
 import {
     type DaemonHealthCheckRuntime,
@@ -39,7 +40,7 @@ const launcherMock = vi.hoisted(() => ({
 vi.mock('../../src/install/binary.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../src/install/binary.js')>()),
     hookCommand: (command: string, tool: 'claude-code' | 'codex', hook = 'session-start') => `${command} hook ${hook} --tool ${tool}`,
-    resolveInstalledElephaBin: () => ({ bin, packageRoot: '/opt/npm/lib/node_modules/elepha' }),
+    resolveInstalledElephaBin: vi.fn(() => ({ bin, packageRoot: '/opt/npm/lib/node_modules/elepha' })),
 }));
 
 // Vitest invokes this factory when the mocked module is imported; the IDE cannot trace that use.
@@ -772,87 +773,78 @@ describe('installer transaction', () => {
         expect(existsSync(servicePaths.transaction)).toBe(false);
     });
 
-    it('journals a failed uninstall and replays its installed state before the next lifecycle operation', () => {
+    it('reports daemon teardown failure after removing configs and artifacts without resurrecting them', () => {
         const root = withTempDir('elepha-installer-uninstall-recovery-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
         writeFileSync(paths.claudeSettings, '{}\n');
         writeFileSync(paths.claudeMcp, '{}\n');
         writeFileSync(paths.codexConfig, '');
-        const servicePaths = defaultLaunchdServicePaths(root);
-        let loaded = false;
-        let disabled = true;
-        let failBootout = false;
         const executor = {
             run(args: readonly string[]) {
-                if (args[0] === 'print') return { stdout: '', stderr: '', status: loaded ? 0 : 3 };
-                if (args[0] === 'print-disabled') {
-                    return { stdout: `"com.elepha.daemon" => ${disabled ? 'true' : 'false'}`, stderr: '', status: 0 };
-                }
-                if (args[0] === 'bootout') {
-                    if (failBootout) throw new Error('forced service teardown failure');
-                    loaded = false;
-                }
-                if (args[0] === 'disable') disabled = true;
-                if (args[0] === 'enable') disabled = false;
-                if (args[0] === 'bootstrap') {
-                    loaded = true;
-                    writeFileSync(
-                        servicePaths.heartbeat,
-                        JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
-                    );
-                }
+                if (args[0] === 'print') return { stdout: '', stderr: '', status: 3 };
+                if (args[0] === 'print-disabled') return { stdout: '"com.elepha.daemon" => true', stderr: '', status: 0 };
                 return { stdout: '', stderr: '', status: 0 };
             },
         };
-
-        installElepha(paths, serviceRuntime(root, executor, 0));
-        const installed = {
-            claudeSettings: readFileSync(paths.claudeSettings, 'utf8'),
-            claudeMcp: readFileSync(paths.claudeMcp, 'utf8'),
-            codexConfig: readFileSync(paths.codexConfig, 'utf8'),
-            launcher: readFileSync(servicePaths.launcher, 'utf8'),
-            plist: readFileSync(servicePaths.plist, 'utf8'),
-            state: readFileSync(servicePaths.state, 'utf8'),
-        };
-        loaded = true;
-        disabled = false;
-        failBootout = true;
-
-        expect(() => uninstallElepha(paths, serviceRuntime(root, executor, 1))).toThrow('forced service teardown failure');
-
-        const journal = readRollbackJournal(servicePaths.transaction);
-        expect(journal?.service).toEqual({ loaded: true, disabled: false, unknown: false });
-        expect(journal?.files).toEqual(
-            expect.arrayContaining([
-                expect.objectContaining({ file: paths.claudeSettings, exists: true, text: installed.claudeSettings }),
-                expect.objectContaining({ file: paths.claudeMcp, exists: true, text: installed.claudeMcp }),
-                expect.objectContaining({ file: paths.codexConfig, exists: true, text: installed.codexConfig }),
-                expect.objectContaining({ file: servicePaths.launcher, exists: true, text: installed.launcher }),
-                expect.objectContaining({ file: servicePaths.plist, exists: true, text: installed.plist }),
-                expect.objectContaining({ file: servicePaths.state, exists: true, text: installed.state }),
-            ]),
-        );
-        expect(readFileSync(paths.claudeSettings, 'utf8')).not.toContain('elepha');
-
-        failBootout = false;
-        const apply = vi.mocked(configFile.applyConfigTransaction);
-        const applyOriginal = apply.getMockImplementation();
-        if (!applyOriginal) throw new Error('missing config transaction implementation');
-        apply.mockImplementationOnce((changes) => {
-            expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(installed.claudeSettings);
-            expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(installed.claudeMcp);
-            expect(readFileSync(paths.codexConfig, 'utf8')).toBe(installed.codexConfig);
-            expect(readFileSync(servicePaths.launcher, 'utf8')).toBe(installed.launcher);
-            expect(readFileSync(servicePaths.plist, 'utf8')).toBe(installed.plist);
-            expect(readFileSync(servicePaths.state, 'utf8')).toBe(installed.state);
-            expect(loaded).toBe(true);
-            expect(disabled).toBe(false);
-            return applyOriginal(changes);
+        const runtime = serviceRuntime(root, executor, 0);
+        installElepha(paths, runtime);
+        const stop = vi.spyOn(runtime.service, 'stop').mockImplementationOnce(() => {
+            throw new Error('forced service teardown failure');
         });
+        const disable = vi.spyOn(runtime.service, 'disable');
+        const removed = uninstallElepha(paths, runtime);
+        expect(removed.failures).toContain('Stop daemon: forced service teardown failure');
+        expect(stop).toHaveBeenCalledOnce();
+        expect(disable).toHaveBeenCalledOnce();
+        expect(readFileSync(paths.claudeSettings, 'utf8')).toBe('{}\n');
+        expect(readFileSync(paths.claudeMcp, 'utf8')).toBe('{}\n');
+        expect(readFileSync(paths.codexConfig, 'utf8')).toBe('');
+        for (const file of runtime.service.artifactPaths) expect(existsSync(file)).toBe(false);
+        expect(existsSync(runtime.service.transactionPath)).toBe(false);
+        expect(uninstallElepha(paths, runtime).failures).toEqual([]);
+    });
 
-        expect(installElepha(paths, serviceRuntime(root, executor, 0)).service).toBe('registered, awaiting consent');
-        expect(existsSync(servicePaths.transaction)).toBe(false);
+    it('cleans a stale launcher with a missing global manifest and preserves database and encryption bytes', async () => {
+        const root = withTempDir('elepha-installer-broken-global-');
+        const paths = installPaths(root);
+        createConfigDirectories(paths);
+        writeFileSync(paths.claudeSettings, '{}\n');
+        writeFileSync(paths.claudeMcp, '{}\n');
+        writeFileSync(paths.codexConfig, '');
+        const runtime = serviceRuntime(
+            root,
+            {
+                run(args: readonly string[]) {
+                    if (args[0] === 'print') return { stdout: '', stderr: '', status: 3 };
+                    if (args[0] === 'print-disabled') return { stdout: '"com.elepha.daemon" => true', stderr: '', status: 0 };
+                    return { stdout: '', stderr: '', status: 0 };
+                },
+            },
+            0,
+        );
+        installElepha(paths, runtime);
+        writeFileSync(runtime.service.launcherPath, '#!/bin/sh\necho "bad Node-version marker" >&2\nexit 66\n');
+        const preserved = ['elepha.db', 'elepha.db-wal', 'elepha.db-shm', 'encryption.json'].map((name) =>
+            path.join(root, '.elepha', name),
+        );
+        for (const file of preserved) writeFileSync(file, `untouched: ${file}`);
+        const brokenBin = path.join(root, 'lib', 'node_modules', 'elepha', 'bin', 'elepha.js');
+        mkdirSync(path.dirname(brokenBin), { recursive: true });
+        writeFileSync(brokenBin, '#!/usr/bin/env node\n', { mode: 0o755 });
+        const actual = await vi.importActual<typeof import('../../src/install/binary.js')>('../../src/install/binary.js');
+        vi.mocked(resolveInstalledElephaBin).mockImplementationOnce(() =>
+            actual.resolveInstalledElephaBin({ pathValue: '', argvEntrypoint: brokenBin }),
+        );
+        const result = uninstallElepha(paths, runtime);
+        expect(result.failures).toEqual([]);
+        expect(result.warnings).toEqual([expect.stringContaining('Installed binary unavailable')]);
+        expect(result.service).toBe('not installed');
+        expect(readFileSync(paths.claudeSettings, 'utf8')).toBe('{}\n');
+        expect(readFileSync(paths.claudeMcp, 'utf8')).toBe('{}\n');
+        expect(readFileSync(paths.codexConfig, 'utf8')).toBe('');
+        for (const file of runtime.service.artifactPaths) expect(existsSync(file)).toBe(false);
+        for (const file of preserved) expect(readFileSync(file, 'utf8')).toBe(`untouched: ${file}`);
     });
 
     it('refuses to install when a leftover rollback journal is malformed', () => {
@@ -1020,7 +1012,7 @@ describe('installer transaction', () => {
         expect(lstatSync(paths.claudeSettings).isSymbolicLink()).toBe(true);
     });
 
-    it('leaves a running launchd service untouched when the uninstall config transaction fails', () => {
+    it('attempts other configs and service cleanup when one uninstall config transaction fails', () => {
         const root = withTempDir('elepha-installer-uninstall-ordering-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -1045,11 +1037,12 @@ describe('installer transaction', () => {
             throw new Error('forced config transaction failure');
         });
 
-        expect(() => uninstallElepha(paths, serviceRuntime(root, executor, 1))).toThrow('forced config transaction failure');
-
-        expect(loaded).toBe(true);
-        expect(disabled).toBe(false);
-        expect(calls.some(([verb]) => verb === 'bootout' || verb === 'disable')).toBe(false);
+        const removed = uninstallElepha(paths, serviceRuntime(root, executor, 1));
+        expect(removed.failures).toEqual([expect.stringContaining('forced config transaction failure')]);
+        expect(loaded).toBe(false);
+        expect(disabled).toBe(true);
+        expect(calls.some(([verb]) => verb === 'bootout')).toBe(true);
+        expect(calls.some(([verb]) => verb === 'disable')).toBe(true);
     });
 
     it('Codex-only registers Codex without writing either Claude config', () => {

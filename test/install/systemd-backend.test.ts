@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, SYSTEMD_SERVICE_NAME } from '../../src/config/constants.js';
@@ -73,6 +73,36 @@ class ScriptedSystemctl implements SystemctlExecutor {
 }
 
 describe('systemd service ownership', () => {
+    it('removes the other artifacts even when one artifact cannot be unlinked', () => {
+        const home = withTempDir('elepha-systemd-cleanup-');
+        const paths = defaultSystemdServicePaths(home);
+        const service = new SystemdBackend(paths, new FakeSystemctl());
+        service.install('#!/bin/sh\n', { kind: 'standalone', command: '/usr/bin/elepha', node: '/usr/bin/node' });
+        // A directory at the launcher path makes unlink fail without platform-specific permission tricks.
+        unlinkSync(paths.launcher);
+        mkdirSync(paths.launcher);
+        expect(() => service.uninstall()).toThrow(`Remove ${paths.launcher}`);
+        expect(existsSync(paths.state)).toBe(false);
+        expect(existsSync(paths.unit)).toBe(false);
+    });
+
+    it('removes artifacts and reloads even when stop and disable both throw', () => {
+        const home = withTempDir('elepha-systemd-broken-');
+        const paths = defaultSystemdServicePaths(home, {});
+        const executor = new FakeSystemctl();
+        const service = new SystemdBackend(paths, executor);
+        service.install('#!/bin/sh\n', { kind: 'standalone', command: '/usr/bin/elepha', node: '/usr/bin/node' });
+        vi.spyOn(service, 'stop').mockImplementation(() => {
+            throw new Error('stop failed');
+        });
+        vi.spyOn(service, 'disable').mockImplementation(() => {
+            throw new Error('disable failed');
+        });
+        expect(() => service.uninstall()).toThrow('Stop daemon: stop failed\nDisable daemon: disable failed');
+        for (const file of service.artifactPaths) expect(existsSync(file)).toBe(false);
+        expect(executor.calls.at(-1)).toEqual(['--user', 'daemon-reload']);
+    });
+
     it('uses XDG_CONFIG_HOME only for the user unit and keeps other artifacts under ELEPHA_HOME', () => {
         const home = '/home/test';
         const layout = elephaPaths(home);

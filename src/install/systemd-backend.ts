@@ -12,6 +12,7 @@ import {
 import { elephaPaths } from '../config/paths.js';
 import { clearHeartbeat } from '../daemon/heartbeat.js';
 import { systemctl } from '../security/subprocess-allowlist.js';
+import { attemptCleanup } from '../util/error.js';
 import { atomicWrite, readJson } from '../util/fs.js';
 import {
     boundedDaemonOutput,
@@ -279,14 +280,20 @@ export class SystemdBackend implements ServiceBackend {
     }
 
     uninstall(): void {
-        this.stop();
-        this.disable();
-        for (const file of [this.paths.state, this.paths.unit, this.paths.launcher]) {
-            if (existsSync(file)) {
-                unlinkSync(file);
-            }
+        const failures: string[] = [];
+        attemptCleanup(failures, 'Stop daemon', () => this.stop());
+        attemptCleanup(failures, 'Disable daemon', () => this.disable());
+        for (const file of this.artifactPaths) {
+            attemptCleanup(failures, `Remove ${file}`, () => {
+                if (existsSync(file)) {
+                    unlinkSync(file);
+                }
+            });
         }
-        this.daemonReload();
+        attemptCleanup(failures, 'Reload systemd', () => this.daemonReload());
+        if (failures.length > 0) {
+            throw new Error(failures.join('\n'));
+        }
     }
 
     healthy(): boolean {

@@ -12,6 +12,7 @@ import {
 } from '../config/constants.js';
 import { elephaPaths, elephaServiceLabel } from '../config/paths.js';
 import { clearHeartbeat } from '../daemon/heartbeat.js';
+import { attemptCleanup } from '../util/error.js';
 import { atomicWrite, readJson } from '../util/fs.js';
 import {
     boundedDaemonOutput,
@@ -314,10 +315,16 @@ export class LaunchdBackend implements ServiceBackend {
     }
 
     uninstall(): void {
-        for (const file of [this.paths.state, this.paths.plist, this.paths.launcher]) {
-            if (existsSync(file)) {
-                unlinkSync(file);
-            }
+        const failures: string[] = [];
+        for (const file of this.artifactPaths) {
+            attemptCleanup(failures, `Remove ${file}`, () => {
+                if (existsSync(file)) {
+                    unlinkSync(file);
+                }
+            });
+        }
+        if (failures.length > 0) {
+            throw new Error(failures.join('\n'));
         }
     }
 
