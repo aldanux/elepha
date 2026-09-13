@@ -24,13 +24,20 @@ async function queryGitHub(query) {
             },
             body: JSON.stringify({ query }),
         });
-        if (!response.ok) return undefined;
+        if (!response.ok) {
+            console.error(`changelog: GitHub GraphQL request failed with status ${response.status}`);
+            return undefined;
+        }
 
         const result = await response.json();
-        if (result.errors) return undefined;
+        if (result.errors) {
+            console.error(`changelog: GitHub GraphQL returned errors: ${JSON.stringify(result.errors)}`);
+            return undefined;
+        }
 
         return result.data?.repository;
-    } catch {
+    } catch (error) {
+        console.error(`changelog: GitHub GraphQL request threw: ${error instanceof Error ? error.message : String(error)}`);
         return undefined;
     }
 }
