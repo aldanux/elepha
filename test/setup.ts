@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
-import { beforeEach } from 'vitest';
+import { beforeEach, onTestFinished } from 'vitest';
 
 const workerId = process.env.VITEST_WORKER_ID ?? String(process.pid);
 const workerElephaHome = path.join(process.cwd(), '.test-scratch', `elepha-home-${workerId}`);
@@ -20,7 +20,15 @@ process.env.ELEPHA_HOME = workerElephaHome;
 beforeEach(() => {
     // Retired aliases coordinate for the entire test, including completion
     // cleanup; unrelated tests must not inherit those inode tombstones.
-    (globalThis as Record<symbol, unknown>)[Symbol.for(lifecycleTestDirectorySymbol)] = `${lifecycleTestDirectory}-${randomUUID()}`;
+    const directory = `${lifecycleTestDirectory}-${randomUUID()}`;
+    (globalThis as Record<symbol, unknown>)[Symbol.for(lifecycleTestDirectorySymbol)] = directory;
+    onTestFinished(() => {
+        try {
+            rmSync(directory, { recursive: true, force: true });
+        } catch {
+            // Cleanup is best-effort; permission-locked fixtures must not fail the test.
+        }
+    });
 });
 const mutableChildProcess = createRequire(import.meta.url)('node:child_process') as {
     spawn: typeof import('node:child_process').spawn;
