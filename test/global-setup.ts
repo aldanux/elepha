@@ -50,7 +50,7 @@ export function sweepTestScratch(root: string): { removed: string[]; remaining: 
 }
 
 //noinspection JSUnusedGlobalSymbols
-export function setup(): void {
+export function setup(): () => void {
     // Some tests execute the released bin entrypoint from dist/. Build once
     // before workers start so no test can replace artifacts another is using.
     execFileSync(process.execPath, [path.resolve('node_modules/typescript/bin/tsc'), '-p', 'tsconfig.json'], {
@@ -61,4 +61,10 @@ export function setup(): void {
     const testScratchRoot = path.join(process.cwd(), '.test-scratch');
 
     sweepTestScratch(testScratchRoot);
+
+    // Per-worker fixtures (e.g. elepha-home-<workerId>) outlive every individual test's own
+    // cleanup, so sweep again once all workers have exited instead of waiting for the next run.
+    return () => {
+        sweepTestScratch(testScratchRoot);
+    };
 }
