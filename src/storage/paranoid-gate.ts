@@ -17,6 +17,9 @@ import {
 } from '../config/constants.js';
 import { readPrivateFile, writePrivateFileAtomic } from './database-encryption.js';
 
+// Single quotes, never backticks: this message is persisted into injections and
+// served over MCP, so the write-time sanitizer escapes shell execution syntax
+// and a backticked command would reach the reader as \`elepha unlock\`.
 export const LOCKED_MEMORY_MESSAGE = "elepha memory is locked. Run 'elepha unlock' in a terminal, then retry.";
 export const NON_TTY_UNLOCK_MESSAGE = "Refusing to unlock without a controlling terminal. Run 'elepha unlock' yourself in a terminal.";
 export const WRONG_PASSPHRASE_MESSAGE = 'Unlock failed: incorrect passphrase. Memory remains locked.';
@@ -463,31 +466,37 @@ function registeredStateForMutation(
     if (authority !== undefined && (validPristineState || (stored !== undefined && authorityMatches(authority, stored)))) {
         return { registered, authority, stored, agreement: 'exact' };
     }
-    const matchingCredential =
+    // Both recovery agreements below require an authenticated stored state, so
+    // the credential match guards them as a block rather than repeating as a
+    // condition. Narrowing `authority` and `stored` here, instead of aliasing
+    // the check into a boolean, keeps every `stored.` reachable only after the
+    // match and readable as such by any analyzer.
+    if (
         authority !== undefined &&
         authority.credentialTag !== null &&
-        stored?.authentic === true &&
-        stored.credentialTag === authority.credentialTag;
-    if (
-        matchingCredential &&
-        recover === 'restrictive_lock' &&
-        authority.enrolled === 1 &&
-        authority.state === 'locked' &&
-        stored.payload.mode === 'paranoid' &&
-        authority.generation === stored.payload.epoch + 1
+        stored !== undefined &&
+        stored.authentic === true &&
+        stored.credentialTag === authority.credentialTag
     ) {
-        return { registered, authority, stored, agreement: 'restrictive_lock_pending' };
-    }
-    const permissiveMode = recover === 'permissive_unlock' ? 'paranoid' : recover === 'permissive_disable' ? 'default' : undefined;
-    if (
-        matchingCredential &&
-        permissiveMode !== undefined &&
-        authority.enrolled === 1 &&
-        stored.payload.mode === permissiveMode &&
-        stored.payload.state === 'unlocked' &&
-        stored.payload.epoch === authority.generation + 1
-    ) {
-        return { registered, authority, stored, agreement: 'permissive_pending' };
+        if (
+            recover === 'restrictive_lock' &&
+            authority.enrolled === 1 &&
+            authority.state === 'locked' &&
+            stored.payload.mode === 'paranoid' &&
+            authority.generation === stored.payload.epoch + 1
+        ) {
+            return { registered, authority, stored, agreement: 'restrictive_lock_pending' };
+        }
+        const permissiveMode = recover === 'permissive_unlock' ? 'paranoid' : recover === 'permissive_disable' ? 'default' : undefined;
+        if (
+            permissiveMode !== undefined &&
+            authority.enrolled === 1 &&
+            stored.payload.mode === permissiveMode &&
+            stored.payload.state === 'unlocked' &&
+            stored.payload.epoch === authority.generation + 1
+        ) {
+            return { registered, authority, stored, agreement: 'permissive_pending' };
+        }
     }
     throw new Error('Paranoid gate state failed authentication. Memory remains locked.');
 }

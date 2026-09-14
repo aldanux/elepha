@@ -42,7 +42,7 @@ anything, a transcript path structurally cannot reach a shell.
 subprocesses live in `src/security/subprocess-allowlist.ts`: a fixed set of read-only
 `git` subcommands, the platform service manager (`launchctl` / `systemctl --user`) with
 fixed lifecycle verbs, the resolved npm backend with fixed package-management argv
-for self-update and the isolated Memory Plus runtime install (enforced by
+for self-update and the isolated "Memory-Plus" runtime install (enforced by
 `test/security/npm-allowlist.test.ts`), and fixed read-only macOS `/bin/ps` and `/usr/sbin/lsof` probes for
 installer-owned legacy MCP retirement, and the generated OpenCode hook client invoking
 only the installed elepha launcher with `hook user-prompt-submit --tool opencode` and a

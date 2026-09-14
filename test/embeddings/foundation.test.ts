@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { enableMemoryPlus, MEMORY_PLUS_API_NOTICE, MEMORY_PLUS_CONFIRM, MEMORY_PLUS_LOCAL_NOTICE } from '../../src/cli/commands/enable.js';
+import * as cliProgress from '../../src/cli/progress.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { generateEmbeddings } from '../../src/embeddings/generate.js';
 import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration } from '../../src/embeddings/provider-config.js';
@@ -53,7 +54,7 @@ function saveVector(f: ReturnType<typeof fixture>) {
 
 afterEach(() => vi.restoreAllMocks());
 
-describe('Memory Plus opt-in and provider boundary', () => {
+describe('"Memory-Plus" opt-in and provider boundary', () => {
     it.each([{}, { OPENAI_API_KEY: 'present' }])('does no provider or storage work while disabled (%j)', async (environment) => {
         const f = fixture();
         const factory = vi.fn();
@@ -65,10 +66,10 @@ describe('Memory Plus opt-in and provider boundary', () => {
         expect(embeddingConfiguration(false, environment)).toBeUndefined();
         expect(await createEmbeddingProvider(false, environment)).toBeUndefined();
         await expect(generateEmbeddings(f.db, { configPath: f.configPath, environment, createProvider: factory })).rejects.toThrow(
-            'Memory Plus is off',
+            '"Memory-Plus" is off',
         );
         expect(factory).not.toHaveBeenCalled();
-        expect(f.embeddings.source.bind(f.embeddings, f.session.id)).toThrow('Memory Plus is off');
+        expect(f.embeddings.source.bind(f.embeddings, f.session.id)).toThrow('"Memory-Plus" is off');
         expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual([]);
         expect(existsSync(f.configPath)).toBe(false);
     });
@@ -96,7 +97,7 @@ describe('Memory Plus opt-in and provider boundary', () => {
         expect(existsSync(configPath)).toBe(false);
     });
 
-    it.each([false, true])('leaves Memory Plus off when package installation fails (previously enabled: %s)', async (enabled) => {
+    it.each([false, true])('leaves "Memory-Plus" off when package installation fails (previously enabled: %s)', async (enabled) => {
         const f = fixture();
         if (enabled) setSetting('memory-plus', 'true', f.configPath);
         const createProvider = vi.fn();
@@ -162,13 +163,26 @@ describe('Memory Plus opt-in and provider boundary', () => {
         expect(provider.dispose).toHaveBeenCalled();
     });
 
-    it('indexes pre-existing eligible history during enable without a manual generation step', async () => {
+    it('runs every slow enable step behind the same loader elepha install uses, and indexes pre-existing eligible history', async () => {
         const f = fixture();
         const second = seedSession(f, { project: f.project, nativeId: 'older-history', title: 'Multilingual recall' });
         const excluded = seedProject(f, { path: path.join(f.directory, 'not-granted') });
         seedSession(f, { project: excluded, nativeId: 'private', title: 'Not permitted' });
         const provider = fakeProvider();
         const log = vi.fn();
+        const phases: { done: number; fail: number }[] = [];
+        vi.spyOn(cliProgress, 'startCliProgress').mockImplementation(() => {
+            const phase = { done: 0, fail: 0 };
+            phases.push(phase);
+            return {
+                done: () => {
+                    phase.done += 1;
+                },
+                fail: () => {
+                    phase.fail += 1;
+                },
+            };
+        });
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
@@ -186,8 +200,40 @@ describe('Memory Plus opt-in and provider boundary', () => {
         }
         expect(f.embeddings.scan([f.project.id])).toHaveLength(2);
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_embeddings').get()).toEqual({ count: 2 });
-        expect(log.mock.calls.some(([message]) => /Indexing:.*2.*indexed/.test(message))).toBe(true);
+        // Runtime install, probe and backfill each own one loader that resolves
+        // successfully; no phase is left spinning and none reports a failure.
+        expect(phases).toEqual([
+            { done: 1, fail: 0 },
+            { done: 1, fail: 0 },
+            { done: 1, fail: 0 },
+        ]);
+        // The counts are a result, so they are printed rather than folded into a
+        // loader line the terminal erases; per-session progress is not.
+        expect(log).toHaveBeenCalledWith(expect.stringContaining('2 sessions indexed'));
+        expect(log.mock.calls.flat().join('\n')).not.toContain('Indexing:');
         expect(log.mock.calls.flat().join('\n')).not.toContain('elepha embeddings');
+    });
+
+    it('fails the loader for the step that failed and leaves no phase spinning', async () => {
+        const f = fixture();
+        const phases: string[] = [];
+        vi.spyOn(cliProgress, 'startCliProgress').mockImplementation(() => ({
+            done: () => phases.push('done'),
+            fail: () => phases.push('fail'),
+        }));
+        await expect(
+            enableMemoryPlus({
+                configPath: f.configPath,
+                environment: {},
+                confirm: async () => true,
+                installDependency: vi.fn(async () => {
+                    throw new Error('npm install failed');
+                }),
+                createProvider: vi.fn(),
+                log: vi.fn(),
+            }),
+        ).rejects.toThrow('npm install failed');
+        expect(phases).toEqual(['fail']);
     });
 
     it('retains the enabled setting and completed vectors when initial backfill fails partway', async () => {

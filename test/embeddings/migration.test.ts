@@ -8,7 +8,7 @@ function vectorTable(db: ReturnType<typeof openUnmanagedDb>) {
     return db.prepare("SELECT sql FROM sqlite_master WHERE name = 'session_embeddings'").get();
 }
 
-describe('Memory Plus vector migration', () => {
+describe('"Memory-Plus" vector migration', () => {
     it('creates a fresh table with cascade provenance and a vector-size constraint', () => {
         const { db } = createTestDb('embedding-fresh-');
         expect(vectorTable(db)).toBeDefined();

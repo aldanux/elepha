@@ -1,7 +1,7 @@
 import { createRequire } from 'node:module';
 import { memoryPlusPackagePath } from './dependency.js';
 
-export const MEMORY_PLUS_INSTALL_HINT = 'Run elepha enable memory-plus to install or repair the local runtime.';
+export const MEMORY_PLUS_INSTALL_HINT = 'Run `elepha enable memory-plus` to install or repair the local runtime.';
 
 // Only the runtime surface used here is typed; the optional package is absent
 // from normal installs, including development and TypeScript builds.
@@ -30,7 +30,7 @@ export function loadLocalRuntime(): TransformersRuntime {
         }
         return runtime;
     } catch (error) {
-        throw new Error(`elepha Memory Plus local runtime is missing or could not be loaded. ${MEMORY_PLUS_INSTALL_HINT}`, {
+        throw new Error(`elepha's "Memory-Plus" local runtime is missing or could not be loaded. ${MEMORY_PLUS_INSTALL_HINT}`, {
             cause: error,
         });
     }

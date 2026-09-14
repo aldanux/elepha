@@ -14,7 +14,7 @@ import {
 import { ProjectResolver } from './project-resolver.js';
 import { readEmbeddingSession, type ServedSession } from './session-read-model.js';
 
-export const MEMORY_PLUS_DISABLED = 'elepha Memory Plus is off. Run elepha enable memory-plus first.';
+export const MEMORY_PLUS_DISABLED = 'elepha\'s "Memory-Plus" is off. Run `elepha enable memory-plus` first.';
 export const EMBEDDING_SOURCE_CHANGED = 'Embedding source or authorization changed; vector was not stored. Re-run elepha embeddings.';
 
 export interface EmbeddingSource {

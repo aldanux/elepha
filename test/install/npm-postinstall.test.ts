@@ -137,7 +137,7 @@ describe('global npm postinstall bootstrap', () => {
         expect(readFileSync(test.database)).toEqual(bytes);
         expect(test.report).toHaveBeenCalledExactlyOnceWith(npmPostinstallFailureMessage('process inspection denied'));
         expect(npmPostinstallFailureMessage('process inspection denied')).toBe(
-            'elepha could not retire a legacy MCP during npm upgrade: process inspection denied. Run elepha install to retry.',
+            'elepha could not retire a legacy MCP during npm upgrade: process inspection denied. Run `elepha install` to retry.',
         );
     });
 });

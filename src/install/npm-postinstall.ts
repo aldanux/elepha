@@ -15,7 +15,7 @@ export interface NpmPostinstallRuntime {
 }
 
 export function npmPostinstallFailureMessage(detail: string): string {
-    return `elepha could not retire a legacy MCP during npm upgrade: ${detail}. Run elepha install to retry.`;
+    return `elepha could not retire a legacy MCP during npm upgrade: ${detail}. Run \`elepha install\` to retry.`;
 }
 
 export function npmPostinstallRetiredMessage(count: number): string {
