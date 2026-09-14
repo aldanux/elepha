@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { withTempDir } from '../helpers/tmp.js';
@@ -29,7 +29,7 @@ vi.mock('node:child_process', () => ({
     },
 }));
 
-const { main } = await import('../../scripts/dev-install.mjs');
+const { main, verifyPathResolution } = await import('../../scripts/dev-install.mjs');
 const checkout = path.resolve(import.meta.dirname, '../..');
 const savedEnvironment = { ...process.env };
 let root;
@@ -53,6 +53,7 @@ beforeEach(() => {
             writeFileSync(tarball, 'fixture tarball');
             return { stdout: `${path.basename(tarball)}\n` };
         }
+        if (args[0] === 'install' && args[1] === '-g') existingBinary();
         return {};
     };
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -89,6 +90,49 @@ describe('maintainer dev install', () => {
         ]);
         expect(mock.calls.at(-1).command).toBe(bin);
         expect(process.stdout.write).toHaveBeenCalledWith(`${path.basename(tarball)}\n`);
+        expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/verified.*PATH.*fresh build/i));
+        expect(console.warn).not.toHaveBeenCalled();
+    });
+
+    it('warns without failing when PATH resolves to a stale install after doctor', async () => {
+        const bin = path.join(prefix, 'bin', 'elepha');
+        const stale = path.join(root, 'stale', 'elepha');
+        mkdirSync(path.dirname(stale));
+        const respond = mock.respond;
+        mock.respond = (command, args) => {
+            if (args[0] === 'doctor') {
+                writeFileSync(stale, '#!/bin/sh\n', { mode: 0o755 });
+                process.env.PATH = `${path.dirname(stale)}${path.delimiter}${process.env.PATH}`;
+            }
+            return respond(command, args);
+        };
+        const exitCode = process.exitCode;
+        await expect(main()).resolves.toBeUndefined();
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(stale));
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(bin));
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining(`nvm use ${process.version}`));
+        expect(console.log).not.toHaveBeenCalledWith(expect.stringMatching(/verified.*PATH/i));
+        expect(process.exitCode).toBe(exitCode);
+    });
+
+    it('recognizes a different PATH symlink to the same fresh build', () => {
+        const bin = existingBinary();
+        const linked = path.join(root, 'linked');
+        mkdirSync(linked);
+        symlinkSync(bin, path.join(linked, 'elepha'));
+        process.env.PATH = linked;
+        verifyPathResolution(bin);
+        expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/verified.*PATH.*fresh build/i));
+        expect(console.warn).not.toHaveBeenCalled();
+    });
+
+    it('handles an absent PATH executable without claiming resolution was verified', () => {
+        const bin = existingBinary();
+        process.env.PATH = root;
+        expect(() => verifyPathResolution(bin)).not.toThrow();
+        expect(console.log).toHaveBeenCalledWith(expect.stringContaining(bin));
+        expect(console.log).toHaveBeenCalledWith(expect.stringMatching(/not found on PATH/i));
+        expect(console.warn).not.toHaveBeenCalled();
     });
 
     it.each(['--version', 'uninstall'])('recovers through the fresh checkout when the old %s fails', async (failed) => {
