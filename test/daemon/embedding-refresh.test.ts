@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { WorkerOptions } from 'node:worker_threads';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { disableMemoryPlus } from '../../src/cli/commands/disable.js';
 import { EMBEDDING_REFRESH_INTERVAL_MS } from '../../src/config/constants.js';
 import { setSetting } from '../../src/config/settings.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
@@ -108,6 +109,40 @@ function fixture() {
 }
 
 describe('automatic daemon embedding refresh', () => {
+    it('observes disable during an active worker, retains completed vectors and starts no subsequent passes', async () => {
+        const f = fixture();
+        setSetting('memory-plus', 'true');
+        const provider = {
+            configuration: embeddingConfiguration(true)!,
+            embed: async () => Array(384).fill(0.25),
+            dispose: async () => {},
+        };
+        await generateEmbeddings(f.db, { createProvider: async () => provider });
+        const vectors = f.db.prepare('SELECT * FROM session_embeddings').all();
+        const pending = seedSession(f, { project: f.project, nativeId: 'pending', title: 'Not indexed yet' });
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+        f.daemon.start();
+        try {
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+            await f.entered;
+            disableMemoryPlus({ log: () => {} });
+            f.release();
+            // The in-flight native call can finish, but the generator's use-time
+            // setting check prevents its write and stops the rest of the pass.
+            await vi.waitFor(() => expect(f.errors).toHaveLength(1));
+            expect(f.errors[0]).toContain('"Memory-Plus" is off');
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(vectors);
+            expect(f.db.prepare('SELECT session_id FROM session_embeddings WHERE session_id = ?').get(pending.id)).toBeUndefined();
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS * 2);
+            expect(thread.created).toHaveBeenCalledOnce();
+            expect(f.errors).toHaveLength(1);
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(vectors);
+        } finally {
+            f.release();
+            await f.daemon.stop();
+        }
+    });
+
     it('does no provider creation while disabled, rechecks each tick, and cancels its timer on stop', async () => {
         const f = fixture();
         const createProvider = vi.spyOn(providerConfig, 'createEmbeddingProvider').mockResolvedValue({
