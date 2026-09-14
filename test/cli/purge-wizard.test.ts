@@ -8,6 +8,7 @@ import { buildPurgeScope, type PurgePrompts, runPurgeWizard } from '../../src/cl
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { fixtureGitEnv } from '../helpers/git.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const CANCELLED = Symbol('cancelled');
@@ -120,7 +121,7 @@ describe('elepha purge wizard', () => {
         const selectedPath = path.join(withTempDir('elepha-purge-selected-'), 'elepha');
         const fragmentPath = path.join(selectedPath, 'src');
         mkdirSync(fragmentPath, { recursive: true });
-        execFileSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '-q', selectedPath]);
+        execFileSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '-q', selectedPath], { env: fixtureGitEnv() });
         const retainedPath = path.join(directory, 'non-live-project');
         const selectedProject = store.upsertProject(selectedPath);
         const fragmentProjectId = Number(
