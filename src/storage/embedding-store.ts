@@ -17,6 +17,11 @@ import { readEmbeddingSession, type ServedSession } from './session-read-model.j
 export const MEMORY_PLUS_DISABLED = 'elepha\'s "Memory-Plus" is off. Run `elepha enable memory-plus` first.';
 export const EMBEDDING_SOURCE_CHANGED = 'Embedding source or authorization changed; vector was not stored. Re-run elepha embeddings.';
 
+// Authorization projections exclude activity and presentation metadata. Schema
+// coverage tests require every new column to be explicitly classified.
+export const EMBEDDING_CONSENT_COLUMNS = ['id', 'ulid', 'path', 'state', 'decided_at', 'source'] as const;
+export const EMBEDDING_PROJECT_AUTHORIZATION_COLUMNS = ['id', 'path', 'git_root', 'git_remote', 'git_root_commit'] as const;
+
 export class EmbeddingSourceChangedError extends Error {
     constructor() {
         super(EMBEDDING_SOURCE_CHANGED);
@@ -79,12 +84,7 @@ export class EmbeddingStore {
     // may change during ingestion; source reads still resolve eligibility live.
     generationConsent(generation: AuthenticatedReadGeneration): string {
         this.assertEnabled();
-        return withMemoryReadGeneration(
-            this.db,
-            lockedEmbedding,
-            () => JSON.stringify(this.db.prepare('SELECT * FROM consent_roots ORDER BY id').all()),
-            generation,
-        );
+        return withMemoryReadGeneration(this.db, lockedEmbedding, () => JSON.stringify(this.consentRoots()), generation);
     }
 
     private projectIds(): number[] {
@@ -254,10 +254,14 @@ export class EmbeddingStore {
         );
     }
 
+    private consentRoots(): unknown[] {
+        return this.db.prepare(`SELECT ${EMBEDDING_CONSENT_COLUMNS.join(', ')} FROM consent_roots ORDER BY id`).all();
+    }
+
     private consentIdentity(): string {
         return JSON.stringify([
-            this.db.prepare('SELECT * FROM consent_roots ORDER BY id').all(),
-            this.db.prepare('SELECT * FROM projects ORDER BY id').all(),
+            this.consentRoots(),
+            this.db.prepare(`SELECT ${EMBEDDING_PROJECT_AUTHORIZATION_COLUMNS.join(', ')} FROM projects ORDER BY id`).all(),
         ]);
     }
 }

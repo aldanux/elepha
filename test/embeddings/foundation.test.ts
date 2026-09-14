@@ -10,7 +10,13 @@ import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration
 import { embeddingSourceHash } from '../../src/embeddings/source.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
+import {
+    EMBEDDING_CONSENT_COLUMNS,
+    EMBEDDING_PROJECT_AUTHORIZATION_COLUMNS,
+    EMBEDDING_SOURCE_CHANGED,
+    EmbeddingStore,
+    lockedEmbedding,
+} from '../../src/storage/embedding-store.js';
 import {
     enableParanoidMode,
     lockMemory,
@@ -481,6 +487,149 @@ describe('derived vector storage and manual generation', () => {
             expect(provider.dispose).toHaveBeenCalled();
         },
     );
+
+    it.each([
+        {
+            table: 'consent_roots',
+            selected: EMBEDDING_CONSENT_COLUMNS,
+            authorization: ['id', 'ulid', 'path', 'state', 'decided_at', 'source'],
+            excluded: ['nudged_at'],
+        },
+        {
+            table: 'projects',
+            selected: EMBEDDING_PROJECT_AUTHORIZATION_COLUMNS,
+            authorization: ['id', 'path', 'git_root', 'git_remote', 'git_root_commit'],
+            excluded: ['display_name', 'first_seen_at', 'last_seen_at'],
+        },
+    ])('pins the authorization projection and classifies every $table column', ({ table, selected, authorization, excluded }) => {
+        const f = fixture();
+        expect(selected).toEqual(authorization);
+        const columns = (f.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name);
+        expect(columns.sort(), 'Schema changes require an explicit embedding authorization classification').toEqual(
+            [...selected, ...excluded].sort(),
+        );
+    });
+
+    it('uses only consent decision columns for the generation snapshot', () => {
+        const f = fixture();
+        saveVector(f);
+        const token = generation(f);
+        const before = f.embeddings.generationConsent(token);
+        expect(Object.keys(JSON.parse(before)[0])).toEqual(EMBEDDING_CONSENT_COLUMNS);
+        f.db.prepare('UPDATE consent_roots SET nudged_at = ?').run('2099-01-01T00:00:00.000Z');
+        f.db.prepare('UPDATE projects SET last_seen_at = ?').run('2099-01-01T00:00:00.000Z');
+        expect(f.embeddings.generationConsent(token)).toBe(before);
+        f.store.consent.revoke(f.project.path);
+        expect(f.embeddings.generationConsent(token)).not.toBe(before);
+    });
+
+    describe.each(['scan', 'source'] as const)('%s authorization checkpoints', (operation) => {
+        it.each([
+            ['projects', 'display_name'],
+            ['projects', 'first_seen_at'],
+            ['consent_roots', 'nudged_at'],
+        ])('ignores %s.%s metadata changes', (table, column) => {
+            const f = fixture();
+            const source = saveVector(f);
+            const vectors = f.embeddings.scan([f.project.id]);
+            const stored = f.db.prepare('SELECT * FROM session_embeddings').all();
+            const original = ProjectResolver.prototype.listConsentedStored;
+            const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
+                this: ProjectResolver,
+                consent,
+            ) {
+                const projects = original.call(this, consent);
+                f.db.prepare(`UPDATE ${table} SET ${column} = ?`).run('2099-01-01T00:00:00.000Z');
+                return projects;
+            });
+            expect(operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
+                operation === 'scan' ? vectors : source,
+            );
+            expect(checkpoint).toHaveBeenCalledOnce();
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(stored);
+        });
+
+        it.each(['git_root', 'git_remote', 'git_root_commit'])('rejects eligibility loss through %s grouping', (column) => {
+            const f = fixture();
+            const denied = seedProject(f, { path: path.join(f.directory, 'denied') });
+            seedConsentRoot(f, { path: denied.path, state: 'denied' });
+            f.db.prepare(`UPDATE projects SET ${column} = ? WHERE id = ?`).run(denied.path, denied.id);
+            saveVector(f);
+            const original = ProjectResolver.prototype.listConsentedStored;
+            vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (this: ProjectResolver, consent) {
+                const projects = original.call(this, consent);
+                f.db.prepare(`UPDATE projects SET ${column} = ? WHERE id = ?`).run(denied.path, f.project.id);
+                expect(original.call(new ProjectResolver(f.db), consent).flatMap((project) => project.projectIds)).not.toContain(
+                    f.project.id,
+                );
+                return projects;
+            });
+            expect(() => (operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
+                EMBEDDING_SOURCE_CHANGED,
+            );
+        });
+
+        it.each(['target', 'unrelated'] as const)('ignores a last_seen_at-only update to the %s project', (target) => {
+            const f = fixture();
+            const other = seedProject(f, { path: path.join(f.directory, 'other') });
+            const source = saveVector(f);
+            const vectors = f.embeddings.scan([f.project.id]);
+            const stored = f.db.prepare('SELECT * FROM session_embeddings').all();
+            const projectId = target === 'target' ? f.project.id : other.id;
+            const before = f.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+            const original = ProjectResolver.prototype.listConsentedStored;
+            const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
+                this: ProjectResolver,
+                consent,
+            ) {
+                const projects = original.call(this, consent);
+                f.db.prepare('UPDATE projects SET last_seen_at = ? WHERE id = ?').run('2099-01-01T00:00:00.000Z', projectId);
+                return projects;
+            });
+
+            expect(operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
+                operation === 'scan' ? vectors : source,
+            );
+            expect(checkpoint).toHaveBeenCalledOnce();
+            expect(f.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId)).toEqual({
+                ...(before as object),
+                last_seen_at: '2099-01-01T00:00:00.000Z',
+            });
+            expect(f.embeddings.source(f.session.id)).toEqual(source);
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(stored);
+            expect(f.embeddings.scan([f.project.id])).toEqual(vectors);
+        });
+
+        it.each(['revoke', 'add-root', 'remove-root', 'path-change', 'unconsented'] as const)(
+            'rejects %s between authorization checks',
+            (action) => {
+                const f = fixture();
+                saveVector(f);
+                const original = ProjectResolver.prototype.listConsentedStored;
+                const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
+                    this: ProjectResolver,
+                    consent,
+                ) {
+                    const projects = original.call(this, consent);
+                    if (action === 'revoke') f.store.consent.revoke(f.project.path);
+                    if (action === 'add-root') seedConsentRoot(f, { path: path.join(f.directory, 'other') });
+                    if (action === 'remove-root') f.store.consent.remove(f.store.consent.list()[0].ulid);
+                    if (action === 'path-change' || action === 'unconsented') {
+                        const changedPath =
+                            action === 'path-change' ? path.join(f.project.path, 'child') : path.join(f.directory, 'unconsented');
+                        f.db.prepare('UPDATE projects SET path = ? WHERE id = ?').run(changedPath, f.project.id);
+                        expect(f.store.consent.isConsented(changedPath)).toBe(action === 'path-change');
+                    }
+                    return projects;
+                });
+
+                expect(() => (operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
+                    EMBEDDING_SOURCE_CHANGED,
+                );
+                expect(checkpoint).toHaveBeenCalled();
+            },
+        );
+    });
 
     it('rejects consent changes while resolving eligible project IDs', () => {
         const f = fixture();
