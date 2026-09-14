@@ -13,7 +13,8 @@ export interface GenerationResult {
     ineligibleOrEmpty: number;
 }
 
-// Explicit batch consumer only. Hooks, MCP and the daemon do not import this module.
+// Batch consumers only: foreground CLI commands and the isolated refresh worker.
+// Hooks, MCP and the daemon's ingestion event loop do not import this module.
 export async function generateEmbeddings(
     db: Database,
     options: {

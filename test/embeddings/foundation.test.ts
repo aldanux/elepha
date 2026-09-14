@@ -8,6 +8,7 @@ import { generateEmbeddings } from '../../src/embeddings/generate.js';
 import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration } from '../../src/embeddings/provider-config.js';
 import { embeddingSourceHash } from '../../src/embeddings/source.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
+import { openUnmanagedDb } from '../../src/storage/db.js';
 import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
 import {
     enableParanoidMode,
@@ -121,6 +122,7 @@ describe('Memory Plus opt-in and provider boundary', () => {
         const installDependency = vi.fn();
         await enableMemoryPlus({
             configPath: f.configPath,
+            openDatabase: async () => openUnmanagedDb(f.dbPath),
             environment: { OPENAI_API_KEY: 'key' },
             confirm: async () => true,
             installDependency,
@@ -137,13 +139,14 @@ describe('Memory Plus opt-in and provider boundary', () => {
         const createProvider = vi.fn(async () => provider);
         const options = {
             configPath: f.configPath,
+            openDatabase: async () => openUnmanagedDb(f.dbPath),
             environment: {},
             createProvider,
             installDependency: vi.fn(async () => {}),
             confirm: async () => true,
             log: vi.fn(),
         };
-        vi.mocked(provider.embed).mockImplementation(async () => {
+        vi.mocked(provider.embed).mockImplementationOnce(async () => {
             expect(getSetting('memory-plus', {}, f.configPath).value).toBe(false);
             return Array(384).fill(0.25);
         });
@@ -157,6 +160,59 @@ describe('Memory Plus opt-in and provider boundary', () => {
         await expect(enableMemoryPlus(options)).rejects.toThrow('download failed');
         expect(getSetting('memory-plus', {}, f.configPath).value).toBe(false);
         expect(provider.dispose).toHaveBeenCalled();
+    });
+
+    it('indexes pre-existing eligible history during enable without a manual generation step', async () => {
+        const f = fixture();
+        const second = seedSession(f, { project: f.project, nativeId: 'older-history', title: 'Multilingual recall' });
+        const excluded = seedProject(f, { path: path.join(f.directory, 'not-granted') });
+        seedSession(f, { project: excluded, nativeId: 'private', title: 'Not permitted' });
+        const provider = fakeProvider();
+        const log = vi.fn();
+        await expect(
+            enableMemoryPlus({
+                configPath: f.configPath,
+                environment: {},
+                openDatabase: async () => openUnmanagedDb(f.dbPath),
+                confirm: async () => true,
+                installDependency: vi.fn(),
+                createProvider: async () => provider,
+                log,
+            }),
+        ).resolves.toBe(true);
+
+        for (const session of [f.session, second]) {
+            expect(f.embeddings.current(f.embeddings.source(session.id)!, provider.configuration, generation(f))).toBe(true);
+        }
+        expect(f.embeddings.scan([f.project.id])).toHaveLength(2);
+        expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_embeddings').get()).toEqual({ count: 2 });
+        expect(log.mock.calls.some(([message]) => /Indexing:.*2.*indexed/.test(message))).toBe(true);
+        expect(log.mock.calls.flat().join('\n')).not.toContain('elepha embeddings');
+    });
+
+    it('retains the enabled setting and completed vectors when initial backfill fails partway', async () => {
+        const f = fixture();
+        const second = seedSession(f, { project: f.project, nativeId: 'newest-history', title: 'Indexed before failure' });
+        const provider = fakeProvider();
+        vi.mocked(provider.embed)
+            .mockResolvedValueOnce(Array(384).fill(0.25))
+            .mockResolvedValueOnce(Array(384).fill(0.25))
+            .mockRejectedValueOnce(new Error('provider interrupted'));
+        await expect(
+            enableMemoryPlus({
+                configPath: f.configPath,
+                environment: {},
+                openDatabase: async () => openUnmanagedDb(f.dbPath),
+                confirm: async () => true,
+                installDependency: vi.fn(),
+                createProvider: async () => provider,
+                log: vi.fn(),
+            }),
+        ).rejects.toThrow(/remains enabled.*provider interrupted.*elepha embeddings/);
+        expect(getSetting('memory-plus', {}, f.configPath).value).toBe(true);
+        expect(f.embeddings.current(f.embeddings.source(second.id)!, provider.configuration, generation(f))).toBe(true);
+        expect(f.embeddings.current(f.embeddings.source(f.session.id)!, provider.configuration, generation(f))).toBe(false);
+        expect(provider.dispose).toHaveBeenCalledTimes(2);
     });
 });
 

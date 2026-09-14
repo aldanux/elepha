@@ -90,9 +90,9 @@ leave the 1 GiB default in effect.
 
 ## Memory Plus foundation (optional)
 
-`memory-plus` defaults to `false`. Normal capture, hooks, MCP recall and
-`elepha:query` do not load an embedding model or call an embeddings API. This
-release prepares and stores vectors; semantic search is not connected yet.
+`memory-plus` defaults to `false`. While disabled, automatic indexing creates no
+worker or embedding provider. When enabled, indexing runs independently of turn
+capture in a background worker.
 
 Run `elepha enable memory-plus` and confirm the setup notice. With no
 `OPENAI_API_KEY`, setup installs the optional Transformers runtime under
@@ -104,7 +104,10 @@ its files under `ELEPHA_HOME/models/embeddings` (normally
 `~/.elepha/models/embeddings`). Model weights download once (~113MB); the active
 model uses approximately 1GB of RAM. Session content stays local. Setup verifies
 inference with fixed synthetic text and saves the flag only after success.
-Declining leaves configuration unchanged; failed setup leaves the flag off.
+Declining leaves configuration unchanged; a failed provider setup leaves the flag
+off. After successful setup, the command indexes all eligible existing history
+before returning. A backfill failure keeps the flag enabled and retains completed
+vectors; the error reports how to retry immediately.
 
 If `OPENAI_API_KEY` is configured, setup uses OpenAI `text-embedding-3-small`
 instead of loading or downloading the local model. A key alone never enables
@@ -115,13 +118,17 @@ schema addition lands; the current schema does not contain instructions.
 No raw transcript turns, assistant bodies, tool output or transcript files are
 sent. The setup probe itself contains no session content.
 
-After setup, run `elepha embeddings` to generate missing or stale vectors.
-API generation asks for confirmation on every invocation, including when a key
-was added after local setup. Use `elepha embeddings --rebuild` to regenerate all
-eligible vectors; it does not delete or rewrite source sessions or rollups.
-These commands are manual batches, not background jobs. Completed vectors survive
-an interrupted batch, and rerunning skips current vectors. The model is shared
-within one invocation and released afterward.
+The daemon checks for missing or stale vectors every minute while Memory
+Plus is enabled and memory is unlocked. Passes never overlap. The model is shared
+within each pass and released afterward; local loading and tokenization run in a
+worker thread so they cannot block the capture event loop. Failed passes are
+reported in the daemon log and retried on the next interval. Automatic API indexing
+uses the daemon's configured `OPENAI_API_KEY` and incurs provider usage charges.
+
+For troubleshooting, `elepha embeddings` retries immediately and `elepha embeddings
+--rebuild` regenerates all eligible vectors without changing source sessions or
+rollups. These advanced commands retain their API confirmation. No manual indexing
+command is needed during normal use.
 
 Vectors live in the encrypted database's `session_embeddings` table with
 session/rollup/project provenance, the exact sanitized source hash, model,
