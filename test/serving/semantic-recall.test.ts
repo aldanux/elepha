@@ -12,7 +12,7 @@ import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
-import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
+import { lexicalRecall, STRICT_RECALL_FALLBACK_NOTICE, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import * as semanticModule from '../../src/serving/semantic-recall.js';
 import { renderSemanticUnion, SEMANTIC_DISCOVERY, semanticRecall, unionRecallIds } from '../../src/serving/semantic-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
@@ -160,8 +160,8 @@ describe('semantic retrieval and explicit search integration', () => {
         const before = f.db.prepare('SELECT * FROM session_embeddings ORDER BY session_id').all();
         const result = await semanticRecall(f.db, [f.project.id], 'recovery');
         expect(result.candidates.map((candidate) => candidate.sessionId)).toEqual([
-            nearest.id,
             tied.id,
+            nearest.id,
             close.id,
             middle.id,
             perpendicular.id,
@@ -174,14 +174,14 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(f.db.prepare('SELECT * FROM session_embeddings ORDER BY session_id').all()).toEqual(before);
     });
 
-    it.each([8, 12])('scores each vector before decoding the next and preserves legacy ranking for %s rows', async (count) => {
+    it.each([8, 12])('streams and ranks %s vectors by similarity then newest stored session', async (count) => {
         const f = fixture();
         const expected = Array.from({ length: count }, (_, index) => {
             const vector = [(index % 4) - 1, (index % 3) + 1];
             const session = f.add(`stream ${index}`, vector);
             return { sessionId: session.id, similarity: vector[0] / Math.hypot(...vector) };
         })
-            .sort((a, b) => b.similarity - a.similarity || a.sessionId - b.sessionId)
+            .sort((a, b) => b.similarity - a.similarity || b.sessionId - a.sessionId)
             .slice(0, SEMANTIC_RECALL_MAX_HITS);
         vi.spyOn(performance, 'now').mockReturnValue(0);
         let decodedSinceScore = 0;
@@ -295,6 +295,80 @@ describe('semantic retrieval and explicit search integration', () => {
         const semantic = Array.from({ length: 5 }, (_, index) => f.add(`semantic ${index}`, [1, index]).id);
         await hook(f);
         expect(f.store.shownSessionLists.forChat('codex', 'current')).toEqual([...semantic, ...lexical]);
+    });
+
+    it('preserves the five-of-six lexical total and strict fallback when a semantic-only hit joins', async () => {
+        const f = fixture();
+        const lexicalSessions = Array.from({ length: 6 }, (_, index) => f.add(`receipt recovery ledger ${index}`));
+        f.add('Payment history', [1, 0]);
+        const query = tokenizeRecallQuery('receipt recovery ledger missing')!;
+        const lexical = await lexicalRecall(new SessionReader(f.db), projects(f), query, 'global', undefined, NOW, 'strict');
+        expect(lexical.body).toContain('(5 shown of 6)');
+        expect(lexical.body).toContain('+1 more matches');
+        expect(lexical.body).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+        const semantic = await semanticRecall(f.db, [f.project.id], query.display);
+        const union = renderSemanticUnion(f.db, projects(f), query, 'global', lexical, semantic, NOW);
+        for (const output of [
+            union.body,
+            await hook(f, `elepha:query ${query.display}`),
+            await hook(f, `elepha:query:here ${query.display}`),
+        ]) {
+            expect.soft(output).toContain('(6 shown of 7)');
+            expect.soft(output).toContain('+1 more matches');
+            expect.soft(output).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+        }
+        // A semantic hit can recover the lexical match that the lexical cap hid.
+        const recovered = renderSemanticUnion(
+            f.db,
+            projects(f),
+            query,
+            'global',
+            lexical,
+            { candidates: [...semantic.candidates, { sessionId: lexicalSessions[5].id, similarity: 0.9 }] },
+            NOW,
+        );
+        expect(recovered.body).toContain('(7 shown of 7)');
+        expect(recovered.body).not.toContain('+1 more matches');
+        expect(recovered.body).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+    });
+
+    it('keeps the newest tied vectors and serves the hit-cap loss on every semantic surface', async () => {
+        const f = fixture();
+        const sessions = Array.from({ length: SEMANTIC_RECALL_MAX_HITS + 1 }, (_, index) => f.add(`tied ${index}`, [1, 0]));
+        const result = await semanticRecall(f.db, [f.project.id], 'recovery');
+        expect.soft(result.candidates.map((candidate) => candidate.sessionId)).toEqual(
+            sessions
+                .slice(1)
+                .reverse()
+                .map((session) => session.id),
+        );
+        for (const output of [
+            text(await new ElephaMcpService(f.db).recall({ query: 'recovery' })),
+            await hook(f, 'elepha:query recovery'),
+            await hook(f, 'elepha:query:here recovery'),
+            await hook(f, 'Find a previous recovery decision'),
+        ]) {
+            expect.soft(output).toContain(semanticModule.semanticHitCapTruncation(1));
+            expect.soft(output).not.toContain(semanticModule.semanticScanTruncation('rows'));
+            expect.soft(output).not.toContain(semanticModule.semanticScanTruncation('time'));
+        }
+    });
+
+    it('composes scan truncation, semantic hit-cap loss and omitted lexical matches', async () => {
+        const f = fixture();
+        for (let index = 0; index < 6; index++) f.add(`receipt recovery ledger ${index}`);
+        for (let index = 0; index <= SEMANTIC_SCAN_MAX_ROWS; index++) f.add(`semantic ${index}`, [1, 0]);
+        vi.spyOn(performance, 'now').mockReturnValue(0);
+        for (const output of [
+            await hook(f, 'elepha:query receipt recovery ledger missing'),
+            await hook(f, 'elepha:query:here receipt recovery ledger missing'),
+        ]) {
+            expect.soft(output).toContain('(10 shown of 11)');
+            expect.soft(output).toContain('+1 more matches');
+            expect.soft(output).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+            expect.soft(output).toContain(semanticModule.semanticScanTruncation('rows'));
+            expect.soft(output).toContain(semanticModule.semanticHitCapTruncation(SEMANTIC_SCAN_MAX_ROWS - SEMANTIC_RECALL_MAX_HITS));
+        }
     });
 
     it('scopes semantic-only hits to the requested project on MCP and query:here', async () => {

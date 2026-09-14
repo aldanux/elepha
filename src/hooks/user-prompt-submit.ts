@@ -28,7 +28,7 @@ import {
     servedContextInstructions,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
-import { currentRecallHits, renderSemanticUnion, semanticRecall, semanticScanTruncation } from '../serving/semantic-recall.js';
+import { currentRecallHits, renderSemanticUnion, semanticRecall, semanticRecallNotices } from '../serving/semantic-recall.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
@@ -323,7 +323,7 @@ export async function runUserPromptSubmit(
                 if (belowFloor !== -1) {
                     candidates.length = belowFloor;
                 }
-                const notice = semantic.truncation === undefined ? undefined : semanticScanTruncation(semantic.truncation);
+                const notice = semanticRecallNotices(semantic);
                 if (candidates.length === 0) {
                     return notice === undefined ? { reason: 'not_command' } : emit(notice);
                 }

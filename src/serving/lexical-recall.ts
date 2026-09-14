@@ -53,13 +53,12 @@ interface RecallHit {
     sessionId: number;
 }
 
-export interface LexicalRecallResult {
+export type LexicalRecallResult = {
     body: string;
     sessionIds: number[];
     coverage?: string;
-    state?: 'locked';
     content_coverage?: LockedContentCoverage;
-}
+} & ({ state?: undefined; matchedSessionIds: number[]; usedLaxFallback: boolean } | { state: 'locked' });
 
 export type RecallDisplayHit = Pick<RecallHit, 'project' | 'sessionTitle' | 'tool' | 'endedAt' | 'sessionId'> & {
     discovery?: string;
@@ -384,19 +383,22 @@ export function renderRecallBody(
     project: ProjectSet | undefined,
     usedLaxFallback: boolean,
     maxHits: number = REMEMBER_MAX_HITS,
+    matchedSessionIds: number[] = hits.map((hit) => hit.sessionId),
 ): LexicalRecallResult {
     const trailer = coverage === undefined ? ['', SELECT_HINT] : ['', coverage, '', SELECT_HINT];
-    if (hits.length === 0) {
+    if (matchedSessionIds.length === 0) {
         return {
             body: escapeShellSyntax([DISPLAY_VERBATIM_INSTRUCTIONS, emptyMessage(query, scope, project), ...trailer].join('\n')),
             sessionIds: [],
+            matchedSessionIds,
+            usedLaxFallback,
             coverage,
         };
     }
 
     const nonce = randomUUID();
     const cappedHits = hits.slice(0, maxHits);
-    const resultCapOmitted = hits.length - cappedHits.length;
+    const resultCapOmitted = matchedSessionIds.length - cappedHits.length;
     const build = (shown: RecallDisplayHit[], budgetOmitted: number): string => {
         const lines = [
             servedContextInstructions(nonce),
@@ -404,7 +406,7 @@ export function renderRecallBody(
             '',
             usedLaxFallback ? STRICT_RECALL_FALLBACK_NOTICE : undefined,
             usedLaxFallback ? '' : undefined,
-            `Recall hits for “${query.display}” (${shown.length} shown of ${hits.length}):`,
+            `Recall hits for “${query.display}” (${shown.length} shown of ${matchedSessionIds.length}):`,
             ...shown.map(
                 (hit, index) =>
                     `${index + 1}. [${relativeTime(hit.endedAt, now)} | ${hit.tool} | ${hit.project}] · ${hit.sessionTitle}${hit.discovery === undefined ? '' : ` (${hit.discovery})`}`,
@@ -424,7 +426,7 @@ export function renderRecallBody(
         shown -= 1;
         body = build(cappedHits.slice(0, shown), cappedHits.length - shown);
     }
-    return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId), coverage };
+    return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId), matchedSessionIds, usedLaxFallback, coverage };
 }
 
 async function lexicalRecallUnlocked(

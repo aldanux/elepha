@@ -18,7 +18,7 @@ import {
     type SemanticRecallResult,
     semanticDiscovery,
     semanticRecall,
-    semanticScanTruncation,
+    semanticRecallNotices,
     unionRecallIds,
 } from '../serving/semantic-recall.js';
 import { publicSessionId } from '../serving/session-id.js';
@@ -280,6 +280,7 @@ export class ElephaMcpService implements McpToolHandlers {
         semantic: SemanticRecallResult,
     ): string {
         const nonce = randomUUID();
+        const semanticNotice = semanticRecallNotices(semantic);
         const opening = [
             servedContextInstructions(nonce),
             '',
@@ -287,7 +288,7 @@ export class ElephaMcpService implements McpToolHandlers {
             hits.length === 0
                 ? `No recall matches found for “${escapeShellSyntax(query.display)}”.`
                 : `Recall material for “${escapeShellSyntax(query.display)}” (${hits.length} matching episode(s)):`,
-            ...(semantic.truncation === undefined ? [] : [semanticScanTruncation(semantic.truncation)]),
+            ...(semanticNotice === undefined ? [] : [semanticNotice]),
         ].join('\n');
         const closing = dataBlockClose(nonce);
         const truncation = 'Recall material was truncated to fit the 4k-token response budget.';
