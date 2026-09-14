@@ -39,7 +39,7 @@ export function memoryPlusNpm(backend?: LauncherBackend): MemoryPlusNpm {
                 throw error;
             }
             if (typeof manifest.version !== 'string') {
-                throw new Error('Memory Plus package has an invalid version');
+                throw new Error('elepha Memory Plus package has an invalid version');
             }
             return manifest.version;
         },
