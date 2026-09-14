@@ -17,6 +17,12 @@ import { readEmbeddingSession, type ServedSession } from './session-read-model.j
 export const MEMORY_PLUS_DISABLED = 'elepha\'s "Memory-Plus" is off. Run `elepha enable memory-plus` first.';
 export const EMBEDDING_SOURCE_CHANGED = 'Embedding source or authorization changed; vector was not stored. Re-run elepha embeddings.';
 
+export class EmbeddingSourceChangedError extends Error {
+    constructor() {
+        super(EMBEDDING_SOURCE_CHANGED);
+    }
+}
+
 export interface EmbeddingSource {
     sessionId: number;
     projectId: number;
@@ -67,6 +73,18 @@ export class EmbeddingStore {
         if (!getSetting('memory-plus', {}, this.configPath).value) {
             throw new Error(MEMORY_PLUS_DISABLED);
         }
+    }
+
+    // Snapshot only explicit consent decisions across a pass. Project activity
+    // may change during ingestion; source reads still resolve eligibility live.
+    generationConsent(generation: AuthenticatedReadGeneration): string {
+        this.assertEnabled();
+        return withMemoryReadGeneration(
+            this.db,
+            lockedEmbedding,
+            () => JSON.stringify(this.db.prepare('SELECT * FROM consent_roots ORDER BY id').all()),
+            generation,
+        );
     }
 
     private projectIds(): number[] {
@@ -151,8 +169,11 @@ export class EmbeddingStore {
 
     assertCurrent(source: EmbeddingSource, generation: AuthenticatedReadGeneration): void {
         const current = this.source(source.sessionId, generation);
-        if (current === undefined || JSON.stringify(current) !== JSON.stringify(source)) {
+        if (current === undefined || current.identity !== source.identity) {
             throw new Error(EMBEDDING_SOURCE_CHANGED);
+        }
+        if (JSON.stringify(current) !== JSON.stringify(source)) {
+            throw new EmbeddingSourceChangedError();
         }
     }
 
@@ -200,8 +221,12 @@ export class EmbeddingStore {
                             throw new Error(EMBEDDING_SOURCE_CHANGED);
                         }
                         const row = readEmbeddingSession(this.db, source.sessionId, projectIds);
-                        if (row === undefined || JSON.stringify(sourceFor(row)) !== JSON.stringify(source)) {
+                        const current = row === undefined ? undefined : sourceFor(row);
+                        if (current === undefined || current.identity !== source.identity) {
                             throw new Error(EMBEDDING_SOURCE_CHANGED);
+                        }
+                        if (JSON.stringify(current) !== JSON.stringify(source)) {
+                            throw new EmbeddingSourceChangedError();
                         }
                         this.db
                             .prepare(`INSERT INTO session_embeddings

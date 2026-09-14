@@ -283,7 +283,13 @@ describe('derived vector storage and manual generation', () => {
         setSetting('memory-plus', 'true', f.configPath);
         const provider = fakeProvider();
         const options = { configPath: f.configPath, createProvider: async () => provider };
-        expect(await generateEmbeddings(f.db, options)).toEqual({ generated: 1, current: 0, ineligibleOrEmpty: 0 });
+        expect(await generateEmbeddings(f.db, options)).toEqual({
+            generated: 1,
+            current: 0,
+            ineligibleOrEmpty: 0,
+            sourceChanged: 0,
+            failed: 0,
+        });
         const input = vi.mocked(provider.embed).mock.calls[0][0];
         expect(input).toContain('permitted first prompt');
         expect(input).toContain('Local encryption');
@@ -300,13 +306,104 @@ describe('derived vector storage and manual generation', () => {
         expect(row.source_hash).toBe(embeddingSourceHash(input));
         expect(row.vector.length).toBe(384 * 4);
         expect(row.model_revision).toContain(provider.configuration.revision);
-        expect(await generateEmbeddings(f.db, options)).toEqual({ generated: 0, current: 1, ineligibleOrEmpty: 0 });
+        expect(await generateEmbeddings(f.db, options)).toEqual({
+            generated: 0,
+            current: 1,
+            ineligibleOrEmpty: 0,
+            sourceChanged: 0,
+            failed: 0,
+        });
         expect(provider.embed).toHaveBeenCalledTimes(1);
         expect((await generateEmbeddings(f.db, { ...options, rebuild: true })).generated).toBe(1);
         f.db.exec('DELETE FROM session_embeddings');
         expect((await generateEmbeddings(f.db, options)).generated).toBe(1);
         expect(f.store.findSession('codex', f.session.native_id)).toBeDefined();
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_rollups').get()).toEqual({ count: 1 });
+    });
+
+    it.each(['title', 'rollup'] as const)('reports a changing %s and drains older sessions across passes', async (field) => {
+        const f = fixture();
+        const newer = seedSession(f, { project: f.project, nativeId: 'active', title: 'Active session' });
+        seedRollup(f, { project: f.project, session: newer });
+        setSetting('memory-plus', 'true', f.configPath);
+        const provider = fakeProvider();
+        const report = vi.fn();
+        const progress = vi.fn();
+        let changes = 0;
+        vi.mocked(provider.embed).mockImplementation(async (text, beforeUse) => {
+            if (text.includes('Active session')) {
+                const query =
+                    field === 'title'
+                        ? 'UPDATE sessions SET title = ? WHERE id = ?'
+                        : 'UPDATE session_rollups SET summary = ? WHERE session_id = ?';
+                f.db.prepare(query).run(`Active session ${++changes}`, newer.id);
+                beforeUse();
+            }
+            return Array(384).fill(0.25);
+        });
+        const options = { configPath: f.configPath, createProvider: async () => provider, report, progress };
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, sourceChanged: 1, failed: 0 });
+        expect(f.embeddings.current(f.embeddings.source(f.session.id)!, provider.configuration, generation(f))).toBe(true);
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1, sourceChanged: 1, failed: 0 });
+        expect(report).toHaveBeenCalledTimes(2);
+        expect(report.mock.calls.every(([message]) => message.includes(`Session ${newer.id}`) && message.includes('retry next pass'))).toBe(
+            true,
+        );
+        expect(progress).toHaveBeenCalledTimes(4);
+        vi.mocked(provider.embed).mockResolvedValue(Array(384).fill(0.25));
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, current: 1, sourceChanged: 0, failed: 0 });
+    });
+
+    it('reports repeated malformed sources without inference and resumes automatically after repair', async () => {
+        const f = fixture();
+        const newer = seedSession(f, { project: f.project, nativeId: 'malformed', title: 'Malformed session' });
+        seedRollup(f, { project: f.project, session: newer });
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('{broken private data', newer.id);
+        setSetting('memory-plus', 'true', f.configPath);
+        const provider = fakeProvider();
+        const createProvider = vi.fn(async () => provider);
+        const report = vi.fn();
+        const options = { configPath: f.configPath, createProvider, report };
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, failed: 1, sourceChanged: 0 });
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1, failed: 1 });
+        expect(provider.embed).toHaveBeenCalledOnce();
+        expect(report).toHaveBeenCalledTimes(2);
+        expect(report.mock.calls.every(([message]) => message.includes(`Session ${newer.id}`) && message.includes('decisions'))).toBe(true);
+        expect(report.mock.calls.flat().join(' ')).not.toContain('private data');
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('[]', newer.id);
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, current: 1, failed: 0 });
+        expect(provider.embed).toHaveBeenCalledTimes(2);
+        seedRollup(f, { project: f.project, session: f.session });
+        f.db.prepare('UPDATE session_rollups SET decisions = ?').run('null');
+        createProvider.mockClear();
+        for (let pass = 0; pass < 2; pass++) {
+            expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, failed: 2 });
+        }
+        expect(createProvider).not.toHaveBeenCalled();
+        expect(provider.embed).toHaveBeenCalledTimes(2);
+    });
+
+    it('reports every empty or ineligible session and advances progress without creating a provider', async () => {
+        const f = fixture();
+        f.db.prepare('UPDATE sessions SET title = NULL WHERE id = ?').run(f.session.id);
+        const other = seedProject(f, { path: path.join(f.directory, 'unconsented') });
+        const ineligible = seedSession(f, { project: other, nativeId: 'unconsented', title: 'Unconsented' });
+        setSetting('memory-plus', 'true', f.configPath);
+        const createProvider = vi.fn();
+        const report = vi.fn();
+        const progress = vi.fn();
+        expect(await generateEmbeddings(f.db, { configPath: f.configPath, createProvider, report, progress })).toMatchObject({
+            generated: 0,
+            ineligibleOrEmpty: 2,
+            failed: 0,
+            sourceChanged: 0,
+        });
+        expect(createProvider).not.toHaveBeenCalled();
+        expect(report.mock.calls.map(([message]) => message)).toEqual([
+            expect.stringContaining(`Session ${ineligible.id}`),
+            expect.stringContaining(`Session ${f.session.id}`),
+        ]);
+        expect(progress).toHaveBeenCalledTimes(2);
     });
 
     it.each(['title', 'first_prompt_search'])('rejects stale %s source hashes and model revisions', (column) => {
@@ -359,19 +456,28 @@ describe('derived vector storage and manual generation', () => {
             registerParanoidDatabase(f.db, f.dbPath, randomBytes(32));
             enableParanoidMode(f.db, 'passphrase');
             unlockMemory(f.db, 'passphrase');
+            if (['revoke', 'disable', 'lock', 'lock-unlock'].includes(action)) {
+                seedSession(f, { project: f.project, nativeId: 'newest-security', title: 'Newest security source' });
+            }
             const provider = fakeProvider();
             vi.mocked(provider.embed).mockImplementation(async () => {
                 if (action === 'revoke') f.store.consent.revoke(f.project.path);
                 if (action === 'incognito') f.store.recordIncognitoTranscript(f.session.tool, f.session.native_id);
                 if (action === 'delete') f.db.prepare('DELETE FROM sessions WHERE id = ?').run(f.session.id);
-                if (action === 'change') f.db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Changed', f.session.id);
+                if (action === 'change') f.db.prepare('UPDATE sessions SET title = ?').run('Changed');
                 if (action === 'disable') setSetting('memory-plus', 'false', f.configPath);
                 if (action === 'lock' || action === 'lock-unlock') lockMemory(f.db);
                 if (action === 'lock-unlock') unlockMemory(f.db, 'passphrase');
                 return Array(384).fill(0.25);
             });
-            await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider: async () => provider })).rejects.toThrow();
+            const generating = generateEmbeddings(f.db, { configPath: f.configPath, createProvider: async () => provider });
+            if (action === 'change') {
+                await expect(generating).resolves.toMatchObject({ generated: 0, sourceChanged: 1 });
+            } else {
+                await expect(generating).rejects.toThrow();
+            }
             expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual([]);
+            expect(provider.embed).toHaveBeenCalledOnce();
             expect(provider.dispose).toHaveBeenCalled();
         },
     );

@@ -12,7 +12,7 @@ import { embeddingConfiguration } from '../../src/embeddings/provider-config.js'
 import * as refresh from '../../src/embeddings/refresh.js';
 import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
 import { withMemoryReadGeneration } from '../../src/storage/paranoid-gate.js';
-import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 const thread = vi.hoisted(() => ({
     created: vi.fn(),
@@ -208,6 +208,31 @@ describe('automatic daemon embedding refresh', () => {
             await f.daemon.stop();
         }
     }, 15000);
+
+    it('streams malformed-session diagnostics and partial counts from successive workers while draining older history', async () => {
+        const f = fixture();
+        const malformed = seedSession(f, { project: f.project, nativeId: 'malformed', title: 'Malformed source' });
+        seedRollup(f, { project: f.project, session: malformed });
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('{broken', malformed.id);
+        setSetting('memory-plus', 'true');
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+        f.release();
+        f.daemon.start();
+        try {
+            for (let pass = 1; pass <= 2; pass++) {
+                await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+                await vi.waitFor(() => expect(f.logs.filter((line) => line.startsWith('[elepha] automatic indexing:'))).toHaveLength(pass));
+                expect(f.current()).toBe(true);
+                expect(f.errors).toHaveLength(pass);
+                expect(f.errors[pass - 1]).toContain(`Session ${malformed.id}`);
+                expect(f.errors[pass - 1]).toContain('decisions');
+                expect(f.logs.filter((line) => line.startsWith('[elepha] automatic indexing:'))[pass - 1]).toContain('1 malformed');
+            }
+            expect(thread.created).toHaveBeenCalledTimes(2);
+        } finally {
+            await f.daemon.stop();
+        }
+    });
 
     it('reports failures, retries on the next interval, and closes the worker cooperatively on shutdown', async () => {
         const f = fixture();

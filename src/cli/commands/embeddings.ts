@@ -30,7 +30,7 @@ export function registerEmbeddings(program: Command): void {
                 try {
                     const result = await generateEmbeddings(db, { environment, rebuild: options.rebuild });
                     console.log(
-                        `Vectors: ${result.generated} generated, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped.`,
+                        `Vectors: ${result.generated} generated, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference).`,
                     );
                 } finally {
                     db.close();

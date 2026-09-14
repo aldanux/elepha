@@ -83,12 +83,13 @@ export async function enableMemoryPlus(
                 configPath: options.configPath,
                 environment,
                 createProvider: options.createProvider,
+                report: log,
             });
             indexing.done();
             // Printed rather than folded into the loader line: the counts are a
             // result, and the loader renders nothing on a non-TTY stdout.
             log(
-                `elepha's "Memory-Plus" enabled. ${result.generated} sessions indexed, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped. New and updated sessions will be indexed automatically.`,
+                `elepha's "Memory-Plus" enabled. ${result.generated} sessions indexed, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference). New and updated sessions will be indexed automatically.`,
             );
         } finally {
             db.close();

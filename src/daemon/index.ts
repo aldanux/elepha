@@ -449,13 +449,15 @@ export class IngestionDaemon {
             if (!getSetting('memory-plus').value || isMemoryLocked(this.store.database)) {
                 return;
             }
-            const refresh = startEmbeddingRefresh(this.store.database.name);
+            const refresh = startEmbeddingRefresh(this.store.database.name, (message) =>
+                this.logError(`[elepha] automatic indexing: ${message}`),
+            );
             this.embeddingRefresh = refresh;
             this.embeddingRefreshPromise = refresh.done
                 .then((result) => {
                     if (result) {
                         this.log(
-                            `[elepha] automatic indexing: ${result.generated} indexed, ${result.current} current, ${result.ineligibleOrEmpty} skipped`,
+                            `[elepha] automatic indexing: ${result.generated} indexed, ${result.current} current, ${result.ineligibleOrEmpty} ineligible or empty, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference)`,
                         );
                     }
                 })

@@ -6,7 +6,7 @@ export interface EmbeddingRefresh {
     stop(): void;
 }
 
-export function startEmbeddingRefresh(databasePath: string): EmbeddingRefresh {
+export function startEmbeddingRefresh(databasePath: string, report: (message: string) => void = console.warn): EmbeddingRefresh {
     // Only installed code is executable; this path is the daemon's configured
     // database, never a transcript path. Even synchronous native model loading
     // and all-current history scans stay off the ingestion event loop.
@@ -17,8 +17,12 @@ export function startEmbeddingRefresh(databasePath: string): EmbeddingRefresh {
     const done = new Promise<GenerationResult | undefined>((resolve, reject) => {
         let reply: { result?: GenerationResult } | undefined;
         let failure: unknown;
-        worker.on('message', (message: { result?: GenerationResult }) => {
-            reply = message;
+        worker.on('message', (message: { result?: GenerationResult; diagnostic?: string }) => {
+            if (typeof message.diagnostic === 'string') {
+                report(message.diagnostic);
+            } else if (Object.hasOwn(message, 'result')) {
+                reply = message;
+            }
         });
         worker.once('error', (error) => {
             failure = error;

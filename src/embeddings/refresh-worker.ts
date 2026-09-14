@@ -25,6 +25,7 @@ async function refresh(): Promise<GenerationResult | undefined> {
         checkRunning();
         return await generateEmbeddings(db, {
             progress: checkRunning,
+            report: (diagnostic) => parentPort?.postMessage({ diagnostic }),
             createProvider: async (...args) => {
                 checkRunning();
                 const provider = await createEmbeddingProvider(...args);

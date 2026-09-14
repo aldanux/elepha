@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import type { ServedSession } from '../storage/session-read-model.js';
 
+export class MalformedEmbeddingSourceError extends Error {}
+
 function storedArray(value: string, field: string): unknown[] {
     try {
         const decoded: unknown = JSON.parse(value);
@@ -11,7 +13,7 @@ function storedArray(value: string, field: string): unknown[] {
     } catch {
         // Parser errors can echo stored content; report only the failed field.
     }
-    throw new Error(`Invalid stored ${field}; semantic source was not generated.`);
+    throw new MalformedEmbeddingSourceError(`Invalid stored ${field}; semantic source was not generated.`);
 }
 
 function strings(value: string | null | undefined, field: string): string[] {
@@ -20,7 +22,7 @@ function strings(value: string | null | undefined, field: string): string[] {
     }
     const decoded = storedArray(value, field);
     if (decoded.some((item) => typeof item !== 'string')) {
-        throw new Error(`Invalid stored ${field}; semantic source was not generated.`);
+        throw new MalformedEmbeddingSourceError(`Invalid stored ${field}; semantic source was not generated.`);
     }
     return decoded as string[];
 }
@@ -40,7 +42,7 @@ export function embeddingSourceText(session: ServedSession): string {
                 typeof decision.what !== 'string' ||
                 typeof decision.why !== 'string'
             ) {
-                throw new Error('Invalid stored decision; semantic source was not generated.');
+                throw new MalformedEmbeddingSourceError('Invalid stored decision; semantic source was not generated.');
             }
             texts.push(decision.what, decision.why);
         }
@@ -56,7 +58,7 @@ export function embeddingSourceText(session: ServedSession): string {
                 typeof instruction.what !== 'string' ||
                 (why !== undefined && typeof why !== 'string')
             ) {
-                throw new Error('Invalid stored instruction; semantic source was not generated.');
+                throw new MalformedEmbeddingSourceError('Invalid stored instruction; semantic source was not generated.');
             }
             texts.push(instruction.what);
             if (why !== undefined) {
