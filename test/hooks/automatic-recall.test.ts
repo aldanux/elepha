@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+    AUTOMATIC_RECALL_MAX_CANDIDATES,
     AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
     AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
     AUTOMATIC_RECALL_MIN_SIMILARITY,
@@ -42,11 +43,11 @@ function fixture(similarity = 1) {
     });
     setSetting('memory-plus', 'true', configPath);
     const embeddings = new EmbeddingStore(f.db, configPath);
-    const writeVector = () =>
+    const writeVector = (target = session, score = similarity) =>
         embeddings.write(
-            embeddings.source(session.id)!,
+            embeddings.source(target.id)!,
             configuration,
-            [similarity, Math.sqrt(1 - similarity ** 2)],
+            [score, Math.sqrt(1 - score ** 2)],
             withMemoryReadGeneration(f.db, lockedEmbedding, (token) => token),
         );
     writeVector();
@@ -221,6 +222,77 @@ describe('automatic "Memory-Plus" candidates', () => {
         seedConsentRoot(f, { path: other.path });
         f.project.path = other.path;
         expect(await f.run()).toEqual({ reason: 'not_command' });
+    });
+
+    describe.each(['self', 'injected'] as const)('ranked fallback after a %s candidate', (top) => {
+        async function competition() {
+            const f = fixture(0.99);
+            const chat = top === 'self' ? f.session.native_id : 'current';
+            if (top === 'injected') context(await f.run(undefined, 'codex', chat));
+            const historical = seedSession(f, {
+                project: f.project,
+                nativeId: 'historical-recovery',
+                title: 'Historical recovery decision',
+                startedAt: '2026-09-13T00:00:00Z',
+                lastTurnAt: '2026-09-13T00:00:00Z',
+            });
+            f.writeVector(historical, 0.98);
+            return { ...f, historical, chat };
+        }
+
+        it('serves the next qualifying historical session and then deduplicates it', async () => {
+            const f = await competition();
+            const output = context(await f.run(undefined, 'codex', f.chat));
+            expect(output).toContain(`get_session({"id":"${publicSessionId(f.historical)}"})`);
+            expect(output).not.toContain(`get_session({"id":"${publicSessionId(f.session)}"})`);
+            const count = f.store.injectionsForSession('codex', f.chat, new Date(NOW).toISOString()).length;
+            expect(await f.run(undefined, 'codex', f.chat)).toEqual({ reason: 'not_command' });
+            expect(f.store.injectionsForSession('codex', f.chat, new Date(NOW).toISOString())).toHaveLength(count);
+        });
+
+        it.each(['below floor', 'at floor', 'incognito'] as const)('abstains when the fallback is %s', async (rejection) => {
+            const f = await competition();
+            // Establish that this exact ranked competition can serve the fallback
+            // before changing its eligibility; silence alone cannot detect early exit.
+            expect(context(await f.run(undefined, 'codex', f.chat))).toContain(publicSessionId(f.historical));
+            f.db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Changed historical decision', f.historical.id);
+            f.writeVector(f.historical, 0.98);
+            const count = f.store.injectionsForSession('codex', f.chat, new Date(NOW).toISOString()).length;
+            const recall = vi.spyOn(semantic, 'semanticRecall').mockImplementation(async () => {
+                // Return an inference result that predates the eligibility change.
+                if (rejection === 'incognito') f.store.recordIncognitoTranscript(f.historical.tool, f.historical.native_id);
+                return [
+                    { sessionId: f.session.id, similarity: 0.99 },
+                    {
+                        sessionId: f.historical.id,
+                        similarity:
+                            rejection === 'incognito' ? 0.98 : AUTOMATIC_RECALL_MIN_SIMILARITY - (rejection === 'below floor' ? 0.01 : 0),
+                    },
+                ];
+            });
+            expect(await f.run(undefined, 'codex', f.chat)).toEqual({ reason: 'not_command' });
+            expect(recall).toHaveBeenCalledOnce();
+            expect(f.store.injectionsForSession('codex', f.chat, new Date(NOW).toISOString())).toHaveLength(count);
+        });
+    });
+
+    it('serves at the candidate budget boundary but never walks beyond it', async () => {
+        const f = fixture(0.99);
+        const historical = seedSession(f, { project: f.project, nativeId: 'bounded-history', title: 'Bounded historical decision' });
+        const skipped = { sessionId: f.session.id, similarity: 0.99 };
+        const fallback = { sessionId: historical.id, similarity: 0.98 };
+        const recall = vi
+            .spyOn(semantic, 'semanticRecall')
+            .mockResolvedValue([...Array.from({ length: AUTOMATIC_RECALL_MAX_CANDIDATES - 1 }, () => skipped), fallback]);
+        expect(context(await f.run(undefined, 'codex', f.session.native_id))).toContain(publicSessionId(historical));
+        f.db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Fresh bounded historical decision', historical.id);
+        recall.mockResolvedValue([...Array.from({ length: AUTOMATIC_RECALL_MAX_CANDIDATES }, () => skipped), fallback]);
+        const hydrate = vi.spyOn(semantic, 'currentRecallHits');
+        expect(await f.run(undefined, 'codex', f.session.native_id)).toEqual({ reason: 'not_command' });
+        expect(hydrate).toHaveBeenCalledOnce();
+        expect(hydrate.mock.calls[0][2]).toHaveLength(AUTOMATIC_RECALL_MAX_CANDIDATES);
+        expect(hydrate.mock.calls[0][2]).not.toContain(historical.id);
+        expect(f.store.injectionsForSession('codex', f.session.native_id, new Date(NOW).toISOString())).toHaveLength(1);
     });
 
     it('does no model work for empty, oversized or explicit command prompts', async () => {

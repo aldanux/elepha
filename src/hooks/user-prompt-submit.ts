@@ -4,6 +4,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import {
+    AUTOMATIC_RECALL_MAX_CANDIDATES,
     AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
     AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
     AUTOMATIC_RECALL_MIN_SIMILARITY,
@@ -317,30 +318,53 @@ export async function runUserPromptSubmit(
                         }
                     },
                 });
-                const candidate = semantic[0];
-                if (candidate === undefined || candidate.similarity <= AUTOMATIC_RECALL_MIN_SIMILARITY) {
+                const candidates = semantic.slice(0, AUTOMATIC_RECALL_MAX_CANDIDATES);
+                const belowFloor = candidates.findIndex((candidate) => candidate.similarity <= AUTOMATIC_RECALL_MIN_SIMILARITY);
+                if (belowFloor !== -1) {
+                    candidates.length = belowFloor;
+                }
+                if (candidates.length === 0) {
                     return { reason: 'not_command' };
                 }
-                const hit = currentRecallHits(db, [project], [candidate.sessionId])[0];
-                if (hit === undefined || (hit.session.tool === tool && hit.session.native_id === payload.session_id)) {
-                    return { reason: 'not_command' };
+                // Resolve current projects and consent once for the bounded shortlist.
+                const hits = new Map(
+                    currentRecallHits(
+                        db,
+                        [project],
+                        candidates.map((candidate) => candidate.sessionId),
+                    ).map((hit) => [hit.session.id, hit]),
+                );
+                let selected: { sessionId: number; body: string } | undefined;
+                for (const candidate of candidates) {
+                    const hit = hits.get(candidate.sessionId);
+                    if (hit === undefined || (hit.session.tool === tool && hit.session.native_id === payload.session_id)) {
+                        continue;
+                    }
+                    const { prefix, body } = automaticRecallCandidate(hit, candidate.similarity);
+                    if (body.length > AUTOMATIC_RECALL_MAX_CONTEXT_CHARS) {
+                        log(promptLogLine(tool, payload, 'discarded reason=automatic_context_budget'));
+                        continue;
+                    }
+                    if (store.hasInjectionBodyPrefix(tool, payload.session_id, prefix)) {
+                        continue;
+                    }
+                    if (store.isTranscriptIncognito(hit.session.tool, hit.session.native_id)) {
+                        continue;
+                    }
+                    selected = { sessionId: candidate.sessionId, body };
+                    break;
                 }
-                const { prefix, body } = automaticRecallCandidate(hit, candidate.similarity);
-                if (body.length > AUTOMATIC_RECALL_MAX_CONTEXT_CHARS) {
-                    log(promptLogLine(tool, payload, 'discarded reason=automatic_context_budget'));
-                    return { reason: 'not_command' };
-                }
-                if (store.hasInjectionBodyPrefix(tool, payload.session_id, prefix)) {
+                if (selected === undefined) {
                     return { reason: 'not_command' };
                 }
                 if (
                     !getSetting('memory-plus', {}, dependencies.configPath).value ||
-                    !contributingSessionsStillConsented(db, new SessionReader(db), [candidate.sessionId])
+                    !contributingSessionsStillConsented(db, new SessionReader(db), [selected.sessionId])
                 ) {
                     log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
                     return { reason: 'not_command' };
                 }
-                const result = emit(body);
+                const result = emit(selected.body);
                 if ('output' in result) {
                     log(promptLogLine(tool, payload, 'served automatic_candidate'));
                 }

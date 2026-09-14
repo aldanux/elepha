@@ -190,6 +190,8 @@ export const SEMANTIC_RECALL_MAX_HITS = 5;
 // Unsolicited candidates require near-identical vector direction; interactive
 // retrieval has no cosine floor. This conservative bar favors missed candidates.
 export const AUTOMATIC_RECALL_MIN_SIMILARITY = 0.95;
+// Match today's semantic shortlist while keeping hook work bounded if retrieval grows.
+export const AUTOMATIC_RECALL_MAX_CANDIDATES = 5;
 export const AUTOMATIC_RECALL_MAX_PROMPT_CHARS = 4_000;
 export const AUTOMATIC_RECALL_MAX_CONTEXT_CHARS = 2_000;
 export const EMBEDDING_LOCAL_MAX_TOKENS = 512;
