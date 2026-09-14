@@ -45,6 +45,21 @@ function onPath(name) {
         });
 }
 
+export function verifyPathResolution(globalBin) {
+    const resolved = onPath('elepha');
+    if (!resolved) {
+        console.log(`Fresh build installed at ${globalBin}; elepha was not found on PATH, so PATH resolution could not be verified.`);
+    } else if (realpathSync(resolved) === realpathSync(globalBin)) {
+        console.log('Verified: elepha on PATH resolves to the fresh build.');
+    } else {
+        console.warn(
+            `Warning: \`elepha\` on PATH resolves to ${resolved}, not the fresh build at ${globalBin}.\n` +
+                'This usually means a different Node version is active now than during this install.\n' +
+                `Open a new shell (or \`nvm use ${process.version}\`) before running \`elepha\` commands.`,
+        );
+    }
+}
+
 export async function main() {
     const execPath = realpathSync(process.execPath);
     // npm run can retain a different Node on PATH. All npm children must use this runtime.
@@ -156,6 +171,7 @@ export async function main() {
     // Prefer the package just installed even if PATH still contains an older launcher or global.
     await run(globalBin, ['install']);
     await run(globalBin, ['doctor'], { allowFailure: true });
+    verifyPathResolution(globalBin);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === script) {
