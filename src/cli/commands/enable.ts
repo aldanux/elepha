@@ -5,7 +5,7 @@ import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration
 import { errorMessage } from '../../util/error.js';
 import { confirmYesNo } from '../shared.js';
 
-export const MEMORY_PLUS_INTRO = 'Memory Plus finds past sessions by meaning, not just matching words — works in any language.';
+export const MEMORY_PLUS_INTRO = 'elepha Memory Plus finds past sessions by meaning, not just matching words. Works in any language.';
 export const MEMORY_PLUS_LOCAL_NOTICE =
     'Downloads a small AI model once (~113MB), runs locally, uses ~1GB of memory while active. No session data leaves your machine.';
 export const MEMORY_PLUS_API_NOTICE =
@@ -30,13 +30,13 @@ export async function enableMemoryPlus(
     log(embeddingConfiguration(true, environment)?.provider === 'openai' ? MEMORY_PLUS_API_NOTICE : MEMORY_PLUS_LOCAL_NOTICE);
     log('');
     if (!(await (options.confirm ?? confirmYesNo)(MEMORY_PLUS_CONFIRM))) {
-        log('Cancelled. Memory Plus settings were not changed.');
+        log('Cancelled. elepha Memory Plus settings were not changed.');
         return false;
     }
     let provider: EmbeddingProvider | undefined;
     try {
         if (embeddingConfiguration(true, environment)?.provider === 'local') {
-            log('Installing Memory Plus local runtime…');
+            log('Installing elepha Memory Plus local runtime…');
             await (options.installDependency ?? installMemoryPlusDependency)();
         }
         provider = await (options.createProvider ?? createEmbeddingProvider)(true, environment);
@@ -57,7 +57,7 @@ export async function enableMemoryPlus(
     } finally {
         await provider?.dispose();
     }
-    log('Memory Plus enabled. Run elepha embeddings to generate vectors. Search integration is not available yet.');
+    log('elepha Memory Plus enabled. Run elepha embeddings to generate vectors.');
     return true;
 }
 
@@ -71,7 +71,7 @@ export function registerEnable(program: Command): void {
             try {
                 await enableMemoryPlus();
             } catch (error) {
-                console.error(`Memory Plus setup failed: ${errorMessage(error)}`);
+                console.error(`elepha Memory Plus setup failed: ${errorMessage(error)}`);
                 process.exitCode = 1;
             }
         });
