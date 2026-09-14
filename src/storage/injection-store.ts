@@ -22,10 +22,13 @@ export interface RecordInjectionInput {
 }
 
 export class InjectionStore {
-    private readonly stmts: { insertInjection: Statement; injectionsForSession: Statement };
+    private readonly stmts: { insertInjection: Statement; injectionsForSession: Statement; injectionsForPrefix: Statement };
 
     constructor(db: Database) {
         this.stmts = {
+            injectionsForPrefix: db.prepare(
+                'SELECT 1 FROM injections WHERE tool = ? AND native_session_id = ? AND substr(body, 1, ?) = ? LIMIT 1',
+            ),
             insertInjection: db.prepare(
                 `INSERT OR IGNORE INTO injections (tool, native_session_id, injected_at, injection_id, body_hash, body)
                  VALUES (@tool, @native_session_id, @injected_at, @injection_id, @body_hash, @body)`,
@@ -62,6 +65,12 @@ export class InjectionStore {
 
     injectionsForSession(tool: ToolName, nativeSessionId: string, atOrBefore: string): InjectionRow[] {
         return this.stmts.injectionsForSession.all(tool, nativeSessionId, atOrBefore) as InjectionRow[];
+    }
+
+    // Query the existing chat index without loading its historical bodies. A
+    // stable candidate prefix survives fresh DATA nonces and changed prompts.
+    hasBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): boolean {
+        return this.stmts.injectionsForPrefix.get(tool, nativeSessionId, prefix.length, prefix) !== undefined;
     }
 
     isQuoteBack(

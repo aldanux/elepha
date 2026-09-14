@@ -181,6 +181,26 @@ export function readSessionById(db: Database.Database, id: number): ServedSessio
     return row === undefined ? undefined : hydrateServedSession(db, row);
 }
 
+// Manual embedding jobs page identities, then hydrate only a currently
+// authorized session. No transcript or filtered-turn body is selected.
+export function readEmbeddingSessionIds(db: Database.Database, before: number, limit: number): number[] {
+    return (db.prepare('SELECT id FROM sessions WHERE id < ? ORDER BY id DESC LIMIT ?').all(before, limit) as Array<{ id: number }>).map(
+        (row) => row.id,
+    );
+}
+
+export function readEmbeddingSession(db: Database.Database, id: number, projectIds: readonly number[]): ServedSession | undefined {
+    const row = db
+        .prepare(`${SERVED_SESSION_SELECT}
+        WHERE s.id = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
+          AND s.project_id IN (SELECT value FROM json_each(?))
+          AND NOT EXISTS (SELECT 1 FROM purged_transcripts p WHERE p.tool = s.tool AND p.native_id = s.native_id)
+          AND NOT EXISTS (SELECT 1 FROM incognito_transcripts i WHERE i.tool = s.tool AND i.native_id = s.native_id)
+        GROUP BY s.id`)
+        .get(id, ...SUPPORTED_TOOLS, JSON.stringify(projectIds)) as RawServedSession | undefined;
+    return row === undefined ? undefined : hydrateServedSession(db, row);
+}
+
 // Indexed lookup on sessions.UNIQUE(tool, native_id, segment_index), for
 // callers that need exactly one session. Consent-independent by design; the
 // caller owns any consent gate.

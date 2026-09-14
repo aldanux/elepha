@@ -130,7 +130,27 @@ export class ConsentStore {
     }
 
     remove(ulid: string): boolean {
-        return this.db.prepare('DELETE FROM consent_roots WHERE ulid = ?').run(ulid).changes > 0;
+        return this.db.transaction(() => {
+            const removed = this.db.prepare('DELETE FROM consent_roots WHERE ulid = ?').run(ulid).changes > 0;
+            this.removeUnconsentedEmbeddings();
+            return removed;
+        })();
+    }
+
+    // Revocation keeps captured history, but the rebuildable vector cache must
+    // disappear immediately, including other members of a denied ProjectSet.
+    private removeUnconsentedEmbeddings(): void {
+        const cached = this.db.prepare('SELECT DISTINCT project_id FROM session_embeddings').all() as Array<{ project_id: number }>;
+        if (cached.length === 0) {
+            return;
+        }
+        const allowed = new Set(new ProjectResolver(this.db).listConsentedStored(this).flatMap((project) => project.projectIds));
+        const remove = this.db.prepare('DELETE FROM session_embeddings WHERE project_id = ?');
+        for (const { project_id } of cached) {
+            if (!allowed.has(project_id)) {
+                remove.run(project_id);
+            }
+        }
     }
 
     // An approved root covers itself and its descendants, case-insensitively on macOS.
@@ -230,13 +250,16 @@ export class ConsentStore {
             decided_at: new Date().toISOString(),
             source,
         };
-        this.db
-            .prepare(
-                `INSERT INTO consent_roots (ulid, path, state, decided_at, source)
+        this.db.transaction(() => {
+            this.db
+                .prepare(
+                    `INSERT INTO consent_roots (ulid, path, state, decided_at, source)
                  VALUES (@ulid, @path, @state, @decided_at, @source)
                  ON CONFLICT(path) DO UPDATE SET state = excluded.state, decided_at = excluded.decided_at, source = excluded.source`,
-            )
-            .run(row);
+                )
+                .run(row);
+            this.removeUnconsentedEmbeddings();
+        })();
         return row;
     }
 }

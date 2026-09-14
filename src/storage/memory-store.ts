@@ -118,6 +118,10 @@ export class MemoryStore {
         return this.injections.recordInjection(input);
     }
 
+    hasInjectionBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): boolean {
+        return this.injections.hasBodyPrefix(tool, nativeSessionId, prefix);
+    }
+
     injectionsForSession(tool: ToolName, nativeSessionId: string, atOrBefore: string): InjectionRow[] {
         return this.injections.injectionsForSession(tool, nativeSessionId, atOrBefore);
     }
@@ -175,6 +179,9 @@ export class MemoryStore {
             this.db
                 .prepare('INSERT OR IGNORE INTO incognito_transcripts (tool, native_id, tombstoned_at) VALUES (?, ?, ?)')
                 .run(tool, nativeId, new Date().toISOString());
+            this.db
+                .prepare('DELETE FROM session_embeddings WHERE session_id IN (SELECT id FROM sessions WHERE tool = ? AND native_id = ?)')
+                .run(tool, nativeId);
             // Delete the child explicitly: SQLite does not reliably run this
             // table's FTS cleanup trigger for an FK cascade.
             this.db

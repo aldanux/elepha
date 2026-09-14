@@ -12,6 +12,7 @@ export const SETTING_KEYS = [
     'capture-codex',
     'capture-opencode',
     'durable-capture',
+    'memory-plus',
     'query-matching',
 ] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
@@ -38,6 +39,7 @@ export const SETTING_SCHEMA = {
     'capture-codex': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'capture-opencode': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: true },
     'durable-capture': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
+    'memory-plus': { kind: 'boolean', values: BOOLEAN_SETTING_VALUES, default: false },
     'query-matching': { kind: 'enum', values: ['strict', 'lax'], default: 'strict' },
 } as const satisfies Record<SettingKey, SettingSchema>;
 

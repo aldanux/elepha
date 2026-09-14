@@ -2,6 +2,9 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { MINIMUM_NODE_VERSION } from '../config/constants.js';
 import { updateAvailablePath } from '../config/paths.js';
+import { getSetting } from '../config/settings.js';
+import { isNewerVersion } from '../daemon/update-check.js';
+import { type MemoryPlusNpm, memoryPlusNpm } from '../embeddings/dependency.js';
 import { npmInstallGlobalElephaAsync, npmInvocationForBackend, npmViewElephaLatestAsync } from '../security/subprocess-allowlist.js';
 import { defaultDbPath } from '../storage/db.js';
 import { errorMessage } from '../util/error.js';
@@ -29,6 +32,8 @@ export interface SelfUpdateRuntime {
     readPackageVersion?: (packageRoot: string) => string;
     detectBackend?: (options: { packageRoot: string; sourceBin: string; minimumNodeVersion: string }) => LauncherBackend;
     npm?: SelfUpdateNpm;
+    memoryPlusNpm?: MemoryPlusNpm;
+    configPath?: string;
     service?: ServiceBackend;
     approvedRoots?: number;
     readApprovedRoots?: () => Promise<number>;
@@ -79,6 +84,31 @@ function defaultNpm(backend: LauncherBackend): SelfUpdateNpm {
         installLatest: () => npmInstallGlobalElephaAsync(invocation, 'latest'),
         installVersion: (version) => npmInstallGlobalElephaAsync(invocation, version),
     };
+}
+
+// Optional runtime failures never enter elepha's package/service rollback path.
+async function refreshMemoryPlus(runtime: SelfUpdateRuntime, backend: LauncherBackend): Promise<void> {
+    const report = runtime.report ?? console.log;
+    try {
+        if (!getSetting('memory-plus', {}, runtime.configPath).value) {
+            return;
+        }
+        const npm = runtime.memoryPlusNpm ?? memoryPlusNpm(backend);
+        const latest = await npm.latestVersion();
+        const installed = npm.installedVersion();
+        // The user may disable the feature while the registry query is in flight.
+        if (!getSetting('memory-plus', {}, runtime.configPath).value) {
+            return;
+        }
+        if (installed === undefined || isNewerVersion(latest, installed)) {
+            await npm.installVersion(latest);
+            report(`Memory Plus dependency updated to ${latest}.`);
+        } else {
+            report(`Memory Plus dependency is current (${installed}).`);
+        }
+    } catch (error) {
+        report(`Memory Plus dependency update failed: ${errorMessage(error)}; run elepha enable memory-plus again to retry`);
+    }
 }
 
 class ServiceNotInstalledError extends Error {
@@ -145,6 +175,7 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
 
     if (latestVersion === previousVersion) {
         removeFileIfExists(updateAvailablePath());
+        await refreshMemoryPlus(runtime, backend);
         return { status: 'current', version: previousVersion };
     }
 
@@ -207,6 +238,7 @@ export async function selfUpdate(runtime: SelfUpdateRuntime = missingApprovedRoo
         report(`${skipped.integration}: ${skipped.status} — left untouched (${skipped.file}); run elepha doctor`);
     }
     removeFileIfExists(updateAvailablePath());
+    await refreshMemoryPlus(runtime, backend);
     return { status: 'updated', previousVersion, version: installedVersion };
 }
 

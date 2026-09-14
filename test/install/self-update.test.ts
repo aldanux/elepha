@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { opencodePluginPath, updateAvailablePath } from '../../src/config/paths.js';
+import { setSetting } from '../../src/config/settings.js';
 import { type IntegrationPaths, reconcileOwnedIntegrations } from '../../src/install/integrations.js';
 import { renderOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { type SelfUpdateRuntime, selfUpdate } from '../../src/install/self-update.js';
@@ -87,6 +88,85 @@ describe('selfUpdate', () => {
         vi.stubEnv('ELEPHA_HOME', withGrantableTestDir('self-update-home-'));
     });
     afterEach(() => vi.unstubAllEnvs());
+
+    function optionalNpm() {
+        return {
+            latestVersion: vi.fn(async () => '4.3.0'),
+            installedVersion: vi.fn((): string | undefined => '4.2.0'),
+            installVersion: vi.fn(async (_version: string) => {}),
+        };
+    }
+
+    it('does no optional npm work when Memory Plus is disabled', async () => {
+        const { runtime } = runtimeFor({ latest: '1.2.4', reconciliation: ['active'] });
+        runtime.memoryPlusNpm = optionalNpm();
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
+        expect(runtime.memoryPlusNpm.latestVersion).not.toHaveBeenCalled();
+        expect(runtime.memoryPlusNpm.installedVersion).not.toHaveBeenCalled();
+        expect(runtime.memoryPlusNpm.installVersion).not.toHaveBeenCalled();
+    });
+
+    it.each(['1.2.3', '1.2.4'])('refreshes and reports the optional runtime even when elepha is already current (%s)', async (latest) => {
+        setSetting('memory-plus', 'true');
+        const { runtime, events } = runtimeFor({ latest, reconciliation: ['active'] });
+        runtime.memoryPlusNpm = optionalNpm();
+        runtime.report = vi.fn();
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: latest === '1.2.3' ? 'current' : 'updated' });
+        expect(runtime.memoryPlusNpm.installVersion).toHaveBeenCalledExactlyOnceWith('4.3.0');
+        expect(runtime.report).toHaveBeenCalledWith(expect.stringMatching(/Memory Plus.*updated.*4\.3\.0/));
+        expect(events).not.toContain('npm install elepha@1.2.3');
+    });
+
+    it.each(['lookup', 'install'])('reports optional %s failure without rolling back elepha', async (failure) => {
+        setSetting('memory-plus', 'true');
+        const { runtime, events } = runtimeFor({ latest: '1.2.4', reconciliation: ['active'] });
+        const npm = optionalNpm();
+        if (failure === 'lookup') npm.latestVersion.mockRejectedValue(new Error('registry offline'));
+        else npm.installVersion.mockRejectedValue(new Error('disk full'));
+        runtime.memoryPlusNpm = npm;
+        runtime.report = vi.fn();
+        await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated', version: '1.2.4' });
+        expect(runtime.report).toHaveBeenCalledWith(
+            expect.stringMatching(
+                /Memory Plus dependency update failed: (registry offline|disk full); run elepha enable memory-plus again to retry/,
+            ),
+        );
+        expect(events).toContain('service reconcile and verify heartbeat');
+        expect(events).not.toContain('npm install elepha@1.2.3');
+    });
+
+    it.each(['4.3.0', '4.4.0'])('does not reinstall or downgrade an up-to-date optional runtime (%s)', async (installed) => {
+        setSetting('memory-plus', 'true');
+        const { runtime } = runtimeFor({ reconciliation: ['active'] });
+        const npm = optionalNpm();
+        npm.installedVersion.mockReturnValue(installed);
+        runtime.memoryPlusNpm = npm;
+        await selfUpdate(runtime);
+        expect(npm.installVersion).not.toHaveBeenCalled();
+    });
+
+    it('repairs a missing optional package while enabled', async () => {
+        setSetting('memory-plus', 'true');
+        const { runtime } = runtimeFor({ reconciliation: ['active'] });
+        const npm = optionalNpm();
+        npm.installedVersion.mockReturnValue(undefined);
+        runtime.memoryPlusNpm = npm;
+        await selfUpdate(runtime);
+        expect(npm.installVersion).toHaveBeenCalledWith('4.3.0');
+    });
+
+    it('rechecks the setting after the awaited registry query', async () => {
+        setSetting('memory-plus', 'true');
+        const { runtime } = runtimeFor({ reconciliation: ['active'] });
+        const npm = optionalNpm();
+        npm.latestVersion.mockImplementation(async () => {
+            setSetting('memory-plus', 'false');
+            return '4.3.0';
+        });
+        runtime.memoryPlusNpm = npm;
+        await selfUpdate(runtime);
+        expect(npm.installVersion).not.toHaveBeenCalled();
+    });
 
     function integrationFixture() {
         const root = withGrantableTestDir('self-update-integrations-');

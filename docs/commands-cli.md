@@ -113,3 +113,19 @@ Full guide: [docs/troubleshooting.md](troubleshooting.md).
 | `elepha status`            | Print the quick daemon health and recent-ingestion summary. More details in [docs/troubleshooting.md](troubleshooting.md#quick-health-check).               |
 | `elepha doctor`            | Run deep checks and repair a down managed daemon when possible. More details in [docs/troubleshooting.md](troubleshooting.md#deep-health-check-and-repair). |
 | `elepha inspect <project>` | Print recent stored memory for one project. More details in [docs/troubleshooting.md](troubleshooting.md#inspect-recently-captured-memory).                 |
+
+### `elepha enable memory-plus`
+
+Confirm optional Memory Plus setup, verify the local multilingual model (or OpenAI
+when `OPENAI_API_KEY` is configured), and enable the setting only after success.
+Rerunning reuses downloaded model files. See [Memory Plus configuration](configuration.md#memory-plus-foundation-optional)
+for the resource costs and external-provider privacy trade-off. Search integration
+and automatic generation are not part of this command.
+
+### `elepha embeddings [--rebuild]`
+
+Manually generate versioned vectors from currently permitted stored session
+metadata. Requires Memory Plus to be enabled and memory to be unlocked.
+Existing current vectors are skipped; `--rebuild` regenerates all eligible vectors
+without changing source material. API mode always requires confirmation before
+sending session content to OpenAI. Neither command changes hooks or search ranking.

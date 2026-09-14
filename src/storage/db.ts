@@ -772,6 +772,20 @@ function initializeDatabase(db: Database.Database, dbPath: string): Database.Dat
     initializeParanoidAuthoritySchema(db);
     db.exec(SCHEMA);
     migrate(db);
+    // Create the optional cache after legacy session-table rebuilds so its
+    // foreign keys always reference the final session table.
+    db.exec(`CREATE TABLE IF NOT EXISTS session_embeddings (
+        session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        rollup_session_id INTEGER REFERENCES session_rollups(session_id) ON DELETE CASCADE,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        source_hash TEXT NOT NULL,
+        model TEXT NOT NULL,
+        model_revision TEXT NOT NULL,
+        dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+        vector BLOB NOT NULL CHECK (length(vector) = dimensions * 4),
+        computed_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_embeddings_project ON session_embeddings(project_id);`);
     initializeParanoidAuthority(db);
     migrateDurableCaptureFts(db);
     migrateDurableCaptureUsage(db);

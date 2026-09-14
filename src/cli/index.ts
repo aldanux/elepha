@@ -11,6 +11,8 @@ import { registerConfig } from './commands/config.js';
 import { registerConsent } from './commands/consent.js';
 import { registerDaemonControl } from './commands/daemon-control.js';
 import { registerDoctor } from './commands/doctor.js';
+import { registerEmbeddings } from './commands/embeddings.js';
+import { registerEnable } from './commands/enable.js';
 import { registerHook } from './commands/hook.js';
 import { registerImport } from './commands/import.js';
 import { registerInit } from './commands/init.js';
@@ -54,6 +56,8 @@ program.configureHelp({
 program.addHelpText('after', `\nRun 'elepha <command> -h' for details on a command.\nFull documentation: ${DOCS_URL}`);
 
 registerConfig(program);
+registerEnable(program);
+registerEmbeddings(program);
 registerHook(program);
 registerInstall(program);
 registerUninstall(program);
