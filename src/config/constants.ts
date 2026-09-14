@@ -46,7 +46,6 @@ export const ELEPHA_LIST_MAX_LIMIT = 100;
 export const REMEMBER_SESSION_RECENCY_CAP = { global: 5_000, here: 5_000 } as const;
 export const REMEMBER_SCAN_BUDGET_MS = 3_000;
 export const REMEMBER_MAX_HITS = 5;
-export const REMEMBER_DISTINCTIVE_TOKEN_FRACTION = 0.005;
 export const REMEMBER_QUERY_FILLER_WORDS = ['a', 'about', 'an', 'and', 'for', 'me', 'of', 'please', 'the', 'to'] as const;
 export const FIRST_PROMPT_SEARCH_CAP = 4_000;
 export const REMEMBER_MATCH_SCORES = {

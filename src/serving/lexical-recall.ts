@@ -4,7 +4,6 @@
 
 import { randomUUID } from 'node:crypto';
 import {
-    REMEMBER_DISTINCTIVE_TOKEN_FRACTION,
     REMEMBER_MATCH_SCORES,
     REMEMBER_MAX_HITS,
     REMEMBER_QUERY_FILLER_WORDS,
@@ -81,8 +80,8 @@ interface PreparedMetadata {
 }
 
 interface RecallRarity {
-    distinctiveTokens: Set<string>;
     idfByToken: Map<string, number>;
+    minimumHitScore: number;
 }
 
 const FILLER_WORDS = new Set<string>(REMEMBER_QUERY_FILLER_WORDS);
@@ -263,15 +262,14 @@ function prepareRarity(prepared: PreparedMetadata[], query: RecallQuery): Recall
         }
     }
     const idfByToken = new Map<string, number>();
-    const distinctiveTokens = new Set<string>();
+    let minimumHitScore = 0;
     for (const token of query.tokens) {
         const frequency = documentFrequency.get(token) ?? 0;
-        idfByToken.set(token, Math.log((prepared.length + 1) / (frequency + 1)) + 1);
-        if (prepared.length > 0 && frequency / prepared.length < REMEMBER_DISTINCTIVE_TOKEN_FRACTION) {
-            distinctiveTokens.add(token);
-        }
+        const score = Math.log((prepared.length + 1) / (frequency + 1)) + 1;
+        idfByToken.set(token, score);
+        minimumHitScore = Math.max(minimumHitScore, score);
     }
-    return { distinctiveTokens, idfByToken };
+    return { idfByToken, minimumHitScore };
 }
 
 function hitForSession(metadata: PreparedMetadata, query: RecallQuery, matchingMode: QueryMatchingMode): RecallHit | undefined {
@@ -324,11 +322,8 @@ function hitForSession(metadata: PreparedMetadata, query: RecallQuery, matchingM
 }
 
 function rankAndFloorHits(hits: RecallHit[], rarity: RecallRarity): RecallHit[] {
-    const qualifyingHits =
-        rarity.distinctiveTokens.size === 0
-            ? hits
-            : hits.filter((hit) => [...hit.matchedTokens].some((token) => rarity.distinctiveTokens.has(token)));
-    const ranked = qualifyingHits.sort((a, b) => compareHits(a, b, rarity));
+    // Cumulative IDF lets several common overlaps compensate for missing one rare term.
+    const ranked = hits.filter((hit) => idfScore(hit, rarity) >= rarity.minimumHitScore).sort((a, b) => compareHits(a, b, rarity));
     return (ranked[0]?.matchedTokens.size ?? 0) >= 2 ? ranked.filter((hit) => hit.matchedTokens.size >= 2) : ranked;
 }
 
