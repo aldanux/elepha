@@ -12,6 +12,7 @@ import * as providers from '../../src/embeddings/provider-config.js';
 import type { HookTool } from '../../src/hooks/common.js';
 import { runUserPromptSubmit, type UserPromptSubmitDependencies } from '../../src/hooks/user-prompt-submit.js';
 import { containsSentinel } from '../../src/security/sentinel.js';
+import * as automatic from '../../src/serving/automatic-recall.js';
 import { AUTOMATIC_RECALL_INSTRUCTIONS, dataBlockClose, dataBlockOpen, servedContextInstructions } from '../../src/serving/instructions.js';
 import * as semantic from '../../src/serving/semantic-recall.js';
 import { publicSessionId } from '../../src/serving/session-id.js';
@@ -181,6 +182,36 @@ describe('automatic "Memory-Plus" candidates', () => {
         expect(await f.run()).toEqual({ reason: 'not_command' });
         expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
     });
+
+    it.each(['codex', 'claude-code', 'opencode'] as const)(
+        'does not emit a candidate that becomes incognito after hydration: %s',
+        async (tool) => {
+            const f = fixture();
+            const candidate = vi.spyOn(automatic, 'automaticRecallCandidate');
+            const deduplicate = vi.spyOn(MemoryStore.prototype, 'hasInjectionBodyPrefix').mockImplementation(() => {
+                f.store.recordIncognitoTranscript(f.session.tool, f.session.native_id);
+                return false;
+            });
+
+            const result = await f.run(undefined, tool);
+
+            // The real renderer already held the private title and pointer before
+            // the deduplication lookup changed eligibility on another connection.
+            expect(candidate).toHaveBeenCalledOnce();
+            expect(candidate.mock.results[0].value.body).toContain(`Title: ${f.session.title}`);
+            expect(candidate.mock.results[0].value.body).toContain(publicSessionId(f.session));
+            expect(deduplicate).toHaveBeenCalledOnce();
+            expect(f.store.isTranscriptIncognito(f.session.tool, f.session.native_id)).toBe(true);
+            expect(f.db.prepare('SELECT id FROM sessions WHERE id = ?').get(f.session.id)).toBeDefined();
+            expect(f.db.prepare('SELECT session_id FROM session_embeddings').all()).toEqual([]);
+            const output = 'output' in result ? JSON.stringify(result.output) : '';
+            expect(output).not.toContain(f.session.title);
+            expect(output).not.toContain(publicSessionId(f.session));
+            expect(output).toBe('');
+            expect(result).toEqual({ reason: 'not_command' });
+            expect(f.store.injectionsForSession(tool, 'current', new Date(NOW).toISOString())).toEqual([]);
+        },
+    );
 
     it('does not recall the receiving chat or a different project', async () => {
         const f = fixture();

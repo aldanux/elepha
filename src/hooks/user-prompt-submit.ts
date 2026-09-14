@@ -97,9 +97,16 @@ function contributingSessionsStillConsented(db: Database.Database, reader: Sessi
     const consentedProjectIds = new Set(
         new ProjectResolver(db).listConsentedStored(new ConsentStore(db)).flatMap((project) => project.projectIds),
     );
+    const store = new MemoryStore(db);
     return sessionIds.every((sessionId) => {
         const session = reader.sessionById(sessionId);
-        return session !== undefined && consentedProjectIds.has(session.project_id);
+        // Incognito keeps the session row, so existence and project consent alone
+        // cannot authorize content hydrated before the final use-time check.
+        return (
+            session !== undefined &&
+            consentedProjectIds.has(session.project_id) &&
+            !store.isTranscriptIncognito(session.tool, session.native_id)
+        );
     });
 }
 
