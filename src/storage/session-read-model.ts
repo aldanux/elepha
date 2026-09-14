@@ -26,6 +26,7 @@ export interface ServedSession {
     rollup_title: string | null;
     rollup_summary?: string | null;
     rollup_decisions: string | null;
+    rollup_instructions: string | null;
     rollup_pending_items?: string | null;
     rollup_files_touched?: string | null;
     rollup_state: string | null;
@@ -97,21 +98,25 @@ export function jsonArrayLength(value: string | null): number | null {
     }
 }
 
-// Canonical read-time substantive predicate. A rollup with decisions
-// or files is substantive; otherwise stored capture is substantive from two
+// Canonical read-time substantive predicate. A rollup with decisions,
+// instructions, or files is substantive; otherwise stored capture is substantive from two
 // turns onward or when a turn touched files.
 export function isSubstantive(
-    session: Pick<ServedSession, 'rollup_state' | 'rollup_decisions' | 'turn_count' | 'has_files_touched'>,
+    session: Pick<ServedSession, 'rollup_state' | 'rollup_decisions' | 'rollup_instructions' | 'turn_count' | 'has_files_touched'>,
 ): boolean {
     if (session.rollup_state !== null) {
-        return (jsonArrayLength(session.rollup_decisions) ?? 0) > 0 || session.has_files_touched === 1;
+        return (
+            (jsonArrayLength(session.rollup_decisions) ?? 0) > 0 ||
+            (jsonArrayLength(session.rollup_instructions) ?? 0) > 0 ||
+            session.has_files_touched === 1
+        );
     }
     return session.turn_count >= 2 || session.has_files_touched === 1;
 }
 
 // One SELECT shared by every served-session reader: a narrow lookup that
 // diverged from the project query would silently split the canonical shape.
-const SERVED_SESSION_SELECT = `SELECT s.*, r.title AS rollup_title, r.summary AS rollup_summary, r.decisions AS rollup_decisions,
+const SERVED_SESSION_SELECT = `SELECT s.*, r.title AS rollup_title, r.summary AS rollup_summary, r.decisions AS rollup_decisions, r.instructions AS rollup_instructions,
         r.pending_items AS rollup_pending_items, r.files_touched AS rollup_files_touched, r.rollup_state,
         COUNT(m.id) AS turn_count, MAX(CASE WHEN m.files_touched <> '[]' THEN 1 ELSE 0 END) AS has_files_touched,
         MAX(CASE WHEN m.has_external_content = 1 THEN 1 ELSE 0 END) AS has_external_content

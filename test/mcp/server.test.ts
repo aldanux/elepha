@@ -327,6 +327,7 @@ describe('elepha MCP server surface', () => {
             project,
             session: rollup,
             decisions: [{ what: 'Use durable receipts', why: 'Restarts support recovery' }],
+            instructions: [{ what: 'Always preserve audit trails' }],
         });
         fixture.db
             .prepare('UPDATE session_rollups SET pending_items = ? WHERE session_id = ?')
@@ -377,6 +378,8 @@ describe('elepha MCP server surface', () => {
         expect(rollupResult).toContain('- What: Use durable receipts');
         expect(rollupResult).toContain('Why: Restarts support recovery');
         expect(rollupResult).toContain('- Verify recovery');
+        expect(rollupResult).toContain('Instructions:\n- What: Always preserve audit trails\nPending items:');
+        expect(text(await service.recall({ query: 'audit trails' }))).toContain('Title: Receipt storage choice');
 
         const naturalLanguageResult = text(await service.recall({ query: 'durable receipts recovery' }));
         expect(naturalLanguageResult).toContain('Title: Receipt storage choice');

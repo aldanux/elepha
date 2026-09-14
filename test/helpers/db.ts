@@ -176,6 +176,7 @@ export interface SeedRollupOptions {
     session: SessionRow;
     project: ProjectRow;
     decisions?: RollupDecision[];
+    instructions?: RollupDecision[];
     filesTouched?: string[];
     state?: RollupState;
 }
@@ -191,6 +192,7 @@ export function seedRollup(fixture: TestDatabase, options: SeedRollupOptions): v
             title: options.session.title ?? 'Seeded rollup',
             summary: '',
             decisions: options.decisions ?? [],
+            instructions: options.instructions ?? [],
             pendingItems: [],
             filesTouched: options.filesTouched ?? [],
             turnCount: fixture.store.listMemoriesForSession(options.session.id).length,

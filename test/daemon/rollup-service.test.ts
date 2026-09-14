@@ -30,7 +30,15 @@ class StubProvider implements RollupProvider {
     mergeCalls: RollupTurnInput[][] = [];
     result: RollupResult = {
         status: 'ok',
-        output: { title: 'T', summary: 'S', decisions: [{ what: 'w', why: 'y' }], pending_items: ['p'], droppedDecisions: 0 },
+        output: {
+            title: 'T',
+            summary: 'S',
+            decisions: [{ what: 'w', why: 'y' }],
+            pending_items: ['p'],
+            instructions: [],
+            droppedInstructions: 0,
+            droppedDecisions: 0,
+        },
     };
 
     async rollup(turns: RollupTurnInput[]): Promise<RollupResult> {
@@ -85,6 +93,43 @@ describe('RollupService', () => {
         expect(provider.mergeCalls[0]!.map((t) => t.turnIndex)).toEqual([2]);
     });
 
+    it('retains standing instructions when an incremental model omits them and during a state-only write', async () => {
+        record(0);
+        provider.result.output.instructions = [{ what: 'Always run tests' }];
+        await service.rollupSession(session, 'primary', null, 'live');
+        const original = rollups.get(session.id)!.instructions;
+        expect(original).toEqual([{ what: 'Always run tests', turnIndex: 0, at: makeTurn(0).startedAt }]);
+        record(1);
+        provider.result.output.instructions = [{ what: 'Use tabs', turn_index: 1 }];
+        provider.result.output.pending_items = [];
+        await service.rollupSession(session, 'primary', null, 'live');
+        const merged = rollups.get(session.id)!.instructions;
+        expect(merged).toEqual([...original, { what: 'Use tabs', turnIndex: 1, at: makeTurn(1).startedAt }]);
+        await service.rollupSession(session, 'primary', null, 'final');
+        expect(rollups.get(session.id)!.instructions).toEqual(merged);
+        expect(rollups.get(session.id)!.pending_items).toEqual([]);
+    });
+
+    it('makes a pre-instruction rollup eligible for rebuilding with the new category', async () => {
+        record(0);
+        await service.rollupSession(session, 'primary', null, 'final');
+        db.prepare('UPDATE session_rollups SET rollup_version = ? WHERE session_id = ?').run(ROLLUP_VERSION - 1, session.id);
+        expect(store.listSessionsForRollupRebuild(ROLLUP_VERSION).map((row) => row.id)).toContain(session.id);
+        provider.result.output.instructions = [{ what: 'Always run tests' }];
+        expect(await service.rollupSession(session, 'primary', null, 'final')).toEqual({ wrote: true, complete: true });
+        expect(rollups.get(session.id)!.instructions).toEqual([{ what: 'Always run tests', turnIndex: 0, at: makeTurn(0).startedAt }]);
+        expect(store.listSessionsForRollupRebuild(ROLLUP_VERSION)).toEqual([]);
+    });
+
+    it('reports malformed instruction loss with the session and batch', async () => {
+        record(0);
+        const messages: string[] = [];
+        provider.result.output.droppedInstructions = 2;
+        const loggingService = new RollupService({ store, rollups, provider, log: (message) => messages.push(message) });
+        await loggingService.rollupSession(session, 'primary', null, 'live');
+        expect(messages).toContain(`[elepha] session ${session.id} batch 1/1: dropped 2 instruction(s) with no usable what`);
+    });
+
     it('does nothing when no turns have arrived past the watermark', async () => {
         record(0, ['/repo/a.ts']);
         await service.rollupSession(session, 'primary', null, 'live');
@@ -120,7 +165,15 @@ describe('RollupService', () => {
         record(0, ['/repo/a.ts']);
         provider.result = {
             status: 'parse_error',
-            output: { title: '', summary: '', decisions: [], pending_items: [], droppedDecisions: 0 },
+            output: {
+                title: '',
+                summary: '',
+                decisions: [],
+                pending_items: [],
+                instructions: [],
+                droppedInstructions: 0,
+                droppedDecisions: 0,
+            },
         };
 
         expect(await service.rollupSession(session, 'primary', null, 'live')).toEqual({ wrote: false, complete: false });
@@ -128,7 +181,15 @@ describe('RollupService', () => {
 
         provider.result = {
             status: 'ok',
-            output: { title: 'T', summary: 'S', decisions: [{ what: 'w', why: 'y' }], pending_items: [], droppedDecisions: 0 },
+            output: {
+                title: 'T',
+                summary: 'S',
+                decisions: [{ what: 'w', why: 'y' }],
+                pending_items: [],
+                instructions: [],
+                droppedInstructions: 0,
+                droppedDecisions: 0,
+            },
         };
         expect(await service.rollupSession(session, 'primary', null, 'live')).toEqual({ wrote: true, complete: true });
         expect(rollups.get(session.id)!.rolled_up_through_turn_index).toBe(0);
@@ -147,7 +208,15 @@ describe('RollupService', () => {
         record(0);
         provider.result = {
             status: 'api_error',
-            output: { title: '', summary: '', decisions: [], pending_items: [], droppedDecisions: 0 },
+            output: {
+                title: '',
+                summary: '',
+                decisions: [],
+                pending_items: [],
+                instructions: [],
+                droppedInstructions: 0,
+                droppedDecisions: 0,
+            },
         };
 
         await expect(service.rollupSession(session, 'primary', null, 'live')).resolves.toEqual({ wrote: false, complete: false });
@@ -186,6 +255,7 @@ describe('RollupService', () => {
                 title: 'old',
                 summary: 'old',
                 decisions: [],
+                instructions: [],
                 pendingItems: [],
                 filesTouched: [],
                 turnCount: 2,
@@ -235,7 +305,18 @@ describe('RollupService', () => {
             calls++;
             if (calls === batchCount - 1) {
                 // last merge call (batches after the first use merge())
-                return { status: 'api_error', output: { title: '', summary: '', decisions: [], pending_items: [], droppedDecisions: 0 } };
+                return {
+                    status: 'api_error',
+                    output: {
+                        title: '',
+                        summary: '',
+                        decisions: [],
+                        pending_items: [],
+                        instructions: [],
+                        droppedInstructions: 0,
+                        droppedDecisions: 0,
+                    },
+                };
             }
             return originalMerge(prev, newTurns);
         };
@@ -264,6 +345,7 @@ describe('watermarkStillMatches', () => {
                 title: 'T',
                 summary: 'S',
                 decisions: [],
+                instructions: [],
                 pendingItems: [],
                 filesTouched: [],
                 turnCount: 1,

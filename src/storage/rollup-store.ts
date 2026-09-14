@@ -37,13 +37,16 @@ import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 //
 // `elepha rollup --rebuild` is what actually reaches them: the default sweep
 // skips `final` rollups.
-export const ROLLUP_VERSION = 2;
+// Version 3 adds standing instructions. Older rollups must remain eligible
+// for the existing cost-previewed rebuild command to extract this category.
+export const ROLLUP_VERSION = 3;
 
 export type RollupState = 'live' | 'final';
 
 export interface RollupDecision {
     what: string;
-    why: string;
+    // Instructions may omit a reason; the decision parser still requires one.
+    why?: string;
     // Turn this decision came from. Optional because rows written before
     // provenance existed have none, and because the model cannot be trusted to
     // supply it - it is assigned deterministically in code and only
@@ -79,6 +82,7 @@ export interface SessionRollupRow {
     title: string;
     summary: string;
     decisions: RollupDecision[];
+    instructions: RollupDecision[];
     pending_items: string[];
     files_touched: string[];
     turn_count: number;
@@ -101,6 +105,7 @@ export interface RollupWrite {
     title: string;
     summary: string;
     decisions: RollupDecision[];
+    instructions: RollupDecision[];
     pendingItems: string[];
     filesTouched: string[];
     turnCount: number;
@@ -118,8 +123,9 @@ export interface RollupWrite {
     rollupVersion?: number;
 }
 
-type RawRollupRow = Omit<SessionRollupRow, 'decisions' | 'pending_items' | 'files_touched'> & {
+type RawRollupRow = Omit<SessionRollupRow, 'decisions' | 'instructions' | 'pending_items' | 'files_touched'> & {
     decisions: string;
+    instructions: string;
     pending_items: string;
     files_touched: string;
 };
@@ -131,18 +137,15 @@ function hydrate(row: RawRollupRow | undefined): SessionRollupRow | undefined {
     return {
         ...row,
         decisions: JSON.parse(row.decisions),
+        instructions: JSON.parse(row.instructions),
         pending_items: JSON.parse(row.pending_items),
         files_touched: JSON.parse(row.files_touched),
     };
 }
 
-// Merges two rollup halves with set semantics, so applying the same merge twice is a no-op.
-export function mergeRollupContent(
-    previous: { decisions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] },
-    incoming: { decisions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] },
-): { decisions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] } {
+function unionDecisions(previous: RollupDecision[], incoming: RollupDecision[]): RollupDecision[] {
     const byWhat = new Map<string, RollupDecision>();
-    for (const d of [...previous.decisions, ...incoming.decisions]) {
+    for (const d of [...previous, ...incoming]) {
         // Sanitize-normalized key. `previous` was read back from the store and
         // is therefore already escaped (Rule 3 runs in write() below), while
         // `incoming` is raw summarizer output. Keying on the raw text would
@@ -165,6 +168,14 @@ export function mergeRollupContent(
             byWhat.set(key, { ...seen, turnIndex: d.turnIndex, at: d.at });
         }
     }
+    return [...byWhat.values()].sort((a, b) => (a.turnIndex ?? -1) - (b.turnIndex ?? -1));
+}
+
+// Merges two rollup halves with set semantics, so applying the same merge twice is a no-op.
+export function mergeRollupContent(
+    previous: { decisions: RollupDecision[]; instructions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] },
+    incoming: { decisions: RollupDecision[]; instructions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] },
+): { decisions: RollupDecision[]; instructions: RollupDecision[]; pendingItems: string[]; filesTouched: string[] } {
     // pending_items come from the merge model, which is told to drop resolved
     // ones - so incoming REPLACES rather than unions, otherwise a resolved item
     // could never leave the list.
@@ -172,7 +183,8 @@ export function mergeRollupContent(
     return {
         // Stored in turn order, oldest first, so array position carries meaning
         // and "the newest K" is a slice rather than a search.
-        decisions: [...byWhat.values()].sort((a, b) => (a.turnIndex ?? -1) - (b.turnIndex ?? -1)),
+        decisions: unionDecisions(previous.decisions, incoming.decisions),
+        instructions: unionDecisions(previous.instructions, incoming.instructions),
         pendingItems,
         filesTouched: dedupePaths([...previous.filesTouched, ...incoming.filesTouched]),
     };
@@ -197,14 +209,14 @@ export class RollupStore {
             // and must be replaced wholesale rather than merged onto.
             insert: db.prepare(
                 `INSERT INTO session_rollups
-           (session_id, project_id, tool, title, summary, decisions, pending_items, files_touched,
+           (session_id, project_id, tool, title, summary, decisions, instructions, pending_items, files_touched,
             turn_count, started_at, ended_at, kind, parent_session_id, summarizer_status,
             rollup_state, rolled_up_through_turn_index, computed_at, rollup_version)
-         VALUES (@session_id, @project_id, @tool, @title, @summary, @decisions, @pending_items, @files_touched,
+         VALUES (@session_id, @project_id, @tool, @title, @summary, @decisions, @instructions, @pending_items, @files_touched,
             @turn_count, @started_at, @ended_at, @kind, @parent_session_id, @summarizer_status,
             @rollup_state, @through, @now, @version)
          ON CONFLICT (session_id) DO UPDATE SET
-           title = excluded.title, summary = excluded.summary, decisions = excluded.decisions,
+           title = excluded.title, summary = excluded.summary, decisions = excluded.decisions, instructions = excluded.instructions,
            pending_items = excluded.pending_items, files_touched = excluded.files_touched,
            turn_count = excluded.turn_count, started_at = excluded.started_at, ended_at = excluded.ended_at,
            kind = excluded.kind, parent_session_id = excluded.parent_session_id,
@@ -217,7 +229,7 @@ export class RollupStore {
             // of the same turns finds it already advanced and changes nothing.
             updateIfWatermark: db.prepare(
                 `UPDATE session_rollups SET
-           title = @title, summary = @summary, decisions = @decisions,
+           title = @title, summary = @summary, decisions = @decisions, instructions = @instructions,
            pending_items = @pending_items, files_touched = @files_touched,
            turn_count = @turn_count, ended_at = @ended_at,
            summarizer_status = @summarizer_status,
@@ -252,9 +264,17 @@ export class RollupStore {
             decisions: JSON.stringify(
                 w.decisions.map((d) => ({
                     what: escapeShellSyntax(d.what),
-                    why: escapeShellSyntax(d.why),
+                    why: escapeShellSyntax(d.why ?? ''),
                     ...(d.turnIndex !== undefined ? { turnIndex: d.turnIndex } : {}),
                     ...(d.at !== undefined ? { at: d.at } : {}),
+                })),
+            ),
+            instructions: JSON.stringify(
+                unionDecisions([], w.instructions).map((instruction) => ({
+                    what: escapeShellSyntax(instruction.what),
+                    ...(instruction.why !== undefined ? { why: escapeShellSyntax(instruction.why) } : {}),
+                    ...(instruction.turnIndex !== undefined ? { turnIndex: instruction.turnIndex } : {}),
+                    ...(instruction.at !== undefined ? { at: instruction.at } : {}),
                 })),
             ),
             pending_items: JSON.stringify(w.pendingItems.map(stripShellSyntax)),

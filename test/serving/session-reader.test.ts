@@ -62,6 +62,7 @@ function session(nativeId: string, lastTurnAt: string, sourcePath = '/tmp/episod
         custom_title: null,
         first_prompt_search: null,
         rollup_title: null,
+        rollup_instructions: null,
         rollup_decisions: null,
         rollup_state: null,
         turn_count: 1,

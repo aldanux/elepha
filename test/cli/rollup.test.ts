@@ -23,7 +23,15 @@ vi.mock('../../src/summarizer/provider-config.js', () => ({
 
 const rollupResult: RollupResult = {
     status: 'ok',
-    output: { title: 'T', summary: 'S', decisions: [{ what: 'w', why: 'y' }], pending_items: [], droppedDecisions: 0 },
+    output: {
+        title: 'T',
+        summary: 'S',
+        decisions: [{ what: 'w', why: 'y' }],
+        pending_items: [],
+        instructions: [],
+        droppedInstructions: 0,
+        droppedDecisions: 0,
+    },
 };
 
 function seedRollupCandidate(renderedChars: number | null = 400) {

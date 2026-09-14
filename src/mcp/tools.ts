@@ -410,6 +410,7 @@ export class ElephaMcpService implements McpToolHandlers {
             turn_count: session.turn_count,
             token_estimate: session.rendered_chars === null ? null : Math.ceil(session.rendered_chars / CHARS_PER_TOKEN),
             decision_count: hasRollup ? jsonArrayLength(session.rollup_decisions) : null,
+            instruction_count: hasRollup ? jsonArrayLength(session.rollup_instructions) : null,
             pending_count: hasRollup ? jsonArrayLength(session.rollup_pending_items ?? null) : null,
             substantive: isSubstantive(session),
         };
@@ -507,7 +508,7 @@ function parsedStringArray(value: string | null | undefined): string[] {
     }
 }
 
-function parsedDecisions(value: string | null): Array<{ what: string; why: string }> {
+function parsedDecisions(value: string | null, allowMissingWhy = false): Array<{ what: string; why: string }> {
     if (!value?.trim()) {
         return [];
     }
@@ -521,7 +522,9 @@ function parsedDecisions(value: string | null): Array<{ what: string; why: strin
                 return [];
             }
             const { what, why } = item as Record<string, unknown>;
-            return typeof what === 'string' && typeof why === 'string' ? [{ what, why }] : [];
+            return typeof what === 'string' && (typeof why === 'string' || allowMissingWhy)
+                ? [{ what, why: typeof why === 'string' ? why : '' }]
+                : [];
         });
     } catch {
         return [];
@@ -530,10 +533,16 @@ function parsedDecisions(value: string | null): Array<{ what: string; why: strin
 
 function rollupMaterial(session: ServedSession): string {
     const decisions = parsedDecisions(session.rollup_decisions);
+    const instructions = parsedDecisions(session.rollup_instructions, true);
     const pending = parsedStringArray(session.rollup_pending_items);
     const lines = [
         decisions.length === 0 ? 'Decisions: none recorded.' : 'Decisions:',
         ...decisions.flatMap((decision) => [`- What: ${escapeShellSyntax(decision.what)}`, `  Why: ${escapeShellSyntax(decision.why)}`]),
+        instructions.length === 0 ? 'Instructions: none recorded.' : 'Instructions:',
+        ...instructions.flatMap((instruction) => [
+            `- What: ${escapeShellSyntax(instruction.what)}`,
+            ...(instruction.why ? [`  Why: ${escapeShellSyntax(instruction.why)}`] : []),
+        ]),
         pending.length === 0 ? 'Pending items: none recorded.' : 'Pending items:',
         ...pending.map((item) => `- ${escapeShellSyntax(item)}`),
     ];

@@ -66,6 +66,8 @@ class RecordingRollupProvider implements RollupProvider {
                 summary: `covered ${turns.map((turn) => turn.turnIndex).join(',')}`,
                 decisions: turns.flatMap((turn) => turn.decisions.map((what) => ({ what, why: 'captured in turn' }))),
                 pending_items: [],
+                instructions: [],
+                droppedInstructions: 0,
                 droppedDecisions: 0,
             },
         };
