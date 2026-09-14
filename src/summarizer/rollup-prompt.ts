@@ -3,6 +3,7 @@
 // existing rollup without re-reading the turns already accounted for.
 
 import { MAX_ROLLUP_BATCH_CHARS, MAX_ROLLUP_CARRY_CHARS } from '../config/constants.js';
+import type { RollupDecision } from '../storage/rollup-store.js';
 
 // Per-call budget for the turns half of a rollup or merge prompt. Turns are
 // Callers chunk turns to fit this budget; they never truncate the batch.
@@ -32,9 +33,21 @@ const DECISIONS_CONTRACT = `decisions — array of {"what": string, "why": strin
 as "why", and never invent a rationale: if the transcript does not give a reason
 for a choice, omit that decision entirely rather than emitting a hollow one.`;
 
+export const INSTRUCTIONS_CONTRACT = `instructions — array of {"what": string, "why"?: string}. Capture standing rules or
+preferences the USER stated that should keep applying in this project, such as
+"always run tests before committing". These are distinct from one-off decisions
+and unresolved work. "why" is optional: omit it when no rationale was given;
+never invent one, and never drop an instruction just because it has no reason.
+Include "turn_index" copied from the <turn index="…"> where the user gave it.`;
+
+export const INSTRUCTIONS_ORDERING_CONTRACT = `Carry forward every previous instruction and append new instructions in turn
+order, oldest first. Union, never replace: do not drop an instruction because the
+new turns did not repeat it. Dedupe by "what" and retain its earliest known
+turn_index. Do not automatically remove or resolve old instructions.`;
+
 export const ROLLUP_SYSTEM_PROMPT = `You summarize one complete session of a coding-AI transcript into a durable
 record another AI will later read to regain context. Output strict JSON only:
-{"title": string, "summary": string, "decisions": [{"what": string, "why": string}], "pending_items": string[]}
+{"title": string, "summary": string, "decisions": [{"what": string, "why": string}], "instructions": [{"what": string, "why"?: string, "turn_index": number}], "pending_items": string[]}
 
 title — one short line, scannable in a list of sessions. Name the actual work,
 not the tool ("Fix ScrollTrigger reset on modal open", not "Debugging session").
@@ -44,6 +57,8 @@ summary — 2-3 sentences: what was worked on, what state it ended in.
 ${DECISIONS_CONTRACT}
 Include "turn_index" on every decision, copied from the <turn index="…"> it came
 from. Omit it only if you genuinely cannot tell.
+
+${INSTRUCTIONS_CONTRACT}
 
 pending_items — what was still unresolved when the session ended. Empty if
 everything was concluded.
@@ -72,13 +87,17 @@ export const ROLLUP_MERGE_SYSTEM_PROMPT = `You are updating an existing session 
 and new turns were appended. You receive the previous rollup and only the NEW
 turns. Produce the updated rollup for the session as a whole. Output strict JSON
 only:
-{"title": string, "summary": string, "decisions": [{"what": string, "why": string, "turn_index": number}], "pending_items": string[]}
+{"title": string, "summary": string, "decisions": [{"what": string, "why": string, "turn_index": number}], "instructions": [{"what": string, "why"?: string, "turn_index": number}], "pending_items": string[]}
 
 Carry forward everything from the previous rollup that is still accurate. Add
 what the new turns establish. Crucially: DROP any pending_item the new turns
 resolved, and do not duplicate a decision that is already present.
 
 ${ORDERING_CONTRACT}
+
+${INSTRUCTIONS_ORDERING_CONTRACT}
+
+${INSTRUCTIONS_CONTRACT}
 
 ${DECISIONS_CONTRACT}
 
@@ -203,7 +222,8 @@ export function buildRollupUserContent(turns: RollupTurnInput[]): string {
 export interface PreviousRollup {
     title: string;
     summary: string;
-    decisions: Array<{ what: string; why: string }>;
+    decisions: RollupDecision[];
+    instructions: RollupDecision[];
     pendingItems: string[];
 }
 
@@ -228,10 +248,23 @@ export function renderPreviousRollup(previous: PreviousRollup, maxChars: number 
                     ...decisions.map((d) => `${d.what} (because ${d.why})`),
                 ].join(' | ') || '(none)'
             }`,
+            ...(instructions.length || droppedInstructions
+                ? [
+                      `instructions: ${[
+                          ...(droppedInstructions ? [omittedMarker(droppedInstructions, 'instructions')] : []),
+                          ...instructions.map(
+                              (instruction) =>
+                                  `${instruction.what}${instruction.why ? ` (because ${instruction.why})` : ''}${instruction.turnIndex !== undefined ? ` [turn_index: ${instruction.turnIndex}]` : ''}`,
+                          ),
+                      ].join(' | ')}`,
+                  ]
+                : []),
             `pending_items: ${previous.pendingItems.join(' | ') || '(none)'}`,
             '</previous_rollup>',
         ].join('\n');
 
+    let instructions = previous.instructions;
+    let droppedInstructions = 0;
     let summary = previous.summary;
     let decisions = previous.decisions;
     let dropped = 0;
@@ -250,6 +283,13 @@ export function renderPreviousRollup(previous: PreviousRollup, maxChars: number 
     while (render(summary, decisions, dropped).length > maxChars && decisions.length > 1) {
         decisions = decisions.slice(1);
         dropped++;
+    }
+
+    // Only the prompt view is bounded; the store unions the full carried list
+    // even when the model cannot see or does not repeat these instructions.
+    while (render(summary, decisions, dropped).length > maxChars && instructions.length > 0) {
+        instructions = instructions.slice(1);
+        droppedInstructions++;
     }
 
     return render(summary, decisions, dropped);

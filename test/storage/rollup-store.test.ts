@@ -1,7 +1,11 @@
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { escapeShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { mergeRollupContent, ROLLUP_VERSION, RollupStore, type RollupWrite } from '../../src/storage/rollup-store.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 function baseWrite(overrides: Partial<RollupWrite> = {}): RollupWrite {
     return {
@@ -11,6 +15,7 @@ function baseWrite(overrides: Partial<RollupWrite> = {}): RollupWrite {
         title: 'Fix the thing',
         summary: 'Fixed the thing.',
         decisions: [{ what: 'used SQLite', why: 'local single-user tool' }],
+        instructions: [],
         pendingItems: ['write tests'],
         filesTouched: ['/repo/a.ts'],
         turnCount: 3,
@@ -57,6 +62,35 @@ describe('RollupStore', () => {
         // Second writer still believes the watermark is 2 - it is now 5.
         expect(rollups.write(baseWrite({ throughTurnIndex: 5, title: 'duplicate' }), 2)).toBe(false);
         expect(rollups.get(1)!.title).toBe('first');
+    });
+
+    it('stores optional reasons safely and preserves instructions through insert, update, and rebuild upsert', () => {
+        const instructions = [{ what: 'Never use `$(unsafe)`', turnIndex: 1, at: 'first' }];
+        rollups.write(baseWrite({ instructions }), undefined);
+        const expected = [{ ...instructions[0], what: escapeShellSyntax(instructions[0].what) }];
+        expect(rollups.get(1)!.instructions).toEqual(expected);
+        expect(rollups.listByProject(1)[0].instructions).toEqual(expected);
+        expect(rollups.write(baseWrite({ instructions, throughTurnIndex: 3 }), 2)).toBe(true);
+        expect(rollups.get(1)!.instructions).toEqual(expected);
+        expect(rollups.write(baseWrite({ instructions: [{ what: 'Use tabs', why: 'Avoid `$(noise)`' }] }), undefined)).toBe(true);
+        expect(rollups.get(1)!.instructions).toEqual([{ what: 'Use tabs', why: escapeShellSyntax('Avoid `$(noise)`') }]);
+    });
+
+    it('orders and deduplicates instructions on the first write even when the model does not', () => {
+        rollups.write(
+            baseWrite({
+                instructions: [
+                    { what: 'New rule', turnIndex: 4 },
+                    { what: 'Old rule', turnIndex: 1 },
+                    { what: 'NEW RULE', turnIndex: 2 },
+                ],
+            }),
+            undefined,
+        );
+        expect(rollups.get(1)!.instructions).toEqual([
+            { what: 'Old rule', turnIndex: 1 },
+            { what: 'New rule', turnIndex: 2 },
+        ]);
     });
 
     it('markLive flips a final rollup back to live, and is a no-op on an already-live one', () => {
@@ -148,6 +182,7 @@ describe('RollupStore.listSessions', () => {
 describe('mergeRollupContent', () => {
     const prev = {
         decisions: [{ what: 'used SQLite', why: 'local tool' }],
+        instructions: [],
         pendingItems: ['write tests', 'update docs'],
         filesTouched: ['/repo/a.ts'],
     };
@@ -158,6 +193,7 @@ describe('mergeRollupContent', () => {
                 { what: 'Used SQLite', why: 'restated' },
                 { what: 'added index', why: 'slow query' },
             ],
+            instructions: [],
             pendingItems: [],
             filesTouched: [],
         });
@@ -169,13 +205,14 @@ describe('mergeRollupContent', () => {
     // items the new turns resolved, so unioning would make a resolved item
     // immortal.
     it('replaces pending_items so resolved ones can leave the list', () => {
-        const merged = mergeRollupContent(prev, { decisions: [], pendingItems: ['update docs'], filesTouched: [] });
+        const merged = mergeRollupContent(prev, { decisions: [], instructions: [], pendingItems: ['update docs'], filesTouched: [] });
         expect(merged.pendingItems).toEqual(['update docs']);
     });
 
     it('unions files_touched with host-appropriate case dedupe', () => {
         const merged = mergeRollupContent(prev, {
             decisions: [],
+            instructions: [],
             pendingItems: [],
             filesTouched: ['/repo/A.ts', '/repo/b.ts'],
         });
@@ -189,11 +226,97 @@ describe('mergeRollupContent', () => {
     it('is idempotent - applying the same merge twice yields the same result', () => {
         const incoming = {
             decisions: [{ what: 'added index', why: 'slow query' }],
+            instructions: [],
             pendingItems: ['ship it'],
             filesTouched: ['/repo/b.ts'],
         };
         const once = mergeRollupContent(prev, incoming);
         const twice = mergeRollupContent(once, incoming);
         expect(twice).toEqual(once);
+    });
+});
+
+describe('instruction union', () => {
+    const empty = { decisions: [], instructions: [], pendingItems: [], filesTouched: [] };
+
+    it('unions instructions instead of replacing them when a model omits old rules', () => {
+        const previous = { ...empty, instructions: [{ what: 'Always run tests' }], pendingItems: ['Run tests now'] };
+        const incoming = { ...empty, instructions: [{ what: 'Use tabs', why: 'Project convention' }] };
+        const merged = mergeRollupContent(previous, incoming);
+        expect(merged.instructions).toEqual([...previous.instructions, ...incoming.instructions]);
+        expect(merged.pendingItems).toEqual([]);
+        expect(mergeRollupContent(merged, incoming)).toEqual(merged);
+        expect(mergeRollupContent(merged, empty).instructions).toEqual(merged.instructions);
+    });
+
+    it('dedupes escaped, case-folded, trimmed what and retains earliest known provenance', () => {
+        const what = 'Never use `$(unsafe)`';
+        const previous = { ...empty, instructions: [{ what: escapeShellSyntax(what), turnIndex: 8, at: 'later' }, { what: 'Use tabs' }] };
+        const incoming = {
+            ...empty,
+            instructions: [
+                { what: `  ${what.toUpperCase()}  `, turnIndex: 2, at: 'first' },
+                { what: 'USE TABS', turnIndex: 4, at: 'known' },
+                { what: 'Use tabs', turnIndex: 9, at: 'repeated' },
+            ],
+        };
+        const merged = mergeRollupContent(previous, incoming);
+        expect(merged.instructions).toEqual([
+            { what: escapeShellSyntax(what), turnIndex: 2, at: 'first' },
+            { what: 'Use tabs', turnIndex: 4, at: 'known' },
+        ]);
+        expect(mergeRollupContent(merged, incoming)).toEqual(merged);
+    });
+});
+
+describe('instructions schema migration', () => {
+    it('creates a functional instructions column in a fresh database', () => {
+        const db = openUnmanagedDb(':memory:');
+        try {
+            const store = new MemoryStore(db);
+            store.upsertProject('/repo');
+            store.upsertSession('claude-code', 's1', 1, '/repo/s1.jsonl');
+            const rollups = new RollupStore(db);
+            expect(db.pragma('table_info(session_rollups)')).toContainEqual(expect.objectContaining({ name: 'instructions', notnull: 1 }));
+            rollups.write(baseWrite({ instructions: [{ what: 'Always run tests' }] }), undefined);
+            expect(rollups.get(1)!.instructions).toEqual([{ what: 'Always run tests' }]);
+        } finally {
+            db.close();
+        }
+    });
+
+    it('upgrades a populated prior schema and preserves all data on an idempotent reopen', () => {
+        const dbPath = path.join(withTempDir('elepha-instructions-migration-'), 'legacy.db');
+        const legacy = openUnmanagedDb(dbPath);
+        const store = new MemoryStore(legacy);
+        store.upsertProject('/repo');
+        store.upsertSession('claude-code', 's1', 1, '/repo/s1.jsonl');
+        legacy.exec('DROP TABLE session_rollups');
+        legacy.exec(readFileSync(new URL('../fixtures/legacy-session-rollups.sql', import.meta.url), 'utf8'));
+        legacy
+            .prepare(`INSERT INTO session_rollups VALUES
+            (1, 1, 'claude-code', 'Prior title', 'Prior summary', ?, ?, ?, 3,
+             '2026-08-01', '2026-08-02', 'primary', NULL, 'ok', 'final', 2, '2026-08-02', 2)`)
+            .run(JSON.stringify([{ what: 'SQLite', why: 'Local storage', turnIndex: 0 }]), '["Ship"]', '["a.ts"]');
+        const before = legacy.prepare('SELECT * FROM session_rollups').get() as Record<string, unknown>;
+        expect((legacy.pragma('table_info(session_rollups)') as Array<{ name: string }>).map((c) => c.name)).not.toContain('instructions');
+        legacy.close();
+
+        const upgraded = openUnmanagedDb(dbPath);
+        expect(upgraded.prepare('SELECT * FROM session_rollups').get()).toEqual({ ...before, instructions: '[]' });
+        expect(new RollupStore(upgraded).get(1)!.instructions).toEqual([]);
+        upgraded.prepare('UPDATE session_rollups SET instructions = ? WHERE session_id = 1').run('[{"what":"Use tabs"}]');
+        upgraded.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        try {
+            expect(reopened.prepare('SELECT * FROM session_rollups').get()).toEqual({ ...before, instructions: '[{"what":"Use tabs"}]' });
+            const columns = reopened.pragma('table_info(session_rollups)') as Array<{ name: string }>;
+            expect(columns.filter((column) => column.name === 'instructions')).toHaveLength(1);
+            expect(new RollupStore(reopened).get(1)!.instructions).toEqual([{ what: 'Use tabs' }]);
+            expect(reopened.pragma('foreign_key_check')).toEqual([]);
+        } finally {
+            reopened.close();
+        }
     });
 });

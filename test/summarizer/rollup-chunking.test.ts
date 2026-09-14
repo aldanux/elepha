@@ -12,7 +12,11 @@ import {
     buildRollupMergeUserContent,
     buildRollupUserContent,
     chunkTurns,
+    INSTRUCTIONS_CONTRACT,
+    INSTRUCTIONS_ORDERING_CONTRACT,
     type PreviousRollup,
+    ROLLUP_MERGE_SYSTEM_PROMPT,
+    ROLLUP_SYSTEM_PROMPT,
     type RollupTurnInput,
     renderPreviousRollup,
     renderTurn,
@@ -50,7 +54,10 @@ describe('chunkTurns', () => {
         const promptBuilders = [
             (input: RollupTurnInput[]) => buildRollupUserContent(input),
             (input: RollupTurnInput[]) =>
-                buildRollupMergeUserContent({ title: 't', summary: 's', decisions: [{ what: 'a', why: 'b' }], pendingItems: [] }, input),
+                buildRollupMergeUserContent(
+                    { title: 't', summary: 's', decisions: [{ what: 'a', why: 'b' }], instructions: [], pendingItems: [] },
+                    input,
+                ),
         ];
         const promptTurns = Array.from({ length: 30 }, (_, i) => turn(i));
         for (const buildPrompt of promptBuilders) {
@@ -134,12 +141,19 @@ describe('renderPreviousRollup', () => {
                 what: `choice ${i} ${'w'.repeat(60)}`,
                 why: `reason ${i} ${'r'.repeat(60)}`,
             })),
+            instructions: [],
             pendingItems: ['still open'],
         };
     }
 
     it('shortens the summary before dropping any decision', () => {
-        const small = renderPreviousRollup({ title: 't', summary: 's', decisions: [{ what: 'a', why: 'b' }], pendingItems: [] });
+        const small = renderPreviousRollup({
+            title: 't',
+            summary: 's',
+            decisions: [{ what: 'a', why: 'b' }],
+            instructions: [],
+            pendingItems: [],
+        });
         expect(small).toContain('a (because b)');
         expect(small).not.toContain('omitted');
 
@@ -163,5 +177,29 @@ describe('renderPreviousRollup', () => {
 
     it('never drops the pending items - they are the continuity payload', () => {
         expect(renderPreviousRollup(previous(60))).toContain('still open');
+    });
+});
+
+describe('instruction prompt contract', () => {
+    it('includes the category and its optional-reason contract in fresh and merge prompts', () => {
+        for (const prompt of [ROLLUP_SYSTEM_PROMPT, ROLLUP_MERGE_SYSTEM_PROMPT]) {
+            expect(prompt).toContain('"instructions": [{"what": string, "why"?: string, "turn_index": number}]');
+            expect(prompt).toContain(INSTRUCTIONS_CONTRACT);
+        }
+        expect(ROLLUP_MERGE_SYSTEM_PROMPT).toContain(INSTRUCTIONS_ORDERING_CONTRACT);
+    });
+
+    it('renders optional reasons and provenance, bounding only the prompt view with an omission marker', () => {
+        const instructions = Array.from({ length: 40 }, (_, i) => ({ what: `Rule ${i} ${'x'.repeat(80)}`, turnIndex: i }));
+        const previous = { title: 'T', summary: 'S', decisions: [], instructions, pendingItems: [] };
+        const out = renderPreviousRollup(previous, 1000);
+        expect(out.length).toBeLessThanOrEqual(1000);
+        expect(out).not.toContain('Rule 0 ');
+        expect(out).toContain('Rule 39 ');
+        expect(out).toContain('[turn_index: 39]');
+        expect(out).toMatch(/\[\d+ earlier instructions omitted - batch budget]/);
+        expect(previous.instructions).toHaveLength(40);
+        const small = renderPreviousRollup({ ...previous, instructions: [{ what: 'Use tabs', why: 'Project convention', turnIndex: 1 }] });
+        expect(small).toContain('Use tabs (because Project convention) [turn_index: 1]');
     });
 });

@@ -46,7 +46,15 @@ function makeTurn(index: number): ParsedTurn {
 class StubProvider implements RollupProvider {
     result: RollupResult = {
         status: 'ok',
-        output: { title: 'T', summary: 'S', decisions: [{ what: 'w', why: 'y' }], pending_items: [], droppedDecisions: 0 },
+        output: {
+            title: 'T',
+            summary: 'S',
+            decisions: [{ what: 'w', why: 'y' }],
+            pending_items: [],
+            instructions: [],
+            droppedInstructions: 0,
+            droppedDecisions: 0,
+        },
     };
     async rollup(_turns: RollupTurnInput[]): Promise<RollupResult> {
         return this.result;

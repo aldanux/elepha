@@ -77,10 +77,30 @@ function coerceDecision(raw: unknown): ParsedDecision | undefined {
     return { what, why, turn_index: coerceTurnIndex(rec.turn_index) };
 }
 
+export interface ParsedInstruction {
+    what: string;
+    why?: string;
+    turn_index?: number;
+}
+
+function coerceInstruction(raw: unknown): ParsedInstruction | undefined {
+    if (!raw || typeof raw !== 'object') {
+        return undefined;
+    }
+    const rec = raw as Record<string, unknown>;
+    const what = typeof rec.what === 'string' ? rec.what.trim() : '';
+    if (!what) {
+        return undefined;
+    }
+    const why = typeof rec.why === 'string' ? rec.why.trim() : '';
+    return { what, ...(why ? { why } : {}), turn_index: coerceTurnIndex(rec.turn_index) };
+}
+
 const rollupSchema = z.object({
     title: z.string().min(1),
     summary: z.string().min(1),
     decisions: z.array(z.unknown()),
+    instructions: z.array(z.unknown()).default([]),
     pending_items: z.array(z.unknown()),
 });
 
@@ -88,6 +108,8 @@ export interface RollupOutput {
     title: string;
     summary: string;
     decisions: ParsedDecision[];
+    instructions: ParsedInstruction[];
+    droppedInstructions: number;
     pending_items: string[];
     // Decisions the model emitted that were unusable (no `what`, or no `why`).
     // Reported rather than dropped silently: a rollup that quietly loses half
@@ -96,7 +118,15 @@ export interface RollupOutput {
     droppedDecisions: number;
 }
 
-const EMPTY_ROLLUP: RollupOutput = { title: '', summary: '', decisions: [], pending_items: [], droppedDecisions: 0 };
+const EMPTY_ROLLUP: RollupOutput = {
+    title: '',
+    summary: '',
+    decisions: [],
+    instructions: [],
+    droppedInstructions: 0,
+    pending_items: [],
+    droppedDecisions: 0,
+};
 
 function tryParse(candidate: string): RollupOutput | undefined {
     try {
@@ -114,10 +144,22 @@ function tryParse(candidate: string): RollupOutput | undefined {
                 droppedDecisions++;
             }
         }
+        const instructions: ParsedInstruction[] = [];
+        let droppedInstructions = 0;
+        for (const raw of result.data.instructions) {
+            const instruction = coerceInstruction(raw);
+            if (instruction) {
+                instructions.push(instruction);
+            } else {
+                droppedInstructions++;
+            }
+        }
         return {
             title: result.data.title,
             summary: result.data.summary,
             decisions,
+            instructions,
+            droppedInstructions,
             pending_items: result.data.pending_items.filter((p): p is string => typeof p === 'string' && p.trim() !== ''),
             droppedDecisions,
         };
@@ -215,6 +257,15 @@ export function attributeDecisions(
         const resolved = best?.turn ?? lastTurn;
         return { what: d.what, why: d.why, turnIndex: resolved.turnIndex, at: resolved.startedAt };
     });
+}
+
+// Instructions originate in the same per-turn material as decisions. Reuse
+// the validated index, overlap match, and deterministic fallback unchanged.
+export function attributeInstructions(instructions: ParsedInstruction[], batch: RollupTurnInput[]) {
+    return attributeDecisions(
+        instructions.map((instruction) => ({ ...instruction, why: instruction.why ?? '' })),
+        batch,
+    ).map(({ why, ...instruction }) => ({ ...instruction, ...(why ? { why } : {}) }));
 }
 
 export interface RollupProvider {

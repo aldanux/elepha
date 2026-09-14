@@ -10,7 +10,7 @@
 // the next field added to this schema cannot repeat the failure.
 
 import { describe, expect, it } from 'vitest';
-import { parseRollup } from '../../src/summarizer/rollup-provider.js';
+import { attributeInstructions, parseRollup } from '../../src/summarizer/rollup-provider.js';
 
 const base = { title: 'T', summary: 'S', pending_items: ['p'] };
 
@@ -80,5 +80,55 @@ describe('parseRollup tolerance', () => {
     it('drops non-string pending items instead of failing', () => {
         const parsed = parseRollup(output([{ what: 'a', why: 'b' }], { pending_items: ['keep', 42, null, '  '] }));
         expect(parsed?.pending_items).toEqual(['keep']);
+    });
+});
+
+describe('instruction parsing and attribution', () => {
+    it('keeps missing, blank, or unusable reasons while counting malformed instructions independently', () => {
+        const parsed = parseRollup(
+            output([{ what: 'No rationale' }], {
+                instructions: [
+                    { what: ' Always run tests ', turn_index: '2' },
+                    { what: 'Use tabs', why: ' ' },
+                    { what: 'Avoid globals', why: 42 },
+                    { what: 'Prefer SQLite', why: ' Local storage ' },
+                    { what: '' },
+                    null,
+                    'bad entry',
+                ],
+            }),
+        );
+        expect(parsed?.instructions).toEqual([
+            { what: 'Always run tests', turn_index: 2 },
+            { what: 'Use tabs' },
+            { what: 'Avoid globals' },
+            { what: 'Prefer SQLite', why: 'Local storage' },
+        ]);
+        expect(parsed?.droppedInstructions).toBe(3);
+        expect(parsed?.decisions).toEqual([]);
+        expect(parsed?.droppedDecisions).toBe(1);
+        expect(parseRollup(output([], { instructions: 'broken array' }))).toBeUndefined();
+    });
+
+    it('validates claimed turns and uses overlap or the batch fallback when provenance is absent or invalid', () => {
+        const batch = [
+            { turnIndex: 2, startedAt: 'earlier', decisions: ['Always run regression tests'], pendingItems: [], filesTouched: [] },
+            { turnIndex: 5, startedAt: 'later', decisions: ['Use tabs'], pendingItems: [], filesTouched: [] },
+        ];
+        expect(
+            attributeInstructions(
+                [
+                    { what: 'Use tabs', turn_index: 5 },
+                    { what: 'Always run regression tests', turn_index: 999 },
+                    { what: 'Preserve audit trails' },
+                ],
+                batch,
+            ),
+        ).toEqual([
+            { what: 'Use tabs', turnIndex: 5, at: 'later' },
+            { what: 'Always run regression tests', turnIndex: 2, at: 'earlier' },
+            { what: 'Preserve audit trails', turnIndex: 5, at: 'later' },
+        ]);
+        expect(attributeInstructions([{ what: 'Use tabs' }], [])).toEqual([{ what: 'Use tabs' }]);
     });
 });

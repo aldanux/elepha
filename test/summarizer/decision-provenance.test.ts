@@ -16,6 +16,7 @@ function batch(indices: number[], decisionsByTurn: Record<number, string[]> = {}
         turnIndex: i,
         startedAt: `2026-08-01T00:00:${String(i).padStart(2, '0')}.000Z`,
         decisions: decisionsByTurn[i] ?? [`decision from turn ${i}`],
+        instructions: [],
         pendingItems: [],
         filesTouched: [],
     }));
@@ -101,8 +102,8 @@ describe('newest-K selection', () => {
 describe('mergeRollupContent provenance', () => {
     it('keeps the EARLIEST turn for a repeated decision - the first occurrence is when it was made', () => {
         const merged = mergeRollupContent(
-            { decisions: [{ what: 'chose SQLite', why: 'local', turnIndex: 3 }], pendingItems: [], filesTouched: [] },
-            { decisions: [{ what: 'chose SQLite', why: 'local', turnIndex: 40 }], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'chose SQLite', why: 'local', turnIndex: 3 }], instructions: [], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'chose SQLite', why: 'local', turnIndex: 40 }], instructions: [], pendingItems: [], filesTouched: [] },
         );
         expect(merged.decisions).toHaveLength(1);
         expect(merged.decisions[0].turnIndex).toBe(3);
@@ -110,20 +111,21 @@ describe('mergeRollupContent provenance', () => {
 
     it('adopts provenance from the incoming copy when the stored one predates it', () => {
         const merged = mergeRollupContent(
-            { decisions: [{ what: 'chose SQLite', why: 'local' }], pendingItems: [], filesTouched: [] },
-            { decisions: [{ what: 'chose SQLite', why: 'local', turnIndex: 7 }], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'chose SQLite', why: 'local' }], instructions: [], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'chose SQLite', why: 'local', turnIndex: 7 }], instructions: [], pendingItems: [], filesTouched: [] },
         );
         expect(merged.decisions[0].turnIndex).toBe(7);
     });
 
     it('stores decisions in turn order, so position carries meaning', () => {
         const merged = mergeRollupContent(
-            { decisions: [{ what: 'late', why: 'r', turnIndex: 80 }], pendingItems: [], filesTouched: [] },
+            { decisions: [{ what: 'late', why: 'r', turnIndex: 80 }], instructions: [], pendingItems: [], filesTouched: [] },
             {
                 decisions: [
                     { what: 'early', why: 'r', turnIndex: 2 },
                     { what: 'later still', why: 'r', turnIndex: 90 },
                 ],
+                instructions: [],
                 pendingItems: [],
                 filesTouched: [],
             },
@@ -136,11 +138,13 @@ describe('mergeRollupContent provenance', () => {
         // not be able to displace new ones.
         const previous = {
             decisions: Array.from({ length: 14 }, (_, i) => ({ what: `old ${i}`, why: 'r', turnIndex: i })),
+            instructions: [],
             pendingItems: [],
             filesTouched: [],
         };
         const incoming = {
             decisions: Array.from({ length: 5 }, (_, i) => ({ what: `new ${i}`, why: 'r', turnIndex: 100 + i })),
+            instructions: [],
             pendingItems: [],
             filesTouched: [],
         };

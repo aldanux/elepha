@@ -227,7 +227,14 @@ function rollupDecisionTexts(value: string | null): string[] {
 function rollupTexts(session: ServedSession): string[] {
     const summary = typeof session.rollup_summary === 'string' && session.rollup_summary.trim() ? [session.rollup_summary] : [];
     const pendingItems = parsedJsonArray(session.rollup_pending_items).filter((item): item is string => typeof item === 'string');
-    return [...summary, ...rollupDecisionTexts(session.rollup_decisions), ...pendingItems];
+    const instructions = parsedJsonArray(session.rollup_instructions).flatMap((item) => {
+        if (item === null || Array.isArray(item) || typeof item !== 'object') {
+            return [];
+        }
+        const { what, why } = item as Record<string, unknown>;
+        return typeof what === 'string' ? [what, ...(typeof why === 'string' ? [why] : [])] : [];
+    });
+    return [...summary, ...rollupDecisionTexts(session.rollup_decisions), ...instructions, ...pendingItems];
 }
 
 function prepareMetadata(candidate: SessionCandidate, query: RecallQuery): PreparedMetadata {

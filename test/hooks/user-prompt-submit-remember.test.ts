@@ -232,6 +232,7 @@ function recallSession(id: number, title: string, timestamp: string, firstPrompt
         first_prompt_search: firstPromptSearch,
         git_commit_count: null,
         rollup_title: null,
+        rollup_instructions: null,
         rollup_decisions: null,
         rollup_state: null,
         turn_count: 1,
@@ -611,7 +612,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(singleTokenBody).toContain('Alpha Beta Gamma oldest title');
     });
 
-    it('matches rollup summaries, decision text, and pending items without exposing rollup text or indexing file paths', async () => {
+    it('matches rollup summaries, decision and instruction text, and pending items without exposing rollup text or indexing file paths', async () => {
         const project: ProjectSet = {
             key: 'rollup-project',
             displayName: 'rollup-project',
@@ -634,6 +635,13 @@ describe('UserPromptSubmit lexical recall', () => {
                 rollup_pending_items: JSON.stringify(['Verify cache recovery']),
             },
             {
+                ...recallSession(5, 'Project preferences', '2026-08-22T08:30:00.000Z'),
+                rollup_instructions: JSON.stringify([
+                    { what: 'Always preserve audit trails' },
+                    { what: 'Prefer typed boundaries', why: 'Detect integration drift' },
+                ]),
+            },
+            {
                 ...recallSession(4, 'Unrelated file work', '2026-08-22T08:00:00.000Z'),
                 rollup_files_touched: JSON.stringify(['/workspace/secret-rollup-needle.ts']),
             },
@@ -648,6 +656,8 @@ describe('UserPromptSubmit lexical recall', () => {
             ['durable receipts', 2],
             ['restarts idempotent', 2],
             ['cache recovery', 3],
+            ['audit trails', 5],
+            ['integration drift', 5],
         ] as const) {
             const query = tokenizeRecallQuery(queryText);
             expect(query).toBeDefined();
@@ -1124,7 +1134,12 @@ describe('UserPromptSubmit lexical recall', () => {
         const reader = {
             sessionsFor: () => sessions,
             storedRecallFieldsFor: () =>
-                new Map(sessions.map((session) => [session.id, new Map([[0, { decisions: [], filesTouched: [], pendingItems: [] }]])])),
+                new Map(
+                    sessions.map((session) => [
+                        session.id,
+                        new Map([[0, { decisions: [], filesTouched: [], instructions: [], pendingItems: [] }]]),
+                    ]),
+                ),
             turns: async (session: ServedSession) => {
                 transcriptParses += 1;
                 return {
@@ -1270,7 +1285,8 @@ describe('UserPromptSubmit lexical recall', () => {
         const session = recallSession(1, `Needle target ${'x'.repeat(SESSION_CHAR_BUDGET)}`, '2026-08-22T11:00:00.000Z');
         const reader = {
             sessionsFor: () => [session],
-            storedRecallFieldsFor: () => new Map([[session.id, new Map([[0, { decisions: [], filesTouched: [], pendingItems: [] }]])]]),
+            storedRecallFieldsFor: () =>
+                new Map([[session.id, new Map([[0, { decisions: [], filesTouched: [], instructions: [], pendingItems: [] }]])]]),
             turns: async () => ({ turns: [{ turnIndex: 0, userMessage: 'ordinary opening request' }] }),
         } as unknown as SessionReader;
         const query = tokenizeRecallQuery('needle target');
@@ -1312,6 +1328,7 @@ describe('UserPromptSubmit lexical recall', () => {
                 first_prompt_search: 'unrelated opening request',
                 git_commit_count: null,
                 rollup_title: null,
+                rollup_instructions: null,
                 rollup_decisions: null,
                 rollup_state: null,
                 turn_count: 1,
@@ -1323,7 +1340,12 @@ describe('UserPromptSubmit lexical recall', () => {
             sessionsFor: () => sessions,
             turns: async () => ({ turns: [{ turnIndex: 0, userMessage: 'unrelated opening request' }] }),
             storedRecallFieldsFor: () =>
-                new Map(sessions.map((session) => [session.id, new Map([[0, { decisions: [], filesTouched: [], pendingItems: [] }]])])),
+                new Map(
+                    sessions.map((session) => [
+                        session.id,
+                        new Map([[0, { decisions: [], filesTouched: [], instructions: [], pendingItems: [] }]]),
+                    ]),
+                ),
         } as unknown as SessionReader;
         const query = tokenizeRecallQuery('cap session');
         expect(query).toBeDefined();

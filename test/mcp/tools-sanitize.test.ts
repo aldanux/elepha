@@ -143,6 +143,7 @@ describe('MCP response shell-syntax net', () => {
                     turn_count: 0,
                     token_estimate: 100,
                     decision_count: null,
+                    instruction_count: null,
                     pending_count: null,
                     substantive: false,
                 },

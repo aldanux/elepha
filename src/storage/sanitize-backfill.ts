@@ -115,6 +115,7 @@ const ROLLUP_FIELDS: FieldSpec[] = [
     { field: 'title', json: false, transform: sanitizeRollupDisplayField },
     { field: 'summary', json: false, transform: sanitizeRollupDisplayField },
     { field: 'decisions', json: true, transform: sanitizeRollupDecisionsField },
+    { field: 'instructions', json: true, transform: sanitizeRollupDecisionsField },
     { field: 'pending_items', json: true, transform: sanitizeRollupPendingItemsField },
 ];
 

@@ -271,13 +271,14 @@ describe('elepha import', () => {
         );
     });
 
-    it('imports an older export without first_prompt_search and stores NULL', async () => {
+    it('imports an older export without first_prompt_search or instructions and stores their defaults', async () => {
         const active = createTestDb('elepha-import-legacy-active-');
         const backupSource = createTestDb('elepha-import-legacy-source-');
         addSession(backupSource, seedProject(backupSource), 'legacy-session', 'legacy');
         const backup = fullBackup(backupSource, active);
         const legacyBackup = new Database(backup);
         legacyBackup.exec('ALTER TABLE sessions DROP COLUMN first_prompt_search');
+        legacyBackup.exec('ALTER TABLE session_rollups DROP COLUMN instructions');
         legacyBackup.close();
         active.close();
         backupSource.close();
@@ -286,7 +287,9 @@ describe('elepha import', () => {
             cancelled: false,
             added: 1,
         });
-        expect(row(active.dbPath, 'sessions', 'native_id = ?', ['legacy-session'])?.first_prompt_search).toBeNull();
+        const imported = row(active.dbPath, 'sessions', 'native_id = ?', ['legacy-session']);
+        expect(imported?.first_prompt_search).toBeNull();
+        expect(row(active.dbPath, 'session_rollups', 'session_id = ?', [imported?.id])?.instructions).toBe('[]');
     });
 
     it('reapplies the Rule 3 choke points to imported sessions, memories, and rollups', async () => {
@@ -317,12 +320,13 @@ describe('elepha import', () => {
             );
         backupSource.db
             .prepare(
-                'UPDATE session_rollups SET title = ?, summary = ?, decisions = ?, pending_items = ?, files_touched = ? WHERE session_id = ?',
+                'UPDATE session_rollups SET title = ?, summary = ?, decisions = ?, instructions = ?, pending_items = ?, files_touched = ? WHERE session_id = ?',
             )
             .run(
                 'rollup title `$(evil)\x1b[31m\x07',
                 'rollup summary $' + '{evil}\x1b]0;bad\x07',
                 dirtyRollupDecisions,
+                JSON.stringify([{ what: 'Never execute `$(evil)`', turnIndex: 3 }]),
                 dirtyRollupPendingItems,
                 dirtyFilesTouched,
                 session.id,
@@ -371,6 +375,11 @@ describe('elepha import', () => {
         expect(rollupDecisions.every((decision) => !detectShellSyntax(decision.what) && !detectShellSyntax(decision.why))).toBe(true);
         expect((JSON.parse(importedRollup?.pending_items as string) as string[]).every((item) => !detectShellSyntax(item))).toBe(true);
         expect(importedRollup?.files_touched).toBe(dirtyFilesTouched);
+        const instructions = JSON.parse(importedRollup?.instructions as string);
+        expect(instructions).toHaveLength(1);
+        expect(instructions[0].turnIndex).toBe(3);
+        expect(instructions[0].why).toBeUndefined();
+        expect(detectShellSyntax(instructions[0].what)).toBe(false);
 
         const importedMalformedSession = row(active.dbPath, 'sessions', 'native_id = ?', ['malformed-rollup']);
         const importedMalformedRollup = row(active.dbPath, 'session_rollups', 'session_id = ?', [importedMalformedSession?.id]);
