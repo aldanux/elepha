@@ -30,6 +30,7 @@ import {
     DEFAULT_MAX_CONCURRENT,
     DURABLE_CAPTURE_BACKFILL_BATCH_SIZE,
     DURABLE_CAPTURE_MAX_BYTES,
+    EMBEDDING_REFRESH_INTERVAL_MS,
     FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
@@ -54,7 +55,9 @@ import {
     updateAvailablePath,
     updateCheckStatePath,
 } from '../config/paths.js';
+import { getSetting } from '../config/settings.js';
 import { readSessionMetadata } from '../discovery/session-projects.js';
+import { type EmbeddingRefresh, startEmbeddingRefresh } from '../embeddings/refresh.js';
 import { installedAndLatestElephaVersionAsync } from '../install/self-update.js';
 import { filterTurn } from '../rendering/filtered-turn.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
@@ -226,6 +229,9 @@ export class IngestionDaemon {
     private readonly sweepIntervalMs: number;
     private readonly updateCheck: () => Promise<unknown> | unknown;
     private readonly updateCheckIntervalMs: number;
+    private embeddingRefreshTimer: NodeJS.Timeout | undefined;
+    private embeddingRefresh: EmbeddingRefresh | undefined;
+    private embeddingRefreshPromise: Promise<void> | undefined;
     private readonly readInstalledPackageVersion: () => string | undefined;
     private readonly exit: (code: number) => void;
     private readonly watcherUsePolling: boolean;
@@ -407,6 +413,9 @@ export class IngestionDaemon {
         this.updateCheckTimer = setInterval(checkForUpdate, this.updateCheckIntervalMs);
         this.updateCheckTimer.unref();
 
+        this.embeddingRefreshTimer = setInterval(() => this.refreshEmbeddings(), EMBEDDING_REFRESH_INTERVAL_MS);
+        this.embeddingRefreshTimer.unref();
+
         if (this.rollupService) {
             // Startup sweep: sessions that ended while the daemon was down will
             // never produce another file event, so nothing else would ever
@@ -428,6 +437,38 @@ export class IngestionDaemon {
         }
         this.stopPromise = this.stopInternal();
         return this.stopPromise;
+    }
+
+    private refreshEmbeddings(): void {
+        if (this.stopping || this.embeddingRefresh) {
+            return;
+        }
+        try {
+            // Zero provider/thread work while disabled; never occupy an ingestion
+            // queue slot or share its database connection during a batch.
+            if (!getSetting('memory-plus').value || isMemoryLocked(this.store.database)) {
+                return;
+            }
+            const refresh = startEmbeddingRefresh(this.store.database.name);
+            this.embeddingRefresh = refresh;
+            this.embeddingRefreshPromise = refresh.done
+                .then((result) => {
+                    if (result) {
+                        this.log(
+                            `[elepha] automatic indexing: ${result.generated} indexed, ${result.current} current, ${result.ineligibleOrEmpty} skipped`,
+                        );
+                    }
+                })
+                .catch((error: unknown) => {
+                    this.logError(`[elepha] automatic indexing failed; will retry next pass: ${(error as Error).message}`);
+                })
+                .finally(() => {
+                    this.embeddingRefresh = undefined;
+                    this.embeddingRefreshPromise = undefined;
+                });
+        } catch (error) {
+            this.logError(`[elepha] automatic indexing failed; will retry next pass: ${(error as Error).message}`);
+        }
     }
 
     private refreshInstallationHeartbeat(): void {
@@ -500,6 +541,10 @@ export class IngestionDaemon {
         if (this.updateCheckTimer) {
             clearInterval(this.updateCheckTimer);
         }
+        if (this.embeddingRefreshTimer) {
+            clearInterval(this.embeddingRefreshTimer);
+        }
+        this.embeddingRefresh?.stop();
         if (this.firstPromptSearchBackfillTimer) {
             clearTimeout(this.firstPromptSearchBackfillTimer);
         }
@@ -515,6 +560,7 @@ export class IngestionDaemon {
         await this.startupSweepPromise;
         await this.firstPromptSearchBackfillPromise;
         await this.durableCaptureBackfillPromise;
+        await this.embeddingRefreshPromise;
     }
 
     private async backfillDurableCapture(): Promise<void> {

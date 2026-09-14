@@ -108,6 +108,10 @@ export const HEARTBEAT_STALE_MS = HEARTBEAT_INTERVAL_MS * 3;
 export const DAEMON_MISSING_PACKAGE_CHECK_LIMIT = 3;
 export const DAEMON_PACKAGE_REPLACED_EXIT_CODE = 75;
 export const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+// Runs off the ingestion hot path in its own worker thread, so a tighter cadence
+// than the idle sweep is fine here. Only one pass runs at a time.
+export const EMBEDDING_REFRESH_INTERVAL_MS = 60 * 1000;
 export const FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE = 25;
 export const DURABLE_CAPTURE_BACKFILL_BATCH_SIZE = 25;
 export const UPDATE_CHECK_LOOP_INTERVAL_MS = 5 * 60 * 1000;

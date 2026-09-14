@@ -1,7 +1,10 @@
+import type { Database } from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { getSetting, setSetting } from '../../config/settings.js';
 import { installMemoryPlusDependency } from '../../embeddings/dependency.js';
+import { generateEmbeddings } from '../../embeddings/generate.js';
 import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration } from '../../embeddings/provider-config.js';
+import { openDb } from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
 import { confirmYesNo } from '../shared.js';
 
@@ -20,6 +23,7 @@ export async function enableMemoryPlus(
         confirm?: typeof confirmYesNo;
         createProvider?: typeof createEmbeddingProvider;
         installDependency?: typeof installMemoryPlusDependency;
+        openDatabase?: () => Promise<Database>;
         log?: (message: string) => void;
     } = {},
 ): Promise<boolean> {
@@ -57,7 +61,30 @@ export async function enableMemoryPlus(
     } finally {
         await provider?.dispose();
     }
-    log('elepha Memory Plus enabled. Run elepha embeddings to generate vectors.');
+    // Setup succeeded. A partial backfill keeps both the opt-in and completed
+    // vectors so the next automatic pass (or an explicit retry) can resume.
+    try {
+        log('Indexing existing history for elepha Memory Plus…');
+        const db = await (options.openDatabase ?? openDb)();
+        try {
+            const result = await generateEmbeddings(db, {
+                configPath: options.configPath,
+                environment,
+                createProvider: options.createProvider,
+                progress: ({ generated, current }) => log(`Indexing: ${generated} sessions indexed, ${current} already current.`),
+            });
+            log(
+                `elepha Memory Plus enabled. ${result.generated} sessions indexed, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped. New and updated sessions will be indexed automatically.`,
+            );
+        } finally {
+            db.close();
+        }
+    } catch (error) {
+        throw new Error(
+            `elepha Memory Plus remains enabled, but initial indexing failed: ${errorMessage(error)} Completed vectors are retained. Automatic indexing will retry; run elepha embeddings to retry now.`,
+            { cause: error },
+        );
+    }
     return true;
 }
 

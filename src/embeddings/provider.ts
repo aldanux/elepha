@@ -91,7 +91,7 @@ async function responseJson(response: Response): Promise<unknown> {
 }
 
 export function createProvider(configuration: EmbeddingConfiguration): EmbeddingProvider {
-    // One reusable loader per manual invocation, with a rejected load evicted so
+    // One reusable loader per batch or query, with a rejected load evicted so
     // a retry can actually retry. No model is loaded merely by creating a provider.
     let loaded: Promise<FeatureExtractionPipeline> | undefined;
     async function localModel(beforeUse: () => void): Promise<FeatureExtractionPipeline> {
