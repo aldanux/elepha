@@ -57,6 +57,9 @@ export function printInstallation(result: ReturnType<typeof installElepha>, acti
     }
     if (action === 'install') {
         console.log('\nRun `elepha init` to choose which projects you want elepha to remember');
+        console.log(
+            'Optional: run `elepha enable memory-plus` to let elepha understand questions in any language, not just exact keywords (one-time ~113MB download, runs entirely on your machine).',
+        );
     }
 }
 

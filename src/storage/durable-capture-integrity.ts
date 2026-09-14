@@ -12,10 +12,11 @@ interface SchemaObjectRow {
 }
 
 const DURABLE_SCHEMA_OBJECTS = `
-    name IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage')
+    name IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'session_embeddings')
     OR lower(name) GLOB 'filtered_turns_fts*'
     OR lower(tbl_name) GLOB 'filtered_turns_fts*'
     OR lower(tbl_name) IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage')
+    OR lower(tbl_name) = 'session_embeddings'
     OR (type IN ('trigger', 'index') AND lower(tbl_name) IN ('memories', 'session_rollups'))
 `;
 
@@ -170,6 +171,9 @@ function exactUsage(db: Database): number {
 // repair either commits together or leaves the candidate unchanged.
 export function normalizeAndVerifyDurableCapture(db: Database): void {
     db.transaction(() => {
+        // A restored cache has no current provider/source/consent proof. Rebuild
+        // vectors explicitly from the restored, normalized source material.
+        db.exec('DELETE FROM session_embeddings');
         applySanitize(db);
         db.exec("INSERT INTO filtered_turns_fts(filtered_turns_fts) VALUES ('rebuild')");
         const measured = exactUsage(db);

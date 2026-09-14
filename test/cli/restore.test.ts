@@ -406,6 +406,9 @@ function removeConsentRootUlid(dbPath: string): void {
 }
 
 function replaceWithLegacySessionsTable(db: Database.Database): void {
+    // Legacy backups predate vectors; retaining the new table would rewrite
+    // its foreign key to sessions_old while constructing this fixture.
+    db.exec('DROP TABLE session_embeddings');
     db.pragma('foreign_keys = OFF');
     try {
         db.exec(`

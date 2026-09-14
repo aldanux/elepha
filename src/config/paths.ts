@@ -133,6 +133,8 @@ export function elephaPaths(home = homedir()): {
     home: string;
     root: string;
     config: string;
+    memoryPlus: string;
+    embeddingModels: string;
     launcher: string;
     logDir: string;
     serviceDir: string;
@@ -158,6 +160,8 @@ export function elephaPaths(home = homedir()): {
         home,
         root,
         config: path.join(root, 'config.json'),
+        memoryPlus: path.join(root, 'memory-plus'),
+        embeddingModels: path.join(root, 'models', 'embeddings'),
         launcher: path.join(root, 'bin', 'elepha'),
         logDir,
         serviceDir,

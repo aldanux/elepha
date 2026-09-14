@@ -1,14 +1,18 @@
 import { execFile, execFileSync } from 'node:child_process';
-import { chmodSync, writeFileSync } from 'node:fs';
+import { chmodSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MEMORY_PLUS_TRANSFORMERS_MIN_VERSION } from '../../src/config/constants.js';
+import { elephaPaths } from '../../src/config/paths.js';
 import {
     npmInstallGlobalElepha,
     npmInstallGlobalElephaAsync,
+    npmInstallMemoryPlusAsync,
     npmInvocationForBackend,
     npmViewElephaLatest,
     npmViewElephaLatestAsync,
+    npmViewMemoryPlusLatestAsync,
 } from '../../src/security/subprocess-allowlist.js';
 import { withTempDir } from '../helpers/tmp.js';
 
@@ -158,4 +162,82 @@ describe('npm subprocess allowlist', () => {
             else process.env.ELEPHA_TEST_SECRET = previousSecret;
         }
     });
+});
+
+describe('Memory Plus npm subprocess allowlist', () => {
+    beforeEach(() => {
+        vi.stubEnv('ELEPHA_HOME', withTempDir('memory-plus-npm-'));
+        mockedExecFile.mockReset();
+        mockedExecFileSync.mockReset();
+    });
+    afterEach(() => vi.unstubAllEnvs());
+
+    function respond(output: string) {
+        mockedExecFile.mockImplementationOnce(((_executable, _args, _options, callback) => {
+            (callback as (error: Error | null, stdout: string, stderr: string) => void)(null, output, '');
+            return {} as ReturnType<typeof execFile>;
+        }) as typeof execFile);
+    }
+
+    it.each(['4.2.0', '4.3.0-rc.1+build.2', 'latest'])(
+        'installs only Transformers in the private prefix with CUDA downloads disabled (%s)',
+        async (version) => {
+            respond('');
+            const invocation = npmInvocationForBackend({ kind: 'nvm', command: '/opt/nvm/nvm-exec', root: '/opt/nvm' });
+            const environment = { ...invocation.environment };
+            await npmInstallMemoryPlusAsync(invocation, version);
+            expect(mockedExecFile).toHaveBeenCalledExactlyOnceWith(
+                '/opt/nvm/nvm-exec',
+                [
+                    'npm',
+                    'install',
+                    '--global=false',
+                    '--no-save',
+                    '--prefix',
+                    elephaPaths().memoryPlus,
+                    `@huggingface/transformers@${version}`,
+                ],
+                expect.objectContaining({
+                    shell: false,
+                    cwd: homedir(),
+                    timeout: 60_000,
+                    env: { ...environment, ONNXRUNTIME_NODE_INSTALL: 'skip' },
+                }),
+                expect.any(Function),
+            );
+            expect(invocation.environment).toEqual(environment);
+            expect(statSync(elephaPaths().memoryPlus).mode & 0o777).toBe(0o700);
+            expect(mockedExecFileSync).not.toHaveBeenCalled();
+        },
+    );
+
+    it.each(['', 'next', '^4.2.0', '4.2', '4.2.0 --global', '4.2.0;id', '4.2.0\n', '01.2.3', '4.2.0-01', '4.2.0-rc..1', '4.2.0+'])(
+        'rejects malformed version %j before spawning',
+        async (version) => {
+            await expect(npmInstallMemoryPlusAsync(npmInvocationForBackend(standaloneBackend()), version)).rejects.toThrow(
+                'outside elepha allowlist',
+            );
+            expect(mockedExecFile).not.toHaveBeenCalled();
+        },
+    );
+
+    it.each(['"4.2.0"', '["4.2.0", "4.10.0", "4.9.0"]'])('selects the highest compatible version from registry JSON %s', async (output) => {
+        respond(output);
+        const backend = standaloneBackend();
+        expect(await npmViewMemoryPlusLatestAsync(npmInvocationForBackend(backend))).toBe(output.startsWith('[') ? '4.10.0' : '4.2.0');
+        expect(mockedExecFile).toHaveBeenCalledWith(
+            path.join(backend.npmBin, 'npm'),
+            ['view', `@huggingface/transformers@^${MEMORY_PLUS_TRANSFORMERS_MIN_VERSION}`, 'version', '--json'],
+            expect.objectContaining({ shell: false, timeout: 10_000 }),
+            expect.any(Function),
+        );
+    });
+
+    it.each(['[]', 'null', '"5.0.0"', '"4.1.9"', '"4.3.0-rc.1"', '["4.2.0", "latest;id"]', 'not json'])(
+        'rejects invalid or incompatible registry output %s',
+        async (output) => {
+            respond(output);
+            await expect(npmViewMemoryPlusLatestAsync(npmInvocationForBackend(standaloneBackend()))).rejects.toThrow();
+        },
+    );
 });

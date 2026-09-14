@@ -54,6 +54,7 @@ describe('elepha config', () => {
             'capture-codex = On (default)',
             'capture-opencode = On (default)',
             'durable-capture = Off (default)',
+            'memory-plus = Off (default)',
             'query-matching = strict (default)',
         ];
         const program = configProgram();
@@ -95,6 +96,7 @@ describe('elepha config', () => {
                 'capture-codex = On (default)',
                 'capture-opencode = On (default)',
                 'durable-capture = Off (default)',
+                'memory-plus = Off (default)',
                 'query-matching = strict (default)',
             ]);
             const booleanValue = await run('get', 'update-check');
@@ -109,6 +111,7 @@ describe('elepha config', () => {
                 'capture-codex = On (default)',
                 'capture-opencode = On (default)',
                 'durable-capture = Off (default)',
+                'memory-plus = Off (default)',
                 'query-matching = lax',
             ]);
             const enumValue = await run('get', 'query-matching');
@@ -135,7 +138,7 @@ describe('elepha config', () => {
             await expect(runConfigWizard({ output, prompts: applied.prompts, configPath, environment: {} })).resolves.toBe(0);
 
             expect(applied.events[1]).toContain(
-                'update-check = On (default),capture-claude-code = On (default),capture-codex = On (default),capture-opencode = On (default),durable-capture = Off (default),query-matching = strict (default)',
+                'update-check = On (default),capture-claude-code = On (default),capture-codex = On (default),capture-opencode = On (default),durable-capture = Off (default),memory-plus = Off (default),query-matching = strict (default)',
             );
             expect(applied.events[2]).toContain('On (default),Off');
             expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({ 'capture-claude-code': false });
@@ -151,7 +154,7 @@ describe('elepha config', () => {
             ).resolves.toBe(0);
 
             expect(overridden.events[1]).toContain(
-                'update-check = Off (env),capture-claude-code = Off,capture-codex = On (default),capture-opencode = On (default),durable-capture = Off (default),query-matching = strict (default)',
+                'update-check = Off (env),capture-claude-code = Off,capture-codex = On (default),capture-opencode = On (default),durable-capture = Off (default),memory-plus = Off (default),query-matching = strict (default)',
             );
             expect(overridden.events[2]).toBe(
                 'note:Environment override:ELEPHA_NO_UPDATE_CHECK currently overrides this setting for this run. Your config preference will still be saved.',

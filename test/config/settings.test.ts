@@ -24,6 +24,7 @@ describe('settings', () => {
             { key: 'capture-codex', value: true, source: 'default' },
             { key: 'capture-opencode', value: true, source: 'default' },
             { key: 'durable-capture', value: false, source: 'default' },
+            { key: 'memory-plus', value: false, source: 'default' },
             { key: 'query-matching', value: 'strict', source: 'default' },
         ]);
     });
@@ -65,6 +66,7 @@ describe('settings', () => {
         try {
             expect(listSettings({ ELEPHA_NO_UPDATE_CHECK: '1' }, configPath())).toEqual([
                 { key: 'query-matching', value: 'strict', source: 'default' },
+                { key: 'memory-plus', value: false, source: 'default' },
                 { key: 'durable-capture', value: false, source: 'default' },
                 { key: 'capture-opencode', value: true, source: 'default' },
                 { key: 'capture-codex', value: true, source: 'default' },
@@ -196,7 +198,7 @@ describe('settings', () => {
         const file = configPath();
 
         expect(() => setSetting('auto-update', 'true', file)).toThrow(
-            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, durable-capture, query-matching',
+            'unknown setting "auto-update"; valid keys: update-check, capture-claude-code, capture-codex, capture-opencode, durable-capture, memory-plus, query-matching',
         );
         expect(() => setSetting('update-check', 'yes', file)).toThrow('update-check must be true, false, 1, 0, on, or off');
         expect(() => setSetting('query-matching', 'loose', file)).toThrow('query-matching must be strict or lax');

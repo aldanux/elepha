@@ -20,13 +20,15 @@ import {
     INSTALLED_HOOK_TIMEOUT_SECONDS,
     LEGACY_MCP_INSPECTION_MAX_BYTES,
     LEGACY_MCP_INSPECTION_TIMEOUT_MS,
+    MEMORY_PLUS_TRANSFORMERS_MIN_VERSION,
     NPM_INSTALL_TIMEOUT_MS,
     NPM_REGISTRY_LOOKUP_TIMEOUT_MS,
     OPENCODE_PLUGIN_OUTPUT_MAX_BYTES,
     SYSTEMD_SERVICE_NAME,
 } from '../config/constants.js';
-import { daemonLaunchAgentPath, elephaServiceLabel } from '../config/paths.js';
+import { daemonLaunchAgentPath, elephaPaths, elephaServiceLabel } from '../config/paths.js';
 import type { LauncherBackend } from '../install/launcher.js';
+import { ensurePrivateDir } from '../util/fs.js';
 
 export const OPENCODE_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'opencode'] as const;
 
@@ -404,7 +406,12 @@ export interface NpmInvocation {
 }
 
 function validPackageVersion(value: string): boolean {
-    return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(value);
+    return (
+        value === value.trim() &&
+        /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+            value,
+        )
+    );
 }
 
 function requiredBackendPath(value: string | undefined, label: string): string {
@@ -554,4 +561,44 @@ export async function npmInstallGlobalElephaAsync(invocation: NpmInvocation, ver
         throw new Error('npm installation version is outside elepha allowlist');
     }
     await runNpmAsync(invocation, ['install', '-g', `elepha@${version}`], NPM_INSTALL_TIMEOUT_MS);
+}
+
+// Query only stable releases within the supported optional runtime range.
+export async function npmViewMemoryPlusLatestAsync(invocation: NpmInvocation): Promise<string> {
+    const output = await runNpmAsync(invocation, [
+        'view',
+        `@huggingface/transformers@^${MEMORY_PLUS_TRANSFORMERS_MIN_VERSION}`,
+        'version',
+        '--json',
+    ]);
+    const decoded: unknown = JSON.parse(output);
+    const versions = Array.isArray(decoded) ? decoded : [decoded];
+    if (
+        versions.length === 0 ||
+        versions.some(
+            (version) =>
+                typeof version !== 'string' ||
+                !validPackageVersion(version) ||
+                !/^\d+\.\d+\.\d+$/.test(version) ||
+                version.split('.')[0] !== MEMORY_PLUS_TRANSFORMERS_MIN_VERSION.split('.')[0] ||
+                version.localeCompare(MEMORY_PLUS_TRANSFORMERS_MIN_VERSION, 'en', { numeric: true }) < 0,
+        )
+    ) {
+        throw new Error('npm view Memory Plus returned an invalid or incompatible version');
+    }
+    return (versions as string[]).sort((left, right) => right.localeCompare(left, 'en', { numeric: true }))[0];
+}
+
+// This package has its own private prefix. Never install it into elepha's tree.
+export async function npmInstallMemoryPlusAsync(invocation: NpmInvocation, version: string): Promise<void> {
+    if (version !== 'latest' && !validPackageVersion(version)) {
+        throw new Error('npm installation version is outside elepha allowlist');
+    }
+    const prefix = elephaPaths().memoryPlus;
+    ensurePrivateDir(prefix);
+    await runNpmAsync(
+        { ...invocation, environment: { ...invocation.environment, ONNXRUNTIME_NODE_INSTALL: 'skip' } },
+        ['install', '--global=false', '--no-save', '--prefix', prefix, `@huggingface/transformers@${version}`],
+        NPM_INSTALL_TIMEOUT_MS,
+    );
 }

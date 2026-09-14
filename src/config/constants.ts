@@ -179,3 +179,15 @@ export const PLIST_PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
 export const SYSTEMD_SERVICE_NAME = 'elepha.service';
 export const SYSTEMD_RESTART_SECONDS = 30;
 export const SYSTEMD_UMASK = '0077';
+
+// Manual embedding jobs keep one source and one model input resident at a time.
+export const EMBEDDING_SESSION_PAGE_SIZE = 100;
+export const EMBEDDING_LOCAL_MAX_TOKENS = 512;
+export const EMBEDDING_CHUNK_CHARACTERS = 1000;
+export const EMBEDDING_API_TIMEOUT_MS = 30_000;
+export const EMBEDDING_API_RESPONSE_BYTES = 128 * 1024;
+export const EMBEDDING_LOCAL_DIMENSIONS = 384;
+export const EMBEDDING_API_DIMENSIONS = 1536;
+
+// Keep optional runtime upgrades within the supported Transformers major.
+export const MEMORY_PLUS_TRANSFORMERS_MIN_VERSION = '4.2.0';
