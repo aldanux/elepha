@@ -19,7 +19,7 @@ export interface EmbeddingProvider {
     dispose(): Promise<void>;
 }
 
-// A key selects the external provider only AFTER an explicit Memory Plus opt-in.
+// A key selects the external provider only AFTER an explicit "Memory-Plus" opt-in.
 // OpenAI receives titles, first-prompt search text, summaries, decisions and pending
 // items (and instructions when that field lands). This is a privacy trade-off.
 export function embeddingConfiguration(enabled: boolean, env: NodeJS.ProcessEnv = process.env): EmbeddingConfiguration | undefined {

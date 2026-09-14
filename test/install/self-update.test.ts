@@ -97,7 +97,7 @@ describe('selfUpdate', () => {
         };
     }
 
-    it('does no optional npm work when Memory Plus is disabled', async () => {
+    it('does no optional npm work when "Memory-Plus" is disabled', async () => {
         const { runtime } = runtimeFor({ latest: '1.2.4', reconciliation: ['active'] });
         runtime.memoryPlusNpm = optionalNpm();
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated' });
@@ -113,7 +113,7 @@ describe('selfUpdate', () => {
         runtime.report = vi.fn();
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: latest === '1.2.3' ? 'current' : 'updated' });
         expect(runtime.memoryPlusNpm.installVersion).toHaveBeenCalledExactlyOnceWith('4.3.0');
-        expect(runtime.report).toHaveBeenCalledWith(expect.stringMatching(/Memory Plus.*updated.*4\.3\.0/));
+        expect(runtime.report).toHaveBeenCalledWith(expect.stringMatching(/"Memory-Plus".*updated.*4\.3\.0/));
         expect(events).not.toContain('npm install elepha@1.2.3');
     });
 
@@ -128,7 +128,7 @@ describe('selfUpdate', () => {
         await expect(selfUpdate(runtime)).resolves.toMatchObject({ status: 'updated', version: '1.2.4' });
         expect(runtime.report).toHaveBeenCalledWith(
             expect.stringMatching(
-                /Memory Plus dependency update failed: (registry offline|disk full); run elepha enable memory-plus again to retry/,
+                /"Memory-Plus" dependency update failed: (registry offline|disk full); run `elepha enable memory-plus` again to retry/,
             ),
         );
         expect(events).toContain('service reconcile and verify heartbeat');

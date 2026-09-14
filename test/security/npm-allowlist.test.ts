@@ -164,7 +164,7 @@ describe('npm subprocess allowlist', () => {
     });
 });
 
-describe('Memory Plus npm subprocess allowlist', () => {
+describe('"Memory-Plus" npm subprocess allowlist', () => {
     beforeEach(() => {
         vi.stubEnv('ELEPHA_HOME', withTempDir('memory-plus-npm-'));
         mockedExecFile.mockReset();

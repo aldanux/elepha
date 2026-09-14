@@ -1008,7 +1008,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         const expectedStageHash = await validatedStageHash(stagedPath);
         const health = (runtime.daemonHealth ?? currentDaemonHealth)();
         if (health.healthy) {
-            throw new Error(`Refusing restore while the daemon is running (${health.state}). Run elepha pause first.`);
+            throw new Error(`Refusing restore while the daemon is running (${health.state}). Run \`elepha pause\` first.`);
         }
         if (health.state.startsWith('STUCK')) {
             console.error(`Daemon appears stuck (${health.state}); proceeding — it is not writing.`);
@@ -1024,7 +1024,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         return await withExclusiveDatabaseLifecycle(dbPath, async (lifecycle) => {
             const currentHealth = (runtime.daemonHealth ?? currentDaemonHealth)();
             if (currentHealth.healthy) {
-                throw new Error(`Refusing restore while the daemon is running (${currentHealth.state}). Run elepha pause first.`);
+                throw new Error(`Refusing restore while the daemon is running (${currentHealth.state}). Run \`elepha pause\` first.`);
             }
             if (currentHealth.state.startsWith('STUCK') && currentHealth.state !== health.state) {
                 console.error(`Daemon appears stuck (${currentHealth.state}); proceeding — it is not writing.`);
