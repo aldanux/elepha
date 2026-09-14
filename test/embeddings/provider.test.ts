@@ -71,6 +71,17 @@ describe('embedding model runtime', () => {
         await provider.dispose();
     });
 
+    it('embeds retrieval queries with the E5 query prefix and preserves all chunks', async () => {
+        const provider = (await createEmbeddingProvider(true, {}))!;
+        const text = 'recover earlier decisions '.repeat(80);
+        await provider.embed(text, () => {}, 'query');
+        const pieces = model.extractor.mock.calls.map((call) => (call as unknown as [string])[0]);
+        expect(pieces.every((piece) => piece.startsWith('query: '))).toBe(true);
+        expect(pieces.every((piece) => model.extractor.tokenizer.encode(piece).length <= EMBEDDING_LOCAL_MAX_TOKENS)).toBe(true);
+        expect(pieces.map((piece) => piece.slice('query: '.length)).join('')).toBe(text);
+        await provider.dispose();
+    });
+
     it('uses the OpenAI HTTP contract without loading local ML', async () => {
         const request = vi.fn(
             async () =>

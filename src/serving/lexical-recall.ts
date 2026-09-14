@@ -57,9 +57,14 @@ interface RecallHit {
 export interface LexicalRecallResult {
     body: string;
     sessionIds: number[];
+    coverage?: string;
     state?: 'locked';
     content_coverage?: LockedContentCoverage;
 }
+
+export type RecallDisplayHit = Pick<RecallHit, 'project' | 'sessionTitle' | 'tool' | 'endedAt' | 'sessionId'> & {
+    discovery?: string;
+};
 
 interface Match {
     exactPhrase: boolean;
@@ -184,7 +189,9 @@ function isRecallCommandSession(session: ServedSession): boolean {
     return [session.custom_title, session.title, session.first_prompt_search].some(startsWithElephaCommand);
 }
 
-function hitIdentity(candidate: SessionCandidate): Pick<RecallHit, 'project' | 'sessionTitle' | 'date' | 'tool' | 'endedAt' | 'sessionId'> {
+export function hitIdentity(
+    candidate: SessionCandidate,
+): Pick<RecallHit, 'project' | 'sessionTitle' | 'date' | 'tool' | 'endedAt' | 'sessionId'> {
     return {
         project: candidate.project.displayName,
         sessionTitle: titleOf(candidate.session),
@@ -366,27 +373,29 @@ function emptyMessage(query: RecallQuery, scope: RecallScope, project: ProjectSe
     return `No recall matches found for “${query.display}” in ${project.displayName}. Search every project with elepha:query ${query.display}.`;
 }
 
-function renderBody(
+export function renderRecallBody(
     query: RecallQuery,
-    hits: RecallHit[],
+    hits: RecallDisplayHit[],
     coverage: string | undefined,
     now: number,
     scope: RecallScope,
     project: ProjectSet | undefined,
     usedLaxFallback: boolean,
+    maxHits: number = REMEMBER_MAX_HITS,
 ): LexicalRecallResult {
     const trailer = coverage === undefined ? ['', SELECT_HINT] : ['', coverage, '', SELECT_HINT];
     if (hits.length === 0) {
         return {
             body: escapeShellSyntax([DISPLAY_VERBATIM_INSTRUCTIONS, emptyMessage(query, scope, project), ...trailer].join('\n')),
             sessionIds: [],
+            coverage,
         };
     }
 
     const nonce = randomUUID();
-    const cappedHits = hits.slice(0, REMEMBER_MAX_HITS);
+    const cappedHits = hits.slice(0, maxHits);
     const resultCapOmitted = hits.length - cappedHits.length;
-    const build = (shown: RecallHit[], budgetOmitted: number): string => {
+    const build = (shown: RecallDisplayHit[], budgetOmitted: number): string => {
         const lines = [
             servedContextInstructions(nonce),
             DISPLAY_VERBATIM_INSTRUCTIONS,
@@ -395,7 +404,8 @@ function renderBody(
             usedLaxFallback ? '' : undefined,
             `Recall hits for “${query.display}” (${shown.length} shown of ${hits.length}):`,
             ...shown.map(
-                (hit, index) => `${index + 1}. [${relativeTime(hit.endedAt, now)} | ${hit.tool} | ${hit.project}] · ${hit.sessionTitle}`,
+                (hit, index) =>
+                    `${index + 1}. [${relativeTime(hit.endedAt, now)} | ${hit.tool} | ${hit.project}] · ${hit.sessionTitle}${hit.discovery === undefined ? '' : ` (${hit.discovery})`}`,
             ),
             resultCapOmitted > 0 ? `+${resultCapOmitted} more matches — refine your query.` : undefined,
             budgetOmitted > 0
@@ -412,7 +422,7 @@ function renderBody(
         shown -= 1;
         body = build(cappedHits.slice(0, shown), cappedHits.length - shown);
     }
-    return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId) };
+    return { body, sessionIds: cappedHits.slice(0, shown).map((hit) => hit.sessionId), coverage };
 }
 
 async function lexicalRecallUnlocked(
@@ -524,7 +534,7 @@ async function lexicalRecallUnlocked(
         contentRecall?.coverage,
         hits.length === 0,
     );
-    return renderBody(query, hits, coverage, renderedAt, scope, projects[0], usedLaxFallback);
+    return renderRecallBody(query, hits, coverage, renderedAt, scope, projects[0], usedLaxFallback);
 }
 
 // Scans recent metadata plus indexed durable content and returns a fully budgeted injection body.

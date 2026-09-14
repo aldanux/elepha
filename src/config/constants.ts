@@ -182,6 +182,8 @@ export const SYSTEMD_UMASK = '0077';
 
 // Manual embedding jobs keep one source and one model input resident at a time.
 export const EMBEDDING_SESSION_PAGE_SIZE = 100;
+// Retrieval was evaluated by presence among the five nearest sessions.
+export const SEMANTIC_RECALL_MAX_HITS = 5;
 export const EMBEDDING_LOCAL_MAX_TOKENS = 512;
 export const EMBEDDING_CHUNK_CHARACTERS = 1000;
 export const EMBEDDING_API_TIMEOUT_MS = 30_000;

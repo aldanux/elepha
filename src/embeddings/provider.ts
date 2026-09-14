@@ -45,8 +45,8 @@ function* textChunks(text: string): Generator<string> {
     }
 }
 
-function* localChunks(text: string, extractor: FeatureExtractionPipeline): Generator<string> {
-    if (extractor.tokenizer.encode(`passage: ${text}`).length <= EMBEDDING_LOCAL_MAX_TOKENS) {
+function* localChunks(text: string, extractor: FeatureExtractionPipeline, purpose: 'passage' | 'query'): Generator<string> {
+    if (extractor.tokenizer.encode(`${purpose}: ${text}`).length <= EMBEDDING_LOCAL_MAX_TOKENS) {
         yield text;
         return;
     }
@@ -55,8 +55,8 @@ function* localChunks(text: string, extractor: FeatureExtractionPipeline): Gener
     if (middle === 0) {
         throw new Error('Embedding tokenizer cannot fit a single character.');
     }
-    yield* localChunks(characters.slice(0, middle).join(''), extractor);
-    yield* localChunks(characters.slice(middle).join(''), extractor);
+    yield* localChunks(characters.slice(0, middle).join(''), extractor, purpose);
+    yield* localChunks(characters.slice(middle).join(''), extractor, purpose);
 }
 
 async function responseJson(response: Response): Promise<unknown> {
@@ -116,7 +116,7 @@ export function createProvider(configuration: EmbeddingConfiguration): Embedding
     }
     return {
         configuration,
-        async embed(text, beforeUse) {
+        async embed(text, beforeUse, purpose = 'passage') {
             beforeUse();
             if (!text.trim() || detectShellSyntax(text)) {
                 throw new Error('Embedding input must be nonempty, sanitized stored text.');
@@ -125,12 +125,12 @@ export function createProvider(configuration: EmbeddingConfiguration): Embedding
             beforeUse();
             const total = Array<number>(configuration.dimensions).fill(0);
             for (const chunk of textChunks(text)) {
-                const pieces = extractor === undefined ? [chunk] : localChunks(chunk, extractor);
+                const pieces = extractor === undefined ? [chunk] : localChunks(chunk, extractor, purpose);
                 for (const piece of pieces) {
                     beforeUse();
                     let vector: unknown;
                     if (extractor !== undefined) {
-                        vector = Array.from((await extractor(`passage: ${piece}`, { pooling: 'mean', normalize: true })).data);
+                        vector = Array.from((await extractor(`${purpose}: ${piece}`, { pooling: 'mean', normalize: true })).data);
                     } else if (configuration.provider === 'openai') {
                         const response = await fetch('https://api.openai.com/v1/embeddings', {
                             method: 'POST',

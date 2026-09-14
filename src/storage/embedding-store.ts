@@ -26,6 +26,11 @@ export interface EmbeddingSource {
     hash: string;
 }
 
+export interface StoredEmbedding extends EmbeddingModel {
+    sessionId: number;
+    vector: number[];
+}
+
 function sourceFor(session: ServedSession): EmbeddingSource | undefined {
     const text = embeddingSourceText(session);
     if (!text) {
@@ -66,6 +71,64 @@ export class EmbeddingStore {
 
     private projectIds(): number[] {
         return new ProjectResolver(this.db).listConsentedStored(new ConsentStore(this.db)).flatMap((project) => project.projectIds);
+    }
+
+    scan(projectIds: readonly number[], generation?: AuthenticatedReadGeneration): StoredEmbedding[] {
+        this.assertEnabled();
+        return withMemoryReadGeneration(
+            this.db,
+            lockedEmbedding,
+            () => {
+                const authority = this.consentIdentity();
+                const requested = new Set(projectIds);
+                const allowed = this.projectIds().filter((id) => requested.has(id));
+                const rows = this.db
+                    .prepare(`SELECT session_id, project_id, rollup_session_id, source_hash,
+                model, model_revision, dimensions, vector FROM session_embeddings
+                WHERE project_id IN (SELECT value FROM json_each(?)) ORDER BY session_id`)
+                    .iterate(JSON.stringify(allowed));
+                const vectors: StoredEmbedding[] = [];
+                for (const row of rows as Iterable<{
+                    session_id: number;
+                    project_id: number;
+                    rollup_session_id: number | null;
+                    source_hash: string;
+                    model: string;
+                    model_revision: string;
+                    dimensions: number;
+                    vector: Buffer;
+                }>) {
+                    const session = readEmbeddingSession(this.db, row.session_id, allowed);
+                    const source = session === undefined ? undefined : sourceFor(session);
+                    if (
+                        source === undefined ||
+                        source.projectId !== row.project_id ||
+                        source.hash !== row.source_hash ||
+                        source.rollupSessionId !== row.rollup_session_id
+                    ) {
+                        continue;
+                    }
+                    if (row.vector.length !== row.dimensions * 4) {
+                        throw new Error(`Session ${row.session_id}: invalid stored embedding dimensions.`);
+                    }
+                    const vector = Array.from({ length: row.dimensions }, (_, index) => row.vector.readFloatLE(index * 4));
+                    validateEmbedding(vector, row.dimensions);
+                    vectors.push({
+                        sessionId: row.session_id,
+                        model: row.model,
+                        revision: row.model_revision,
+                        dimensions: row.dimensions,
+                        vector,
+                    });
+                }
+                this.assertEnabled();
+                if (authority !== this.consentIdentity()) {
+                    throw new Error(EMBEDDING_SOURCE_CHANGED);
+                }
+                return vectors;
+            },
+            generation,
+        );
     }
 
     source(sessionId: number, generation?: AuthenticatedReadGeneration): EmbeddingSource | undefined {

@@ -15,7 +15,7 @@ export type EmbeddingConfiguration = EmbeddingModel & ({ provider: 'local' } | {
 
 export interface EmbeddingProvider {
     readonly configuration: EmbeddingConfiguration;
-    embed(text: string, beforeUse: () => void): Promise<number[]>;
+    embed(text: string, beforeUse: () => void, purpose?: 'passage' | 'query'): Promise<number[]>;
     dispose(): Promise<void>;
 }
 

@@ -18,6 +18,7 @@ import {
     servedContextInstructions,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
+import { renderSemanticUnion, semanticRecall } from '../serving/semantic-recall.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
@@ -295,7 +296,18 @@ export async function runUserPromptSubmit(
                         commandOutput = `${DISPLAY_VERBATIM_INSTRUCTIONS}\n${REMEMBER_HERE_UNCONSENTED}`;
                     } else {
                         const matchingMode = getSetting('query-matching', process.env, dependencies.configPath).value;
-                        const recall = await lexicalRecall(reader, projects, query, command.scope, Date.now, clock(), matchingMode);
+                        let recall = await lexicalRecall(reader, projects, query, command.scope, Date.now, clock(), matchingMode);
+                        if (recall.state !== 'locked' && getSetting('memory-plus', {}, dependencies.configPath).value) {
+                            const semantic = await semanticRecall(
+                                db,
+                                projects.flatMap((project) => project.projectIds),
+                                query.display,
+                                {
+                                    configPath: dependencies.configPath,
+                                },
+                            );
+                            recall = renderSemanticUnion(db, projects, query, command.scope, recall, semantic, clock());
+                        }
                         if (!contributingSessionsStillConsented(db, reader, recall.sessionIds)) {
                             log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
                             if (command.scope !== 'here') {
