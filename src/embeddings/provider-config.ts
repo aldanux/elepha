@@ -33,13 +33,13 @@ export function embeddingConfiguration(enabled: boolean, env: NodeJS.ProcessEnv 
               apiKey,
               model: `openai/${EMBEDDING_API_MODEL}`,
               // OpenAI exposes a model name, not immutable weight revisions.
-              revision: `${EMBEDDING_API_MODEL}:mean-chunks-v1`,
+              revision: `${EMBEDDING_API_MODEL}:codepoint-weighted-chunks-v2`,
               dimensions: EMBEDDING_API_DIMENSIONS,
           }
         : {
               provider: 'local',
               model: EMBEDDING_LOCAL_MODEL,
-              revision: `${EMBEDDING_LOCAL_REVISION}:q8:mean-chunks-v1`,
+              revision: `${EMBEDDING_LOCAL_REVISION}:q8:token-weighted-chunks-v2`,
               dimensions: EMBEDDING_LOCAL_DIMENSIONS,
           };
 }

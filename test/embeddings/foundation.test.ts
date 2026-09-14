@@ -6,9 +6,16 @@ import { enableMemoryPlus, MEMORY_PLUS_API_NOTICE, MEMORY_PLUS_CONFIRM, MEMORY_P
 import * as cliProgress from '../../src/cli/progress.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { generateEmbeddings } from '../../src/embeddings/generate.js';
-import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration } from '../../src/embeddings/provider-config.js';
+import {
+    createEmbeddingProvider,
+    EMBEDDING_API_MODEL,
+    EMBEDDING_LOCAL_REVISION,
+    type EmbeddingProvider,
+    embeddingConfiguration,
+} from '../../src/embeddings/provider-config.js';
 import { embeddingSourceHash } from '../../src/embeddings/source.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
+import { semanticRecall } from '../../src/serving/semantic-recall.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import {
     EMBEDDING_CONSENT_COLUMNS,
@@ -269,6 +276,54 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
 });
 
 describe('derived vector storage and manual generation', () => {
+    it.each([{}, { OPENAI_API_KEY: 'test-key' }])(
+        'rebuilds old equal-pooling vectors on an ordinary generation pass (%j)',
+        async (environment) => {
+            const f = fixture();
+            setSetting('memory-plus', 'true', f.configPath);
+            const configuration = embeddingConfiguration(true, environment)!;
+            // Historical persisted format: keep this marker independent of the current revision.
+            const oldModel = {
+                ...configuration,
+                revision:
+                    configuration.provider === 'local'
+                        ? `${EMBEDDING_LOCAL_REVISION}:q8:mean-chunks-v1`
+                        : `${EMBEDDING_API_MODEL}:mean-chunks-v1`,
+            };
+            const source = f.embeddings.source(f.session.id)!;
+            const oldVector = Array.from({ length: configuration.dimensions }, (_, index) => Number(index === 0));
+            const newVector = Array.from({ length: configuration.dimensions }, (_, index) => Number(index === 1));
+            f.embeddings.write(source, oldModel, oldVector, generation(f));
+            expect(f.embeddings.current(source, oldModel, generation(f))).toBe(true);
+            expect(f.embeddings.current(source, configuration, generation(f))).toBe(false);
+            const provider: EmbeddingProvider = { configuration, embed: vi.fn(async () => newVector), dispose: vi.fn(async () => {}) };
+            const options = { configPath: f.configPath, createProvider: async () => provider };
+            expect(await semanticRecall(f.db, [f.project.id], 'memory', options)).toEqual([]);
+            vi.mocked(provider.embed).mockClear();
+            expect(await generateEmbeddings(f.db, options)).toEqual({
+                generated: 1,
+                current: 0,
+                ineligibleOrEmpty: 0,
+                sourceChanged: 0,
+                failed: 0,
+            });
+            expect(provider.embed).toHaveBeenCalledExactlyOnceWith(source.text, expect.any(Function));
+            expect(f.embeddings.scan([f.project.id])).toEqual([
+                {
+                    sessionId: f.session.id,
+                    model: configuration.model,
+                    revision: configuration.revision,
+                    dimensions: configuration.dimensions,
+                    vector: newVector,
+                },
+            ]);
+            expect(f.embeddings.current(source, oldModel, generation(f))).toBe(false);
+            expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1 });
+            expect(provider.embed).toHaveBeenCalledOnce();
+            expect(await semanticRecall(f.db, [f.project.id], 'memory', options)).toEqual([{ sessionId: f.session.id, similarity: 1 }]);
+        },
+    );
+
     it('embeds only sanitized durable metadata, reuses current vectors, and supports rebuilding', async () => {
         const f = fixture();
         seedMemory(f, {

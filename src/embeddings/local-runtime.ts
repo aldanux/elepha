@@ -7,7 +7,7 @@ export const MEMORY_PLUS_INSTALL_HINT = 'Run `elepha enable memory-plus` to inst
 // from normal installs, including development and TypeScript builds.
 export interface FeatureExtractionPipeline {
     (text: string, options: { pooling: 'mean'; normalize: true }): Promise<{ data: ArrayLike<number> }>;
-    tokenizer: { encode(text: string): number[] };
+    tokenizer: { encode(text: string, options?: { add_special_tokens?: boolean }): number[] };
     dispose(): Promise<void>;
 }
 
