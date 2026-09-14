@@ -102,12 +102,12 @@ async function refreshMemoryPlus(runtime: SelfUpdateRuntime, backend: LauncherBa
         }
         if (installed === undefined || isNewerVersion(latest, installed)) {
             await npm.installVersion(latest);
-            report(`Memory Plus dependency updated to ${latest}.`);
+            report(`elepha Memory Plus dependency updated to ${latest}.`);
         } else {
-            report(`Memory Plus dependency is current (${installed}).`);
+            report(`elepha Memory Plus dependency is current (${installed}).`);
         }
     } catch (error) {
-        report(`Memory Plus dependency update failed: ${errorMessage(error)}; run elepha enable memory-plus again to retry`);
+        report(`elepha Memory Plus dependency update failed: ${errorMessage(error)}; run elepha enable memory-plus again to retry`);
     }
 }
 
