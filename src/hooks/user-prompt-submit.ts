@@ -3,11 +3,20 @@
 
 import { existsSync, realpathSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { ELEPHA_LIST_DEFAULT_LIMIT, ELEPHA_LIST_MAX_LIMIT, RESUME_CHAR_BUDGET } from '../config/constants.js';
+import {
+    AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
+    AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
+    AUTOMATIC_RECALL_MIN_SIMILARITY,
+    ELEPHA_LIST_DEFAULT_LIMIT,
+    ELEPHA_LIST_MAX_LIMIT,
+    HOOK_WATCHDOG_TIMEOUT_MS,
+    RESUME_CHAR_BUDGET,
+} from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
+import { automaticRecallCandidate } from '../serving/automatic-recall.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
     HELP,
@@ -18,7 +27,7 @@ import {
     servedContextInstructions,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
-import { renderSemanticUnion, semanticRecall } from '../serving/semantic-recall.js';
+import { currentRecallHits, renderSemanticUnion, semanticRecall } from '../serving/semantic-recall.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
@@ -233,8 +242,16 @@ export async function runUserPromptSubmit(
         return { reason: 'invalid_payload' };
     }
     const command = parseUserPromptCommand(payload.prompt);
-    if (!command && !payload.prompt.trim().startsWith('elepha:')) {
-        return { reason: 'not_command' };
+    const automatic = !command && !payload.prompt.trim().startsWith('elepha:');
+    if (automatic) {
+        // Off means no database open, provider construction, or vector scan.
+        if (!getSetting('memory-plus', {}, dependencies.configPath).value || !payload.prompt.trim()) {
+            return { reason: 'not_command' };
+        }
+        if (payload.prompt.length > AUTOMATIC_RECALL_MAX_PROMPT_CHARS) {
+            log(promptLogLine(tool, payload, 'discarded reason=automatic_prompt_budget'));
+            return { reason: 'not_command' };
+        }
     }
     let db: Database.Database;
     try {
@@ -268,6 +285,9 @@ export async function runUserPromptSubmit(
             return { output: envelope(output) };
         };
         const locked = (): UserPromptSubmitResult => {
+            if (automatic) {
+                return { reason: 'not_command' };
+            }
             const result = emit(LOCKED_MEMORY_MESSAGE);
             if ('output' in result) {
                 log(promptLogLine(tool, payload, 'served locked'));
@@ -276,6 +296,49 @@ export async function runUserPromptSubmit(
         };
         return await withMemoryReadGenerationAsync(db, locked, async () => {
             const reader = new SessionReader(db);
+            if (automatic) {
+                const project = consentedProject(db, payload.cwd);
+                if (project === undefined) {
+                    return { reason: 'not_command' };
+                }
+                const deadline = Date.now() + HOOK_WATCHDOG_TIMEOUT_MS;
+                const semantic = await semanticRecall(db, project.projectIds, payload.prompt, {
+                    configPath: dependencies.configPath,
+                    beforeUse: () => {
+                        if (Date.now() >= deadline) {
+                            throw new Error('Automatic recall deadline exceeded.');
+                        }
+                    },
+                });
+                const candidate = semantic[0];
+                if (candidate === undefined || candidate.similarity <= AUTOMATIC_RECALL_MIN_SIMILARITY) {
+                    return { reason: 'not_command' };
+                }
+                const hit = currentRecallHits(db, [project], [candidate.sessionId])[0];
+                if (hit === undefined || (hit.session.tool === tool && hit.session.native_id === payload.session_id)) {
+                    return { reason: 'not_command' };
+                }
+                const { prefix, body } = automaticRecallCandidate(hit, candidate.similarity);
+                if (body.length > AUTOMATIC_RECALL_MAX_CONTEXT_CHARS) {
+                    log(promptLogLine(tool, payload, 'discarded reason=automatic_context_budget'));
+                    return { reason: 'not_command' };
+                }
+                if (store.hasInjectionBodyPrefix(tool, payload.session_id, prefix)) {
+                    return { reason: 'not_command' };
+                }
+                if (
+                    !getSetting('memory-plus', {}, dependencies.configPath).value ||
+                    !contributingSessionsStillConsented(db, new SessionReader(db), [candidate.sessionId])
+                ) {
+                    log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
+                    return { reason: 'not_command' };
+                }
+                const result = emit(body);
+                if ('output' in result) {
+                    log(promptLogLine(tool, payload, 'served automatic_candidate'));
+                }
+                return result;
+            }
             const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
             let commandOutput: string;
             let shownSessionIds: number[] | undefined;
@@ -388,14 +451,28 @@ export async function runUserPromptSubmit(
 
 // CLI boundary: no diagnostics or partial JSON may reach stdout.
 export async function runUserPromptSubmitCli(tool: HookTool): Promise<void> {
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     try {
         const input = await readStdin();
+        const payload = parsePayload(input, tool, 'UserPromptSubmit');
+        // Bound model load/inference (~1 GB for the local runtime) to one
+        // process lifetime. Explicit commands retain their existing behavior.
+        if (payload && !payload.prompt.trim().startsWith('elepha:') && getSetting('memory-plus', {}).value) {
+            watchdog = setTimeout(() => {
+                logLine(promptLogLine(tool, payload, 'failed reason=automatic_recall_timeout'));
+                process.exit(0);
+            }, HOOK_WATCHDOG_TIMEOUT_MS);
+        }
         const result = await runUserPromptSubmit(input, tool);
         if ('output' in result) {
             process.stdout.write(JSON.stringify(result.output));
         }
     } catch {
         // Hooks are fail-open: stdout must stay empty on every failure path.
+    } finally {
+        if (watchdog !== undefined) {
+            clearTimeout(watchdog);
+        }
     }
 }
 

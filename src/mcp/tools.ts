@@ -20,6 +20,7 @@ import {
     semanticRecall,
     unionRecallIds,
 } from '../serving/semantic-recall.js';
+import { publicSessionId } from '../serving/session-id.js';
 import { endedAt, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import {
@@ -482,12 +483,6 @@ export class ElephaMcpService implements McpToolHandlers {
             reason: 'transcript_missing',
         });
     }
-}
-
-function publicSessionId(session: Pick<ServedSession, 'tool' | 'native_id' | 'segment_index'>): string {
-    return Buffer.from(JSON.stringify({ tool: session.tool, nativeId: session.native_id, segmentIndex: session.segment_index })).toString(
-        'base64url',
-    );
 }
 
 function parsePublicSessionId(id: string): PublicSessionId | null {

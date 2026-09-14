@@ -169,7 +169,12 @@ describe('derived vector storage and manual generation', () => {
             userMessage: 'permitted first prompt',
             assistantText: 'RAW ASSISTANT MUST NOT BE EMBEDDED',
         });
-        seedRollup(f, { project: f.project, session: f.session, decisions: [{ what: 'Use SQLite', why: 'Local encryption' }] });
+        seedRollup(f, {
+            project: f.project,
+            session: f.session,
+            decisions: [{ what: 'Use SQLite', why: 'Local encryption' }],
+            instructions: [{ what: 'Always run the full gates', why: 'Protect the release contract' }],
+        });
         f.db
             .prepare('UPDATE session_rollups SET summary = ?, pending_items = ? WHERE session_id = ?')
             .run('safe `title`', '["next task"]', f.session.id);
@@ -180,6 +185,8 @@ describe('derived vector storage and manual generation', () => {
         const input = vi.mocked(provider.embed).mock.calls[0][0];
         expect(input).toContain('permitted first prompt');
         expect(input).toContain('Local encryption');
+        expect(input).toContain('Always run the full gates');
+        expect(input).toContain('Protect the release contract');
         expect(input).toContain('next task');
         expect(input).not.toContain('RAW ASSISTANT');
         expect(detectShellSyntax(input)).toBe(false);
@@ -213,11 +220,13 @@ describe('derived vector storage and manual generation', () => {
         expect(() => f.embeddings.write(source, model, Array(384).fill(0.2), generation(f))).toThrow('source or authorization changed');
     });
 
-    it('invalidates a changed rollup and cascades rollup deletion without removing the session', () => {
+    it('invalidates changed rollup instructions and cascades rollup deletion without removing the session', () => {
         const f = fixture();
-        seedRollup(f, { project: f.project, session: f.session });
+        seedRollup(f, { project: f.project, session: f.session, instructions: [{ what: 'Run focused tests' }] });
         const source = saveVector(f);
-        f.db.prepare('UPDATE session_rollups SET summary = ? WHERE session_id = ?').run('new summary', f.session.id);
+        f.db
+            .prepare('UPDATE session_rollups SET instructions = ? WHERE session_id = ?')
+            .run('[{"what":"Run the full suite"}]', f.session.id);
         const changed = f.embeddings.source(f.session.id)!;
         expect(changed.hash).not.toBe(source.hash);
         expect(f.embeddings.current(changed, fakeProvider().configuration, generation(f))).toBe(false);

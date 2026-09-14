@@ -24,7 +24,12 @@ export async function semanticRecall(
     db: Database,
     projectIds: readonly number[],
     query: string,
-    options: { configPath?: string; environment?: NodeJS.ProcessEnv; createProvider?: typeof createEmbeddingProvider } = {},
+    options: {
+        configPath?: string;
+        environment?: NodeJS.ProcessEnv;
+        createProvider?: typeof createEmbeddingProvider;
+        beforeUse?: () => void;
+    } = {},
 ): Promise<SemanticCandidate[]> {
     // Keep all embedding imports, provider configuration and vector reads behind
     // the opt-in. Checking the setting itself never loads the optional runtime.
@@ -37,7 +42,10 @@ export async function semanticRecall(
         .validateEmbedding;
     const generation = withMemoryReadGeneration(db, lockedEmbedding, (token) => token);
     const store = new EmbeddingStore(db, options.configPath);
-    const check = () => withMemoryReadGeneration(db, lockedEmbedding, () => store.assertEnabled(), generation);
+    const check = () => {
+        options.beforeUse?.();
+        return withMemoryReadGeneration(db, lockedEmbedding, () => store.assertEnabled(), generation);
+    };
     check();
     const provider = await (options.createProvider ?? createEmbeddingProvider)(true, options.environment);
     if (provider === undefined) {
@@ -65,6 +73,7 @@ export async function semanticRecall(
         return [{ sessionId: stored.sessionId, similarity }];
     });
     candidates.sort((a, b) => b.similarity - a.similarity || a.sessionId - b.sessionId);
+    options.beforeUse?.();
     return candidates.slice(0, SEMANTIC_RECALL_MAX_HITS);
 }
 

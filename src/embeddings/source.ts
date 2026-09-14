@@ -45,6 +45,25 @@ export function embeddingSourceText(session: ServedSession): string {
             texts.push(decision.what, decision.why);
         }
     }
+    if (session.rollup_instructions != null) {
+        const instructions = storedArray(session.rollup_instructions, 'instructions');
+        for (const instruction of instructions) {
+            const why = instruction && typeof instruction === 'object' && 'why' in instruction ? instruction.why : undefined;
+            if (
+                !instruction ||
+                typeof instruction !== 'object' ||
+                !('what' in instruction) ||
+                typeof instruction.what !== 'string' ||
+                (why !== undefined && typeof why !== 'string')
+            ) {
+                throw new Error('Invalid stored instruction; semantic source was not generated.');
+            }
+            texts.push(instruction.what);
+            if (why !== undefined) {
+                texts.push(why);
+            }
+        }
+    }
     texts.push(...strings(session.rollup_pending_items, 'pending items'));
     return escapeShellSyntax(texts.filter((text): text is string => typeof text === 'string' && text.trim().length > 0).join('\n'));
 }
