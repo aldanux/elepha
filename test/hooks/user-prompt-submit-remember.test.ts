@@ -585,7 +585,7 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(multiTokenBody).not.toContain('Alpha newest title');
         expect(multiTokenBody.match(/^\d+\. /gm)).toHaveLength(1);
 
-        const { body: misspelledTokenBody } = await lexicalRecall(
+        const { body: misspelledTokenBody, sessionIds: misspelledTokenSessionIds } = await lexicalRecall(
             reader,
             [project],
             misspelledToken,
@@ -594,9 +594,10 @@ describe('UserPromptSubmit lexical recall', () => {
             undefined,
             'strict',
         );
-        expect(misspelledTokenBody).toContain(
-            'No recall matches found for “alpha beta gamma gammma” in coverage-project. Search every project with elepha:query alpha beta gamma gammma.',
-        );
+        expect(misspelledTokenBody).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+        expect(misspelledTokenBody).toContain('Alpha Beta Gamma oldest title');
+        expect(misspelledTokenBody).not.toContain('Alpha newest title');
+        expect(misspelledTokenSessionIds).toEqual([3, 2]);
 
         const { body: unionBody } = await lexicalRecall(reader, [project], unionQuery, 'here', undefined, undefined, 'strict');
         expect(unionBody).toContain('Laravel Cloud application');
@@ -722,6 +723,61 @@ describe('UserPromptSubmit lexical recall', () => {
         const result = await lexicalRecall(reader, [project], query, 'here', () => 0, undefined, 'strict');
 
         expect(result.sessionIds).toEqual([1, 2, 3]);
+    });
+
+    it('ranks strong token overlap above a single distinctive-token match without losing rare-term priority', async () => {
+        const project: ProjectSet = {
+            key: 'rarity-ranking-project',
+            displayName: 'rarity-ranking-project',
+            paths: ['/rarity-ranking-project'],
+            projectIds: [1],
+            gitRoot: null,
+            gitRemote: null,
+        };
+        const strongOverlap = recallSession(
+            1,
+            'Correct endpoint investigation',
+            '2026-08-22T11:00:00.000Z',
+            'fix client how we command card by endpoint',
+        );
+        const accidentalRareMatch = recallSession(2, 'Unrelated discussion', '2026-08-22T10:00:00.000Z', 'talking');
+        const commonTokenBoosters = ['fix', 'client', 'how', 'we', 'command', 'card', 'by', 'endpoint'].map((token, index) =>
+            recallSession(index + 3, `Routine ${token} work`, '2026-08-22T09:00:00.000Z'),
+        );
+        const unrelated = Array.from({ length: 192 }, (_, index) =>
+            recallSession(index + 11, `Unrelated session ${index}`, '2026-08-22T08:00:00.000Z'),
+        );
+        const overlapSessions = [strongOverlap, accidentalRareMatch, ...commonTokenBoosters, ...unrelated];
+        const rareCode = recallSession(1, 'ZXCV-2049 incident', '2026-08-22T11:00:00.000Z');
+        const noisyGeneralMatch = recallSession(2, 'Deploy payment service', '2026-08-22T10:00:00.000Z');
+        const generalTermSessions = Array.from({ length: 200 }, (_, index) =>
+            recallSession(index + 3, `Deploy payment service routine ${index}`, '2026-08-22T09:00:00.000Z'),
+        );
+        const readerFor = (sessions: ServedSession[]) =>
+            ({
+                sessionsFor: () => sessions,
+                turns: async () => ({ reason: 'must_not_parse' }),
+            }) as unknown as SessionReader;
+        const overlapQuery = tokenizeRecallQuery('fix client how we command card by endpoint talking');
+        const rareCodeQuery = tokenizeRecallQuery('deploy payment service ZXCV-2049');
+        expect(overlapQuery).toBeDefined();
+        expect(rareCodeQuery).toBeDefined();
+        if (!overlapQuery || !rareCodeQuery) return;
+
+        const overlapResult = await lexicalRecall(readerFor(overlapSessions), [project], overlapQuery, 'here', () => 0, undefined, 'lax');
+        const rareCodeResult = await lexicalRecall(
+            readerFor([rareCode, noisyGeneralMatch, ...generalTermSessions]),
+            [project],
+            rareCodeQuery,
+            'here',
+            () => 0,
+            undefined,
+            'lax',
+        );
+
+        expect(overlapResult.sessionIds).toEqual([strongOverlap.id]);
+        expect(overlapResult.body).toContain(strongOverlap.title);
+        expect(rareCodeResult.sessionIds).toEqual([rareCode.id]);
     });
 
     it('finds terms across stored filtered turns without exposing the stored conversation', async () => {
