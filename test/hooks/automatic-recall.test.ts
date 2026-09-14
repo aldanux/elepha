@@ -141,7 +141,9 @@ describe('automatic "Memory-Plus" candidates', () => {
         const f = fixture(0.94);
         expect(await f.run()).toEqual({ reason: 'not_command' });
         expect(f.provider.embed).toHaveBeenCalledOnce();
-        vi.spyOn(semantic, 'semanticRecall').mockResolvedValue([{ sessionId: f.session.id, similarity: AUTOMATIC_RECALL_MIN_SIMILARITY }]);
+        vi.spyOn(semantic, 'semanticRecall').mockResolvedValue({
+            candidates: [{ sessionId: f.session.id, similarity: AUTOMATIC_RECALL_MIN_SIMILARITY }],
+        });
         expect(await f.run()).toEqual({ reason: 'not_command' });
         expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
     });
@@ -261,14 +263,18 @@ describe('automatic "Memory-Plus" candidates', () => {
             const recall = vi.spyOn(semantic, 'semanticRecall').mockImplementation(async () => {
                 // Return an inference result that predates the eligibility change.
                 if (rejection === 'incognito') f.store.recordIncognitoTranscript(f.historical.tool, f.historical.native_id);
-                return [
-                    { sessionId: f.session.id, similarity: 0.99 },
-                    {
-                        sessionId: f.historical.id,
-                        similarity:
-                            rejection === 'incognito' ? 0.98 : AUTOMATIC_RECALL_MIN_SIMILARITY - (rejection === 'below floor' ? 0.01 : 0),
-                    },
-                ];
+                return {
+                    candidates: [
+                        { sessionId: f.session.id, similarity: 0.99 },
+                        {
+                            sessionId: f.historical.id,
+                            similarity:
+                                rejection === 'incognito'
+                                    ? 0.98
+                                    : AUTOMATIC_RECALL_MIN_SIMILARITY - (rejection === 'below floor' ? 0.01 : 0),
+                        },
+                    ],
+                };
             });
             expect(await f.run(undefined, 'codex', f.chat)).toEqual({ reason: 'not_command' });
             expect(recall).toHaveBeenCalledOnce();
@@ -283,10 +289,10 @@ describe('automatic "Memory-Plus" candidates', () => {
         const fallback = { sessionId: historical.id, similarity: 0.98 };
         const recall = vi
             .spyOn(semantic, 'semanticRecall')
-            .mockResolvedValue([...Array.from({ length: AUTOMATIC_RECALL_MAX_CANDIDATES - 1 }, () => skipped), fallback]);
+            .mockResolvedValue({ candidates: [...Array.from({ length: AUTOMATIC_RECALL_MAX_CANDIDATES - 1 }, () => skipped), fallback] });
         expect(context(await f.run(undefined, 'codex', f.session.native_id))).toContain(publicSessionId(historical));
         f.db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Fresh bounded historical decision', historical.id);
-        recall.mockResolvedValue([...Array.from({ length: AUTOMATIC_RECALL_MAX_CANDIDATES }, () => skipped), fallback]);
+        recall.mockResolvedValue({ candidates: [...Array.from({ length: AUTOMATIC_RECALL_MAX_CANDIDATES }, () => skipped), fallback] });
         const hydrate = vi.spyOn(semantic, 'currentRecallHits');
         expect(await f.run(undefined, 'codex', f.session.native_id)).toEqual({ reason: 'not_command' });
         expect(hydrate).toHaveBeenCalledOnce();

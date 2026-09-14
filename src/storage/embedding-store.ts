@@ -1,4 +1,5 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { SEMANTIC_SCAN_BUDGET_MS, SEMANTIC_SCAN_MAX_ROWS, SEMANTIC_SCAN_MAX_VECTOR_BYTES } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { validateEmbedding } from '../embeddings/provider.js';
 import type { EmbeddingModel } from '../embeddings/provider-config.js';
@@ -36,6 +37,8 @@ export interface EmbeddingSource {
     text: string;
     hash: string;
 }
+
+export type EmbeddingScanTruncation = 'rows' | 'time';
 
 export interface StoredEmbedding extends EmbeddingModel {
     sessionId: number;
@@ -91,7 +94,11 @@ export class EmbeddingStore {
         return new ProjectResolver(this.db).listConsentedStored(new ConsentStore(this.db)).flatMap((project) => project.projectIds);
     }
 
-    scan(projectIds: readonly number[], generation?: AuthenticatedReadGeneration): StoredEmbedding[] {
+    scan(
+        projectIds: readonly number[],
+        visit: (stored: StoredEmbedding) => void,
+        generation?: AuthenticatedReadGeneration,
+    ): EmbeddingScanTruncation | undefined {
         this.assertEnabled();
         return withMemoryReadGeneration(
             this.db,
@@ -100,22 +107,50 @@ export class EmbeddingStore {
                 const authority = this.consentIdentity();
                 const requested = new Set(projectIds);
                 const allowed = this.projectIds().filter((id) => requested.has(id));
-                const rows = this.db
-                    .prepare(`SELECT session_id, project_id, rollup_session_id, source_hash,
-                model, model_revision, dimensions, vector FROM session_embeddings
-                WHERE project_id IN (SELECT value FROM json_each(?)) ORDER BY session_id`)
-                    .iterate(JSON.stringify(allowed));
-                const vectors: StoredEmbedding[] = [];
-                for (const row of rows as Iterable<{
-                    session_id: number;
-                    project_id: number;
-                    rollup_session_id: number | null;
-                    source_hash: string;
-                    model: string;
-                    model_revision: string;
-                    dimensions: number;
-                    vector: Buffer;
-                }>) {
+                const allowedSet = new Set(allowed);
+                const started = performance.now();
+                // Walk the integer primary key directly: no corpus-sized SQL sort
+                // and no hidden scan of excluded projects between budget checks.
+                // Recency is newest stored session, as in manual embedding jobs.
+                const rows =
+                    allowed.length === 0
+                        ? []
+                        : this.db
+                              .prepare(`SELECT session_id, project_id
+                    FROM session_embeddings NOT INDEXED ORDER BY session_id DESC`)
+                              .iterate();
+                const read = this.db.prepare(`SELECT rollup_session_id, source_hash,
+                    model, model_revision, dimensions, length(vector) AS vector_bytes,
+                    CASE WHEN length(vector) <= ? THEN vector ELSE NULL END AS vector
+                    FROM session_embeddings WHERE session_id = ?`);
+                let scanned = 0;
+                let truncation: EmbeddingScanTruncation | undefined;
+                for (const identity of rows as Iterable<{ session_id: number; project_id: number }>) {
+                    // One identity of lookahead distinguishes exhaustion from loss,
+                    // without hydrating or decoding a row beyond the budget.
+                    if (scanned >= SEMANTIC_SCAN_MAX_ROWS || performance.now() - started >= SEMANTIC_SCAN_BUDGET_MS) {
+                        truncation = scanned >= SEMANTIC_SCAN_MAX_ROWS ? 'rows' : 'time';
+                        break;
+                    }
+                    scanned++;
+                    if (!allowedSet.has(identity.project_id)) {
+                        continue;
+                    }
+                    const row = {
+                        ...identity,
+                        ...(read.get(SEMANTIC_SCAN_MAX_VECTOR_BYTES, identity.session_id) as {
+                            rollup_session_id: number | null;
+                            source_hash: string;
+                            model: string;
+                            model_revision: string;
+                            dimensions: number;
+                            vector_bytes: number;
+                            vector: Buffer | null;
+                        }),
+                    };
+                    if (row.vector === null || row.vector_bytes > SEMANTIC_SCAN_MAX_VECTOR_BYTES) {
+                        throw new Error(`Session ${row.session_id}: stored embedding exceeds the vector byte limit.`);
+                    }
                     const session = readEmbeddingSession(this.db, row.session_id, allowed);
                     const source = session === undefined ? undefined : sourceFor(session);
                     if (
@@ -129,9 +164,10 @@ export class EmbeddingStore {
                     if (row.vector.length !== row.dimensions * 4) {
                         throw new Error(`Session ${row.session_id}: invalid stored embedding dimensions.`);
                     }
-                    const vector = Array.from({ length: row.dimensions }, (_, index) => row.vector.readFloatLE(index * 4));
+                    const bytes = row.vector;
+                    const vector = Array.from({ length: row.dimensions }, (_, index) => bytes.readFloatLE(index * 4));
                     validateEmbedding(vector, row.dimensions);
-                    vectors.push({
+                    visit({
                         sessionId: row.session_id,
                         model: row.model,
                         revision: row.model_revision,
@@ -143,7 +179,7 @@ export class EmbeddingStore {
                 if (authority !== this.consentIdentity()) {
                     throw new Error(EMBEDDING_SOURCE_CHANGED);
                 }
-                return vectors;
+                return truncation;
             },
             generation,
         );

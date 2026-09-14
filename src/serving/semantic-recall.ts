@@ -1,9 +1,10 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { SEMANTIC_RECALL_MAX_HITS } from '../config/constants.js';
+import { SEMANTIC_RECALL_MAX_HITS, SEMANTIC_SCAN_BUDGET_MS, SEMANTIC_SCAN_MAX_ROWS } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import type { createEmbeddingProvider } from '../embeddings/provider-config.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { ConsentStore } from '../storage/consent-store.js';
+import type { EmbeddingScanTruncation } from '../storage/embedding-store.js';
 import { withMemoryReadGeneration } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
 import { readEmbeddingSession } from '../storage/session-read-model.js';
@@ -12,6 +13,16 @@ import { hitIdentity, type LexicalRecallResult, type RecallQuery, type RecallSco
 export interface SemanticCandidate {
     sessionId: number;
     similarity: number;
+}
+
+export interface SemanticRecallResult {
+    candidates: SemanticCandidate[];
+    truncation?: EmbeddingScanTruncation;
+}
+
+export function semanticScanTruncation(reason: EmbeddingScanTruncation): string {
+    const budget = reason === 'rows' ? `${SEMANTIC_SCAN_MAX_ROWS} indexed rows` : `${SEMANTIC_SCAN_BUDGET_MS} ms`;
+    return `Partial semantic search: older stored sessions omitted after the ${budget} scan budget; more matches may exist.`;
 }
 
 export const SEMANTIC_DISCOVERY = 'Found by semantic similarity';
@@ -30,11 +41,11 @@ export async function semanticRecall(
         createProvider?: typeof createEmbeddingProvider;
         beforeUse?: () => void;
     } = {},
-): Promise<SemanticCandidate[]> {
+): Promise<SemanticRecallResult> {
     // Keep all embedding imports, provider configuration and vector reads behind
     // the opt-in. Checking the setting itself never loads the optional runtime.
     if (!getSetting('memory-plus', {}, options.configPath).value || projectIds.length === 0 || !query.trim()) {
-        return [];
+        return { candidates: [] };
     }
     const { EmbeddingStore, lockedEmbedding, MEMORY_PLUS_DISABLED } = await import('../storage/embedding-store.js');
     const { createEmbeddingProvider } = await import('../embeddings/provider-config.js');
@@ -63,18 +74,35 @@ export async function semanticRecall(
     const queryNorm = Math.hypot(...queryVector);
     // Read fresh after inference and disposal: no consent, eligibility or source
     // snapshot from before awaited work can authorize returned candidates.
-    const candidates = store.scan(projectIds, generation).flatMap((stored) => {
-        const model = provider.configuration;
-        if (stored.model !== model.model || stored.revision !== model.revision || stored.dimensions !== model.dimensions) {
-            return [];
-        }
-        const dot = stored.vector.reduce((total, value, index) => total + value * queryVector[index], 0);
-        const similarity = Math.max(-1, Math.min(1, dot / (queryNorm * Math.hypot(...stored.vector))));
-        return [{ sessionId: stored.sessionId, similarity }];
-    });
-    candidates.sort((a, b) => b.similarity - a.similarity || a.sessionId - b.sessionId);
+    const candidates: SemanticCandidate[] = [];
+    const truncation = store.scan(
+        projectIds,
+        (stored) => {
+            const model = provider.configuration;
+            if (stored.model !== model.model || stored.revision !== model.revision || stored.dimensions !== model.dimensions) {
+                return;
+            }
+            const dot = stored.vector.reduce((total, value, index) => total + value * queryVector[index], 0);
+            const similarity = Math.max(-1, Math.min(1, dot / (queryNorm * Math.hypot(...stored.vector))));
+            const candidate = { sessionId: stored.sessionId, similarity };
+            const position = candidates.findIndex(
+                (current) => current.similarity < similarity || (current.similarity === similarity && current.sessionId > stored.sessionId),
+            );
+            if (position === -1) {
+                if (candidates.length < SEMANTIC_RECALL_MAX_HITS) {
+                    candidates.push(candidate);
+                }
+            } else {
+                if (candidates.length === SEMANTIC_RECALL_MAX_HITS) {
+                    candidates.pop();
+                }
+                candidates.splice(position, 0, candidate);
+            }
+        },
+        generation,
+    );
     options.beforeUse?.();
-    return candidates.slice(0, SEMANTIC_RECALL_MAX_HITS);
+    return { candidates, truncation };
 }
 
 // Preserve both candidate sets. A lexical match also found semantically retains
@@ -110,19 +138,23 @@ export function renderSemanticUnion(
     query: RecallQuery,
     scope: RecallScope,
     lexical: LexicalRecallResult,
-    semantic: readonly SemanticCandidate[],
+    semantic: SemanticRecallResult,
     now: number,
 ): LexicalRecallResult {
     if (lexical.state === 'locked') {
         return lexical;
     }
-    const scores = new Map(semantic.map((candidate) => [candidate.sessionId, candidate.similarity]));
-    const hits = currentRecallHits(db, projects, unionRecallIds(lexical.sessionIds, semantic)).map(({ project, session }) => {
+    const scores = new Map(semantic.candidates.map((candidate) => [candidate.sessionId, candidate.similarity]));
+    const hits = currentRecallHits(db, projects, unionRecallIds(lexical.sessionIds, semantic.candidates)).map(({ project, session }) => {
         const similarity = scores.get(session.id);
         return { ...hitIdentity({ project, session }), discovery: similarity === undefined ? undefined : semanticDiscovery(similarity) };
     });
-    if (semantic.length === 0 && hits.length === lexical.sessionIds.length) {
+    if (semantic.truncation === undefined && semantic.candidates.length === 0 && hits.length === lexical.sessionIds.length) {
         return lexical;
     }
-    return renderRecallBody(query, hits, lexical.coverage, now, scope, projects[0], false, hits.length);
+    const coverage =
+        [lexical.coverage, semantic.truncation === undefined ? undefined : semanticScanTruncation(semantic.truncation)]
+            .filter((notice) => notice !== undefined)
+            .join('\n') || undefined;
+    return renderRecallBody(query, hits, coverage, now, scope, projects[0], false, hits.length);
 }

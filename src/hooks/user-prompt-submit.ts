@@ -28,7 +28,7 @@ import {
     servedContextInstructions,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
-import { currentRecallHits, renderSemanticUnion, semanticRecall } from '../serving/semantic-recall.js';
+import { currentRecallHits, renderSemanticUnion, semanticRecall, semanticScanTruncation } from '../serving/semantic-recall.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
@@ -318,13 +318,14 @@ export async function runUserPromptSubmit(
                         }
                     },
                 });
-                const candidates = semantic.slice(0, AUTOMATIC_RECALL_MAX_CANDIDATES);
+                const candidates = semantic.candidates.slice(0, AUTOMATIC_RECALL_MAX_CANDIDATES);
                 const belowFloor = candidates.findIndex((candidate) => candidate.similarity <= AUTOMATIC_RECALL_MIN_SIMILARITY);
                 if (belowFloor !== -1) {
                     candidates.length = belowFloor;
                 }
+                const notice = semantic.truncation === undefined ? undefined : semanticScanTruncation(semantic.truncation);
                 if (candidates.length === 0) {
-                    return { reason: 'not_command' };
+                    return notice === undefined ? { reason: 'not_command' } : emit(notice);
                 }
                 // Resolve current projects and consent once for the bounded shortlist.
                 const hits = new Map(
@@ -340,7 +341,9 @@ export async function runUserPromptSubmit(
                     if (hit === undefined || (hit.session.tool === tool && hit.session.native_id === payload.session_id)) {
                         continue;
                     }
-                    const { prefix, body } = automaticRecallCandidate(hit, candidate.similarity);
+                    const rendered = automaticRecallCandidate(hit, candidate.similarity);
+                    const prefix = rendered.prefix;
+                    const body = notice === undefined ? rendered.body : `${rendered.body}\n${notice}`;
                     if (body.length > AUTOMATIC_RECALL_MAX_CONTEXT_CHARS) {
                         log(promptLogLine(tool, payload, 'discarded reason=automatic_context_budget'));
                         continue;
@@ -355,7 +358,7 @@ export async function runUserPromptSubmit(
                     break;
                 }
                 if (selected === undefined) {
-                    return { reason: 'not_command' };
+                    return notice === undefined ? { reason: 'not_command' } : emit(notice);
                 }
                 if (
                     !getSetting('memory-plus', {}, dependencies.configPath).value ||

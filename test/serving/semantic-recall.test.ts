@@ -2,12 +2,18 @@ import { randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SEMANTIC_RECALL_MAX_HITS } from '../../src/config/constants.js';
+import {
+    SEMANTIC_RECALL_MAX_HITS,
+    SEMANTIC_SCAN_BUDGET_MS,
+    SEMANTIC_SCAN_MAX_ROWS,
+    SEMANTIC_SCAN_MAX_VECTOR_BYTES,
+} from '../../src/config/constants.js';
 import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
+import * as semanticModule from '../../src/serving/semantic-recall.js';
 import { renderSemanticUnion, SEMANTIC_DISCOVERY, semanticRecall, unionRecallIds } from '../../src/serving/semantic-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -21,6 +27,17 @@ import {
 } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
+
+vi.mock('../../src/config/constants.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../../src/config/constants.js')>()),
+    SEMANTIC_SCAN_MAX_ROWS: 12,
+}));
+
+function scan(store: EmbeddingStore, projectIds: number[]) {
+    const vectors: import('../../src/storage/embedding-store.js').StoredEmbedding[] = [];
+    store.scan(projectIds, (vector) => vectors.push(vector));
+    return vectors;
+}
 
 const configuration: providers.EmbeddingConfiguration = { provider: 'local', model: 'fixture', revision: 'v1', dimensions: 2 };
 const NOW = Date.parse('2026-09-14T12:00:00Z');
@@ -115,8 +132,8 @@ describe('semantic retrieval and explicit search integration', () => {
         const reader = new SessionReader(f.db);
         const query = tokenizeRecallQuery('receipt')!;
         const lexical = await lexicalRecall(reader, projects(f), query, 'global', undefined, NOW, 'strict');
-        expect(await semanticRecall(f.db, [f.project.id], query.display)).toEqual([]);
-        expect(renderSemanticUnion(f.db, projects(f), query, 'global', lexical, [], NOW)).toBe(lexical);
+        expect((await semanticRecall(f.db, [f.project.id], query.display)).candidates).toEqual([]);
+        expect(renderSemanticUnion(f.db, projects(f), query, 'global', lexical, { candidates: [] }, NOW)).toBe(lexical);
         const mcp = text(await new ElephaMcpService(f.db).recall({ query: 'receipt' }));
         expect(mcp).toContain('Title: receipt shared');
         expect(mcp).not.toContain(SEMANTIC_DISCOVERY);
@@ -142,13 +159,100 @@ describe('semantic retrieval and explicit search integration', () => {
         f.add('different dimensions', [1, 0, 0], { ...configuration, dimensions: 3 });
         const before = f.db.prepare('SELECT * FROM session_embeddings ORDER BY session_id').all();
         const result = await semanticRecall(f.db, [f.project.id], 'recovery');
-        expect(result.map((candidate) => candidate.sessionId)).toEqual([nearest.id, tied.id, close.id, middle.id, perpendicular.id]);
-        expect(result.map((candidate) => candidate.similarity)).toEqual([1, 1, 0.8, 0.6, 0]);
-        expect(result).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
-        expect(result.some((candidate) => candidate.sessionId === opposite.id)).toBe(false);
+        expect(result.candidates.map((candidate) => candidate.sessionId)).toEqual([
+            nearest.id,
+            tied.id,
+            close.id,
+            middle.id,
+            perpendicular.id,
+        ]);
+        expect(result.candidates.map((candidate) => candidate.similarity)).toEqual([1, 1, 0.8, 0.6, 0]);
+        expect(result.candidates).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
+        expect(result.candidates.some((candidate) => candidate.sessionId === opposite.id)).toBe(false);
         expect(f.provider.embed).toHaveBeenCalledWith('recovery', expect.any(Function), 'query');
         expect(f.provider.dispose).toHaveBeenCalledOnce();
         expect(f.db.prepare('SELECT * FROM session_embeddings ORDER BY session_id').all()).toEqual(before);
+    });
+
+    it.each([8, 12])('scores each vector before decoding the next and preserves legacy ranking for %s rows', async (count) => {
+        const f = fixture();
+        const expected = Array.from({ length: count }, (_, index) => {
+            const vector = [(index % 4) - 1, (index % 3) + 1];
+            const session = f.add(`stream ${index}`, vector);
+            return { sessionId: session.id, similarity: vector[0] / Math.hypot(...vector) };
+        })
+            .sort((a, b) => b.similarity - a.similarity || a.sessionId - b.sessionId)
+            .slice(0, SEMANTIC_RECALL_MAX_HITS);
+        vi.spyOn(performance, 'now').mockReturnValue(0);
+        let decodedSinceScore = 0;
+        let peak = 0;
+        let decoded = 0;
+        const readFloat = Buffer.prototype.readFloatLE;
+        vi.spyOn(Buffer.prototype, 'readFloatLE').mockImplementation(function (this: Buffer, offset = 0) {
+            if (offset === 0) {
+                decoded++;
+                peak = Math.max(peak, ++decodedSinceScore);
+            }
+            return readFloat.call(this, offset);
+        });
+        const hypot = Math.hypot;
+        vi.spyOn(Math, 'hypot').mockImplementation((...values) => {
+            decodedSinceScore = 0;
+            return hypot(...values);
+        });
+        const result = await semanticRecall(f.db, [f.project.id], 'recovery');
+        expect(result.candidates).toEqual(expected);
+        expect(result.truncation).toBeUndefined();
+        expect(decoded).toBe(count);
+        expect(peak).toBe(1);
+    });
+
+    it.each([1, 10])('caps decoded rows, omits oldest stored sessions and serves the loss at %s times the row budget', async (multiple) => {
+        const f = fixture();
+        const old = f.add('old best match', [1, 0]);
+        for (let index = 0; index < SEMANTIC_SCAN_MAX_ROWS * multiple; index++) f.add(`new ${index}`, [1, 0]);
+        vi.spyOn(performance, 'now').mockReturnValue(0);
+        const decode = vi.spyOn(Buffer.prototype, 'readFloatLE');
+        const result = await semanticRecall(f.db, [f.project.id], 'recovery');
+        expect(decode).toHaveBeenCalledTimes(SEMANTIC_SCAN_MAX_ROWS * configuration.dimensions);
+        expect(result.candidates.some((candidate) => candidate.sessionId === old.id)).toBe(false);
+        const marker = semanticModule.semanticScanTruncation('rows');
+        for (const output of [
+            text(await new ElephaMcpService(f.db).recall({ query: 'recovery' })),
+            await hook(f, 'elepha:query recovery'),
+            await hook(f, 'elepha:query:here recovery'),
+            await hook(f, 'Find a previous recovery decision'),
+        ])
+            expect(output).toContain(marker);
+    });
+
+    it('reports elapsed-time truncation even when no compatible candidates were found', async () => {
+        const f = fixture();
+        f.add('older match', [1, 0]);
+        f.add('new incompatible', [1, 0], { ...configuration, revision: 'old' });
+        let elapsed = 0;
+        vi.spyOn(performance, 'now').mockImplementation(() => elapsed);
+        const readFloat = Buffer.prototype.readFloatLE;
+        vi.spyOn(Buffer.prototype, 'readFloatLE').mockImplementation(function (this: Buffer, offset = 0) {
+            elapsed = SEMANTIC_SCAN_BUDGET_MS;
+            return readFloat.call(this, offset);
+        });
+        const output = text(await new ElephaMcpService(f.db).recall({ query: 'recovery' }));
+        expect(output).not.toContain('Title: older match');
+        expect(output).toContain(semanticModule.semanticScanTruncation('time'));
+        elapsed = 0;
+        expect(await hook(f, 'Find a previous recovery decision')).toContain(semanticModule.semanticScanTruncation('time'));
+    });
+
+    it('rejects oversized stored vectors before decoding their elements', async () => {
+        const f = fixture();
+        f.add('oversized', [1, 0]);
+        f.db
+            .prepare('UPDATE session_embeddings SET dimensions = ?, vector = zeroblob(?)')
+            .run(SEMANTIC_SCAN_MAX_VECTOR_BYTES / 4 + 1, SEMANTIC_SCAN_MAX_VECTOR_BYTES + 4);
+        const decode = vi.spyOn(Buffer.prototype, 'readFloatLE');
+        await expect(semanticRecall(f.db, [f.project.id], 'recovery')).rejects.toThrow('stored embedding exceeds');
+        expect(decode).not.toHaveBeenCalled();
     });
 
     it('unions lexical and semantic sessions once in semantic order on MCP and both query commands', async () => {
@@ -161,7 +265,7 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(lexical.sessionIds).toEqual([lexicalOnly.id, shared.id]);
         const semantic = await semanticRecall(f.db, [f.project.id], query.display);
         const expected = [semanticOnly.id, shared.id, lexicalOnly.id];
-        expect(unionRecallIds(lexical.sessionIds, semantic)).toEqual(expected);
+        expect(unionRecallIds(lexical.sessionIds, semantic.candidates)).toEqual(expected);
         const union = renderSemanticUnion(f.db, projects(f), query, 'global', lexical, semantic, NOW);
         expect(union.sessionIds).toEqual(expected);
         const mcp = text(await new ElephaMcpService(f.db).recall({ query: 'receipt' }));
@@ -256,7 +360,7 @@ describe('semantic retrieval and explicit search integration', () => {
         vi.mocked(f.provider.dispose).mockImplementation(async () => {
             f.store.consent.revoke(f.project.path);
         });
-        expect(await semanticRecall(f.db, [f.project.id], 'receipt')).toEqual([]);
+        expect((await semanticRecall(f.db, [f.project.id], 'receipt')).candidates).toEqual([]);
     });
 
     it('reports inference failure and always disposes the provider', async () => {
@@ -278,7 +382,7 @@ describe('consented vector scan', () => {
         if (action === 'purged') f.db.prepare('INSERT INTO purged_transcripts VALUES (?, ?, ?)').run('codex', session.native_id, 'now');
         if (action === 'source-changed') f.db.prepare("UPDATE sessions SET title = 'Changed'").run();
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_embeddings').get()).toEqual({ count: 1 });
-        expect(f.embeddings.scan([f.project.id])).toEqual([]);
+        expect(scan(f.embeddings, [f.project.id])).toEqual([]);
     });
 
     it('rejects revocation between listing projects and reading vectors, even when the vector survives', () => {
@@ -290,15 +394,15 @@ describe('consented vector scan', () => {
             f.db.prepare("UPDATE consent_roots SET state = 'denied'").run();
             return listed;
         });
-        expect(() => f.embeddings.scan([f.project.id])).toThrow(EMBEDDING_SOURCE_CHANGED);
+        expect(() => scan(f.embeddings, [f.project.id])).toThrow(EMBEDDING_SOURCE_CHANGED);
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_embeddings').get()).toEqual({ count: 1 });
     });
 
     it('returns vector identity and dimensions only within the requested project set', () => {
         const f = fixture();
         const session = f.add('Payment recovery', [3, 4]);
-        expect(f.embeddings.scan([])).toEqual([]);
-        expect(f.embeddings.scan([f.project.id])).toEqual([
+        expect(scan(f.embeddings, [])).toEqual([]);
+        expect(scan(f.embeddings, [f.project.id])).toEqual([
             { sessionId: session.id, model: 'fixture', revision: 'v1', dimensions: 2, vector: [3, 4] },
         ]);
     });

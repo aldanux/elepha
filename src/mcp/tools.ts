@@ -15,9 +15,10 @@ import { dataBlockClose, dataBlockOpen, REMEMBER_QUERY_REQUIRED, servedContextIn
 import { lexicalRecall, type RecallQuery, tokenizeRecallQuery } from '../serving/lexical-recall.js';
 import {
     currentRecallHits,
-    type SemanticCandidate,
+    type SemanticRecallResult,
     semanticDiscovery,
     semanticRecall,
+    semanticScanTruncation,
     unionRecallIds,
 } from '../serving/semantic-recall.js';
 import { publicSessionId } from '../serving/session-id.js';
@@ -240,8 +241,8 @@ export class ElephaMcpService implements McpToolHandlers {
                   projects.flatMap((project) => project.projectIds),
                   query.display,
               )
-            : [];
-        const sessionIds = memoryPlus ? unionRecallIds(recalled.sessionIds, semantic) : recalled.sessionIds;
+            : { candidates: [] };
+        const sessionIds = memoryPlus ? unionRecallIds(recalled.sessionIds, semantic.candidates) : recalled.sessionIds;
 
         // Consent may change while the search awaits durable-content or model work.
         // Rebuild the authorized view before material leaves this process.
@@ -276,7 +277,7 @@ export class ElephaMcpService implements McpToolHandlers {
         query: RecallQuery,
         hits: Array<{ project: ProjectSet; session: ServedSession }>,
         durableMatches: ReadonlyMap<number, { texts: string[] }>,
-        semantic: readonly SemanticCandidate[],
+        semantic: SemanticRecallResult,
     ): string {
         const nonce = randomUUID();
         const opening = [
@@ -286,6 +287,7 @@ export class ElephaMcpService implements McpToolHandlers {
             hits.length === 0
                 ? `No recall matches found for “${escapeShellSyntax(query.display)}”.`
                 : `Recall material for “${escapeShellSyntax(query.display)}” (${hits.length} matching episode(s)):`,
+            ...(semantic.truncation === undefined ? [] : [semanticScanTruncation(semantic.truncation)]),
         ].join('\n');
         const closing = dataBlockClose(nonce);
         const truncation = 'Recall material was truncated to fit the 4k-token response budget.';
@@ -293,7 +295,7 @@ export class ElephaMcpService implements McpToolHandlers {
         let materialShortened = 0;
         let omittedHits = 0;
         let body = opening;
-        const scores = new Map(semantic.map((candidate) => [candidate.sessionId, candidate.similarity]));
+        const scores = new Map(semantic.candidates.map((candidate) => [candidate.sessionId, candidate.similarity]));
         for (const hit of hits) {
             const section = this.recallSection(
                 hit.project,

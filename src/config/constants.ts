@@ -187,6 +187,10 @@ export const SYSTEMD_UMASK = '0077';
 export const EMBEDDING_SESSION_PAGE_SIZE = 100;
 // Retrieval was evaluated by presence among the five nearest sessions.
 export const SEMANTIC_RECALL_MAX_HITS = 5;
+// Bound synchronous cache traversal, including stale and out-of-scope rows.
+export const SEMANTIC_SCAN_MAX_ROWS = 1_000;
+// Check between rows because a blocked event loop cannot run the hook watchdog.
+export const SEMANTIC_SCAN_BUDGET_MS = 100;
 // Unsolicited candidates require near-identical vector direction; interactive
 // retrieval has no cosine floor. This conservative bar favors missed candidates.
 export const AUTOMATIC_RECALL_MIN_SIMILARITY = 0.95;
@@ -200,6 +204,9 @@ export const EMBEDDING_API_TIMEOUT_MS = 30_000;
 export const EMBEDDING_API_RESPONSE_BYTES = 128 * 1024;
 export const EMBEDDING_LOCAL_DIMENSIONS = 384;
 export const EMBEDDING_API_DIMENSIONS = 1536;
+// Check in SQLite before transferring a BLOB; a row limit alone cannot bound a
+// malformed vector. Both supported models fit this float32 payload ceiling.
+export const SEMANTIC_SCAN_MAX_VECTOR_BYTES = Math.max(EMBEDDING_LOCAL_DIMENSIONS, EMBEDDING_API_DIMENSIONS) * 4;
 
 // Keep optional runtime upgrades within the supported Transformers major.
 export const MEMORY_PLUS_TRANSFORMERS_MIN_VERSION = '4.2.0';

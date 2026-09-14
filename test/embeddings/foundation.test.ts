@@ -35,6 +35,12 @@ import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withTempDir } from '../helpers/tmp.js';
 
+function scan(store: EmbeddingStore, projectIds: number[]) {
+    const vectors: import('../../src/storage/embedding-store.js').StoredEmbedding[] = [];
+    store.scan(projectIds, (vector) => vectors.push(vector));
+    return vectors;
+}
+
 function fixture() {
     const f = createTestDb('embedding-');
     const project = seedProject(f);
@@ -211,7 +217,7 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         for (const session of [f.session, second]) {
             expect(f.embeddings.current(f.embeddings.source(session.id)!, provider.configuration, generation(f))).toBe(true);
         }
-        expect(f.embeddings.scan([f.project.id])).toHaveLength(2);
+        expect(scan(f.embeddings, [f.project.id])).toHaveLength(2);
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_embeddings').get()).toEqual({ count: 2 });
         // Runtime install, probe and backfill each own one loader that resolves
         // successfully; no phase is left spinning and none reports a failure.
@@ -298,7 +304,7 @@ describe('derived vector storage and manual generation', () => {
             expect(f.embeddings.current(source, configuration, generation(f))).toBe(false);
             const provider: EmbeddingProvider = { configuration, embed: vi.fn(async () => newVector), dispose: vi.fn(async () => {}) };
             const options = { configPath: f.configPath, createProvider: async () => provider };
-            expect(await semanticRecall(f.db, [f.project.id], 'memory', options)).toEqual([]);
+            expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([]);
             vi.mocked(provider.embed).mockClear();
             expect(await generateEmbeddings(f.db, options)).toEqual({
                 generated: 1,
@@ -308,7 +314,7 @@ describe('derived vector storage and manual generation', () => {
                 failed: 0,
             });
             expect(provider.embed).toHaveBeenCalledExactlyOnceWith(source.text, expect.any(Function));
-            expect(f.embeddings.scan([f.project.id])).toEqual([
+            expect(scan(f.embeddings, [f.project.id])).toEqual([
                 {
                     sessionId: f.session.id,
                     model: configuration.model,
@@ -320,7 +326,9 @@ describe('derived vector storage and manual generation', () => {
             expect(f.embeddings.current(source, oldModel, generation(f))).toBe(false);
             expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1 });
             expect(provider.embed).toHaveBeenCalledOnce();
-            expect(await semanticRecall(f.db, [f.project.id], 'memory', options)).toEqual([{ sessionId: f.session.id, similarity: 1 }]);
+            expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([
+                { sessionId: f.session.id, similarity: 1 },
+            ]);
         },
     );
 
@@ -586,7 +594,7 @@ describe('derived vector storage and manual generation', () => {
         ])('ignores %s.%s metadata changes', (table, column) => {
             const f = fixture();
             const source = saveVector(f);
-            const vectors = f.embeddings.scan([f.project.id]);
+            const vectors = scan(f.embeddings, [f.project.id]);
             const stored = f.db.prepare('SELECT * FROM session_embeddings').all();
             const original = ProjectResolver.prototype.listConsentedStored;
             const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
@@ -597,7 +605,7 @@ describe('derived vector storage and manual generation', () => {
                 f.db.prepare(`UPDATE ${table} SET ${column} = ?`).run('2099-01-01T00:00:00.000Z');
                 return projects;
             });
-            expect(operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
+            expect(operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
                 operation === 'scan' ? vectors : source,
             );
             expect(checkpoint).toHaveBeenCalledOnce();
@@ -619,7 +627,7 @@ describe('derived vector storage and manual generation', () => {
                 );
                 return projects;
             });
-            expect(() => (operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
+            expect(() => (operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
                 EMBEDDING_SOURCE_CHANGED,
             );
         });
@@ -628,7 +636,7 @@ describe('derived vector storage and manual generation', () => {
             const f = fixture();
             const other = seedProject(f, { path: path.join(f.directory, 'other') });
             const source = saveVector(f);
-            const vectors = f.embeddings.scan([f.project.id]);
+            const vectors = scan(f.embeddings, [f.project.id]);
             const stored = f.db.prepare('SELECT * FROM session_embeddings').all();
             const projectId = target === 'target' ? f.project.id : other.id;
             const before = f.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
@@ -642,7 +650,7 @@ describe('derived vector storage and manual generation', () => {
                 return projects;
             });
 
-            expect(operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
+            expect(operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
                 operation === 'scan' ? vectors : source,
             );
             expect(checkpoint).toHaveBeenCalledOnce();
@@ -652,7 +660,7 @@ describe('derived vector storage and manual generation', () => {
             });
             expect(f.embeddings.source(f.session.id)).toEqual(source);
             expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(stored);
-            expect(f.embeddings.scan([f.project.id])).toEqual(vectors);
+            expect(scan(f.embeddings, [f.project.id])).toEqual(vectors);
         });
 
         it.each(['revoke', 'add-root', 'remove-root', 'path-change', 'unconsented'] as const)(
@@ -678,7 +686,7 @@ describe('derived vector storage and manual generation', () => {
                     return projects;
                 });
 
-                expect(() => (operation === 'scan' ? f.embeddings.scan([f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
+                expect(() => (operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
                     EMBEDDING_SOURCE_CHANGED,
                 );
                 expect(checkpoint).toHaveBeenCalled();
