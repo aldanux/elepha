@@ -2,10 +2,12 @@ import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { enableMemoryPlus, MEMORY_PLUS_API_NOTICE, MEMORY_PLUS_CONFIRM, MEMORY_PLUS_LOCAL_NOTICE } from '../../src/cli/commands/enable.js';
+import { enableMemoryPlus, MEMORY_PLUS_CONFIRM, MEMORY_PLUS_LOCAL_NOTICE } from '../../src/cli/commands/enable.js';
 import * as cliProgress from '../../src/cli/progress.js';
+import { EMBEDDING_LOCAL_DIMENSIONS } from '../../src/config/constants.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { generateEmbeddings } from '../../src/embeddings/generate.js';
+import * as localRuntime from '../../src/embeddings/local-runtime.js';
 import {
     createEmbeddingProvider,
     EMBEDDING_API_MODEL,
@@ -33,6 +35,7 @@ import {
 } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { openaiEmbeddingConfiguration } from '../helpers/embeddings.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 function scan(store: EmbeddingStore, projectIds: number[]) {
@@ -52,12 +55,27 @@ function fixture() {
 }
 
 function fakeProvider(): EmbeddingProvider {
-    const configuration = embeddingConfiguration(true, {})!;
+    const configuration = embeddingConfiguration(true)!;
     return {
         configuration,
         embed: vi.fn(async () => Array(configuration.dimensions).fill(0.25)),
         dispose: vi.fn(async () => {}),
     };
+}
+
+function stubLocalRuntime(vector: number[]) {
+    const extractor = Object.assign(
+        vi.fn(async (_text: string) => ({ data: vector })),
+        {
+            tokenizer: { encode: () => [1] },
+            dispose: vi.fn(async () => {}),
+        },
+    );
+    vi.spyOn(localRuntime, 'loadLocalRuntime').mockReturnValue({
+        env: { allowLocalModels: true },
+        pipeline: async () => extractor,
+    });
+    return extractor;
 }
 
 function generation(f: ReturnType<typeof fixture>) {
@@ -71,7 +89,11 @@ function saveVector(f: ReturnType<typeof fixture>) {
     return source;
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+});
 
 describe('"Memory-Plus" opt-in and provider boundary', () => {
     it.each([{}, { OPENAI_API_KEY: 'present' }])('does no provider or storage work while disabled (%j)', async (environment) => {
@@ -82,9 +104,10 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
             value: false,
             source: 'default',
         });
-        expect(embeddingConfiguration(false, environment)).toBeUndefined();
-        expect(await createEmbeddingProvider(false, environment)).toBeUndefined();
-        await expect(generateEmbeddings(f.db, { configPath: f.configPath, environment, createProvider: factory })).rejects.toThrow(
+        vi.stubEnv('OPENAI_API_KEY', environment.OPENAI_API_KEY);
+        expect(embeddingConfiguration(false)).toBeUndefined();
+        expect(await createEmbeddingProvider(false)).toBeUndefined();
+        await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider: factory })).rejects.toThrow(
             '"Memory-Plus" is off',
         );
         expect(factory).not.toHaveBeenCalled();
@@ -93,10 +116,9 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         expect(existsSync(f.configPath)).toBe(false);
     });
 
-    it('selects local without a key and OpenAI only with an enabled flag and a nonempty key', () => {
-        expect(embeddingConfiguration(true, {})?.provider).toBe('local');
-        expect(embeddingConfiguration(true, { OPENAI_API_KEY: '  ' })?.provider).toBe('local');
-        expect(embeddingConfiguration(true, { OPENAI_API_KEY: 'key' })?.provider).toBe('openai');
+    it.each([undefined, '', '  ', 'unrelated-key'])('selects local regardless of the ambient OpenAI key (%j)', (key) => {
+        vi.stubEnv('OPENAI_API_KEY', key);
+        expect(embeddingConfiguration(true)?.provider).toBe('local');
         const f = fixture();
         setSetting('memory-plus', 'on', f.configPath);
         expect(getSetting('memory-plus', {}, f.configPath).value).toBe(true);
@@ -108,9 +130,10 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         const installDependency = vi.fn();
         const confirm = vi.fn(async () => false);
         const log = vi.fn();
-        expect(await enableMemoryPlus({ configPath, environment, createProvider, installDependency, confirm, log })).toBe(false);
+        vi.stubEnv('OPENAI_API_KEY', environment.OPENAI_API_KEY);
+        expect(await enableMemoryPlus({ configPath, createProvider, installDependency, confirm, log })).toBe(false);
         expect(confirm).toHaveBeenCalledWith(MEMORY_PLUS_CONFIRM);
-        expect(log).toHaveBeenCalledWith(environment.OPENAI_API_KEY ? MEMORY_PLUS_API_NOTICE : MEMORY_PLUS_LOCAL_NOTICE);
+        expect(log).toHaveBeenCalledWith(MEMORY_PLUS_LOCAL_NOTICE);
         expect(createProvider).not.toHaveBeenCalled();
         expect(installDependency).not.toHaveBeenCalled();
         expect(existsSync(configPath)).toBe(false);
@@ -126,7 +149,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 confirm: async () => true,
                 installDependency,
                 createProvider,
@@ -137,20 +159,25 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         expect(createProvider).not.toHaveBeenCalled();
     });
 
-    it('does not install local dependencies for the API provider', async () => {
+    it('installs the local runtime even with an unrelated OpenAI key', async () => {
         const f = fixture();
         const installDependency = vi.fn();
+        vi.stubEnv('OPENAI_API_KEY', 'unrelated-key');
+        const request = vi.fn();
+        vi.stubGlobal('fetch', request);
+        const extractor = stubLocalRuntime(Array(EMBEDDING_LOCAL_DIMENSIONS).fill(0.25));
         await enableMemoryPlus({
             configPath: f.configPath,
             openDatabase: async () => openUnmanagedDb(f.dbPath),
-            environment: { OPENAI_API_KEY: 'key' },
             confirm: async () => true,
             installDependency,
-            createProvider: async () => fakeProvider(),
             log: vi.fn(),
         });
-        expect(installDependency).not.toHaveBeenCalled();
+        expect(installDependency).toHaveBeenCalledOnce();
         expect(getSetting('memory-plus', {}, f.configPath).value).toBe(true);
+        expect(extractor).toHaveBeenCalled();
+        expect(f.embeddings.current(f.embeddings.source(f.session.id)!, embeddingConfiguration(true)!, generation(f))).toBe(true);
+        expect(request).not.toHaveBeenCalled();
     });
 
     it('enables only after a successful probe, is rerunnable and leaves failure disabled', async () => {
@@ -160,7 +187,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         const options = {
             configPath: f.configPath,
             openDatabase: async () => openUnmanagedDb(f.dbPath),
-            environment: {},
             createProvider,
             installDependency: vi.fn(async () => {}),
             confirm: async () => true,
@@ -205,7 +231,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 openDatabase: async () => openUnmanagedDb(f.dbPath),
                 confirm: async () => true,
                 installDependency: vi.fn(),
@@ -243,7 +268,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 confirm: async () => true,
                 installDependency: vi.fn(async () => {
                     throw new Error('npm install failed');
@@ -266,7 +290,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 openDatabase: async () => openUnmanagedDb(f.dbPath),
                 confirm: async () => true,
                 installDependency: vi.fn(),
@@ -282,12 +305,61 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
 });
 
 describe('derived vector storage and manual generation', () => {
-    it.each([{}, { OPENAI_API_KEY: 'test-key' }])(
-        'rebuilds old equal-pooling vectors on an ordinary generation pass (%j)',
-        async (environment) => {
+    it('excludes persisted OpenAI vectors and rebuilds them locally on an ordinary generation pass', async () => {
+        const f = fixture();
+        setSetting('memory-plus', 'true', f.configPath);
+        vi.stubEnv('OPENAI_API_KEY', 'unrelated-key-still-present');
+        const request = vi.fn();
+        vi.stubGlobal('fetch', request);
+        const localVector = Array.from({ length: EMBEDDING_LOCAL_DIMENSIONS }, (_, index) => Number(index === 1));
+        const extractor = stubLocalRuntime(localVector);
+        const source = f.embeddings.source(f.session.id)!;
+        const oldVector = Array.from({ length: openaiEmbeddingConfiguration.dimensions }, (_, index) => Number(index === 0));
+        f.embeddings.write(source, openaiEmbeddingConfiguration, oldVector, generation(f));
+        const configuration = embeddingConfiguration(true)!;
+        expect(configuration.provider).toBe('local');
+        expect(configuration.model).not.toBe(openaiEmbeddingConfiguration.model);
+        expect(configuration.revision).not.toBe(openaiEmbeddingConfiguration.revision);
+        expect(configuration.dimensions).not.toBe(openaiEmbeddingConfiguration.dimensions);
+        expect(f.embeddings.current(source, openaiEmbeddingConfiguration, generation(f))).toBe(true);
+        expect(f.embeddings.current(source, configuration, generation(f))).toBe(false);
+
+        // Exercise the normal factory, generation and recall paths; only native
+        // inference is stubbed. No explicit rebuild flag or provider override.
+        const options = { configPath: f.configPath };
+        expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([]);
+        extractor.mockClear();
+        expect(await generateEmbeddings(f.db, options)).toEqual({
+            generated: 1,
+            current: 0,
+            ineligibleOrEmpty: 0,
+            sourceChanged: 0,
+            failed: 0,
+        });
+        expect(extractor).toHaveBeenCalledExactlyOnceWith(`passage: ${source.text}`, { pooling: 'mean', normalize: true });
+        expect(scan(f.embeddings, [f.project.id])).toEqual([
+            {
+                sessionId: f.session.id,
+                model: configuration.model,
+                revision: configuration.revision,
+                dimensions: EMBEDDING_LOCAL_DIMENSIONS,
+                vector: localVector,
+            },
+        ]);
+        expect(f.embeddings.current(source, openaiEmbeddingConfiguration, generation(f))).toBe(false);
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1 });
+        expect(extractor).toHaveBeenCalledOnce();
+        expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([
+            { sessionId: f.session.id, similarity: 1 },
+        ]);
+        expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each([embeddingConfiguration(true)!, openaiEmbeddingConfiguration])(
+        'rebuilds old equal-pooling vectors on an ordinary generation pass ($provider)',
+        async (configuration) => {
             const f = fixture();
             setSetting('memory-plus', 'true', f.configPath);
-            const configuration = embeddingConfiguration(true, environment)!;
             // Historical persisted format: keep this marker independent of the current revision.
             const oldModel = {
                 ...configuration,

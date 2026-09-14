@@ -1,12 +1,9 @@
 import type { Command } from 'commander';
 import { getSetting } from '../../config/settings.js';
 import { generateEmbeddings } from '../../embeddings/generate.js';
-import { embeddingConfiguration } from '../../embeddings/provider-config.js';
 import { openDb } from '../../storage/db.js';
 import { MEMORY_PLUS_DISABLED } from '../../storage/embedding-store.js';
 import { errorMessage } from '../../util/error.js';
-import { confirmYesNo } from '../shared.js';
-import { MEMORY_PLUS_API_NOTICE, MEMORY_PLUS_CONFIRM } from './enable.js';
 
 export function registerEmbeddings(program: Command): void {
     program
@@ -18,17 +15,9 @@ export function registerEmbeddings(program: Command): void {
                 if (!getSetting('memory-plus').value) {
                     throw new Error(MEMORY_PLUS_DISABLED);
                 }
-                const environment = { ...process.env };
-                if (embeddingConfiguration(true, environment)?.provider === 'openai') {
-                    console.log(MEMORY_PLUS_API_NOTICE);
-                    if (!(await confirmYesNo(MEMORY_PLUS_CONFIRM))) {
-                        console.log('Cancelled. No vectors were generated.');
-                        return;
-                    }
-                }
                 const db = await openDb();
                 try {
-                    const result = await generateEmbeddings(db, { environment, rebuild: options.rebuild });
+                    const result = await generateEmbeddings(db, { rebuild: options.rebuild });
                     console.log(
                         `Vectors: ${result.generated} generated, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference).`,
                     );

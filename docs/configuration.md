@@ -94,8 +94,8 @@ leave the 1 GiB default in effect.
 worker or embedding provider. When enabled, indexing runs independently of turn
 capture in a background worker.
 
-Run `elepha enable memory-plus` and confirm the setup notice. With no
-`OPENAI_API_KEY`, setup installs the optional Transformers runtime under
+Run `elepha enable memory-plus` and confirm the setup notice.
+Setup installs the optional Transformers runtime under
 `ELEPHA_HOME/memory-plus` (normally `~/.elepha/memory-plus`), with extra ONNX
 binary downloads disabled. Normal elepha installs do not include this package.
 `elepha self-update` refreshes compatible runtime releases when "Memory-Plus" is
@@ -109,32 +109,27 @@ off. After successful setup, the command indexes all eligible existing history
 before returning. A backfill failure keeps the flag enabled and retains completed
 vectors; the error reports how to retry immediately.
 
-If `OPENAI_API_KEY` is configured, setup uses OpenAI `text-embedding-3-small`
-instead of loading or downloading the local model. A key alone never enables
-"Memory-Plus". **The API sends embedded session titles, first-prompt search
-text, rollup summaries, decisions and pending items to OpenAI, with provider
-billing.** The confirmation also covers stored instructions when that separate
-schema addition lands; the current schema does not contain instructions.
-No raw transcript turns, assistant bodies, tool output or transcript files are
-sent. The setup probe itself contains no session content.
+Only the local provider is selectable. `OPENAI_API_KEY` and other environment
+variables do not select an embedding provider. Existing OpenAI vectors are excluded
+from local recall and replaced on the next successful indexing pass. If the local
+runtime is not installed, run `elepha enable memory-plus` to install it and rebuild
+the index.
 
 The daemon checks for missing or stale vectors every minute while Memory
 Plus is enabled and memory is unlocked. Passes never overlap. The model is shared
 within each pass and released afterward; local loading and tokenization run in a
 worker thread so they cannot block the capture event loop. Failed passes are
-reported in the daemon log and retried on the next interval. Automatic API indexing
-uses the daemon's configured `OPENAI_API_KEY` and incurs provider usage charges.
+reported in the daemon log and retried on the next interval.
 
 For troubleshooting, `elepha embeddings` retries immediately and `elepha embeddings
 --rebuild` regenerates all eligible vectors without changing source sessions or
-rollups. These advanced commands retain their API confirmation. No manual indexing
+rollups. No manual indexing
 command is needed during normal use.
 
 Vectors live in the encrypted database's `session_embeddings` table with
 session/rollup/project provenance, the exact sanitized source hash, model,
 revision, dimensions and computation time. Local weights are pinned to an
-immutable model revision; the OpenAI API exposes a model name, not an immutable
-weight revision. Long sources are processed in bounded chunks without dropping
+immutable model revision. Long sources are processed in bounded chunks without dropping
 text and their normalized vectors are mean-pooled. A source/model/revision change
 requires regeneration. The source cache can be rebuilt after deleting its vector
 rows without losing history; restores discard vector rows for explicit rebuilding.

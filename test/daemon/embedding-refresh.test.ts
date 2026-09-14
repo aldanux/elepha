@@ -60,7 +60,7 @@ function fixture() {
     const project = seedProject(f);
     seedConsentRoot(f, { path: project.path });
     const session = seedSession(f, { project, title: 'Existing semantic history' });
-    const model = embeddingConfiguration(true, {})!;
+    const model = embeddingConfiguration(true)!;
     const embeddings = new EmbeddingStore(f.db);
     const watchRoot = path.join(f.directory, '.claude', 'projects');
     mkdirSync(watchRoot, { recursive: true });
@@ -111,7 +111,7 @@ describe('automatic daemon embedding refresh', () => {
     it('does no provider creation while disabled, rechecks each tick, and cancels its timer on stop', async () => {
         const f = fixture();
         const createProvider = vi.spyOn(providerConfig, 'createEmbeddingProvider').mockResolvedValue({
-            configuration: embeddingConfiguration(true, {})!,
+            configuration: embeddingConfiguration(true)!,
             embed: async () => Array(384).fill(0.25),
             dispose: async () => {},
         });

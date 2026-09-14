@@ -28,7 +28,6 @@ export async function generateEmbeddings(
     db: Database,
     options: {
         configPath?: string;
-        environment?: NodeJS.ProcessEnv;
         rebuild?: boolean;
         createProvider?: typeof createEmbeddingProvider;
         progress?: (result: GenerationResult) => void;
@@ -71,7 +70,7 @@ export async function generateEmbeddings(
                         result.ineligibleOrEmpty++;
                         report(`Session ${id}: skipped (ineligible or empty stored source).`);
                     } else {
-                        provider ??= await (options.createProvider ?? createEmbeddingProvider)(true, options.environment);
+                        provider ??= await (options.createProvider ?? createEmbeddingProvider)(true);
                         if (provider === undefined) {
                             throw new Error(MEMORY_PLUS_DISABLED);
                         }

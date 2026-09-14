@@ -53,7 +53,6 @@ export async function semanticRecall(
     query: string,
     options: {
         configPath?: string;
-        environment?: NodeJS.ProcessEnv;
         createProvider?: typeof createEmbeddingProvider;
         beforeUse?: () => void;
     } = {},
@@ -74,7 +73,7 @@ export async function semanticRecall(
         return withMemoryReadGeneration(db, lockedEmbedding, () => store.assertEnabled(), generation);
     };
     check();
-    const provider = await (options.createProvider ?? createEmbeddingProvider)(true, options.environment);
+    const provider = await (options.createProvider ?? createEmbeddingProvider)(true);
     if (provider === undefined) {
         throw new Error(MEMORY_PLUS_DISABLED);
     }
