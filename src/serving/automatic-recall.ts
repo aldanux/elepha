@@ -5,13 +5,15 @@ import { hitIdentity } from './lexical-recall.js';
 import { type currentRecallHits, semanticDiscovery } from './semantic-recall.js';
 import { publicSessionId } from './session-id.js';
 
+export const AUTOMATIC_RECALL_BODY_PREFIX = 'Automatic memory candidate: ';
+
 export function automaticRecallCandidate(hit: ReturnType<typeof currentRecallHits>[number], similarity: number) {
     const id = publicSessionId(hit.session);
     const identity = hitIdentity(hit);
     // Include source and provenance, but not query wording or score: a changed
     // instruction may be shown again; a paraphrased follow-up may not.
     const hash = embeddingSourceHash(JSON.stringify([id, identity, embeddingSourceText(hit.session)]));
-    const prefix = `Automatic memory candidate: ${hash}\n`;
+    const prefix = `${AUTOMATIC_RECALL_BODY_PREFIX}${hash}\n`;
     const nonce = randomUUID();
     const body = [
         prefix.trimEnd(),

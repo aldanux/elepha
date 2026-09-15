@@ -191,9 +191,14 @@ export const SEMANTIC_RECALL_MAX_HITS = 5;
 export const SEMANTIC_SCAN_MAX_ROWS = 1_000;
 // Check between rows because a blocked event loop cannot run the hook watchdog.
 export const SEMANTIC_SCAN_BUDGET_MS = 100;
-// Unsolicited candidates require near-identical vector direction; interactive
-// retrieval has no cosine floor. This conservative bar favors missed candidates.
-export const AUTOMATIC_RECALL_MIN_SIMILARITY = 0.95;
+// Interactive retrieval has no cosine floor. Correct multilingual paraphrase
+// hits measured 0.79 to 0.88 against real rollups, so 0.95 admitted none of them.
+// Similarity ranks reliably but is not calibrated confidence; noise is bounded
+// by the per-chat cap rather than by this number.
+export const AUTOMATIC_RECALL_MIN_SIMILARITY = 0.8;
+// Cap what cannot be calibrated: a chat receives at most this many automatic
+// candidates in total, and explicit recall stays available afterwards.
+export const AUTOMATIC_RECALL_MAX_PER_CHAT = 3;
 // Match today's semantic shortlist while keeping hook work bounded if retrieval grows.
 export const AUTOMATIC_RECALL_MAX_CANDIDATES = 5;
 export const AUTOMATIC_RECALL_MAX_PROMPT_CHARS = 4_000;

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
     AUTOMATIC_RECALL_MAX_CANDIDATES,
     AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
+    AUTOMATIC_RECALL_MAX_PER_CHAT,
     AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
     AUTOMATIC_RECALL_MIN_SIMILARITY,
     HOOK_WATCHDOG_TIMEOUT_MS,
@@ -97,6 +98,21 @@ function context(result: Awaited<ReturnType<typeof runUserPromptSubmit>>) {
     return (result.output.hookSpecificOutput as { additionalContext: string }).additionalContext;
 }
 
+function candidatePool() {
+    const f = fixture();
+    for (let index = 0; index < AUTOMATIC_RECALL_MAX_PER_CHAT; index++) {
+        f.writeVector(seedSession(f, { project: f.project, nativeId: `candidate-${index}`, title: `Candidate ${index}` }));
+    }
+    return f;
+}
+
+async function capChat(f: ReturnType<typeof candidatePool>) {
+    for (let index = 0; index < AUTOMATIC_RECALL_MAX_PER_CHAT; index++) {
+        context(await f.run());
+    }
+    expect(await f.run()).toEqual({ reason: 'not_command' });
+}
+
 afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
@@ -139,7 +155,7 @@ describe('automatic Memory-Plus candidates', () => {
     );
 
     it('abstains below the floor, and at the exact floor', async () => {
-        const f = fixture(0.94);
+        const f = fixture(AUTOMATIC_RECALL_MIN_SIMILARITY - 0.01);
         expect(await f.run()).toEqual({ reason: 'not_command' });
         expect(f.provider.embed).toHaveBeenCalledOnce();
         vi.spyOn(semantic, 'semanticRecall').mockResolvedValue({
@@ -147,6 +163,66 @@ describe('automatic Memory-Plus candidates', () => {
         });
         expect(await f.run()).toEqual({ reason: 'not_command' });
         expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
+    });
+
+    it('injects a candidate at 0.86 similarity between the old and new floors', async () => {
+        const f = fixture(0.86);
+        expect(context(await f.run())).toContain(`get_session({"id":"${publicSessionId(f.session)}"})`);
+        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toHaveLength(1);
+    });
+
+    it.each([false, true])('caps automatic candidates per chat with explicit recall recorded first: %s', async (explicitFirst) => {
+        const f = candidatePool();
+        if (explicitFirst) {
+            expect(context(await f.run('elepha:query payment'))).toContain(f.session.title);
+            const injections = f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString());
+            expect(injections).toHaveLength(1);
+            expect(injections[0].body.startsWith(automatic.AUTOMATIC_RECALL_BODY_PREFIX)).toBe(false);
+        }
+        await capChat(f);
+        for (let index = 0; index < AUTOMATIC_RECALL_MAX_PER_CHAT + 2; index++) {
+            expect(await f.run(`Continue payment recovery, step ${index}`)).toEqual({ reason: 'not_command' });
+        }
+        const injections = f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString());
+        const candidates = injections.filter((row) => row.body.startsWith(automatic.AUTOMATIC_RECALL_BODY_PREFIX));
+        expect(candidates).toHaveLength(AUTOMATIC_RECALL_MAX_PER_CHAT);
+        expect(new Set(candidates.map((row) => row.body.split('\n')[0])).size).toBe(AUTOMATIC_RECALL_MAX_PER_CHAT);
+        expect(injections).toHaveLength(AUTOMATIC_RECALL_MAX_PER_CHAT + Number(explicitFirst));
+    });
+
+    it.each([
+        ['codex', 'another-chat'],
+        ['claude-code', 'current'],
+        ['opencode', 'current'],
+    ] as const)('keeps the cap scoped to the receiving tool and native chat: %s / %s', async (tool, chat) => {
+        const f = candidatePool();
+        await capChat(f);
+        context(await f.run(undefined, tool, chat));
+        expect(f.store.injectionsForSession(tool, chat, new Date(NOW).toISOString())).toHaveLength(1);
+        expect(await f.run()).toEqual({ reason: 'not_command' });
+    });
+
+    it('keeps explicit recall unfiltered after the automatic chat cap', async () => {
+        const f = candidatePool();
+        await capChat(f);
+        const belowFloor = seedSession(f, { project: f.project, nativeId: 'explicit-only', title: 'Explicit-only discovery' });
+        f.writeVector(belowFloor, 0.5);
+        const output = context(await f.run('elepha:query unrelatedword'));
+        expect(output).toContain(belowFloor.title);
+        expect(f.store.shownSessionLists.forChat('codex', 'current')).toContain(belowFloor.id);
+        expect(await f.run()).toEqual({ reason: 'not_command' });
+    });
+
+    it('short-circuits a capped chat before provider construction, embedding or vector scanning', async () => {
+        const f = candidatePool();
+        await capChat(f);
+        f.factory.mockClear();
+        vi.mocked(f.provider.embed).mockClear();
+        const scan = vi.spyOn(EmbeddingStore.prototype, 'scan');
+        expect(await f.run()).toEqual({ reason: 'not_command' });
+        expect(f.factory).not.toHaveBeenCalled();
+        expect(f.provider.embed).not.toHaveBeenCalled();
+        expect(scan).not.toHaveBeenCalled();
     });
 
     it('deduplicates across turns while preserving resume numbering and allowing another chat or changed source', async () => {
@@ -174,20 +250,20 @@ describe('automatic Memory-Plus candidates', () => {
         expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
     });
 
-    it('qualifies emitted candidates with relevant cap loss and stays silent once the shortlist is deduplicated', async () => {
+    it('qualifies emitted candidates with relevant shortlist cap loss and stays silent once the chat is capped', async () => {
         const f = fixture();
         for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) {
             f.writeVector(seedSession(f, { project: f.project, nativeId: `relevant-${index}`, title: `Relevant ${index}` }), 1);
         }
         f.writeVector(seedSession(f, { project: f.project, nativeId: 'irrelevant', title: 'Irrelevant' }), 0.5);
-        for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) {
+        for (let index = 0; index < AUTOMATIC_RECALL_MAX_PER_CHAT; index++) {
             const output = context(await f.run());
             expect(output).toContain('get_session(');
             expect(output).toContain(semantic.semanticHitCapTruncation(1));
         }
         expect(await f.run()).toEqual({ reason: 'not_command' });
         expect(await f.run('Continue the change')).toEqual({ reason: 'not_command' });
-        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
+        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toHaveLength(AUTOMATIC_RECALL_MAX_PER_CHAT);
     });
 
     it.each(['rows', 'time'] as const)(

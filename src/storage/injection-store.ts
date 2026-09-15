@@ -22,12 +22,20 @@ export interface RecordInjectionInput {
 }
 
 export class InjectionStore {
-    private readonly stmts: { insertInjection: Statement; injectionsForSession: Statement; injectionsForPrefix: Statement };
+    private readonly stmts: {
+        insertInjection: Statement;
+        injectionsForSession: Statement;
+        injectionsForPrefix: Statement;
+        countForPrefix: Statement;
+    };
 
     constructor(db: Database) {
         this.stmts = {
             injectionsForPrefix: db.prepare(
                 'SELECT 1 FROM injections WHERE tool = ? AND native_session_id = ? AND substr(body, 1, ?) = ? LIMIT 1',
+            ),
+            countForPrefix: db.prepare(
+                'SELECT count(*) AS count FROM injections WHERE tool = ? AND native_session_id = ? AND substr(body, 1, ?) = ?',
             ),
             insertInjection: db.prepare(
                 `INSERT OR IGNORE INTO injections (tool, native_session_id, injected_at, injection_id, body_hash, body)
@@ -71,6 +79,11 @@ export class InjectionStore {
     // stable candidate prefix survives fresh DATA nonces and changed prompts.
     hasBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): boolean {
         return this.stmts.injectionsForPrefix.get(tool, nativeSessionId, prefix.length, prefix) !== undefined;
+    }
+
+    countBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): number {
+        const row = this.stmts.countForPrefix.get(tool, nativeSessionId, prefix.length, prefix) as { count: number };
+        return row.count;
     }
 
     isQuoteBack(

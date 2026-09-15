@@ -6,6 +6,7 @@ import type Database from 'better-sqlite3-multiple-ciphers';
 import {
     AUTOMATIC_RECALL_MAX_CANDIDATES,
     AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
+    AUTOMATIC_RECALL_MAX_PER_CHAT,
     AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
     AUTOMATIC_RECALL_MIN_SIMILARITY,
     ELEPHA_LIST_DEFAULT_LIMIT,
@@ -17,7 +18,7 @@ import { getSetting } from '../config/settings.js';
 import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
-import { automaticRecallCandidate } from '../serving/automatic-recall.js';
+import { AUTOMATIC_RECALL_BODY_PREFIX, automaticRecallCandidate } from '../serving/automatic-recall.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
     HELP,
@@ -307,6 +308,11 @@ export async function runUserPromptSubmit(
             if (automatic) {
                 const project = consentedProject(db, payload.cwd);
                 if (project === undefined) {
+                    return { reason: 'not_command' };
+                }
+                if (
+                    store.countInjectionBodyPrefix(tool, payload.session_id, AUTOMATIC_RECALL_BODY_PREFIX) >= AUTOMATIC_RECALL_MAX_PER_CHAT
+                ) {
                     return { reason: 'not_command' };
                 }
                 const deadline = Date.now() + HOOK_WATCHDOG_TIMEOUT_MS;
