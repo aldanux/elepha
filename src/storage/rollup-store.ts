@@ -24,6 +24,7 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { dedupePaths } from '../config/paths.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
+import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 
 // Every rollup from the old schema is stale, for three independent reasons
 // that all landed together so the corpus is rebuilt once rather than three
@@ -237,7 +238,8 @@ export class RollupStore {
            computed_at = @now, rollup_version = @version
          WHERE session_id = @session_id AND rolled_up_through_turn_index = @expected`,
             ),
-            markLive: db.prepare(`UPDATE session_rollups SET rollup_state = 'live' WHERE session_id = ? AND rollup_state = 'final'`),
+            markLive: db.prepare(`UPDATE session_rollups SET rollup_state = 'live' WHERE session_id = ? AND rollup_state = 'final'
+                AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = session_rollups.session_id AND ${SERVED_SESSION_KIND_ELIGIBILITY})`),
             listByProject: db.prepare('SELECT * FROM session_rollups WHERE project_id = ? ORDER BY ended_at DESC'),
         };
     }
@@ -292,6 +294,9 @@ export class RollupStore {
         };
 
         const run = this.db.transaction(() => {
+            if (!isSessionKindEligible(this.db, w.sessionId)) {
+                return false;
+            }
             if (w.expectedSourceGeneration !== undefined) {
                 const row = this.db
                     .prepare(`SELECT COALESCE(g.generation, 0) AS generation FROM sessions s

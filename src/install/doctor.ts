@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { elephaInstallTransactionPath } from '../config/paths.js';
 import { terminalHandoff } from '../markers.js';
+import type { SessionKindStatus } from '../storage/session-kind-reconciliation.js';
 import { TOOL_METADATA } from '../types/index.js';
 import { errorMessage } from '../util/error.js';
 import { waitForHealthyHeartbeatAsync } from './daemon-health.js';
@@ -20,6 +21,7 @@ export interface DoctorRuntime {
     inspectDaemon?: () => DaemonHealth;
     inspectIntegrations?: () => IntegrationHealth;
     inspectDatabase?: () => void;
+    inspectSessionKinds?: () => SessionKindStatus;
     inspectLauncher?: () => LauncherHealth;
     inspectInstallRecovery?: () => boolean;
     reconcile?: (
@@ -187,6 +189,26 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
 
     lines.push(databaseLine);
 
+    let classificationOk = true;
+    if (!databaseError && runtime.inspectSessionKinds) {
+        try {
+            const status = runtime.inspectSessionKinds();
+            classificationOk = status.pending === 0;
+            lines.push(
+                status.pending === 0
+                    ? '✓ Session classification: up to date'
+                    : status.updating
+                      ? `⚠ Session classification: updating ${status.pending} sessions`
+                      : status.incidents > 0
+                        ? `✗ Session classification: incomplete; ${status.pending} pending, ${status.incidents} source incidents (see daemon log)`
+                        : `⚠ Session classification: ${status.pending} pending until next daemon start`,
+            );
+        } catch (error) {
+            classificationOk = false;
+            lines.push(`✗ Session classification: ${errorMessage(error)}`);
+        }
+    }
+
     if (approvedRoots === undefined) {
         lines.push(`✗ Consent: unavailable because the database could not be opened${databaseError ? ` (${databaseError})` : ''}`);
     } else if (approvedRoots === 0) {
@@ -223,7 +245,14 @@ export async function runDoctor(runtime: DoctorRuntime = missingApprovedRoots())
                 integrations.status.codexMcp === 'registered')) &&
         (!integrations.present.opencode ||
             (integrations.status.opencodeMcp === 'registered' && integrations.status.opencodePlugin === 'installed'));
-    const healthy = daemonOk && approvedRoots !== undefined && approvedRoots > 0 && integrationsOk && launcherOk && installRecoveryOk;
+    const healthy =
+        daemonOk &&
+        approvedRoots !== undefined &&
+        approvedRoots > 0 &&
+        integrationsOk &&
+        launcherOk &&
+        installRecoveryOk &&
+        classificationOk;
     if (nextSteps.length > 0) {
         lines.push('Next steps:');
         lines.push(...nextSteps);

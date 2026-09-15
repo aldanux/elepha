@@ -27,7 +27,7 @@ export function validateEmbedding(vector: unknown, dimensions: number): asserts 
 }
 
 // Split without dropping either end or cutting a Unicode code point. Long
-// material is embedded in bounded chunks, then mean-pooled and normalized.
+// material is embedded in bounded chunks, then content-weighted and normalized.
 function* textChunks(text: string): Generator<string> {
     let chunk = '';
     let length = 0;
@@ -46,6 +46,9 @@ function* textChunks(text: string): Generator<string> {
 }
 
 function* localChunks(text: string, extractor: FeatureExtractionPipeline, purpose: 'passage' | 'query'): Generator<string> {
+    if (!text.trim()) {
+        return;
+    }
     if (extractor.tokenizer.encode(`${purpose}: ${text}`).length <= EMBEDDING_LOCAL_MAX_TOKENS) {
         yield text;
         return;
@@ -125,9 +128,23 @@ export function createProvider(configuration: EmbeddingConfiguration): Embedding
             beforeUse();
             const total = Array<number>(configuration.dimensions).fill(0);
             for (const chunk of textChunks(text)) {
+                if (!chunk.trim()) {
+                    continue;
+                }
                 const pieces = extractor === undefined ? [chunk] : localChunks(chunk, extractor, purpose);
                 for (const piece of pieces) {
                     beforeUse();
+                    // Count content, not the E5 prefix or special tokens that
+                    // otherwise give tiny remainders a fixed weight floor.
+                    // OpenAI has no local tokenizer: code points are a bounded
+                    // proxy without loading local ML or adding a dependency.
+                    const weight =
+                        extractor === undefined
+                            ? Array.from(piece).length
+                            : extractor.tokenizer.encode(piece, { add_special_tokens: false }).length;
+                    if (weight === 0) {
+                        continue;
+                    }
                     let vector: unknown;
                     if (extractor !== undefined) {
                         vector = Array.from((await extractor(`${purpose}: ${piece}`, { pooling: 'mean', normalize: true })).data);
@@ -151,7 +168,7 @@ export function createProvider(configuration: EmbeddingConfiguration): Embedding
                     beforeUse();
                     validateEmbedding(vector, configuration.dimensions);
                     for (let index = 0; index < total.length; index++) {
-                        total[index] += vector[index];
+                        total[index] += vector[index] * weight;
                     }
                 }
             }

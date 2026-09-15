@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { WorkerOptions } from 'node:worker_threads';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { disableMemoryPlus } from '../../src/cli/commands/disable.js';
 import { EMBEDDING_REFRESH_INTERVAL_MS } from '../../src/config/constants.js';
 import { setSetting } from '../../src/config/settings.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
@@ -12,7 +13,7 @@ import { embeddingConfiguration } from '../../src/embeddings/provider-config.js'
 import * as refresh from '../../src/embeddings/refresh.js';
 import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
 import { withMemoryReadGeneration } from '../../src/storage/paranoid-gate.js';
-import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 const thread = vi.hoisted(() => ({
     created: vi.fn(),
@@ -60,7 +61,7 @@ function fixture() {
     const project = seedProject(f);
     seedConsentRoot(f, { path: project.path });
     const session = seedSession(f, { project, title: 'Existing semantic history' });
-    const model = embeddingConfiguration(true, {})!;
+    const model = embeddingConfiguration(true)!;
     const embeddings = new EmbeddingStore(f.db);
     const watchRoot = path.join(f.directory, '.claude', 'projects');
     mkdirSync(watchRoot, { recursive: true });
@@ -108,10 +109,44 @@ function fixture() {
 }
 
 describe('automatic daemon embedding refresh', () => {
+    it('observes disable during an active worker, retains completed vectors and starts no subsequent passes', async () => {
+        const f = fixture();
+        setSetting('memory-plus', 'true');
+        const provider = {
+            configuration: embeddingConfiguration(true)!,
+            embed: async () => Array(384).fill(0.25),
+            dispose: async () => {},
+        };
+        await generateEmbeddings(f.db, { createProvider: async () => provider });
+        const vectors = f.db.prepare('SELECT * FROM session_embeddings').all();
+        const pending = seedSession(f, { project: f.project, nativeId: 'pending', title: 'Not indexed yet' });
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+        f.daemon.start();
+        try {
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+            await f.entered;
+            disableMemoryPlus({ log: () => {} });
+            f.release();
+            // The in-flight native call can finish, but the generator's use-time
+            // setting check prevents its write and stops the rest of the pass.
+            await vi.waitFor(() => expect(f.errors).toHaveLength(1));
+            expect(f.errors[0]).toContain('Memory-Plus is off');
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(vectors);
+            expect(f.db.prepare('SELECT session_id FROM session_embeddings WHERE session_id = ?').get(pending.id)).toBeUndefined();
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS * 2);
+            expect(thread.created).toHaveBeenCalledOnce();
+            expect(f.errors).toHaveLength(1);
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(vectors);
+        } finally {
+            f.release();
+            await f.daemon.stop();
+        }
+    });
+
     it('does no provider creation while disabled, rechecks each tick, and cancels its timer on stop', async () => {
         const f = fixture();
         const createProvider = vi.spyOn(providerConfig, 'createEmbeddingProvider').mockResolvedValue({
-            configuration: embeddingConfiguration(true, {})!,
+            configuration: embeddingConfiguration(true)!,
             embed: async () => Array(384).fill(0.25),
             dispose: async () => {},
         });
@@ -208,6 +243,31 @@ describe('automatic daemon embedding refresh', () => {
             await f.daemon.stop();
         }
     }, 15000);
+
+    it('streams malformed-session diagnostics and partial counts from successive workers while draining older history', async () => {
+        const f = fixture();
+        const malformed = seedSession(f, { project: f.project, nativeId: 'malformed', title: 'Malformed source' });
+        seedRollup(f, { project: f.project, session: malformed });
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('{broken', malformed.id);
+        setSetting('memory-plus', 'true');
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+        f.release();
+        f.daemon.start();
+        try {
+            for (let pass = 1; pass <= 2; pass++) {
+                await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+                await vi.waitFor(() => expect(f.logs.filter((line) => line.startsWith('[elepha] automatic indexing:'))).toHaveLength(pass));
+                expect(f.current()).toBe(true);
+                expect(f.errors).toHaveLength(pass);
+                expect(f.errors[pass - 1]).toContain(`Session ${malformed.id}`);
+                expect(f.errors[pass - 1]).toContain('decisions');
+                expect(f.logs.filter((line) => line.startsWith('[elepha] automatic indexing:'))[pass - 1]).toContain('1 malformed');
+            }
+            expect(thread.created).toHaveBeenCalledTimes(2);
+        } finally {
+            await f.daemon.stop();
+        }
+    });
 
     it('reports failures, retries on the next interval, and closes the worker cooperatively on shutdown', async () => {
         const f = fixture();

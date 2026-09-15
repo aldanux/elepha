@@ -10,6 +10,7 @@ import { registerBackup } from './commands/backup.js';
 import { registerConfig } from './commands/config.js';
 import { registerConsent } from './commands/consent.js';
 import { registerDaemonControl } from './commands/daemon-control.js';
+import { registerDisable } from './commands/disable.js';
 import { registerDoctor } from './commands/doctor.js';
 import { registerEmbeddings } from './commands/embeddings.js';
 import { registerEnable } from './commands/enable.js';
@@ -57,6 +58,7 @@ program.addHelpText('after', `\nRun 'elepha <command> -h' for details on a comma
 
 registerConfig(program);
 registerEnable(program);
+registerDisable(program);
 registerEmbeddings(program);
 registerHook(program);
 registerInstall(program);

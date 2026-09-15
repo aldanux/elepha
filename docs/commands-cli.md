@@ -116,20 +116,21 @@ Full guide: [docs/troubleshooting.md](troubleshooting.md).
 
 ### `elepha enable memory-plus`
 
-Confirm optional "Memory-Plus" setup, verify the local multilingual model (or OpenAI
-when `OPENAI_API_KEY` is configured), enable the setting after provider verification,
+Confirm optional Memory-Plus setup, verify the local multilingual model,
+enable the setting after provider verification,
 and index all eligible existing history before returning. Progress and indexed
 session counts are displayed. New or updated history is indexed automatically by
 the daemon every minute. A backfill failure retains the enabled setting and
 completed vectors. Rerunning reuses downloaded model files. See
 [Memory-Plus configuration](configuration.md#memory-plus-foundation-optional)
-for the resource costs and external-provider privacy trade-off.
+for the resource costs.
 
 ### `elepha embeddings [--rebuild]`
 
 Advanced repair command; normal setup and ongoing indexing are automatic.
 Manually generate versioned vectors from currently permitted stored session
-metadata. Requires "Memory-Plus" to be enabled and memory to be unlocked.
+metadata. Requires Memory-Plus to be enabled and memory to be unlocked.
 Existing current vectors are skipped; `--rebuild` regenerates all eligible vectors
-without changing source material. API mode always requires confirmation before
-sending session content to OpenAI. Neither command changes hooks or search ranking.
+without changing source material. Embeddings are generated locally with the bundled
+model; session content is not sent to an external provider, and ambient API keys
+are not used. The command does not change hook or search-ranking settings.

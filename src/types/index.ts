@@ -1,5 +1,6 @@
 import type { FileHandle } from 'node:fs/promises';
 import type Database from 'better-sqlite3-multiple-ciphers';
+import type { AssistantStructure } from '../rendering/assistant-structure.js';
 
 export const TOOL_METADATA = {
     'claude-code': { displayName: 'Claude Code' },
@@ -47,6 +48,7 @@ export interface ParsedTurn {
     aiTitle?: string;
     // Plain-text assistant reply. Thinking blocks excluded.
     assistantText: string;
+    assistantStructure?: AssistantStructure;
     toolCalls: ParsedToolCall[];
     // Opaque resume token marking the end of this turn in sourcePath. Stored as sessions.cursor.
     cursor: string;
@@ -91,6 +93,8 @@ export interface ParseTurnsOptions {
     handle?: FileHandle;
     // Stops a bounded read between transcript lines without changing cursor semantics.
     signal?: AbortSignal;
+    // Serving can stop before assembling an oversized historical interaction.
+    maxReadBytes?: number;
 }
 
 // What kind of transcript a session file holds. Drives whether it is ingested

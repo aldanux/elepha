@@ -3,6 +3,7 @@
 
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3-multiple-ciphers';
+import { TranscriptReadBudgetError } from '../adapters/base.js';
 import { defaultAdapters, sessionAdapterFor } from '../adapters/index.js';
 import { OpencodeAdapter, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
@@ -10,8 +11,10 @@ import {
     MAX_GET_SESSION_LAST_N,
     RECENT_SESSION_WINDOW_MS,
     SESSION_CHAR_BUDGET,
+    SESSION_EVIDENCE_SOURCE_MAX_BYTES,
 } from '../config/constants.js';
-import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
+import { type AssistantStructure, decodeAssistantStructure } from '../rendering/assistant-structure.js';
+import { type FilterableToolCall, type FilteredTurnProjection, filterTurn } from '../rendering/filtered-turn.js';
 import {
     omissionMarker,
     RAW_TURN_SEPARATOR,
@@ -21,6 +24,8 @@ import {
     renderRawTurn,
 } from '../rendering/raw-turn-renderer.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
+import { escapeShellSyntax } from '../security/sanitize.js';
+import { matchesFirstPromptSearch } from '../storage/first-prompt-search.js';
 import {
     type AuthenticatedReadGeneration,
     isMemoryLocked,
@@ -36,6 +41,7 @@ import {
     readProjectSessionAggregates,
     readProjectSessions,
     readSessionById,
+    SERVED_SESSION_KIND_ELIGIBILITY,
     type ServedSession,
 } from '../storage/session-read-model.js';
 import { UNTITLED_EPISODE } from '../storage/session-title.js';
@@ -51,6 +57,21 @@ export interface BoundedEpisode {
     total: number;
     renderedChars: number;
     nonce: string;
+}
+
+export interface FirstInteraction {
+    projection?: FilteredTurnProjection;
+    turnIndex?: number;
+    source?: 'durable stored interaction' | 'provider transcript interaction';
+    reason?: string;
+}
+
+export interface EvidenceWindow {
+    projections?: FilteredTurnProjection[];
+    returned: number;
+    omitted: number;
+    total: number;
+    reason?: string;
 }
 
 export interface StoredTurnRecallFields {
@@ -105,6 +126,7 @@ interface StoredFilteredTurnRow {
     included: number;
     user_prompt: string;
     assistant_response: string;
+    assistant_structure: string | null;
     tool_calls: string;
     omitted_tool_call_count: number;
     filter_version: number;
@@ -114,6 +136,7 @@ interface DurableTurnCollection {
     complete: boolean;
     present: boolean;
     projections?: FilteredTurnProjection[];
+    turnIndexes?: number[];
     omittedBefore?: number;
     reason?: string;
 }
@@ -311,7 +334,7 @@ export class SessionReader {
                  FROM requested
                  JOIN sessions s ON s.id = requested.id
                  LEFT JOIN durable_capture_status dcs ON dcs.session_id = s.id
-                 WHERE NOT EXISTS (
+                 WHERE ${SERVED_SESSION_KIND_ELIGIBILITY} AND NOT EXISTS (
                            SELECT 1 FROM purged_transcripts p
                            WHERE p.tool = s.tool AND p.native_id = s.native_id
                        )
@@ -474,7 +497,8 @@ export class SessionReader {
             () => {
                 const rows = this.db
                     .prepare(
-                        `SELECT project_id, title, custom_title FROM sessions WHERE tool IN (${SUPPORTED_TOOLS.map(() => '?').join(',')})`,
+                        `SELECT project_id, title, custom_title FROM sessions s
+                         WHERE tool IN (${SUPPORTED_TOOLS.map(() => '?').join(',')}) AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
                     )
                     .all(...SUPPORTED_TOOLS) as Array<Pick<ServedSession, 'project_id' | 'title' | 'custom_title'>>;
                 const counts = new Map<number, number>();
@@ -515,7 +539,8 @@ export class SessionReader {
             const rows = this.db
                 .prepare(
                     `SELECT session_id, turn_index, decisions, files_touched, pending_items
-                         FROM memories WHERE session_id IN (${ids.map(() => '?').join(',')})
+                         FROM memories m JOIN sessions s ON s.id = m.session_id
+                         WHERE session_id IN (${ids.map(() => '?').join(',')}) AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                          ORDER BY session_id, turn_index`,
                 )
                 .all(...ids) as Array<{
@@ -540,6 +565,165 @@ export class SessionReader {
         return this.withReadGeneration(
             () => new Map(),
             () => this.storedRecallFieldsFor([session]).get(session.id) ?? new Map(),
+        );
+    }
+
+    // The index belongs to this stored segment, not to a guessed transcript
+    // position. Stop at that interaction; later repeated mentions cannot
+    // displace the response paired with the indexed first prompt.
+    async firstInteraction(session: ServedSession, signal?: AbortSignal): Promise<FirstInteraction> {
+        return this.withReadGenerationAsync(
+            () => ({ reason: 'locked' }),
+            async () => {
+                const first = this.db
+                    .prepare('SELECT MIN(turn_index) AS turn_index FROM memories WHERE session_id = ?')
+                    .get(session.id) as { turn_index: number | null };
+                if (first.turn_index === null) {
+                    return { reason: 'no_stored_turn_indexes' };
+                }
+                const row = this.db
+                    .prepare(`SELECT ft.included, ft.filter_version, ft.omitted_before_chars,
+                CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB)) + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0) <= ?
+                    THEN ft.user_prompt END AS user_prompt,
+                CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB)) + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0) <= ?
+                    THEN ft.assistant_response END AS assistant_response,
+                CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB)) + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0) <= ?
+                    THEN ft.assistant_structure END AS assistant_structure
+                FROM memories m JOIN filtered_turns ft ON ft.memory_id = m.id
+                LEFT JOIN durable_capture_status d ON d.session_id = m.session_id
+                WHERE m.session_id = ? AND m.turn_index = ? AND COALESCE(d.state, '') <> 'evicted'`)
+                    .get(
+                        SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                        SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                        SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                        session.id,
+                        first.turn_index,
+                    ) as
+                    | {
+                          included: number;
+                          filter_version: number;
+                          omitted_before_chars: number;
+                          user_prompt: string | null;
+                          assistant_response: string | null;
+                          assistant_structure: string | null;
+                      }
+                    | undefined;
+                let projection: FilteredTurnProjection | undefined;
+                let source: FirstInteraction['source'] = 'durable stored interaction';
+                if (
+                    row?.filter_version === DURABLE_CAPTURE_FILTER_VERSION &&
+                    row.omitted_before_chars === 0 &&
+                    row.user_prompt !== null &&
+                    row.assistant_response !== null
+                ) {
+                    projection = {
+                        included: row.included === 1,
+                        filterVersion: row.filter_version,
+                        userPrompt: row.user_prompt,
+                        assistantResponse: row.assistant_response,
+                        assistantStructure: this.readAssistantStructure(session.id, row.assistant_structure, row.assistant_response.length),
+                        toolCalls: [],
+                        omittedToolCallCount: 0,
+                    };
+                    if (session.tool === 'codex' && projection.assistantStructure === undefined) {
+                        const parsed = await this.sourceTurns(
+                            session,
+                            signal,
+                            new Set([first.turn_index]),
+                            undefined,
+                            SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                        );
+                        projection = this.enrichAssistantStructure(projection, parsed.turns?.[0]);
+                    }
+                } else {
+                    // OpenCode's DB adapter has no byte-bounded directed read yet.
+                    // Do not silently replace an incomplete first interaction.
+                    if (session.tool === 'opencode') {
+                        return { reason: 'first_interaction_requires_durable_capture' };
+                    }
+                    const parsed = await this.sourceTurns(
+                        session,
+                        signal,
+                        new Set([first.turn_index]),
+                        undefined,
+                        SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                    );
+                    const turn = parsed.turns?.[0];
+                    if (turn === undefined) {
+                        return { reason: parsed.reason };
+                    }
+                    if (turn.droppedReason !== undefined) {
+                        return { reason: 'first_interaction_filtered' };
+                    }
+                    projection = filterTurn(turn);
+                    source = 'provider transcript interaction';
+                }
+                if (signal?.aborted) {
+                    return { reason: 'deadline' };
+                }
+                if (!projection.included || !projection.assistantResponse.trim()) {
+                    return { reason: 'first_interaction_has_no_response' };
+                }
+                if (
+                    session.first_prompt_search === null ||
+                    !matchesFirstPromptSearch(projection.userPrompt, session.first_prompt_search, source === 'durable stored interaction')
+                ) {
+                    return { reason: 'first_prompt_source_changed' };
+                }
+                return { projection, turnIndex: first.turn_index, source };
+            },
+        );
+    }
+
+    // Preserve roles from the adapters/storage. Rendered Markdown is content,
+    // so its headings can never establish a user/assistant boundary.
+    async evidenceWindow(session: ServedSession, lastN?: number, signal?: AbortSignal): Promise<EvidenceWindow> {
+        const unavailable = (reason?: string): EvidenceWindow => ({ returned: 0, omitted: 0, total: 0, reason });
+        return this.withReadGenerationAsync(
+            () => unavailable('locked'),
+            async () => {
+                const boundedLastN = lastN === undefined ? undefined : Math.min(Math.max(1, Math.trunc(lastN)), MAX_GET_SESSION_LAST_N);
+                const bounds = { lastN: boundedLastN, charBudget: SESSION_CHAR_BUDGET, nonce: randomUUID() };
+                const durable = this.durableTurns(session, bounds, signal);
+                let projections: FilteredTurnProjection[];
+                let omitted: number;
+                if (durable.complete) {
+                    if (durable.projections === undefined) {
+                        return unavailable(durable.reason);
+                    }
+                    projections = durable.projections;
+                    omitted = durable.omittedBefore ?? 0;
+                    if (session.tool === 'codex' && projections.some((projection) => projection.assistantStructure === undefined)) {
+                        const parsed = await this.sourceTurns(
+                            session,
+                            signal,
+                            new Set(durable.turnIndexes),
+                            bounds,
+                            SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                        );
+                        const sourceByIndex = new Map(parsed.turns?.map((turn) => [turn.turnIndex, turn]));
+                        projections = projections.map((projection, index) =>
+                            projection.assistantStructure === undefined
+                                ? this.enrichAssistantStructure(projection, sourceByIndex.get(durable.turnIndexes?.[index] ?? -1))
+                                : projection,
+                        );
+                    }
+                } else {
+                    if (session.tool === 'opencode') {
+                        return unavailable('evidence_source_requires_durable_capture');
+                    }
+                    const parsed = await this.sourceTurns(session, signal, undefined, bounds, SESSION_EVIDENCE_SOURCE_MAX_BYTES);
+                    if (parsed.turns === undefined) {
+                        return unavailable(parsed.reason);
+                    }
+                    if (parsed.turns.some((turn) => turn.droppedReason !== undefined)) {
+                        return unavailable('evidence_source_turn_filtered');
+                    }
+                    projections = parsed.turns.map(filterTurn).filter((projection) => projection.included);
+                    omitted = parsed.omittedBefore ?? 0;
+                }
+                return { projections, returned: projections.length, omitted, total: projections.length + omitted };
+            },
         );
     }
 
@@ -588,14 +772,16 @@ export class SessionReader {
 
         const rows = this.db
             .prepare(
-                `SELECT m.turn_index, ft.included, ft.user_prompt, ft.assistant_response, ft.tool_calls,
+                `SELECT m.turn_index, ft.included, ft.user_prompt, ft.assistant_response,
+                        CASE WHEN length(CAST(ft.assistant_structure AS BLOB)) <= ? THEN ft.assistant_structure
+                             WHEN ft.assistant_structure IS NOT NULL THEN '{}' END AS assistant_structure, ft.tool_calls,
                         ft.omitted_tool_call_count, ft.filter_version
                  FROM memories m
                  JOIN filtered_turns ft ON ft.memory_id = m.id
                  WHERE m.session_id = ?
                  ORDER BY m.turn_index`,
             )
-            .iterate(session.id) as Iterable<StoredFilteredTurnRow>;
+            .iterate(SESSION_EVIDENCE_SOURCE_MAX_BYTES, session.id) as Iterable<StoredFilteredTurnRow>;
         const retained = new Map<number, RetainedFilteredTurn>();
         let renderedTurns = 0;
         let omittedBefore = 0;
@@ -614,6 +800,7 @@ export class SessionReader {
                     included: row.included === 1,
                     userPrompt: row.user_prompt,
                     assistantResponse: row.assistant_response,
+                    assistantStructure: this.readAssistantStructure(session.id, row.assistant_structure, row.assistant_response.length),
                     toolCalls,
                     omittedToolCallCount: row.omitted_tool_call_count,
                 };
@@ -644,8 +831,32 @@ export class SessionReader {
             complete: true,
             present: true,
             projections: [...retained.values()].map((entry) => entry.projection),
+            turnIndexes: [...retained.keys()],
             omittedBefore,
         };
+    }
+
+    private readAssistantStructure(sessionId: number, value: string | null, textLength: number): AssistantStructure | undefined {
+        try {
+            return decodeAssistantStructure(value, textLength);
+        } catch {
+            console.warn(`[elepha] invalid assistant phase metadata in stored session ${sessionId}; treating response as unclassified`);
+            return undefined;
+        }
+    }
+
+    // Historical rows remain untouched. Borrow phase only from a safely read
+    // source whose complete filtered response still matches the stored value.
+    private enrichAssistantStructure(stored: FilteredTurnProjection, turn: ParsedTurn | undefined): FilteredTurnProjection {
+        if (turn === undefined || turn.droppedReason !== undefined) {
+            return stored;
+        }
+        const current = filterTurn(turn);
+        return current.included &&
+            escapeShellSyntax(current.userPrompt) === stored.userPrompt &&
+            escapeShellSyntax(current.assistantResponse) === stored.assistantResponse
+            ? { ...current, toolCalls: stored.toolCalls, omittedToolCallCount: stored.omittedToolCallCount }
+            : stored;
     }
 
     async turns(
@@ -666,6 +877,7 @@ export class SessionReader {
         signal?: AbortSignal,
         storedIndexes?: ReadonlySet<number>,
         bounds?: TurnCollectionBounds,
+        maxReadBytes?: number,
     ): Promise<SourceTurnCollection> {
         let opened: OpenedSourceTurns | undefined;
         try {
@@ -699,6 +911,7 @@ export class SessionReader {
                         closeTrailingOnIdle: true,
                         handle: transcript.handle,
                         signal,
+                        maxReadBytes,
                     }),
                     close: () => transcript.handle.close(),
                 };
@@ -776,8 +989,8 @@ export class SessionReader {
                 omittedBefore,
                 retentionHighWater: { turns: highWaterTurns, renderedChars: highWaterRenderedChars },
             };
-        } catch {
-            return { reason: 'transcript_unreadable' };
+        } catch (error) {
+            return { reason: error instanceof TranscriptReadBudgetError ? 'evidence_source_byte_budget' : 'transcript_unreadable' };
         } finally {
             await opened?.close();
         }

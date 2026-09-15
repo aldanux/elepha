@@ -21,13 +21,13 @@ describe('managed local runtime loading', () => {
         packageFixture(`module.exports = { env: {}, pipeline: async () => Object.assign(
             async () => ({ data: Array(384).fill(0.25) }),
             { tokenizer: { encode: () => [1] }, dispose: async () => {} }) };`);
-        const provider = (await createEmbeddingProvider(true, {}))!;
+        const provider = (await createEmbeddingProvider(true))!;
         expect(await provider.embed('synthetic test', () => {})).toHaveLength(384);
         await provider.dispose();
     });
 
     it('reports missing managed installation and permits retry after repair', async () => {
-        const provider = (await createEmbeddingProvider(true, {}))!;
+        const provider = (await createEmbeddingProvider(true))!;
         await expect(provider.embed('synthetic test', () => {})).rejects.toThrow(MEMORY_PLUS_INSTALL_HINT);
         await provider.dispose();
         packageFixture('module.exports = { env: {}, pipeline: async () => {} };');

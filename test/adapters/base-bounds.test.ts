@@ -1,9 +1,16 @@
 import { closeSync, openSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { JsonlTurnAdapter, malformedCompleteRecordsDiagnostic, type TurnBuilderState, textValues } from '../../src/adapters/base.js';
+import {
+    JsonlTurnAdapter,
+    malformedCompleteRecordsDiagnostic,
+    TranscriptReadBudgetError,
+    type TurnBuilderState,
+    textValues,
+} from '../../src/adapters/base.js';
+import { CodexAdapter } from '../../src/adapters/codex.js';
 import { MAX_JSON_VALUE_DEPTH, MAX_JSON_VALUE_NODES, MAX_TRANSCRIPT_RECORD_BYTES } from '../../src/config/constants.js';
-import type { SessionAdapterTool } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapterTool } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 interface TestLine {
@@ -69,6 +76,33 @@ function turnLines(cwd: string, index: number): string {
 }
 
 describe('bounded transcript value parsing', () => {
+    it('aborts before emitting an incomplete interaction when a serving byte budget binds', async () => {
+        const directory = withTempDir('elepha-evidence-byte-budget-');
+        const filePath = path.join(directory, 'budget.jsonl');
+        const first = `${JSON.stringify({ type: 'user', text: 'Why?' })}\n`;
+        writeFileSync(filePath, `${first + JSON.stringify({ type: 'assistant', text: 'x'.repeat(4096) })}\n`);
+        const adapter = new CountingAdapter();
+        const emitted: ParsedTurn[] = [];
+        await expect(async () => {
+            for await (const turn of adapter.parseTurns(filePath, undefined, { closeTrailingOnIdle: true, maxReadBytes: 128 })) {
+                emitted.push(turn);
+            }
+        }).rejects.toBeInstanceOf(TranscriptReadBudgetError);
+        expect(emitted).toEqual([]);
+        expect(adapter.classifiedLines).toBe(1);
+    });
+
+    it('applies the same serving byte ceiling to Codex boundary detection', async () => {
+        const directory = withTempDir('elepha-evidence-boundary-budget-');
+        const filePath = path.join(directory, 'budget.jsonl');
+        writeFileSync(filePath, `${JSON.stringify({ type: 'session_meta', payload: { padding: 'x'.repeat(4096) } })}\n`);
+        await expect(async () => {
+            for await (const _ of new CodexAdapter().parseTurns(filePath, undefined, { maxReadBytes: 128 })) {
+                throw new Error('No turn may be emitted from an incomplete boundary scan.');
+            }
+        }).rejects.toBeInstanceOf(TranscriptReadBudgetError);
+    });
+
     it('traverses deeply nested values iteratively and stops at the depth limit', () => {
         let deeplyNested: unknown = 'too deep';
         for (let depth = 0; depth < MAX_JSON_VALUE_DEPTH + 10_000; depth++) {

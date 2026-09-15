@@ -25,12 +25,13 @@ import {
     rememberInstallSnapshots,
     restoreInstallSnapshot,
 } from './config-file.js';
+import type { AsyncDaemonHealthCheckRuntime } from './daemon-health.js';
 import { planIntegrations } from './integrations.js';
 import { detectLauncherBackend, renderLauncher } from './launcher.js';
 import { ownsOpencodePlugin, readOpencodePlugin } from './opencode-plugin.js';
 import { isSupportedPlatform, isWsl, linuxServiceManagerError } from './platform.js';
 import { detectPresentTools, type ToolConfigPaths } from './present-tools.js';
-import { reconcileCaptureService, type ServiceBackend, type ServiceStatus, serviceBackend } from './service-backend.js';
+import { reconcileCaptureServiceAsync, type ServiceBackend, type ServiceStatus, serviceBackend } from './service-backend.js';
 import { type InstallStatus, installationStatus } from './status.js';
 
 export interface InstallPaths extends ToolConfigPaths {}
@@ -52,6 +53,7 @@ export interface InstallRuntime {
     serviceManager?: { hasSystemd: boolean; isWsl: boolean };
     approvedRoots: number;
     onPhase?: InstallPhaseReporter;
+    healthCheck?: AsyncDaemonHealthCheckRuntime;
 }
 
 function missingApprovedRoots(entryPoint: string): never {
@@ -249,11 +251,11 @@ function replayRollbackJournal(service: ServiceBackend): void {
     }
 }
 
-export function installElepha(inputPaths: InstallPaths | undefined, runtime: InstallRuntime): InstallationResult;
-export function installElepha(
+export function installElepha(inputPaths: InstallPaths | undefined, runtime: InstallRuntime): Promise<InstallationResult>;
+export async function installElepha(
     inputPaths: InstallPaths = paths(),
     runtime: InstallRuntime = missingApprovedRoots('installElepha'),
-): InstallationResult {
+): Promise<InstallationResult> {
     const platform = runtime.platform ?? process.platform;
     if (!isSupportedPlatform(platform)) {
         throw new Error('elepha install is supported on macOS and Linux.');
@@ -373,7 +375,7 @@ export function installElepha(
                 }
                 servicePlan.service.install(servicePlan.launcherText, servicePlan.backend);
             }
-            const reconciled = reconcileCaptureService(servicePlan.service, approved);
+            const reconciled = await reconcileCaptureServiceAsync(servicePlan.service, approved, runtime.healthCheck);
             serviceState =
                 reconciled === 'awaiting consent' ? 'registered, awaiting consent' : reconciled === 'active' ? 'active' : 'not installed';
             runtime.onPhase?.(activePhase, 'done');

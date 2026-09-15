@@ -1,10 +1,11 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
-import { TRAILING_FILES_CAP } from '../config/constants.js';
+import { SESSION_KIND_REVISION, TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
 import { stripShellSyntax } from '../security/sanitize.js';
 import { gitRevListCountHead } from '../security/subprocess-allowlist.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
 import type { ProjectRow } from './project-store.js';
+import { SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 import { titleForTurn } from './session-title.js';
 
 export interface SessionRow {
@@ -20,6 +21,7 @@ export interface SessionRow {
     surface: SessionRowSurface | null;
     git_branch: string | null;
     kind: SessionRowKind | null;
+    kind_revision: number;
     last_turn_at: string | null;
     trailing_branch: string | null;
     trailing_files: string[];
@@ -68,8 +70,8 @@ export class SessionStore {
             findSession: db.prepare('SELECT * FROM sessions WHERE tool = ? AND native_id = ? ORDER BY segment_index DESC LIMIT 1'),
             findSessionSegment: db.prepare('SELECT * FROM sessions WHERE tool = ? AND native_id = ? AND segment_index = ?'),
             insertSession: db.prepare(
-                `INSERT INTO sessions (tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at, surface, git_branch, kind, last_turn_at, trailing_branch, trailing_files, title, custom_title, git_commit_count)
-         VALUES (@tool, @native_id, @segment_index, @project_id, @source_path, NULL, @now, @now, @surface, @git_branch, @kind, NULL, NULL, '[]', NULL, @custom_title, @git_commit_count)`,
+                `INSERT INTO sessions (tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at, surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, title, custom_title, git_commit_count)
+         VALUES (@tool, @native_id, @segment_index, @project_id, @source_path, NULL, @now, @now, @surface, @git_branch, @kind, @kind_revision, NULL, NULL, '[]', NULL, @custom_title, @git_commit_count)`,
             ),
             updateSessionCursor: db.prepare('UPDATE sessions SET cursor = ?, last_ingested_at = ? WHERE id = ?'),
             listSessionsWithMemoriesSince: db.prepare(
@@ -109,6 +111,7 @@ export class SessionStore {
             surface: meta?.surface ?? null,
             git_branch: meta?.gitBranch ?? null,
             kind: meta?.kind ?? null,
+            kind_revision: meta?.kind ? SESSION_KIND_REVISION : 0,
             custom_title: customTitle ?? null,
             git_commit_count:
                 gitCommitCount !== undefined
@@ -166,6 +169,7 @@ export class SessionStore {
             surface: meta?.surface ?? null,
             git_branch: meta?.gitBranch ?? null,
             kind: meta?.kind ?? null,
+            kind_revision: meta?.kind ? SESSION_KIND_REVISION : 0,
             custom_title: customTitle,
             git_commit_count:
                 gitCommitCount !== undefined
@@ -196,7 +200,7 @@ export class SessionStore {
             .prepare(
                 `SELECT s.* FROM sessions s
          LEFT JOIN session_rollups r ON r.session_id = s.id
-         WHERE r.session_id IS NULL OR r.rollup_version <> ?
+         WHERE (r.session_id IS NULL OR r.rollup_version <> ?) AND ${SERVED_SESSION_KIND_ELIGIBILITY}
          ORDER BY s.id`,
             )
             .all(currentVersion)
@@ -209,7 +213,7 @@ export class SessionStore {
             .prepare(
                 `SELECT s.* FROM sessions s
          LEFT JOIN session_rollups r ON r.session_id = s.id
-         WHERE r.session_id IS NULL OR r.rollup_state = 'live'`,
+         WHERE (r.session_id IS NULL OR r.rollup_state = 'live') AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
             )
             .all()
             .map((row) => hydrateSessionRow(row as Record<string, unknown>));

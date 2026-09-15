@@ -2,15 +2,30 @@ import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { enableMemoryPlus, MEMORY_PLUS_API_NOTICE, MEMORY_PLUS_CONFIRM, MEMORY_PLUS_LOCAL_NOTICE } from '../../src/cli/commands/enable.js';
+import { enableMemoryPlus, MEMORY_PLUS_CONFIRM, MEMORY_PLUS_LOCAL_NOTICE } from '../../src/cli/commands/enable.js';
 import * as cliProgress from '../../src/cli/progress.js';
+import { EMBEDDING_LOCAL_DIMENSIONS } from '../../src/config/constants.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { generateEmbeddings } from '../../src/embeddings/generate.js';
-import { createEmbeddingProvider, type EmbeddingProvider, embeddingConfiguration } from '../../src/embeddings/provider-config.js';
+import * as localRuntime from '../../src/embeddings/local-runtime.js';
+import {
+    createEmbeddingProvider,
+    EMBEDDING_API_MODEL,
+    EMBEDDING_LOCAL_REVISION,
+    type EmbeddingProvider,
+    embeddingConfiguration,
+} from '../../src/embeddings/provider-config.js';
 import { embeddingSourceHash } from '../../src/embeddings/source.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
+import { semanticRecall } from '../../src/serving/semantic-recall.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
+import {
+    EMBEDDING_CONSENT_COLUMNS,
+    EMBEDDING_PROJECT_AUTHORIZATION_COLUMNS,
+    EMBEDDING_SOURCE_CHANGED,
+    EmbeddingStore,
+    lockedEmbedding,
+} from '../../src/storage/embedding-store.js';
 import {
     enableParanoidMode,
     lockMemory,
@@ -20,7 +35,14 @@ import {
 } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { openaiEmbeddingConfiguration } from '../helpers/embeddings.js';
 import { withTempDir } from '../helpers/tmp.js';
+
+function scan(store: EmbeddingStore, projectIds: number[]) {
+    const vectors: import('../../src/storage/embedding-store.js').StoredEmbedding[] = [];
+    store.scan(projectIds, (vector) => vectors.push(vector));
+    return vectors;
+}
 
 function fixture() {
     const f = createTestDb('embedding-');
@@ -33,12 +55,28 @@ function fixture() {
 }
 
 function fakeProvider(): EmbeddingProvider {
-    const configuration = embeddingConfiguration(true, {})!;
+    const configuration = embeddingConfiguration(true)!;
     return {
         configuration,
         embed: vi.fn(async () => Array(configuration.dimensions).fill(0.25)),
         dispose: vi.fn(async () => {}),
     };
+}
+
+function stubLocalRuntime(vector: number[]) {
+    //noinspection JSUnusedGlobalSymbols
+    const extractor = Object.assign(
+        vi.fn(async (_text: string) => ({ data: vector })),
+        {
+            tokenizer: { encode: () => [1] },
+            dispose: vi.fn(async () => {}),
+        },
+    );
+    vi.spyOn(localRuntime, 'loadLocalRuntime').mockReturnValue({
+        env: { allowLocalModels: true },
+        pipeline: async () => extractor,
+    });
+    return extractor;
 }
 
 function generation(f: ReturnType<typeof fixture>) {
@@ -52,9 +90,13 @@ function saveVector(f: ReturnType<typeof fixture>) {
     return source;
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+});
 
-describe('"Memory-Plus" opt-in and provider boundary', () => {
+describe('Memory-Plus opt-in and provider boundary', () => {
     it.each([{}, { OPENAI_API_KEY: 'present' }])('does no provider or storage work while disabled (%j)', async (environment) => {
         const f = fixture();
         const factory = vi.fn();
@@ -63,21 +105,19 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
             value: false,
             source: 'default',
         });
-        expect(embeddingConfiguration(false, environment)).toBeUndefined();
-        expect(await createEmbeddingProvider(false, environment)).toBeUndefined();
-        await expect(generateEmbeddings(f.db, { configPath: f.configPath, environment, createProvider: factory })).rejects.toThrow(
-            '"Memory-Plus" is off',
-        );
+        vi.stubEnv('OPENAI_API_KEY', environment.OPENAI_API_KEY);
+        expect(embeddingConfiguration(false)).toBeUndefined();
+        expect(await createEmbeddingProvider(false)).toBeUndefined();
+        await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider: factory })).rejects.toThrow('Memory-Plus is off');
         expect(factory).not.toHaveBeenCalled();
-        expect(f.embeddings.source.bind(f.embeddings, f.session.id)).toThrow('"Memory-Plus" is off');
+        expect(f.embeddings.source.bind(f.embeddings, f.session.id)).toThrow('Memory-Plus is off');
         expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual([]);
         expect(existsSync(f.configPath)).toBe(false);
     });
 
-    it('selects local without a key and OpenAI only with an enabled flag and a nonempty key', () => {
-        expect(embeddingConfiguration(true, {})?.provider).toBe('local');
-        expect(embeddingConfiguration(true, { OPENAI_API_KEY: '  ' })?.provider).toBe('local');
-        expect(embeddingConfiguration(true, { OPENAI_API_KEY: 'key' })?.provider).toBe('openai');
+    it.each([undefined, '', '  ', 'unrelated-key'])('selects local regardless of the ambient OpenAI key (%j)', (key) => {
+        vi.stubEnv('OPENAI_API_KEY', key);
+        expect(embeddingConfiguration(true)?.provider).toBe('local');
         const f = fixture();
         setSetting('memory-plus', 'on', f.configPath);
         expect(getSetting('memory-plus', {}, f.configPath).value).toBe(true);
@@ -89,15 +129,16 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         const installDependency = vi.fn();
         const confirm = vi.fn(async () => false);
         const log = vi.fn();
-        expect(await enableMemoryPlus({ configPath, environment, createProvider, installDependency, confirm, log })).toBe(false);
+        vi.stubEnv('OPENAI_API_KEY', environment.OPENAI_API_KEY);
+        expect(await enableMemoryPlus({ configPath, createProvider, installDependency, confirm, log })).toBe(false);
         expect(confirm).toHaveBeenCalledWith(MEMORY_PLUS_CONFIRM);
-        expect(log).toHaveBeenCalledWith(environment.OPENAI_API_KEY ? MEMORY_PLUS_API_NOTICE : MEMORY_PLUS_LOCAL_NOTICE);
+        expect(log).toHaveBeenCalledWith(MEMORY_PLUS_LOCAL_NOTICE);
         expect(createProvider).not.toHaveBeenCalled();
         expect(installDependency).not.toHaveBeenCalled();
         expect(existsSync(configPath)).toBe(false);
     });
 
-    it.each([false, true])('leaves "Memory-Plus" off when package installation fails (previously enabled: %s)', async (enabled) => {
+    it.each([false, true])('leaves Memory-Plus off when package installation fails (previously enabled: %s)', async (enabled) => {
         const f = fixture();
         if (enabled) setSetting('memory-plus', 'true', f.configPath);
         const createProvider = vi.fn();
@@ -107,7 +148,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 confirm: async () => true,
                 installDependency,
                 createProvider,
@@ -118,30 +158,35 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         expect(createProvider).not.toHaveBeenCalled();
     });
 
-    it('does not install local dependencies for the API provider', async () => {
+    it('installs the local runtime even with an unrelated OpenAI key', async () => {
         const f = fixture();
         const installDependency = vi.fn();
+        vi.stubEnv('OPENAI_API_KEY', 'unrelated-key');
+        const request = vi.fn();
+        vi.stubGlobal('fetch', request);
+        const extractor = stubLocalRuntime(Array(EMBEDDING_LOCAL_DIMENSIONS).fill(0.25));
         await enableMemoryPlus({
             configPath: f.configPath,
             openDatabase: async () => openUnmanagedDb(f.dbPath),
-            environment: { OPENAI_API_KEY: 'key' },
             confirm: async () => true,
             installDependency,
-            createProvider: async () => fakeProvider(),
             log: vi.fn(),
         });
-        expect(installDependency).not.toHaveBeenCalled();
+        expect(installDependency).toHaveBeenCalledOnce();
         expect(getSetting('memory-plus', {}, f.configPath).value).toBe(true);
+        expect(extractor).toHaveBeenCalled();
+        expect(f.embeddings.current(f.embeddings.source(f.session.id)!, embeddingConfiguration(true)!, generation(f))).toBe(true);
+        expect(request).not.toHaveBeenCalled();
     });
 
     it('enables only after a successful probe, is rerunnable and leaves failure disabled', async () => {
         const f = fixture();
         const provider = fakeProvider();
         const createProvider = vi.fn(async () => provider);
+        //noinspection JSUnusedGlobalSymbols
         const options = {
             configPath: f.configPath,
             openDatabase: async () => openUnmanagedDb(f.dbPath),
-            environment: {},
             createProvider,
             installDependency: vi.fn(async () => {}),
             confirm: async () => true,
@@ -186,7 +231,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 openDatabase: async () => openUnmanagedDb(f.dbPath),
                 confirm: async () => true,
                 installDependency: vi.fn(),
@@ -198,7 +242,7 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         for (const session of [f.session, second]) {
             expect(f.embeddings.current(f.embeddings.source(session.id)!, provider.configuration, generation(f))).toBe(true);
         }
-        expect(f.embeddings.scan([f.project.id])).toHaveLength(2);
+        expect(scan(f.embeddings, [f.project.id])).toHaveLength(2);
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_embeddings').get()).toEqual({ count: 2 });
         // Runtime install, probe and backfill each own one loader that resolves
         // successfully; no phase is left spinning and none reports a failure.
@@ -224,7 +268,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 confirm: async () => true,
                 installDependency: vi.fn(async () => {
                     throw new Error('npm install failed');
@@ -247,7 +290,6 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         await expect(
             enableMemoryPlus({
                 configPath: f.configPath,
-                environment: {},
                 openDatabase: async () => openUnmanagedDb(f.dbPath),
                 confirm: async () => true,
                 installDependency: vi.fn(),
@@ -263,6 +305,105 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
 });
 
 describe('derived vector storage and manual generation', () => {
+    it('excludes persisted OpenAI vectors and rebuilds them locally on an ordinary generation pass', async () => {
+        const f = fixture();
+        setSetting('memory-plus', 'true', f.configPath);
+        vi.stubEnv('OPENAI_API_KEY', 'unrelated-key-still-present');
+        const request = vi.fn();
+        vi.stubGlobal('fetch', request);
+        const localVector = Array.from({ length: EMBEDDING_LOCAL_DIMENSIONS }, (_, index) => Number(index === 1));
+        const extractor = stubLocalRuntime(localVector);
+        const source = f.embeddings.source(f.session.id)!;
+        const oldVector = Array.from({ length: openaiEmbeddingConfiguration.dimensions }, (_, index) => Number(index === 0));
+        f.embeddings.write(source, openaiEmbeddingConfiguration, oldVector, generation(f));
+        const configuration = embeddingConfiguration(true)!;
+        expect(configuration.provider).toBe('local');
+        expect(configuration.model).not.toBe(openaiEmbeddingConfiguration.model);
+        expect(configuration.revision).not.toBe(openaiEmbeddingConfiguration.revision);
+        expect(configuration.dimensions).not.toBe(openaiEmbeddingConfiguration.dimensions);
+        expect(f.embeddings.current(source, openaiEmbeddingConfiguration, generation(f))).toBe(true);
+        expect(f.embeddings.current(source, configuration, generation(f))).toBe(false);
+
+        // Exercise the normal factory, generation and recall paths; only native
+        // inference is stubbed. No explicit rebuild flag or provider override.
+        const options = { configPath: f.configPath };
+        expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([]);
+        extractor.mockClear();
+        expect(await generateEmbeddings(f.db, options)).toEqual({
+            generated: 1,
+            current: 0,
+            ineligibleOrEmpty: 0,
+            sourceChanged: 0,
+            failed: 0,
+        });
+        expect(extractor).toHaveBeenCalledExactlyOnceWith(`passage: ${source.text}`, { pooling: 'mean', normalize: true });
+        expect(scan(f.embeddings, [f.project.id])).toEqual([
+            {
+                sessionId: f.session.id,
+                model: configuration.model,
+                revision: configuration.revision,
+                dimensions: EMBEDDING_LOCAL_DIMENSIONS,
+                vector: localVector,
+            },
+        ]);
+        expect(f.embeddings.current(source, openaiEmbeddingConfiguration, generation(f))).toBe(false);
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1 });
+        expect(extractor).toHaveBeenCalledOnce();
+        expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([
+            { sessionId: f.session.id, similarity: 1 },
+        ]);
+        expect(request).not.toHaveBeenCalled();
+    });
+
+    it.each([embeddingConfiguration(true)!, openaiEmbeddingConfiguration])(
+        'rebuilds old equal-pooling vectors on an ordinary generation pass ($provider)',
+        async (configuration) => {
+            const f = fixture();
+            setSetting('memory-plus', 'true', f.configPath);
+            // Historical persisted format: keep this marker independent of the current revision.
+            const oldModel = {
+                ...configuration,
+                revision:
+                    configuration.provider === 'local'
+                        ? `${EMBEDDING_LOCAL_REVISION}:q8:mean-chunks-v1`
+                        : `${EMBEDDING_API_MODEL}:mean-chunks-v1`,
+            };
+            const source = f.embeddings.source(f.session.id)!;
+            const oldVector = Array.from({ length: configuration.dimensions }, (_, index) => Number(index === 0));
+            const newVector = Array.from({ length: configuration.dimensions }, (_, index) => Number(index === 1));
+            f.embeddings.write(source, oldModel, oldVector, generation(f));
+            expect(f.embeddings.current(source, oldModel, generation(f))).toBe(true);
+            expect(f.embeddings.current(source, configuration, generation(f))).toBe(false);
+            const provider: EmbeddingProvider = { configuration, embed: vi.fn(async () => newVector), dispose: vi.fn(async () => {}) };
+            const options = { configPath: f.configPath, createProvider: async () => provider };
+            expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([]);
+            vi.mocked(provider.embed).mockClear();
+            expect(await generateEmbeddings(f.db, options)).toEqual({
+                generated: 1,
+                current: 0,
+                ineligibleOrEmpty: 0,
+                sourceChanged: 0,
+                failed: 0,
+            });
+            expect(provider.embed).toHaveBeenCalledExactlyOnceWith(source.text, expect.any(Function));
+            expect(scan(f.embeddings, [f.project.id])).toEqual([
+                {
+                    sessionId: f.session.id,
+                    model: configuration.model,
+                    revision: configuration.revision,
+                    dimensions: configuration.dimensions,
+                    vector: newVector,
+                },
+            ]);
+            expect(f.embeddings.current(source, oldModel, generation(f))).toBe(false);
+            expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1 });
+            expect(provider.embed).toHaveBeenCalledOnce();
+            expect((await semanticRecall(f.db, [f.project.id], 'memory', options)).candidates).toEqual([
+                { sessionId: f.session.id, similarity: 1 },
+            ]);
+        },
+    );
+
     it('embeds only sanitized durable metadata, reuses current vectors, and supports rebuilding', async () => {
         const f = fixture();
         seedMemory(f, {
@@ -283,7 +424,13 @@ describe('derived vector storage and manual generation', () => {
         setSetting('memory-plus', 'true', f.configPath);
         const provider = fakeProvider();
         const options = { configPath: f.configPath, createProvider: async () => provider };
-        expect(await generateEmbeddings(f.db, options)).toEqual({ generated: 1, current: 0, ineligibleOrEmpty: 0 });
+        expect(await generateEmbeddings(f.db, options)).toEqual({
+            generated: 1,
+            current: 0,
+            ineligibleOrEmpty: 0,
+            sourceChanged: 0,
+            failed: 0,
+        });
         const input = vi.mocked(provider.embed).mock.calls[0][0];
         expect(input).toContain('permitted first prompt');
         expect(input).toContain('Local encryption');
@@ -300,13 +447,131 @@ describe('derived vector storage and manual generation', () => {
         expect(row.source_hash).toBe(embeddingSourceHash(input));
         expect(row.vector.length).toBe(384 * 4);
         expect(row.model_revision).toContain(provider.configuration.revision);
-        expect(await generateEmbeddings(f.db, options)).toEqual({ generated: 0, current: 1, ineligibleOrEmpty: 0 });
+        expect(await generateEmbeddings(f.db, options)).toEqual({
+            generated: 0,
+            current: 1,
+            ineligibleOrEmpty: 0,
+            sourceChanged: 0,
+            failed: 0,
+        });
         expect(provider.embed).toHaveBeenCalledTimes(1);
         expect((await generateEmbeddings(f.db, { ...options, rebuild: true })).generated).toBe(1);
         f.db.exec('DELETE FROM session_embeddings');
         expect((await generateEmbeddings(f.db, options)).generated).toBe(1);
         expect(f.store.findSession('codex', f.session.native_id)).toBeDefined();
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM session_rollups').get()).toEqual({ count: 1 });
+    });
+
+    it.each(['title', 'rollup'] as const)('reports a changing %s and drains older sessions across passes', async (field) => {
+        const f = fixture();
+        const newer = seedSession(f, { project: f.project, nativeId: 'active', title: 'Active session' });
+        seedRollup(f, { project: f.project, session: newer });
+        setSetting('memory-plus', 'true', f.configPath);
+        const provider = fakeProvider();
+        const report = vi.fn();
+        const progress = vi.fn();
+        let changes = 0;
+        vi.mocked(provider.embed).mockImplementation(async (text, beforeUse) => {
+            if (text.includes('Active session')) {
+                const query =
+                    field === 'title'
+                        ? 'UPDATE sessions SET title = ? WHERE id = ?'
+                        : 'UPDATE session_rollups SET summary = ? WHERE session_id = ?';
+                f.db.prepare(query).run(`Active session ${++changes}`, newer.id);
+                beforeUse();
+            }
+            return Array(384).fill(0.25);
+        });
+        const options = { configPath: f.configPath, createProvider: async () => provider, report, progress };
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, sourceChanged: 1, failed: 0 });
+        expect(f.embeddings.current(f.embeddings.source(f.session.id)!, provider.configuration, generation(f))).toBe(true);
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1, sourceChanged: 1, failed: 0 });
+        expect(report).toHaveBeenCalledTimes(2);
+        expect(report.mock.calls.every(([message]) => message.includes(`Session ${newer.id}`) && message.includes('retry next pass'))).toBe(
+            true,
+        );
+        expect(progress).toHaveBeenCalledTimes(4);
+        vi.mocked(provider.embed).mockResolvedValue(Array(384).fill(0.25));
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, current: 1, sourceChanged: 0, failed: 0 });
+    });
+
+    it('aborts malformed source classification after concurrent project authorization loss', async () => {
+        const f = fixture();
+        seedRollup(f, { project: f.project, session: f.session });
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('{broken', f.session.id);
+        const denied = seedProject(f, { path: path.join(f.directory, 'denied') });
+        seedConsentRoot(f, { path: denied.path, state: 'denied' });
+        f.db.prepare('UPDATE projects SET git_remote = ? WHERE id = ?').run('shared-remote', denied.id);
+        setSetting('memory-plus', 'true', f.configPath);
+        const other = openUnmanagedDb(f.dbPath);
+        const original = ProjectResolver.prototype.listConsentedStored;
+        vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (this: ProjectResolver, consent) {
+            const projects = original.call(this, consent);
+            other.prepare('UPDATE projects SET git_remote = ? WHERE id = ?').run('shared-remote', f.project.id);
+            return projects;
+        });
+        const report = vi.fn();
+        const progress = vi.fn();
+        const createProvider = vi.fn();
+        try {
+            await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider, report, progress })).rejects.toThrow(
+                /source or authorization changed.*0 failed/,
+            );
+            expect(report).not.toHaveBeenCalled();
+            expect(progress).not.toHaveBeenCalled();
+            expect(createProvider).not.toHaveBeenCalled();
+        } finally {
+            other.close();
+        }
+    });
+
+    it('reports repeated malformed sources without inference and resumes automatically after repair', async () => {
+        const f = fixture();
+        const newer = seedSession(f, { project: f.project, nativeId: 'malformed', title: 'Malformed session' });
+        seedRollup(f, { project: f.project, session: newer });
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('{broken private data', newer.id);
+        setSetting('memory-plus', 'true', f.configPath);
+        const provider = fakeProvider();
+        const createProvider = vi.fn(async () => provider);
+        const report = vi.fn();
+        const options = { configPath: f.configPath, createProvider, report };
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, failed: 1, sourceChanged: 0 });
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, current: 1, failed: 1 });
+        expect(provider.embed).toHaveBeenCalledOnce();
+        expect(report).toHaveBeenCalledTimes(2);
+        expect(report.mock.calls.every(([message]) => message.includes(`Session ${newer.id}`) && message.includes('decisions'))).toBe(true);
+        expect(report.mock.calls.flat().join(' ')).not.toContain('private data');
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('[]', newer.id);
+        expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, current: 1, failed: 0 });
+        expect(provider.embed).toHaveBeenCalledTimes(2);
+        seedRollup(f, { project: f.project, session: f.session });
+        f.db.prepare('UPDATE session_rollups SET decisions = ?').run('null');
+        createProvider.mockClear();
+        for (let pass = 0; pass < 2; pass++) {
+            expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 0, failed: 2 });
+        }
+        expect(createProvider).not.toHaveBeenCalled();
+        expect(provider.embed).toHaveBeenCalledTimes(2);
+    });
+
+    it('counts empty or ineligible sessions without reporting each one and advances progress without creating a provider', async () => {
+        const f = fixture();
+        f.db.prepare('UPDATE sessions SET title = NULL WHERE id = ?').run(f.session.id);
+        const other = seedProject(f, { path: path.join(f.directory, 'unconsented') });
+        seedSession(f, { project: other, nativeId: 'unconsented', title: 'Unconsented' });
+        setSetting('memory-plus', 'true', f.configPath);
+        const createProvider = vi.fn();
+        const report = vi.fn();
+        const progress = vi.fn();
+        expect(await generateEmbeddings(f.db, { configPath: f.configPath, createProvider, report, progress })).toMatchObject({
+            generated: 0,
+            ineligibleOrEmpty: 2,
+            failed: 0,
+            sourceChanged: 0,
+        });
+        expect(createProvider).not.toHaveBeenCalled();
+        expect(report).not.toHaveBeenCalled();
+        expect(progress).toHaveBeenCalledTimes(2);
     });
 
     it.each(['title', 'first_prompt_search'])('rejects stale %s source hashes and model revisions', (column) => {
@@ -359,22 +624,174 @@ describe('derived vector storage and manual generation', () => {
             registerParanoidDatabase(f.db, f.dbPath, randomBytes(32));
             enableParanoidMode(f.db, 'passphrase');
             unlockMemory(f.db, 'passphrase');
+            if (['revoke', 'disable', 'lock', 'lock-unlock'].includes(action)) {
+                seedSession(f, { project: f.project, nativeId: 'newest-security', title: 'Newest security source' });
+            }
             const provider = fakeProvider();
             vi.mocked(provider.embed).mockImplementation(async () => {
                 if (action === 'revoke') f.store.consent.revoke(f.project.path);
                 if (action === 'incognito') f.store.recordIncognitoTranscript(f.session.tool, f.session.native_id);
                 if (action === 'delete') f.db.prepare('DELETE FROM sessions WHERE id = ?').run(f.session.id);
-                if (action === 'change') f.db.prepare('UPDATE sessions SET title = ? WHERE id = ?').run('Changed', f.session.id);
+                if (action === 'change') f.db.prepare('UPDATE sessions SET title = ?').run('Changed');
                 if (action === 'disable') setSetting('memory-plus', 'false', f.configPath);
                 if (action === 'lock' || action === 'lock-unlock') lockMemory(f.db);
                 if (action === 'lock-unlock') unlockMemory(f.db, 'passphrase');
                 return Array(384).fill(0.25);
             });
-            await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider: async () => provider })).rejects.toThrow();
+            const generating = generateEmbeddings(f.db, { configPath: f.configPath, createProvider: async () => provider });
+            if (action === 'change') {
+                await expect(generating).resolves.toMatchObject({ generated: 0, sourceChanged: 1 });
+            } else {
+                await expect(generating).rejects.toThrow();
+            }
             expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual([]);
+            expect(provider.embed).toHaveBeenCalledOnce();
             expect(provider.dispose).toHaveBeenCalled();
         },
     );
+
+    it.each([
+        {
+            table: 'consent_roots',
+            selected: EMBEDDING_CONSENT_COLUMNS,
+            authorization: ['id', 'ulid', 'path', 'state', 'decided_at', 'source'],
+            excluded: ['nudged_at'],
+        },
+        {
+            table: 'projects',
+            selected: EMBEDDING_PROJECT_AUTHORIZATION_COLUMNS,
+            authorization: ['id', 'path', 'git_root', 'git_remote', 'git_root_commit'],
+            excluded: ['display_name', 'first_seen_at', 'last_seen_at'],
+        },
+    ])('pins the authorization projection and classifies every $table column', ({ table, selected, authorization, excluded }) => {
+        const f = fixture();
+        expect(selected).toEqual(authorization);
+        const columns = (f.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map(({ name }) => name);
+        expect(columns.sort(), 'Schema changes require an explicit embedding authorization classification').toEqual(
+            [...selected, ...excluded].sort(),
+        );
+    });
+
+    it('uses only consent decision columns for the generation snapshot', () => {
+        const f = fixture();
+        saveVector(f);
+        const token = generation(f);
+        const before = f.embeddings.generationConsent(token);
+        expect(Object.keys(JSON.parse(before)[0])).toEqual(EMBEDDING_CONSENT_COLUMNS);
+        f.db.prepare('UPDATE consent_roots SET nudged_at = ?').run('2099-01-01T00:00:00.000Z');
+        f.db.prepare('UPDATE projects SET last_seen_at = ?').run('2099-01-01T00:00:00.000Z');
+        expect(f.embeddings.generationConsent(token)).toBe(before);
+        f.store.consent.revoke(f.project.path);
+        expect(f.embeddings.generationConsent(token)).not.toBe(before);
+    });
+
+    describe.each(['scan', 'source'] as const)('%s authorization checkpoints', (operation) => {
+        it.each([
+            ['projects', 'display_name'],
+            ['projects', 'first_seen_at'],
+            ['consent_roots', 'nudged_at'],
+        ])('ignores %s.%s metadata changes', (table, column) => {
+            const f = fixture();
+            const source = saveVector(f);
+            const vectors = scan(f.embeddings, [f.project.id]);
+            const stored = f.db.prepare('SELECT * FROM session_embeddings').all();
+            const original = ProjectResolver.prototype.listConsentedStored;
+            const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
+                this: ProjectResolver,
+                consent,
+            ) {
+                const projects = original.call(this, consent);
+                f.db.prepare(`UPDATE ${table} SET ${column} = ?`).run('2099-01-01T00:00:00.000Z');
+                return projects;
+            });
+            expect(operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
+                operation === 'scan' ? vectors : source,
+            );
+            expect(checkpoint).toHaveBeenCalledOnce();
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(stored);
+        });
+
+        it.each(['git_root', 'git_remote', 'git_root_commit'])('rejects eligibility loss through %s grouping', (column) => {
+            const f = fixture();
+            const denied = seedProject(f, { path: path.join(f.directory, 'denied') });
+            seedConsentRoot(f, { path: denied.path, state: 'denied' });
+            f.db.prepare(`UPDATE projects SET ${column} = ? WHERE id = ?`).run(denied.path, denied.id);
+            saveVector(f);
+            const original = ProjectResolver.prototype.listConsentedStored;
+            vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (this: ProjectResolver, consent) {
+                const projects = original.call(this, consent);
+                f.db.prepare(`UPDATE projects SET ${column} = ? WHERE id = ?`).run(denied.path, f.project.id);
+                expect(original.call(new ProjectResolver(f.db), consent).flatMap((project) => project.projectIds)).not.toContain(
+                    f.project.id,
+                );
+                return projects;
+            });
+            expect(() => (operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
+                EMBEDDING_SOURCE_CHANGED,
+            );
+        });
+
+        it.each(['target', 'unrelated'] as const)('ignores a last_seen_at-only update to the %s project', (target) => {
+            const f = fixture();
+            const other = seedProject(f, { path: path.join(f.directory, 'other') });
+            const source = saveVector(f);
+            const vectors = scan(f.embeddings, [f.project.id]);
+            const stored = f.db.prepare('SELECT * FROM session_embeddings').all();
+            const projectId = target === 'target' ? f.project.id : other.id;
+            const before = f.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId);
+            const original = ProjectResolver.prototype.listConsentedStored;
+            const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
+                this: ProjectResolver,
+                consent,
+            ) {
+                const projects = original.call(this, consent);
+                f.db.prepare('UPDATE projects SET last_seen_at = ? WHERE id = ?').run('2099-01-01T00:00:00.000Z', projectId);
+                return projects;
+            });
+
+            expect(operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id)).toEqual(
+                operation === 'scan' ? vectors : source,
+            );
+            expect(checkpoint).toHaveBeenCalledOnce();
+            expect(f.db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId)).toEqual({
+                ...(before as object),
+                last_seen_at: '2099-01-01T00:00:00.000Z',
+            });
+            expect(f.embeddings.source(f.session.id)).toEqual(source);
+            expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(stored);
+            expect(scan(f.embeddings, [f.project.id])).toEqual(vectors);
+        });
+
+        it.each(['revoke', 'add-root', 'remove-root', 'path-change', 'unconsented'] as const)(
+            'rejects %s between authorization checks',
+            (action) => {
+                const f = fixture();
+                saveVector(f);
+                const original = ProjectResolver.prototype.listConsentedStored;
+                const checkpoint = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (
+                    this: ProjectResolver,
+                    consent,
+                ) {
+                    const projects = original.call(this, consent);
+                    if (action === 'revoke') f.store.consent.revoke(f.project.path);
+                    if (action === 'add-root') seedConsentRoot(f, { path: path.join(f.directory, 'other') });
+                    if (action === 'remove-root') f.store.consent.remove(f.store.consent.list()[0].ulid);
+                    if (action === 'path-change' || action === 'unconsented') {
+                        const changedPath =
+                            action === 'path-change' ? path.join(f.project.path, 'child') : path.join(f.directory, 'unconsented');
+                        f.db.prepare('UPDATE projects SET path = ? WHERE id = ?').run(changedPath, f.project.id);
+                        expect(f.store.consent.isConsented(changedPath)).toBe(action === 'path-change');
+                    }
+                    return projects;
+                });
+
+                expect(() => (operation === 'scan' ? scan(f.embeddings, [f.project.id]) : f.embeddings.source(f.session.id))).toThrow(
+                    EMBEDDING_SOURCE_CHANGED,
+                );
+                expect(checkpoint).toHaveBeenCalled();
+            },
+        );
+    });
 
     it('rejects consent changes while resolving eligible project IDs', () => {
         const f = fixture();

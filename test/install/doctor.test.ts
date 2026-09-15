@@ -36,6 +36,18 @@ function runtime(overrides: Partial<DoctorRuntime> = {}): DoctorRuntime {
 }
 
 describe('elepha doctor', () => {
+    it.each([
+        [{ pending: 0, incidents: 0 }, 0, /classification: up to date/],
+        [{ pending: 3, incidents: 0, updating: true }, 1, /classification: updating 3/],
+        [{ pending: 3, incidents: 0, updating: false }, 1, /classification: 3 pending until next daemon start/],
+        [{ pending: 3, incidents: 2 }, 1, /classification: incomplete.*3 pending.*2 source incidents/],
+    ] as const)('reports classification readiness %j', async (status, exitCode, message) => {
+        const result = await runDoctor(runtime({ inspectSessionKinds: () => status }));
+        expect(result.exitCode).toBe(exitCode);
+        expect(result.lines.some((line) => message.test(line))).toBe(true);
+        if (status.pending > 0) expect(result.lines).not.toContain('Summary: all checks passed.');
+    });
+
     it.each(['not installed', 'stale binary', 'conflict', 'stale plugin'] as const)(
         'reports an OpenCode plugin %s and provides the install handoff',
         async (opencodePlugin) => {

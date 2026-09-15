@@ -87,6 +87,73 @@ describe('CodexAdapter.classifySession', () => {
         const file = writeRollout([meta({ originator: 'codex-tui' })]);
         expect((await new CodexAdapter().classifySession(file)).kind).toBe('primary');
     });
+
+    it.each(['subagent', 'guardian_review', undefined])('excludes guardian metadata with thread_source=%s', async (threadSource) => {
+        const file = writeRollout([
+            meta({
+                thread_source: threadSource,
+                parent_thread_id: 'guardian-parent',
+                source: { subagent: { other: 'guardian' } },
+            }),
+        ]);
+        expect(await new CodexAdapter().classifySession(file)).toMatchObject({
+            kind: 'adjudicator',
+            parentNativeId: 'guardian-parent',
+        });
+    });
+
+    it('recognizes guardian_review without nested metadata', async () => {
+        const file = writeRollout([meta({ thread_source: 'guardian_review' })]);
+        expect((await new CodexAdapter().classifySession(file)).kind).toBe('adjudicator');
+    });
+
+    it('preserves fork and external-import precedence over guardian metadata', async () => {
+        const header = meta({ thread_source: 'guardian_review', forked_from_id: 'parent-copy' });
+        const fork = writeRollout([header]);
+        expect((await new CodexAdapter().classifySession(fork)).kind).toBe('fork-copy');
+        const imported = writeRollout([
+            header,
+            { type: 'event_msg', payload: { type: 'task_started', turn_id: 'external-import-turn-1' } },
+        ]);
+        expect(await new CodexAdapter().classifySession(imported)).toMatchObject({
+            kind: 'primary',
+            exclusion: 'external-agent-import',
+        });
+    });
+
+    it('retains a genuine thread_spawn subagent with identity', async () => {
+        const file = writeRollout([
+            meta({
+                thread_source: 'subagent',
+                parent_thread_id: 'parent-work',
+                source: { subagent: { thread_spawn: { parent_thread_id: 'parent-work' } } },
+                agent_path: '/root/implementation',
+                agent_nickname: 'Locke',
+            }),
+        ]);
+        expect(await new CodexAdapter().classifySession(file)).toEqual({ kind: 'subagent', parentNativeId: 'parent-work' });
+    });
+
+    it.each(['cli', 'exec', 'vscode', 'chatgpt_handoff', undefined])(
+        'retains primary source %s despite quoted guardian text',
+        async (source) => {
+            const file = writeRollout([
+                meta({ source, base_instructions: 'guardian_review {"source":{"subagent":{"other":"guardian"}}}' }),
+                {
+                    type: 'response_item',
+                    payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'guardian_review' }] },
+                },
+            ]);
+            expect(await new CodexAdapter().classifySession(file)).toEqual({ kind: 'primary' });
+        },
+    );
+
+    it.each(
+        [null, 7, [], { subagent: null }, { subagent: 'guardian' }, { subagent: { other: ['guardian'] } }].map((source) => ({ source })),
+    )('does not treat malformed nested metadata as a guardian: $source', async ({ source }) => {
+        const file = writeRollout([meta({ source })]);
+        expect(await new CodexAdapter().classifySession(file)).toEqual({ kind: 'primary' });
+    });
 });
 
 describe('CodexAdapter file paths from exec envelopes', () => {

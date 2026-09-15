@@ -16,6 +16,7 @@
 import { existsSync } from 'node:fs';
 import { stat as fsStat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import { setImmediate as yieldImmediate } from 'node:timers/promises';
 import chokidar, { type FSWatcher } from 'chokidar';
 import { OversizedTranscriptRecordError } from '../adapters/base.js';
 import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
@@ -70,6 +71,12 @@ import { isMemoryLocked } from '../storage/paranoid-gate.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
+import {
+    type KindReconciliationContinuation,
+    reconcileSessionKinds,
+    settleSessionKindReconciliation,
+} from '../storage/session-kind-reconciliation.js';
+import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from '../storage/session-read-model.js';
 import { SourceReconciliation, sourceSnapshotValidator } from '../storage/source-reconciliation.js';
 import type {
     EmptySessionKind,
@@ -207,6 +214,8 @@ export interface DaemonOptions {
     firstPromptSearchBackfillBatchSize?: number;
     // Test seam; production uses DURABLE_CAPTURE_BACKFILL_BATCH_SIZE.
     durableCaptureBackfillBatchSize?: number;
+    // Deterministic budget exhaustion without timing-dependent fixture sleeps.
+    sessionKindReconciliationNow?: () => number;
 }
 
 function formatDaemonLog(message: string, context: { tool?: string; sessionId?: string } = {}): string {
@@ -215,6 +224,8 @@ function formatDaemonLog(message: string, context: { tool?: string; sessionId?: 
 }
 
 export class IngestionDaemon {
+    private kindReconciliationPromise: Promise<void> | undefined;
+    private readonly sessionKindReconciliationNow: (() => number) | undefined;
     private readonly store: MemoryStore;
     private readonly summarizer: SummarizationProvider | undefined;
     private readonly adapters: SessionAdapter[];
@@ -328,6 +339,7 @@ export class IngestionDaemon {
         this.readCorpus = options.readCorpus ?? ((watchRoot) => readdir(watchRoot, { recursive: true }));
         this.firstPromptSearchBackfillBatchSize = options.firstPromptSearchBackfillBatchSize ?? FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE;
         this.durableCaptureBackfillBatchSize = options.durableCaptureBackfillBatchSize ?? DURABLE_CAPTURE_BACKFILL_BATCH_SIZE;
+        this.sessionKindReconciliationNow = options.sessionKindReconciliationNow;
     }
 
     start(): void {
@@ -353,9 +365,38 @@ export class IngestionDaemon {
         this.watcher.on('change', (filePath) => this.onFileEvent(filePath));
         this.log(`[elepha] watching:\n  ${this.watchRoots.join('\n  ')}`);
 
-        const startupSweep = this.sweepStartupFiles().catch((error: unknown) => {
-            this.logError(`[elepha] startup sweep failed: ${(error as Error).message}`);
+        const continuation: KindReconciliationContinuation = { afterId: 0, incidents: 0, hasMore: true };
+        const reconcileKinds = () =>
+            reconcileSessionKinds(this.store, {
+                openTranscript: this.openTranscript,
+                stopped: () => this.stopping,
+                log: this.log,
+                warn: this.warnDeduplicated,
+                continuation,
+                now: this.sessionKindReconciliationNow,
+            });
+        const classification = reconcileKinds().catch((error: unknown) => {
+            continuation.hasMore = false;
+            this.logError(`[elepha] session classification failed; retry pending: ${(error as Error).message}`);
         });
+        this.kindReconciliationPromise = classification
+            .then(async () => {
+                while (continuation.hasMore && !this.stopping) {
+                    await yieldImmediate();
+                    if (!this.stopping) {
+                        await reconcileKinds();
+                    }
+                }
+            })
+            .catch((error: unknown) => {
+                this.logError(`[elepha] session classification failed; retry pending: ${(error as Error).message}`);
+            })
+            .finally(() => settleSessionKindReconciliation(this.store.database));
+        const startupSweep = classification
+            .then(() => this.sweepStartupFiles())
+            .catch((error: unknown) => {
+                this.logError(`[elepha] startup sweep failed: ${(error as Error).message}`);
+            });
         this.startupSweepPromise = startupSweep;
         void startupSweep.then(() => {
             if (this.startupSweepPromise === startupSweep) {
@@ -380,9 +421,11 @@ export class IngestionDaemon {
         });
         this.firstPromptSearchBackfillTimer = setTimeout(() => {
             this.firstPromptSearchBackfillTimer = undefined;
-            const task = this.backfillFirstPromptSearch().catch((error: unknown) => {
-                this.logError(`${FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX} failed: ${(error as Error).message}`);
-            });
+            const task = classification
+                .then(() => this.backfillFirstPromptSearch())
+                .catch((error: unknown) => {
+                    this.logError(`${FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX} failed: ${(error as Error).message}`);
+                });
             this.firstPromptSearchBackfillPromise = task;
             void task.then(() => {
                 if (this.firstPromptSearchBackfillPromise === task) {
@@ -420,9 +463,9 @@ export class IngestionDaemon {
             // Startup sweep: sessions that ended while the daemon was down will
             // never produce another file event, so nothing else would ever
             // close them.
-            void this.sweepIdleSessions().catch((err: unknown) =>
-                this.logError(`[elepha] startup sweep failed: ${(err as Error).message}`),
-            );
+            void classification
+                .then(() => this.sweepIdleSessions())
+                .catch((err: unknown) => this.logError(`[elepha] startup sweep failed: ${(err as Error).message}`));
             this.sweepTimer = setInterval(() => {
                 void this.sweepIdleSessions().catch((err: unknown) => this.logError(`[elepha] sweep failed: ${(err as Error).message}`));
             }, this.sweepIntervalMs);
@@ -449,13 +492,15 @@ export class IngestionDaemon {
             if (!getSetting('memory-plus').value || isMemoryLocked(this.store.database)) {
                 return;
             }
-            const refresh = startEmbeddingRefresh(this.store.database.name);
+            const refresh = startEmbeddingRefresh(this.store.database.name, (message) =>
+                this.logError(`[elepha] automatic indexing: ${message}`),
+            );
             this.embeddingRefresh = refresh;
             this.embeddingRefreshPromise = refresh.done
                 .then((result) => {
                     if (result) {
                         this.log(
-                            `[elepha] automatic indexing: ${result.generated} indexed, ${result.current} current, ${result.ineligibleOrEmpty} skipped`,
+                            `[elepha] automatic indexing: ${result.generated} indexed, ${result.current} current, ${result.ineligibleOrEmpty} ineligible or empty, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference)`,
                         );
                     }
                 })
@@ -558,6 +603,7 @@ export class IngestionDaemon {
         this.idleTimers.clear();
         await this.watcher?.close();
         await this.startupSweepPromise;
+        await this.kindReconciliationPromise;
         await this.firstPromptSearchBackfillPromise;
         await this.durableCaptureBackfillPromise;
         await this.embeddingRefreshPromise;
@@ -607,10 +653,19 @@ export class IngestionDaemon {
                 let writeUnauthorized = false;
                 let writeEvicted = false;
                 try {
+                    if (!isSessionKindEligible(this.store.database, session.id)) {
+                        continue;
+                    }
                     for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
                         closeTrailingOnIdle: true,
                         handle: opened.handle,
                     })) {
+                        // Eligibility may change while the iterator reads.
+                        // Check before skipped turns can request another read.
+                        if (!isSessionKindEligible(this.store.database, session.id)) {
+                            writeUnauthorized = true;
+                            break;
+                        }
                         if (this.stopping) {
                             break;
                         }
@@ -696,11 +751,12 @@ export class IngestionDaemon {
             const projectPlaceholders = consentedProjectIds.map(() => '?').join(', ');
             const candidates = this.store.database
                 .prepare(
-                    `SELECT sessions.id
-                     FROM sessions
-                     LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = sessions.id
-                     WHERE sessions.project_id IN (${projectPlaceholders})
-                       AND sessions.first_prompt_search IS NULL
+                    `SELECT s.id
+                     FROM sessions s
+                     LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = s.id
+                     WHERE s.project_id IN (${projectPlaceholders})
+                       AND s.first_prompt_search IS NULL
+                       AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                        AND skips.session_id IS NULL
                      ORDER BY id
                      LIMIT ?`,
@@ -719,9 +775,9 @@ export class IngestionDaemon {
                     writeAuthorizedProjectIds ??= new Set(
                         new ProjectResolver(db).listConsentedStored(this.store.consent).flatMap((project) => project.projectIds),
                     );
-                    const row = db.prepare('SELECT project_id FROM sessions WHERE id = ?').get(sessionId) as
-                        | { project_id: number }
-                        | undefined;
+                    const row = db
+                        .prepare(`SELECT project_id FROM sessions s WHERE id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}`)
+                        .get(sessionId) as { project_id: number } | undefined;
                     return row !== undefined && writeAuthorizedProjectIds.has(row.project_id);
                 },
             });
@@ -733,7 +789,9 @@ export class IngestionDaemon {
 
             const placeholders = sessionIds.map(() => '?').join(', ');
             const leftNullRows = this.store.database
-                .prepare(`SELECT id FROM sessions WHERE id IN (${placeholders}) AND first_prompt_search IS NULL`)
+                .prepare(
+                    `SELECT id FROM sessions s WHERE id IN (${placeholders}) AND first_prompt_search IS NULL AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
+                )
                 .all(...sessionIds) as Array<{ id: number }>;
             const recordSkips = this.store.database.transaction((rows: Array<{ id: number }>) => {
                 const currentlyConsented = new Set(
@@ -744,7 +802,9 @@ export class IngestionDaemon {
                 const insert = this.store.database.prepare(
                     'INSERT OR IGNORE INTO first_prompt_search_backfill_skips (session_id, skipped_at) VALUES (?, ?)',
                 );
-                const sessionProject = this.store.database.prepare('SELECT project_id FROM sessions WHERE id = ?');
+                const sessionProject = this.store.database.prepare(
+                    `SELECT project_id FROM sessions s WHERE id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
+                );
                 const skippedAt = new Date().toISOString();
                 for (const row of rows) {
                     const session = sessionProject.get(row.id) as { project_id: number } | undefined;
@@ -759,17 +819,18 @@ export class IngestionDaemon {
                 this.store.database
                     .prepare(
                         `SELECT COUNT(*) AS count
-                         FROM sessions
-                         LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = sessions.id
-                         WHERE sessions.project_id IN (${projectPlaceholders})
-                           AND sessions.first_prompt_search IS NULL
+                         FROM sessions s
+                         LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = s.id
+                         WHERE s.project_id IN (${projectPlaceholders})
+                           AND s.first_prompt_search IS NULL
+                           AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                            AND skips.session_id IS NULL`,
                     )
                     .get(...consentedProjectIds) as { count: number }
             ).count;
             this.log(
                 `${FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX} processed through session ${lastSessionId}: ${sessionIds.length} session(s), ` +
-                    `indexed ${sessionIds.length - leftNullRows.length}, left NULL ${leftNullRows.length} ` +
+                    `indexed ${plan.sessionsWritten}, left NULL ${leftNullRows.length} ` +
                     `(unavailable transcript: ${plan.sessionsMissingTranscript}), remaining ${remaining}`,
             );
 
@@ -1778,7 +1839,7 @@ export class IngestionDaemon {
         }
 
         const session = this.store.findSession(adapter.tool, nativeId);
-        if (!session) {
+        if (!session || !isSessionKindEligible(this.store.database, session.id)) {
             return;
         }
 
@@ -1794,7 +1855,7 @@ export class IngestionDaemon {
         classification: SessionClassification | undefined,
         state: 'live' | 'final',
     ): Promise<void> {
-        if (!this.rollupService || isMemoryLocked(this.store.database)) {
+        if (!this.rollupService || isMemoryLocked(this.store.database) || !isSessionKindEligible(this.store.database, session.id)) {
             return;
         }
 
@@ -1838,7 +1899,7 @@ export class IngestionDaemon {
                 continue;
             }
             const stat = await fsStat(session.source_path).catch(() => undefined);
-            if (!stat || !this.rollupService.isIdle(stat.mtimeMs, now)) {
+            if (!stat || !this.rollupService.isIdle(stat.mtimeMs, now) || !isSessionKindEligible(this.store.database, session.id)) {
                 continue;
             }
             try {

@@ -8,9 +8,12 @@ function vectorTable(db: ReturnType<typeof openUnmanagedDb>) {
     return db.prepare("SELECT sql FROM sqlite_master WHERE name = 'session_embeddings'").get();
 }
 
-describe('"Memory-Plus" vector migration', () => {
+describe('Memory-Plus vector migration', () => {
     it('creates a fresh table with cascade provenance and a vector-size constraint', () => {
-        const { db } = createTestDb('embedding-fresh-');
+        const f = createTestDb('embedding-fresh-');
+        const { db } = f;
+        const project = seedProject(f);
+        const session = seedSession(f, { project });
         expect(vectorTable(db)).toBeDefined();
         expect(db.pragma('foreign_key_list(session_embeddings)')).toEqual(
             expect.arrayContaining([
@@ -21,9 +24,14 @@ describe('"Memory-Plus" vector migration', () => {
         );
         expect(() =>
             db
-                .prepare('INSERT INTO session_embeddings VALUES (1, NULL, 1, ?, ?, ?, 384, ?, ?)')
-                .run('hash', 'model', 'revision', Buffer.alloc(1), 'now'),
-        ).toThrow();
+                .prepare('INSERT INTO session_embeddings VALUES (?, NULL, ?, ?, ?, ?, 384, ?, ?)')
+                .run(session.id, project.id, 'hash', 'model', 'revision', Buffer.alloc(1), 'now'),
+        ).toThrow(
+            expect.objectContaining({
+                code: 'SQLITE_CONSTRAINT_CHECK',
+                message: 'CHECK constraint failed: length(vector) = dimensions * 4',
+            }),
+        );
     });
 
     it('migrates an on-disk legacy database missing the table, preserving existing sessions and rollups', () => {

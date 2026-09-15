@@ -67,6 +67,7 @@ const savedEnvironment = { ...process.env };
 
 afterEach(() => {
     process.env = { ...savedEnvironment };
+    vi.useRealTimers();
     vi.restoreAllMocks();
 });
 
@@ -96,6 +97,7 @@ function serviceRuntime(home: string, executor: LaunchctlExecutor, approvedRoots
         home,
         service: new LaunchdBackend(defaultLaunchdServicePaths(home), executor, 501, healthCheck),
         approvedRoots,
+        healthCheck,
     };
 }
 
@@ -122,7 +124,7 @@ class FakeSystemctl implements SystemctlExecutor {
 }
 
 describe('installer transaction', () => {
-    it('runs install and uninstall through the systemd backend on Linux', () => {
+    it('runs install and uninstall through the systemd backend on Linux', async () => {
         const root = withTempDir('elepha-installer-linux-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -140,7 +142,7 @@ describe('installer transaction', () => {
             approvedRoots: 0,
         };
 
-        const installed = installElepha(paths, runtime);
+        const installed = await installElepha(paths, runtime);
         expect(installed.service).toBe('registered, awaiting consent');
         expect(installed.launcher).toBe(service.launcherPath);
         expect(existsSync(servicePaths.unit)).toBe(true);
@@ -151,7 +153,7 @@ describe('installer transaction', () => {
         expect(executor.calls).toContainEqual(['--user', 'disable', 'elepha.service']);
     });
 
-    it('rejects WSL without systemd before writing config, service artifacts, or a journal', () => {
+    it('rejects WSL without systemd before writing config, service artifacts, or a journal', async () => {
         const root = withTempDir('elepha-installer-wsl-preflight-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -163,7 +165,7 @@ describe('installer transaction', () => {
         const servicePaths = defaultSystemdServicePaths(root, {});
         const service = new SystemdBackend(servicePaths, executor);
 
-        expect(() =>
+        await expect(
             installElepha(paths, {
                 platform: 'linux',
                 home: root,
@@ -171,7 +173,7 @@ describe('installer transaction', () => {
                 serviceManager: { hasSystemd: false, isWsl: true },
                 approvedRoots: 0,
             }),
-        ).toThrow('wsl --shutdown');
+        ).rejects.toThrow('wsl --shutdown');
 
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(original.claudeSettings);
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(original.claudeMcp);
@@ -184,15 +186,15 @@ describe('installer transaction', () => {
     it.each([
         ['install', installElepha],
         ['uninstall', uninstallElepha],
-    ] as const)('refuses %s on Windows before touching lifecycle state', (_operation, lifecycle) => {
+    ] as const)('refuses %s on Windows before touching lifecycle state', async (_operation, lifecycle) => {
         const root = withTempDir('elepha-installer-win32-');
 
-        expect(() => lifecycle(installPaths(root), { platform: 'win32', home: root, approvedRoots: 0 })).toThrow(
+        await expect(async () => lifecycle(installPaths(root), { platform: 'win32', home: root, approvedRoots: 0 })).rejects.toThrow(
             'supported on macOS and Linux',
         );
     });
 
-    it('rewrites managed artifacts when the freshly rendered launcher changes backend', () => {
+    it('rewrites managed artifacts when the freshly rendered launcher changes backend', async () => {
         const root = withTempDir('elepha-installer-launcher-refresh-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -207,7 +209,7 @@ describe('installer transaction', () => {
             },
         };
 
-        installElepha(paths, serviceRuntime(root, executor, 0));
+        await installElepha(paths, serviceRuntime(root, executor, 0));
         const launcher = path.join(root, '.elepha', 'bin', 'elepha');
         expect(readFileSync(launcher, 'utf8')).toBe('#!/bin/sh\nset -eu\n');
 
@@ -221,13 +223,13 @@ describe('installer transaction', () => {
         const service = new LaunchdBackend(defaultLaunchdServicePaths(root), executor);
         expect(serviceArtifactsMatchOrWrite(service, launcherMock.text)).toBe(false);
         const writeArtifacts = vi.spyOn(LaunchdBackend.prototype, 'install');
-        installElepha(paths, serviceRuntime(root, executor, 0));
+        await installElepha(paths, serviceRuntime(root, executor, 0));
 
         expect(readFileSync(launcher, 'utf8')).toBe(launcherMock.text);
         expect(writeArtifacts).toHaveBeenCalledWith(launcherMock.text, launcherMock.backend);
     });
 
-    it('leaves exact-match managed artifacts untouched on a repeated install', () => {
+    it('leaves exact-match managed artifacts untouched on a repeated install', async () => {
         const root = withTempDir('elepha-installer-launcher-repeat-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -242,16 +244,16 @@ describe('installer transaction', () => {
             },
         };
 
-        installElepha(paths, serviceRuntime(root, executor, 0));
+        await installElepha(paths, serviceRuntime(root, executor, 0));
         const service = new LaunchdBackend(defaultLaunchdServicePaths(root), executor);
         expect(serviceArtifactsMatchOrWrite(service, launcherMock.text)).toBe(true);
         const writeArtifacts = vi.spyOn(LaunchdBackend.prototype, 'install');
-        installElepha(paths, serviceRuntime(root, executor, 0));
+        await installElepha(paths, serviceRuntime(root, executor, 0));
 
         expect(writeArtifacts).not.toHaveBeenCalled();
     });
 
-    it('refuses to overwrite a user-modified managed artifact', () => {
+    it('refuses to overwrite a user-modified managed artifact', async () => {
         const root = withTempDir('elepha-installer-launcher-modified-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -266,7 +268,7 @@ describe('installer transaction', () => {
             },
         };
 
-        installElepha(paths, serviceRuntime(root, executor, 0));
+        await installElepha(paths, serviceRuntime(root, executor, 0));
         const launcher = path.join(root, '.elepha', 'bin', 'elepha');
         writeFileSync(launcher, '# user modified\n');
         const service = new LaunchdBackend(defaultLaunchdServicePaths(root), executor);
@@ -276,7 +278,7 @@ describe('installer transaction', () => {
         );
     });
 
-    it('runs the injected inert install -> approval projection -> uninstall lifecycle without a real launchctl domain', () => {
+    it('runs the injected inert install -> approval projection -> uninstall lifecycle without a real launchctl domain', async () => {
         const root = withTempDir('elepha-installer-service-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -305,13 +307,13 @@ describe('installer transaction', () => {
             },
         };
 
-        const inert = installElepha(paths, serviceRuntime(root, executor, 0));
+        const inert = await installElepha(paths, serviceRuntime(root, executor, 0));
         expect(inert.service).toBe('registered, awaiting consent');
         expect(disabled).toBe(true);
         expect(loaded).toBe(false);
         expect(readFileSync(paths.claudeSettings, 'utf8')).toContain(path.join(root, '.elepha', 'bin', 'elepha'));
 
-        const active = installElepha(paths, serviceRuntime(root, executor, 1));
+        const active = await installElepha(paths, serviceRuntime(root, executor, 1));
         expect(active.service).toBe('active');
         expect(loaded).toBe(true);
         expect(disabled).toBe(false);
@@ -333,7 +335,7 @@ describe('installer transaction', () => {
         expect(existsSync(uninstallService.transactionPath)).toBe(false);
     });
 
-    it('waits for a late managed heartbeat during install', () => {
+    it('waits for a late managed heartbeat during install', async () => {
         const root = withTempDir('elepha-installer-late-heartbeat-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -354,7 +356,7 @@ describe('installer transaction', () => {
         };
         const phases: string[] = [];
 
-        const result = installElepha(paths, {
+        const result = await installElepha(paths, {
             ...serviceRuntime(root, executor, 1, {
                 now: () => now,
                 sleep(milliseconds) {
@@ -386,7 +388,72 @@ describe('installer transaction', () => {
         ]);
     });
 
-    it('waits for the complete deadline before failing the replacement and accepts a late rollback heartbeat', () => {
+    it('lets progress timers advance while installation awaits a healthy daemon', async () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(0);
+        const root = withTempDir('elepha-installer-responsive-');
+        const paths = installPaths(root);
+        createConfigDirectories(paths);
+        writeFileSync(paths.claudeSettings, '{}');
+        let loaded = false;
+        const executor = {
+            run(args: readonly string[]) {
+                if (args[0] === 'print') return { stdout: '', stderr: '', status: loaded ? 0 : 3 };
+                if (args[0] === 'print-disabled') return { stdout: '"com.elepha.daemon" => false', stderr: '', status: 0 };
+                if (args[0] === 'bootstrap') loaded = true;
+                if (args[0] === 'bootout') loaded = false;
+                return { stdout: '', stderr: '', status: 0 };
+            },
+        };
+        // A synchronous regression reaches its deadline without blocking
+        // the test runner; only async polling runs the progress timer.
+        const service = new LaunchdBackend(defaultLaunchdServicePaths(root), executor, 501, {
+            now: () => Date.now(),
+            sleep: (milliseconds) => vi.setSystemTime(Date.now() + milliseconds),
+        });
+        let progressTicks = 0;
+        let finished = false;
+        let progress: ReturnType<typeof setInterval> | undefined;
+        const installing = installElepha(paths, {
+            home: root,
+            service,
+            approvedRoots: 1,
+            onPhase(phase, event) {
+                if (phase !== 'Starting the capture daemon') return;
+                if (event === 'start') progress = setInterval(() => progressTicks++, 50);
+                else clearInterval(progress);
+            },
+        });
+        const completion = installing.then(
+            (result) => {
+                finished = true;
+                return { result, error: undefined };
+            },
+            (error: unknown) => ({ result: undefined, error }),
+        );
+        try {
+            await vi.advanceTimersByTimeAsync(250);
+            expect(progressTicks).toBeGreaterThan(0);
+            expect(finished).toBe(false);
+            expect(existsSync(service.transactionPath)).toBe(true);
+            writeFileSync(
+                defaultLaunchdServicePaths(root).heartbeat,
+                JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
+            );
+            await vi.advanceTimersByTimeAsync(250);
+            const outcome = await completion;
+            expect(outcome.error).toBeUndefined();
+            expect(outcome.result?.service).toBe('active');
+            expect(existsSync(service.transactionPath)).toBe(false);
+            const completedTicks = progressTicks;
+            await vi.advanceTimersByTimeAsync(250);
+            expect(progressTicks).toBe(completedTicks);
+        } finally {
+            clearInterval(progress);
+        }
+    });
+
+    it('waits for the complete deadline before failing the replacement and accepts a late rollback heartbeat', async () => {
         const root = withTempDir('elepha-installer-rollback-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -434,7 +501,7 @@ describe('installer transaction', () => {
             },
         };
 
-        expect(() =>
+        await expect(
             installElepha(
                 paths,
                 serviceRuntime(root, executor, 1, {
@@ -454,7 +521,7 @@ describe('installer transaction', () => {
                     },
                 }),
             ),
-        ).toThrow(
+        ).rejects.toThrow(
             /capture service did not produce a healthy heartbeat within 60s; launchctl bootstrap gui\/\d+ .* \(status 0; stderr: no stderr; stdout: no stdout\); post-bootstrap launchctl print gui\/\d+\/com\.elepha\.daemon \(status 0; stderr: no stderr; stdout: no stdout\) found service; daemon stderr log tail: launchd daemon startup detail/,
         );
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(original.claudeSettings);
@@ -471,7 +538,7 @@ describe('installer transaction', () => {
         expect(now).toBe(DAEMON_HEALTH_CHECK_DEADLINE_MS + 30_000);
     });
 
-    it('keeps managed service artifacts and launchd state on failure when debug preservation is enabled', () => {
+    it('keeps managed service artifacts and launchd state on failure when debug preservation is enabled', async () => {
         const root = withTempDir('elepha-installer-keep-failure-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -492,7 +559,7 @@ describe('installer transaction', () => {
         };
 
         let now = 0;
-        expect(() =>
+        await expect(
             installElepha(
                 paths,
                 serviceRuntime(root, executor, 1, {
@@ -502,7 +569,7 @@ describe('installer transaction', () => {
                     },
                 }),
             ),
-        ).toThrow('capture service did not produce a healthy heartbeat');
+        ).rejects.toThrow('capture service did not produce a healthy heartbeat');
         expect(existsSync(path.join(root, '.elepha', 'bin', 'elepha'))).toBe(true);
         expect(existsSync(path.join(root, 'Library', 'LaunchAgents', 'com.elepha.daemon.plist'))).toBe(true);
         expect(existsSync(path.join(root, '.elepha', 'service', 'install-state.json'))).toBe(true);
@@ -510,7 +577,7 @@ describe('installer transaction', () => {
         expect(calls.some(([verb]) => verb === 'bootout')).toBe(false);
     });
 
-    it('replays a leftover install journal before applying a new install', () => {
+    it('replays a leftover install journal before applying a new install', async () => {
         const root = withTempDir('elepha-installer-replay-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -592,14 +659,14 @@ describe('installer transaction', () => {
             return applyOriginal(changes);
         });
 
-        const result = installElepha(paths, serviceRuntime(root, executor, 1));
+        const result = await installElepha(paths, serviceRuntime(root, executor, 1));
 
         expect(result.service).toBe('active');
         expect(bootstraps).toBe(2);
         expect(existsSync(transaction)).toBe(false);
     });
 
-    it('restores files and clears the journal when the prior daemon stays unhealthy, allowing the next install to proceed', () => {
+    it('restores files and clears the journal when the prior daemon stays unhealthy, allowing the next install to proceed', async () => {
         const root = withTempDir('elepha-installer-n2-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -650,12 +717,12 @@ describe('installer transaction', () => {
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
         const phases: string[] = [];
 
-        expect(() =>
+        await expect(
             installElepha(paths, {
                 ...serviceRuntime(root, executor, 1, healthCheck),
                 onPhase: (phase, event) => phases.push(`${event}:${phase}`),
             }),
-        ).toThrow('capture service did not produce a healthy heartbeat');
+        ).rejects.toThrow('capture service did not produce a healthy heartbeat');
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(original.claudeSettings);
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(original.claudeMcp);
         expect(readFileSync(servicePaths.launcher, 'utf8')).toBe(legacyLauncher);
@@ -671,7 +738,7 @@ describe('installer transaction', () => {
         ]);
 
         healthy = true;
-        expect(installElepha(paths, serviceRuntime(root, executor, 1, healthCheck)).service).toBe('active');
+        expect((await installElepha(paths, serviceRuntime(root, executor, 1, healthCheck))).service).toBe('active');
         expect(existsSync(servicePaths.transaction)).toBe(false);
     });
 
@@ -690,7 +757,7 @@ describe('installer transaction', () => {
         expect(readRollbackJournal(transaction)?.service).toEqual({ loaded: false, disabled: true, unknown: false });
     });
 
-    it('leaves the service stopped and disabled when install rollback began from an unknown state', () => {
+    it('leaves the service stopped and disabled when install rollback began from an unknown state', async () => {
         const root = withTempDir('elepha-installer-unknown-service-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -719,7 +786,7 @@ describe('installer transaction', () => {
         });
         const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
 
-        expect(() =>
+        await expect(
             installElepha(paths, {
                 platform: 'linux',
                 home: root,
@@ -727,7 +794,7 @@ describe('installer transaction', () => {
                 serviceManager: { hasSystemd: true, isWsl: false },
                 approvedRoots: 1,
             }),
-        ).toThrow('forced install failure');
+        ).rejects.toThrow('forced install failure');
 
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(original.claudeSettings);
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(original.claudeMcp);
@@ -773,7 +840,7 @@ describe('installer transaction', () => {
         expect(existsSync(servicePaths.transaction)).toBe(false);
     });
 
-    it('reports daemon teardown failure after removing configs and artifacts without resurrecting them', () => {
+    it('reports daemon teardown failure after removing configs and artifacts without resurrecting them', async () => {
         const root = withTempDir('elepha-installer-uninstall-recovery-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -788,7 +855,7 @@ describe('installer transaction', () => {
             },
         };
         const runtime = serviceRuntime(root, executor, 0);
-        installElepha(paths, runtime);
+        await installElepha(paths, runtime);
         const stop = vi.spyOn(runtime.service, 'stop').mockImplementationOnce(() => {
             throw new Error('forced service teardown failure');
         });
@@ -823,7 +890,7 @@ describe('installer transaction', () => {
             },
             0,
         );
-        installElepha(paths, runtime);
+        await installElepha(paths, runtime);
         writeFileSync(runtime.service.launcherPath, '#!/bin/sh\necho "bad Node-version marker" >&2\nexit 66\n');
         const preserved = ['elepha.db', 'elepha.db-wal', 'elepha.db-shm', 'encryption.json'].map((name) =>
             path.join(root, '.elepha', name),
@@ -847,7 +914,7 @@ describe('installer transaction', () => {
         for (const file of preserved) expect(readFileSync(file, 'utf8')).toBe(`untouched: ${file}`);
     });
 
-    it('refuses to install when a leftover rollback journal is malformed', () => {
+    it('refuses to install when a leftover rollback journal is malformed', async () => {
         const root = withTempDir('elepha-installer-malformed-journal-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -858,14 +925,14 @@ describe('installer transaction', () => {
         mkdirSync(path.dirname(transaction), { recursive: true });
         writeFileSync(transaction, '{');
 
-        expect(() => installElepha(paths, { home: root, approvedRoots: 1 })).toThrow(
+        await expect(installElepha(paths, { home: root, approvedRoots: 1 })).rejects.toThrow(
             `install rollback journal is unreadable or malformed: ${transaction}; refusing to proceed with a possibly partial install`,
         );
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe('{"before":true}');
         expect(existsSync(transaction)).toBe(true);
     });
 
-    it('both-present registers both tools and removes only mcpServers.elepha from the user-scoped Claude config', () => {
+    it('both-present registers both tools and removes only mcpServers.elepha from the user-scoped Claude config', async () => {
         const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -878,7 +945,7 @@ describe('installer transaction', () => {
         writeFileSync(paths.claudeMcp, JSON.stringify(claudeConfig));
         writeFileSync(paths.codexConfig, '');
 
-        const result = installElepha(paths, { approvedRoots: 1 });
+        const result = await installElepha(paths, { approvedRoots: 1 });
         expect(result.status.claudeHook).toBe('active');
         expect(result.status.claudeUserPromptSubmitHook).toBe('active');
         expect(result.status.claudeMcp).toBe('registered');
@@ -894,12 +961,12 @@ describe('installer transaction', () => {
         expect(existsSync(path.join(root, '.mcp.json'))).toBe(false);
     });
 
-    it('Claude-only registers Claude without creating or modifying the absent Codex config', () => {
+    it('Claude-only registers Claude without creating or modifying the absent Codex config', async () => {
         const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
 
-        const result = installElepha(paths, { approvedRoots: 1 });
+        const result = await installElepha(paths, { approvedRoots: 1 });
 
         expect(result.status.claudeHook).toBe('active');
         expect(result.status.claudeMcp).toBe('registered');
@@ -909,49 +976,49 @@ describe('installer transaction', () => {
         expect(existsSync(paths.codexConfig)).toBe(false);
     });
 
-    it('uninstalls a single-tool Claude installation without reading the absent Codex config', () => {
+    it('uninstalls a single-tool Claude installation without reading the absent Codex config', async () => {
         const root = withTempDir('elepha-installer-h1-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
 
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
         expect(() => uninstallElepha(paths, { home: root, approvedRoots: 1 })).not.toThrow();
 
         expect(existsSync(paths.codexConfig)).toBe(false);
         expect(uninstallElepha(paths, { home: root, approvedRoots: 1 }).status.claudeHook).toBe('not installed');
     });
 
-    it('deletes a settings file created by elepha when uninstall restores an absent original', () => {
+    it('deletes a settings file created by elepha when uninstall restores an absent original', async () => {
         const root = withTempDir('elepha-installer-h2-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
 
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
         expect(existsSync(paths.claudeSettings)).toBe(true);
         uninstallElepha(paths, { home: root, approvedRoots: 1 });
 
         expect(existsSync(paths.claudeSettings)).toBe(false);
     });
 
-    it('refreshes snapshots on a second install so a later uninstall preserves the user edit', () => {
+    it('refreshes snapshots on a second install so a later uninstall preserves the user edit', async () => {
         const root = withTempDir('elepha-installer-h3-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
         writeFileSync(paths.claudeMcp, JSON.stringify({ mcpServers: { original: { command: 'original' } } }));
 
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
         uninstallElepha(paths, { home: root, approvedRoots: 1 });
         const userEdit = JSON.stringify({ mcpServers: { original: { command: 'original' }, userServer: { command: 'user' } } });
         writeFileSync(paths.claudeMcp, userEdit);
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
         uninstallElepha(paths, { home: root, approvedRoots: 1 });
 
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(userEdit);
     });
 
-    it('removes elepha from a re-install snapshot while preserving a user-added hook group', () => {
+    it('removes elepha from a re-install snapshot while preserving a user-added hook group', async () => {
         const root = withTempDir('elepha-installer-n1-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -959,14 +1026,14 @@ describe('installer transaction', () => {
         writeFileSync(paths.claudeMcp, '{}\n');
         writeFileSync(paths.codexConfig, '');
 
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
         const afterFirst = JSON.parse(readFileSync(paths.claudeSettings, 'utf8')) as {
             hooks: { SessionStart: Array<Record<string, unknown>> };
         };
         afterFirst.hooks.SessionStart.push({ matcher: 'startup', hooks: [{ type: 'command', command: 'other-tool hook' }] });
         writeFileSync(paths.claudeSettings, `${JSON.stringify(afterFirst, null, 2)}\n`);
 
-        expect(installElepha(paths, { home: root, approvedRoots: 1 }).changed).toBe(true);
+        expect((await installElepha(paths, { home: root, approvedRoots: 1 })).changed).toBe(true);
         const result = uninstallElepha(paths, { home: root, approvedRoots: 1 });
         const settings = JSON.parse(readFileSync(paths.claudeSettings, 'utf8')) as {
             hooks: { SessionStart: Array<{ hooks: Array<{ command: string }> }> };
@@ -983,13 +1050,13 @@ describe('installer transaction', () => {
         expect(result.status.codexMcp).toBe('not installed');
     });
 
-    it('keeps config snapshots private to elepha and leaves no sibling backups after install', () => {
+    it('keeps config snapshots private to elepha and leaves no sibling backups after install', async () => {
         const root = withTempDir('elepha-installer-m8-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
         writeFileSync(paths.claudeSettings, '{}');
 
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
 
         expect(existsSync(`${paths.claudeSettings}.bak`)).toBe(false);
         expect(existsSync(`${paths.claudeSettings}.elepha-install.bak`)).toBe(false);
@@ -998,7 +1065,7 @@ describe('installer transaction', () => {
         expect(statSync(path.join(snapshots, readdirSync(snapshots)[0])).mode & 0o777).toBe(0o600);
     });
 
-    it('preserves a symlinked config file when a transaction writes it', () => {
+    it('preserves a symlinked config file when a transaction writes it', async () => {
         const root = withTempDir('elepha-installer-m9-');
         const paths = installPaths(root);
         const target = path.join(root, 'dotfiles', 'settings.json');
@@ -1007,7 +1074,7 @@ describe('installer transaction', () => {
         writeFileSync(target, '{}');
         symlinkSync(target, paths.claudeSettings);
 
-        installElepha(paths, { home: root, approvedRoots: 1 });
+        await installElepha(paths, { home: root, approvedRoots: 1 });
 
         expect(lstatSync(paths.claudeSettings).isSymbolicLink()).toBe(true);
     });
@@ -1045,12 +1112,12 @@ describe('installer transaction', () => {
         expect(calls.some(([verb]) => verb === 'disable')).toBe(true);
     });
 
-    it('Codex-only registers Codex without writing either Claude config', () => {
+    it('Codex-only registers Codex without writing either Claude config', async () => {
         const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         mkdirSync(path.dirname(paths.codexConfig), { recursive: true });
 
-        const result = installElepha(paths, { approvedRoots: 1 });
+        const result = await installElepha(paths, { approvedRoots: 1 });
 
         expect(result.status.claudeHook).toBe('not present');
         expect(result.status.claudeMcp).toBe('not present');
@@ -1060,7 +1127,7 @@ describe('installer transaction', () => {
         expect(existsSync(paths.claudeMcp)).toBe(false);
     });
 
-    it('registers OpenCode MCP only when OpenCode is present and removes it on uninstall', () => {
+    it('registers OpenCode MCP only when OpenCode is present and removes it on uninstall', async () => {
         const scratch = path.resolve(import.meta.dirname, '..', '..', '.test-scratch');
         mkdirSync(scratch, { recursive: true });
         const root = mkdtempSync(path.join(scratch, 'opencode-mcp-installer-'));
@@ -1068,7 +1135,7 @@ describe('installer transaction', () => {
         mkdirSync(paths.opencodeStore, { recursive: true });
 
         try {
-            const installed = installElepha(paths, { home: root, approvedRoots: 1 });
+            const installed = await installElepha(paths, { home: root, approvedRoots: 1 });
 
             expect(installed.status.opencodeMcp).toBe('registered');
             expect(installed.status.opencodePlugin).toBe('installed');
@@ -1076,7 +1143,7 @@ describe('installer transaction', () => {
             expect(readFileSync(pluginFile, 'utf8')).toBe(renderOpencodePlugin(bin));
             expect(integrationHealth(paths).status.opencodePlugin).toBe('installed');
             writeFileSync(path.join(path.dirname(pluginFile), 'user.js'), '// user plugin');
-            expect(installElepha(paths, { home: root, approvedRoots: 1 }).changed).toBe(false);
+            expect((await installElepha(paths, { home: root, approvedRoots: 1 })).changed).toBe(false);
             expect(installed.status.ready).toBe(true);
             expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
                 mcp: {
@@ -1100,28 +1167,31 @@ describe('installer transaction', () => {
         }
     });
 
-    it.each(['', '// user-owned plugin'])('preserves a user-owned OpenCode plugin through install refusal and uninstall: %s', (source) => {
-        const scratch = path.resolve('.test-scratch');
-        mkdirSync(scratch, { recursive: true });
-        const root = mkdtempSync(path.join(scratch, 'opencode-plugin-conflict-'));
-        const paths = installPaths(root);
-        const pluginFile = opencodePluginPath(paths.opencodeConfig);
-        mkdirSync(path.dirname(pluginFile), { recursive: true });
-        mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
-        writeFileSync(pluginFile, source);
-        try {
-            expect(() => installElepha(paths, { home: root, approvedRoots: 1 })).toThrow('user-owned');
-            expect(readFileSync(pluginFile, 'utf8')).toBe(source);
-            expect(existsSync(paths.opencodeConfig)).toBe(false);
-            expect(existsSync(paths.claudeSettings)).toBe(false);
-            uninstallElepha(paths, { home: root, approvedRoots: 1 });
-            expect(readFileSync(pluginFile, 'utf8')).toBe(source);
-        } finally {
-            rmSync(root, { recursive: true, force: true });
-        }
-    });
+    it.each(['', '// user-owned plugin'])(
+        'preserves a user-owned OpenCode plugin through install refusal and uninstall: %s',
+        async (source) => {
+            const scratch = path.resolve('.test-scratch');
+            mkdirSync(scratch, { recursive: true });
+            const root = mkdtempSync(path.join(scratch, 'opencode-plugin-conflict-'));
+            const paths = installPaths(root);
+            const pluginFile = opencodePluginPath(paths.opencodeConfig);
+            mkdirSync(path.dirname(pluginFile), { recursive: true });
+            mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
+            writeFileSync(pluginFile, source);
+            try {
+                await expect(installElepha(paths, { home: root, approvedRoots: 1 })).rejects.toThrow('user-owned');
+                expect(readFileSync(pluginFile, 'utf8')).toBe(source);
+                expect(existsSync(paths.opencodeConfig)).toBe(false);
+                expect(existsSync(paths.claudeSettings)).toBe(false);
+                uninstallElepha(paths, { home: root, approvedRoots: 1 });
+                expect(readFileSync(pluginFile, 'utf8')).toBe(source);
+            } finally {
+                rmSync(root, { recursive: true, force: true });
+            }
+        },
+    );
 
-    it('updates a stale plugin with the managed launcher and retains a user replacement on uninstall', () => {
+    it('updates a stale plugin with the managed launcher and retains a user replacement on uninstall', async () => {
         const scratch = path.resolve('.test-scratch');
         mkdirSync(scratch, { recursive: true });
         const root = mkdtempSync(path.join(scratch, 'opencode-plugin-update-'));
@@ -1138,7 +1208,7 @@ describe('installer transaction', () => {
         };
         try {
             const runtime = serviceRuntime(root, service, 0);
-            const installed = installElepha(paths, runtime);
+            const installed = await installElepha(paths, runtime);
             expect(readFileSync(pluginFile, 'utf8')).toBe(renderOpencodePlugin(installed.launcher!));
             expect(installed.status.opencodePlugin).toBe('installed');
             writeFileSync(pluginFile, '// user replacement');
@@ -1149,7 +1219,7 @@ describe('installer transaction', () => {
         }
     });
 
-    it('does not create opencode.json when another supported tool is present but OpenCode is absent', () => {
+    it('does not create opencode.json when another supported tool is present but OpenCode is absent', async () => {
         const scratch = path.resolve(import.meta.dirname, '..', '..', '.test-scratch');
         mkdirSync(scratch, { recursive: true });
         const root = mkdtempSync(path.join(scratch, 'opencode-mcp-absent-'));
@@ -1157,7 +1227,7 @@ describe('installer transaction', () => {
         mkdirSync(path.dirname(paths.claudeSettings), { recursive: true });
 
         try {
-            const installed = installElepha(paths, { home: root, approvedRoots: 1 });
+            const installed = await installElepha(paths, { home: root, approvedRoots: 1 });
 
             expect(installed.status.opencodeMcp).toBe('not present');
             expect(installed.status.opencodePlugin).toBe('not present');
@@ -1168,11 +1238,11 @@ describe('installer transaction', () => {
         }
     });
 
-    it('refuses when neither supported tool is present without writing a config', () => {
+    it('refuses when neither supported tool is present without writing a config', async () => {
         const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
 
-        expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow(
+        await expect(installElepha(paths, { approvedRoots: 1 })).rejects.toThrow(
             'no supported tool found; install Claude Code or Codex or OpenCode first',
         );
         expect(existsSync(paths.claudeSettings)).toBe(false);
@@ -1184,7 +1254,7 @@ describe('installer transaction', () => {
     it.each([
         ['malformed', '{'],
         ['user-owned conflict', JSON.stringify({ mcpServers: { elepha: { command: 'other' } } })],
-    ])('refuses a %s Claude user config before writing any transaction file', (_case, claudeMcp) => {
+    ])('refuses a %s Claude user config before writing any transaction file', async (_case, claudeMcp) => {
         const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -1193,13 +1263,13 @@ describe('installer transaction', () => {
         writeFileSync(paths.claudeMcp, before.claudeMcp);
         writeFileSync(paths.codexConfig, before.codexConfig);
 
-        expect(() => installElepha(paths, { approvedRoots: 1 })).toThrow();
+        await expect(installElepha(paths, { approvedRoots: 1 })).rejects.toThrow();
         expect(readFileSync(paths.claudeSettings, 'utf8')).toBe(before.claudeSettings);
         expect(readFileSync(paths.claudeMcp, 'utf8')).toBe(before.claudeMcp);
         expect(readFileSync(paths.codexConfig, 'utf8')).toBe(before.codexConfig);
     });
 
-    it('preserves a sanitized real-world Codex config when uninstalling an approved elepha hook', () => {
+    it('preserves a sanitized real-world Codex config when uninstalling an approved elepha hook', async () => {
         const root = withTempDir('elepha-installer-');
         const paths = installPaths(root);
         createConfigDirectories(paths);
@@ -1245,7 +1315,7 @@ trust_level = "untrusted"
         writeFileSync(paths.claudeMcp, '{}');
         writeFileSync(paths.codexConfig, codexConfig);
 
-        installElepha(paths, { approvedRoots: 1 });
+        await installElepha(paths, { approvedRoots: 1 });
         const approvedKey = `${paths.codexConfig}:session_start:0:0`;
         const installed = readFileSync(paths.codexConfig, 'utf8');
         const approval = `[hooks.state."${approvedKey}"]

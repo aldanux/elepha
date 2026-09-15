@@ -2,6 +2,7 @@ import type { Command } from 'commander';
 import { uninstallElepha } from '../../install/installer.js';
 import { errorMessage } from '../../util/error.js';
 import { printInstallation } from '../shared.js';
+import { registerUninstallMemoryPlus } from './uninstall-memory-plus.js';
 
 export function registerUninstall(program: Command): void {
     const hook = program.commands.find((command) => command.name() === 'hook');
@@ -9,7 +10,8 @@ export function registerUninstall(program: Command): void {
         throw new Error('Uninstall hooks require the hidden hook command to be registered first.');
     }
 
-    program.command('uninstall').description('Remove only elepha global registrations').action(runUninstall);
+    const uninstall = program.command('uninstall').description('Remove only elepha global registrations').action(runUninstall);
+    registerUninstallMemoryPlus(uninstall);
     hook.command('uninstall').action(runUninstall);
 }
 

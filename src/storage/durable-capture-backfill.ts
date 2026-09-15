@@ -4,6 +4,7 @@ import type { FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import type { ToolName } from '../types/index.js';
 import type { ConsentStore } from './consent-store.js';
 import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
+import { SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 
 export interface DurableCaptureBackfillSession {
     id: number;
@@ -52,6 +53,7 @@ export class DurableCaptureBackfillStore {
                  FROM sessions s
                  LEFT JOIN durable_capture_status dcs ON dcs.session_id = s.id
                  WHERE s.project_id IN (${placeholders})
+                   AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                    AND EXISTS (SELECT 1 FROM memories m WHERE m.session_id = s.id)
                    AND (
                        dcs.state = 'backfilling'
@@ -121,6 +123,9 @@ export class DurableCaptureBackfillStore {
         evictionPlan?: DurableEvictionPlan,
     ): DurableCaptureBackfillRecordResult {
         const record = this.db.transaction((): DurableCaptureBackfillRecordResult => {
+            if (!this.isAuthorizedSession(session)) {
+                return { state: 'unauthorized' };
+            }
             const memory = this.db
                 .prepare(
                     `SELECT m.id AS memory_id, m.session_id, p.path AS project_path
@@ -128,6 +133,7 @@ export class DurableCaptureBackfillStore {
                      JOIN sessions s ON s.id = m.session_id
                      JOIN projects p ON p.id = m.project_id
                      WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ?
+                       AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                      LIMIT 1`,
                 )
                 .get(session.tool, session.nativeId, turnIndex) as MemoryIdentity | undefined;
@@ -178,7 +184,7 @@ export class DurableCaptureBackfillStore {
                         `SELECT s.tool, s.native_id, p.path AS project_path
                          FROM sessions s
                          JOIN projects p ON p.id = s.project_id
-                         WHERE s.id = ?`,
+                         WHERE s.id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
                     )
                     .get(sessionId) as { tool: ToolName; native_id: string; project_path: string } | undefined;
                 if (
@@ -218,7 +224,7 @@ export class DurableCaptureBackfillStore {
                 `SELECT s.project_id, s.tool, s.native_id, s.source_path, p.path AS project_path
                  FROM sessions s
                  JOIN projects p ON p.id = s.project_id
-                 WHERE s.id = ?`,
+                 WHERE s.id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
             )
             .get(session.id) as
             | { project_id: number; tool: ToolName; native_id: string; source_path: string; project_path: string }

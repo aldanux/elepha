@@ -22,6 +22,9 @@ export const RESUME_TOKEN_BUDGET = 400_000;
 export const RESUME_CHAR_BUDGET = RESUME_TOKEN_BUDGET * CHARS_PER_TOKEN;
 export const DURABLE_CAPTURE_MAX_BYTES = 1024 * 1024 * 1024;
 export const DURABLE_CAPTURE_FILTER_VERSION = 1;
+// Structural offsets retain whole final messages without duplicating their
+// text. Bound metadata independently when a turn contains many messages.
+export const ASSISTANT_STRUCTURE_MAX_FINALS = 256;
 export const DURABLE_CAPTURE_STATES = [
     'complete',
     'complete_truncated',
@@ -164,6 +167,12 @@ export const FINGERPRINT_WINDOW_BYTES = 4096;
 export const MAX_TRANSCRIPT_RECORD_BYTES = 64 * 1024 * 1024;
 export const MAX_METADATA_SCAN_BYTES = 4 * 1024 * 1024;
 export const MAX_METADATA_SCAN_LINES = 2_048;
+// Revision of historical guardian exclusion, not full reclassification.
+// Repair consumes a bounded preamble, never turns.
+export const SESSION_KIND_REVISION = 1;
+export const SESSION_KIND_RECONCILIATION_BATCH_SIZE = 25;
+export const SESSION_KIND_RECONCILIATION_BUDGET_MS = 5_000;
+export const SESSION_KIND_PREAMBLE_MAX_BYTES = 1024 * 1024;
 export const MAX_JSON_VALUE_DEPTH = 64;
 export const MAX_JSON_VALUE_NODES = 100_000;
 export const REFUSED_HOME_PROJECT_ROOTS = ['', 'Documents', 'Desktop', 'Downloads'] as const;
@@ -185,19 +194,44 @@ export const SYSTEMD_UMASK = '0077';
 
 // Manual embedding jobs keep one source and one model input resident at a time.
 export const EMBEDDING_SESSION_PAGE_SIZE = 100;
+// Leave room for the fixed tool and project parameters under SQLite's variable limit.
+export const SESSION_ELIGIBILITY_BATCH_SIZE = 500;
 // Retrieval was evaluated by presence among the five nearest sessions.
 export const SEMANTIC_RECALL_MAX_HITS = 5;
-// Unsolicited candidates require near-identical vector direction; interactive
-// retrieval has no cosine floor. This conservative bar favors missed candidates.
-export const AUTOMATIC_RECALL_MIN_SIMILARITY = 0.95;
+// Bound synchronous cache traversal, including stale and out-of-scope rows.
+export const SEMANTIC_SCAN_MAX_ROWS = 1_000;
+// Check between rows because a blocked event loop cannot run the hook watchdog.
+export const SEMANTIC_SCAN_BUDGET_MS = 100;
+// Interactive retrieval has no cosine floor. Correct multilingual paraphrase
+// hits measured 0.79 to 0.88 against real rollups, so 0.95 admitted none of them.
+// Similarity ranks reliably but is not calibrated confidence; noise is bounded
+// by the per-chat cap rather than by this number.
+export const AUTOMATIC_RECALL_MIN_SIMILARITY = 0.8;
+// Cap what cannot be calibrated: a chat receives at most this many automatic
+// candidates in total, and explicit recall stays available afterwards.
+export const AUTOMATIC_RECALL_MAX_PER_CHAT = 3;
+// Match today's semantic shortlist while keeping hook work bounded if retrieval grows.
+export const AUTOMATIC_RECALL_MAX_CANDIDATES = 5;
 export const AUTOMATIC_RECALL_MAX_PROMPT_CHARS = 4_000;
-export const AUTOMATIC_RECALL_MAX_CONTEXT_CHARS = 2_000;
+// A complete production payload measured 2,854 characters and needed a
+// 2,855-character cap because selection reserves one character. A 3,000
+// cap provides bounded headroom without truncating structural finals.
+export const AUTOMATIC_RECALL_MAX_CONTEXT_CHARS = 3_000;
+// Query-aware expansion shares the automatic evidence source selection.
+export const SESSION_EVIDENCE_MAX_CONTEXT_CHARS = 4_000;
+export const SESSION_EVIDENCE_MAX_QUERY_CHARS = 4_000;
+export const SESSION_EVIDENCE_EXCERPT_CHARS = 800;
+// A directed first-interaction read stops once found, or at this byte ceiling.
+export const SESSION_EVIDENCE_SOURCE_MAX_BYTES = 4 * 1024 * 1024;
 export const EMBEDDING_LOCAL_MAX_TOKENS = 512;
 export const EMBEDDING_CHUNK_CHARACTERS = 1000;
 export const EMBEDDING_API_TIMEOUT_MS = 30_000;
 export const EMBEDDING_API_RESPONSE_BYTES = 128 * 1024;
 export const EMBEDDING_LOCAL_DIMENSIONS = 384;
 export const EMBEDDING_API_DIMENSIONS = 1536;
+// Check in SQLite before transferring a BLOB; a row limit alone cannot bound a
+// malformed vector. Both supported models fit this float32 payload ceiling.
+export const SEMANTIC_SCAN_MAX_VECTOR_BYTES = Math.max(EMBEDDING_LOCAL_DIMENSIONS, EMBEDDING_API_DIMENSIONS) * 4;
 
 // Keep optional runtime upgrades within the supported Transformers major.
 export const MEMORY_PLUS_TRANSFORMERS_MIN_VERSION = '4.2.0';

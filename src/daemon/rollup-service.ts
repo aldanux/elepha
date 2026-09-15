@@ -13,6 +13,7 @@ import { dedupePaths } from '../config/paths.js';
 import type { MemoryRow, MemoryStore, SessionRow } from '../storage/memory-store.js';
 import { type AuthenticatedReadGeneration, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { mergeRollupContent, ROLLUP_VERSION, type RollupDecision, type RollupStore } from '../storage/rollup-store.js';
+import { isSessionKindEligible } from '../storage/session-read-model.js';
 import { chunkTurns, type RollupTurnInput } from '../summarizer/rollup-prompt.js';
 import { attributeDecisions, attributeInstructions, type RollupProvider } from '../summarizer/rollup-provider.js';
 import type { SessionKind } from '../types/index.js';
@@ -120,6 +121,9 @@ export class RollupService {
         generation: AuthenticatedReadGeneration,
         progress: { wrote: boolean },
     ): Promise<RollupOutcome> {
+        if (!isSessionKindEligible(this.store.database, session.id)) {
+            return { wrote: false, complete: false };
+        }
         const sourceRevision = sourceGeneration(this.store, session.tool, session.native_id);
         const all = this.store.listMemoriesForSession(session.id);
         if (all.length === 0) {
@@ -182,6 +186,9 @@ export class RollupService {
         let wroteAny = false;
 
         for (const [index, batch] of batches.entries()) {
+            if (!isSessionKindEligible(this.store.database, session.id)) {
+                return { wrote: wroteAny, complete: false };
+            }
             if (batch.omitted > 0) {
                 // A single turn too large for one batch is the one irreducible
                 // ceiling. It binds from the oldest end and it is never silent.
@@ -223,6 +230,10 @@ export class RollupService {
             );
             if (result === undefined) {
                 return { wrote: wroteAny, complete: false, deferred: 'locked' };
+            }
+
+            if (!isSessionKindEligible(this.store.database, session.id)) {
+                return { wrote: wroteAny, complete: false };
             }
 
             if (result.status !== 'ok') {

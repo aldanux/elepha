@@ -2,11 +2,13 @@ import type { Stats } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import {
+    ASSISTANT_STRUCTURE_MAX_FINALS,
     DURABLE_CAPTURE_FILTER_VERSION,
     DURABLE_CAPTURE_MAX_BYTES,
     type DurableCaptureState,
     SESSION_CHAR_BUDGET,
 } from '../config/constants.js';
+import { transformAssistantStructure } from '../rendering/assistant-structure.js';
 import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import {
     openProviderTranscript,
@@ -186,6 +188,7 @@ type ProjectionEntry = MutableTextEntry | ToolEntry;
 interface StoredProjection {
     userPrompt: string;
     assistantResponse: string;
+    assistantStructure: string | null;
     toolCalls: FilterableToolCall[];
     omittedBeforeChars: number;
     droppedToolRefCount: number;
@@ -239,7 +242,9 @@ function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredP
     };
 
     const userPrompt = appendText(projection.userPrompt);
+    const sanitizedAssistantLength = escapeShellSyntax(projection.assistantResponse).length;
     const assistantResponse = appendText(projection.assistantResponse);
+    const structure = transformAssistantStructure(projection.assistantResponse, projection.assistantStructure, escapeShellSyntax);
     for (const call of projection.toolCalls) {
         const value = {
             name: escapeShellSyntax(call.name),
@@ -251,9 +256,23 @@ function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredP
         enforceBound();
     }
 
+    const retainedAssistant = entries.includes(assistantResponse) ? assistantResponse.value : '';
+    const droppedAssistantChars = sanitizedAssistantLength - retainedAssistant.length;
+    const retainedFinals = structure?.finals
+        .filter(([start]) => start >= droppedAssistantChars)
+        .map(([start, end]): [number, number] => [start - droppedAssistantChars, end - droppedAssistantChars])
+        .slice(-ASSISTANT_STRUCTURE_MAX_FINALS);
     return {
         userPrompt: entries.includes(userPrompt) ? userPrompt.value : '',
-        assistantResponse: entries.includes(assistantResponse) ? assistantResponse.value : '',
+        assistantResponse: retainedAssistant,
+        assistantStructure:
+            structure === undefined || retainedFinals === undefined
+                ? null
+                : JSON.stringify({
+                      ...structure,
+                      finals: retainedFinals,
+                      omitted: structure.omitted + structure.finals.length - retainedFinals.length,
+                  }),
         toolCalls: entries.flatMap((entry) => (entry.kind === 'tool' ? [entry.value] : [])),
         omittedBeforeChars,
         droppedToolRefCount,
@@ -263,10 +282,11 @@ function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredP
 function storedProjectionBytes(projection: FilteredTurnProjection): number {
     const stored = projection.included
         ? boundedSanitizedProjection(projection)
-        : { userPrompt: '', assistantResponse: '', toolCalls: [], omittedBeforeChars: 0, droppedToolRefCount: 0 };
+        : { userPrompt: '', assistantResponse: '', assistantStructure: null, toolCalls: [], omittedBeforeChars: 0, droppedToolRefCount: 0 };
     return (
         Buffer.byteLength(stored.userPrompt) +
         Buffer.byteLength(stored.assistantResponse) +
+        Buffer.byteLength(stored.assistantStructure ?? '') +
         Buffer.byteLength(JSON.stringify(stored.toolCalls))
     );
 }
@@ -284,9 +304,9 @@ export class DurableCaptureStore {
         this.insertFilteredTurn = db.prepare(
             `INSERT INTO filtered_turns
              (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
-              dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+              dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at, assistant_structure)
              VALUES (@memory_id, @included, @user_prompt, @assistant_response, @tool_calls, @omitted_tool_call_count,
-                     @dropped_tool_ref_count, @omitted_before_chars, @filter_version, @captured_at)`,
+                     @dropped_tool_ref_count, @omitted_before_chars, @filter_version, @captured_at, @assistant_structure)`,
         );
         this.sessionCaptureState = db.prepare(
             `SELECT CASE
@@ -339,12 +359,25 @@ export class DurableCaptureStore {
         }
         const stored = projection.included
             ? boundedSanitizedProjection(projection)
-            : { userPrompt: '', assistantResponse: '', toolCalls: [], omittedBeforeChars: 0, droppedToolRefCount: 0 };
+            : {
+                  userPrompt: '',
+                  assistantResponse: '',
+                  assistantStructure: null,
+                  toolCalls: [],
+                  omittedBeforeChars: 0,
+                  droppedToolRefCount: 0,
+              };
+        if (projection.included && projection.assistantStructure !== undefined && stored.assistantStructure === null) {
+            console.warn(
+                `[elepha] assistant phase mapping unavailable after sanitizing session ${sessionId}, memory ${memoryId}; response unclassified`,
+            );
+        }
         this.insertFilteredTurn.run({
             memory_id: memoryId,
             included: projection.included ? 1 : 0,
             user_prompt: stored.userPrompt,
             assistant_response: stored.assistantResponse,
+            assistant_structure: stored.assistantStructure,
             tool_calls: JSON.stringify(stored.toolCalls),
             omitted_tool_call_count: projection.included ? projection.omittedToolCallCount : 0,
             dropped_tool_ref_count: stored.droppedToolRefCount,

@@ -1,4 +1,5 @@
 import { DURABLE_CAPTURE_FILTER_VERSION } from '../config/constants.js';
+import { type AssistantStructure, transformAssistantStructure } from './assistant-structure.js';
 
 export interface FilterableToolCall {
     name: string;
@@ -6,8 +7,10 @@ export interface FilterableToolCall {
 }
 
 export interface FilterableTurn {
+    sourcePath?: string;
     userMessage: string;
     assistantText: string;
+    assistantStructure?: AssistantStructure;
     toolCalls: FilterableToolCall[];
 }
 
@@ -16,6 +19,7 @@ export interface FilteredTurnProjection {
     included: boolean;
     userPrompt: string;
     assistantResponse: string;
+    assistantStructure?: AssistantStructure;
     toolCalls: FilterableToolCall[];
     omittedToolCallCount: number;
 }
@@ -36,7 +40,8 @@ function withoutMemoryCitations(text: string): string {
 
 export function filterTurn(turn: FilterableTurn): FilteredTurnProjection {
     const userPrompt = withoutMemoryCitations(turn.userMessage).trim();
-    const assistantResponse = withoutMemoryCitations(turn.assistantText).trim();
+    const assistantText = turn.assistantText;
+    const assistantResponse = withoutMemoryCitations(assistantText).trim();
     const included = !(turn.toolCalls.length === 0 && EXPLICIT_PAUSE_REQUEST.test(userPrompt));
     if (!included) {
         return {
@@ -52,11 +57,18 @@ export function filterTurn(turn: FilterableTurn): FilteredTurnProjection {
     const toolCalls = turn.toolCalls
         .filter((call) => call.filePaths.length > 0)
         .map((call) => ({ name: call.name, filePaths: [...call.filePaths] }));
+    const assistantStructure = transformAssistantStructure(assistantText, turn.assistantStructure, withoutMemoryCitations, true);
+    if (turn.assistantStructure !== undefined && assistantStructure === undefined) {
+        console.warn(
+            `[elepha] assistant phase mapping unavailable after filtering in ${turn.sourcePath ?? 'stored turn'}; response unclassified`,
+        );
+    }
     return {
         filterVersion: DURABLE_CAPTURE_FILTER_VERSION,
         included: true,
         userPrompt,
         assistantResponse,
+        assistantStructure,
         toolCalls,
         omittedToolCallCount: turn.toolCalls.length - toolCalls.length,
     };
