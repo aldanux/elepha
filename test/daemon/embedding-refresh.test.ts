@@ -130,7 +130,7 @@ describe('automatic daemon embedding refresh', () => {
             // The in-flight native call can finish, but the generator's use-time
             // setting check prevents its write and stops the rest of the pass.
             await vi.waitFor(() => expect(f.errors).toHaveLength(1));
-            expect(f.errors[0]).toContain('"Memory-Plus" is off');
+            expect(f.errors[0]).toContain('Memory-Plus is off');
             expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual(vectors);
             expect(f.db.prepare('SELECT session_id FROM session_embeddings WHERE session_id = ?').get(pending.id)).toBeUndefined();
             await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS * 2);

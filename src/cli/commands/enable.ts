@@ -9,11 +9,11 @@ import { errorMessage } from '../../util/error.js';
 import { startCliProgress } from '../progress.js';
 import { confirmYesNo } from '../shared.js';
 
-export const MEMORY_PLUS_INTRO = 'elepha\'s "Memory-Plus" finds past sessions by meaning, not just matching words. Works in any language.';
+export const MEMORY_PLUS_INTRO = "elepha's Memory-Plus finds past sessions by meaning, not just matching words. Works in any language.";
 export const MEMORY_PLUS_LOCAL_NOTICE =
     'Downloads a small AI model once (~113MB), runs locally, uses ~1GB of memory while active. No session data leaves your machine.';
 export const MEMORY_PLUS_CONFIRM = 'Continue? [y/N] ';
-export const MEMORY_PLUS_PROBE = 'elepha\'s "Memory-Plus" setup check';
+export const MEMORY_PLUS_PROBE = "elepha's Memory-Plus setup check";
 
 export async function enableMemoryPlus(
     options: {
@@ -31,14 +31,14 @@ export async function enableMemoryPlus(
     log(MEMORY_PLUS_LOCAL_NOTICE);
     log('');
     if (!(await (options.confirm ?? confirmYesNo)(MEMORY_PLUS_CONFIRM))) {
-        log('Cancelled. elepha\'s "Memory-Plus" settings were not changed.');
+        log("Cancelled. elepha's Memory-Plus settings were not changed.");
         return false;
     }
     let provider: EmbeddingProvider | undefined;
     // Both setup steps block for minutes on a first run — npm resolves the
     // runtime, then the probe downloads the model — so each gets the same
     // loader `elepha install` uses instead of a bare line and a silent wait.
-    const runtime = startCliProgress('Installing elepha\'s "Memory-Plus" local runtime');
+    const runtime = startCliProgress("Installing elepha's Memory-Plus local runtime");
     try {
         await (options.installDependency ?? installMemoryPlusDependency)();
         runtime.done();
@@ -47,7 +47,7 @@ export async function enableMemoryPlus(
         disableAfterFailedSetup(options.configPath);
         throw error;
     }
-    const setup = startCliProgress('Verifying elepha\'s "Memory-Plus" setup');
+    const setup = startCliProgress("Verifying elepha's Memory-Plus setup");
     try {
         provider = await (options.createProvider ?? createEmbeddingProvider)(true);
         if (provider === undefined) {
@@ -69,7 +69,7 @@ export async function enableMemoryPlus(
     }
     // Setup succeeded. A partial backfill keeps both the opt-in and completed
     // vectors so the next automatic pass (or an explicit retry) can resume.
-    const indexing = startCliProgress('Indexing existing sessions for elepha\'s "Memory-Plus"');
+    const indexing = startCliProgress("Indexing existing sessions for elepha's Memory-Plus");
     try {
         const db = await (options.openDatabase ?? openDb)();
         try {
@@ -82,7 +82,7 @@ export async function enableMemoryPlus(
             // Printed rather than folded into the loader line: the counts are a
             // result, and the loader renders nothing on a non-TTY stdout.
             log(
-                `elepha's "Memory-Plus" enabled. ${result.generated} sessions indexed, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference). New and updated sessions will be indexed automatically.`,
+                `elepha's Memory-Plus enabled. ${result.generated} sessions indexed, ${result.current} already current, ${result.ineligibleOrEmpty} ineligible or empty sessions skipped, ${result.sourceChanged} changed (retry next pass), ${result.failed} malformed (no inference). New and updated sessions will be indexed automatically.`,
             );
         } finally {
             db.close();
@@ -90,7 +90,7 @@ export async function enableMemoryPlus(
     } catch (error) {
         indexing.fail();
         throw new Error(
-            `elepha's "Memory-Plus" remains enabled, but initial indexing failed: ${errorMessage(error)} Completed vectors are retained. Automatic indexing will retry; run elepha embeddings to retry now.`,
+            `elepha's Memory-Plus remains enabled, but initial indexing failed: ${errorMessage(error)} Completed vectors are retained. Automatic indexing will retry; run elepha embeddings to retry now.`,
             { cause: error },
         );
     }
@@ -115,7 +115,7 @@ export function registerEnable(program: Command): void {
             try {
                 await enableMemoryPlus();
             } catch (error) {
-                console.error(`elepha's "Memory-Plus" setup failed: ${errorMessage(error)}`);
+                console.error(`elepha's Memory-Plus setup failed: ${errorMessage(error)}`);
                 process.exitCode = 1;
             }
         });

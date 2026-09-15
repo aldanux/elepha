@@ -25,7 +25,7 @@ export async function uninstallMemoryPlus(
         if (getSetting('memory-plus', {}, configPath).value) {
             setSetting('memory-plus', 'false', configPath);
         }
-        log(`elepha's "Memory-Plus" runtime is already uninstalled. Memory-Plus is off. ${MEMORY_PLUS_UNINSTALL_RETENTION}`);
+        log(`elepha's Memory-Plus runtime is already uninstalled. Memory-Plus is off. ${MEMORY_PLUS_UNINSTALL_RETENTION}`);
         return true;
     }
     const assertPlan = () => {
@@ -73,7 +73,7 @@ export async function uninstallMemoryPlus(
             cause: error,
         });
     }
-    log(`elepha's "Memory-Plus" runtime removed. Memory-Plus is off. ${MEMORY_PLUS_UNINSTALL_RETENTION}`);
+    log(`elepha's Memory-Plus runtime removed. Memory-Plus is off. ${MEMORY_PLUS_UNINSTALL_RETENTION}`);
     return true;
 }
 
@@ -85,7 +85,7 @@ export function registerUninstallMemoryPlus(uninstall: Command): void {
             try {
                 await uninstallMemoryPlus();
             } catch (error) {
-                console.error(`elepha's "Memory-Plus" uninstall failed: ${errorMessage(error)}`);
+                console.error(`elepha's Memory-Plus uninstall failed: ${errorMessage(error)}`);
                 process.exitCode = 1;
             }
         });

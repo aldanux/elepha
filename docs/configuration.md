@@ -98,7 +98,7 @@ Run `elepha enable memory-plus` and confirm the setup notice.
 Setup installs the optional Transformers runtime under
 `ELEPHA_HOME/memory-plus` (normally `~/.elepha/memory-plus`), with extra ONNX
 binary downloads disabled. Normal elepha installs do not include this package.
-`elepha self-update` refreshes compatible runtime releases when "Memory-Plus" is
+`elepha self-update` refreshes compatible runtime releases when Memory-Plus is
 enabled; a failed refresh is reported without failing the elepha update. Setup loads `Xenova/multilingual-e5-small` (q8, CPU) and caches
 its files under `ELEPHA_HOME/models/embeddings` (normally
 `~/.elepha/models/embeddings`). Model weights download once (~113MB); the active
@@ -115,8 +115,8 @@ from local recall and replaced on the next successful indexing pass. If the loca
 runtime is not installed, run `elepha enable memory-plus` to install it and rebuild
 the index.
 
-The daemon checks for missing or stale vectors every minute while Memory
-Plus is enabled and memory is unlocked. Passes never overlap. The model is shared
+The daemon checks for missing or stale vectors every minute while Memory-Plus
+is enabled and memory is unlocked. Passes never overlap. The model is shared
 within each pass and released afterward; local loading and tokenization run in a
 worker thread so they cannot block the capture event loop. Failed passes are
 reported in the daemon log and retried on the next interval.

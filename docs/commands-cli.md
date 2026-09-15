@@ -116,7 +116,7 @@ Full guide: [docs/troubleshooting.md](troubleshooting.md).
 
 ### `elepha enable memory-plus`
 
-Confirm optional "Memory-Plus" setup, verify the local multilingual model,
+Confirm optional Memory-Plus setup, verify the local multilingual model,
 enable the setting after provider verification,
 and index all eligible existing history before returning. Progress and indexed
 session counts are displayed. New or updated history is indexed automatically by
@@ -129,7 +129,7 @@ for the resource costs.
 
 Advanced repair command; normal setup and ongoing indexing are automatic.
 Manually generate versioned vectors from currently permitted stored session
-metadata. Requires "Memory-Plus" to be enabled and memory to be unlocked.
+metadata. Requires Memory-Plus to be enabled and memory to be unlocked.
 Existing current vectors are skipped; `--rebuild` regenerates all eligible vectors
 without changing source material. API mode always requires confirmation before
 sending session content to OpenAI. Neither command changes hooks or search ranking.

@@ -95,7 +95,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-describe('"Memory-Plus" opt-in and provider boundary', () => {
+describe('Memory-Plus opt-in and provider boundary', () => {
     it.each([{}, { OPENAI_API_KEY: 'present' }])('does no provider or storage work while disabled (%j)', async (environment) => {
         const f = fixture();
         const factory = vi.fn();
@@ -107,11 +107,9 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         vi.stubEnv('OPENAI_API_KEY', environment.OPENAI_API_KEY);
         expect(embeddingConfiguration(false)).toBeUndefined();
         expect(await createEmbeddingProvider(false)).toBeUndefined();
-        await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider: factory })).rejects.toThrow(
-            '"Memory-Plus" is off',
-        );
+        await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider: factory })).rejects.toThrow('Memory-Plus is off');
         expect(factory).not.toHaveBeenCalled();
-        expect(f.embeddings.source.bind(f.embeddings, f.session.id)).toThrow('"Memory-Plus" is off');
+        expect(f.embeddings.source.bind(f.embeddings, f.session.id)).toThrow('Memory-Plus is off');
         expect(f.db.prepare('SELECT * FROM session_embeddings').all()).toEqual([]);
         expect(existsSync(f.configPath)).toBe(false);
     });
@@ -139,7 +137,7 @@ describe('"Memory-Plus" opt-in and provider boundary', () => {
         expect(existsSync(configPath)).toBe(false);
     });
 
-    it.each([false, true])('leaves "Memory-Plus" off when package installation fails (previously enabled: %s)', async (enabled) => {
+    it.each([false, true])('leaves Memory-Plus off when package installation fails (previously enabled: %s)', async (enabled) => {
         const f = fixture();
         if (enabled) setSetting('memory-plus', 'true', f.configPath);
         const createProvider = vi.fn();

@@ -30,7 +30,7 @@ export function loadLocalRuntime(): TransformersRuntime {
         }
         return runtime;
     } catch (error) {
-        throw new Error(`elepha's "Memory-Plus" local runtime is missing or could not be loaded. ${MEMORY_PLUS_INSTALL_HINT}`, {
+        throw new Error(`elepha's Memory-Plus local runtime is missing or could not be loaded. ${MEMORY_PLUS_INSTALL_HINT}`, {
             cause: error,
         });
     }

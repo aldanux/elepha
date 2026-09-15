@@ -8,7 +8,7 @@ export function disableMemoryPlus(options: { configPath?: string; log?: (message
         setSetting('memory-plus', 'false', options.configPath);
     }
     (options.log ?? console.log)(
-        `elepha's "Memory-Plus" ${enabled ? 'disabled' : 'is already off'}. Stored vectors and the local runtime are retained.`,
+        `elepha's Memory-Plus ${enabled ? 'disabled' : 'is already off'}. Stored vectors and the local runtime are retained.`,
     );
 }
 
@@ -22,7 +22,7 @@ export function registerDisable(program: Command): void {
             try {
                 disableMemoryPlus();
             } catch (error) {
-                console.error(`elepha's "Memory-Plus" disable failed: ${errorMessage(error)}`);
+                console.error(`elepha's Memory-Plus disable failed: ${errorMessage(error)}`);
                 process.exitCode = 1;
             }
         });

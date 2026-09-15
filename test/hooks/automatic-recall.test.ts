@@ -101,7 +101,7 @@ afterEach(() => {
     vi.unstubAllEnvs();
 });
 
-describe('automatic "Memory-Plus" candidates', () => {
+describe('automatic Memory-Plus candidates', () => {
     it('returns the exact off result without opening the database, constructing a provider, embedding or scanning', async () => {
         const f = fixture();
         setSetting('memory-plus', 'false', f.configPath);
@@ -330,7 +330,7 @@ describe('automatic "Memory-Plus" candidates', () => {
         expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
     });
 
-    it('does not inject when "Memory-Plus" is disabled during inference', async () => {
+    it('does not inject when Memory-Plus is disabled during inference', async () => {
         const f = fixture();
         vi.mocked(f.provider.embed).mockImplementation(async () => {
             setSetting('memory-plus', 'false', f.configPath);

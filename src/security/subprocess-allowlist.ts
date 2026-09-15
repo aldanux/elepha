@@ -584,7 +584,7 @@ export async function npmViewMemoryPlusLatestAsync(invocation: NpmInvocation): P
                 version.localeCompare(MEMORY_PLUS_TRANSFORMERS_MIN_VERSION, 'en', { numeric: true }) < 0,
         )
     ) {
-        throw new Error('npm view elepha\'s "Memory-Plus" returned an invalid or incompatible version');
+        throw new Error("npm view elepha's Memory-Plus returned an invalid or incompatible version");
     }
     return (versions as string[]).sort((left, right) => right.localeCompare(left, 'en', { numeric: true }))[0];
 }
