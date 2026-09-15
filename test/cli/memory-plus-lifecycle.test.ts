@@ -16,6 +16,7 @@ import { elephaPaths } from '../../src/config/paths.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { generateEmbeddings } from '../../src/embeddings/generate.js';
 import { embeddingConfiguration } from '../../src/embeddings/provider-config.js';
+import { memoryPlusRenamedReport, memoryPlusRenameFailureReport } from '../../src/embeddings/uninstall.js';
 import * as installer from '../../src/install/installer.js';
 import * as backup from '../../src/storage/backup.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -115,6 +116,7 @@ describe('Memory-Plus disable and runtime uninstall', () => {
             return true;
         });
         const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+        const rename = vi.spyOn(fs, 'renameSync');
         const remove = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
             expect(getSetting('memory-plus').value).toBe(false);
             expect(backup.listManagedBackups(f.dbPath)).toHaveLength(1);
@@ -122,7 +124,14 @@ describe('Memory-Plus disable and runtime uninstall', () => {
         });
         await expect(uninstallMemoryPlus({ confirm, log })).resolves.toBe(true);
         expect(confirm).toHaveBeenCalledExactlyOnceWith(MEMORY_PLUS_UNINSTALL_CONFIRM);
-        expect(remove).toHaveBeenCalledExactlyOnceWith(f.paths.memoryPlus, { recursive: true });
+        expect(rename).toHaveBeenCalledTimes(1);
+        const [originalPath, renamedPath] = rename.mock.calls[0]!;
+        expect(originalPath).toBe(f.paths.memoryPlus);
+        expect(path.dirname(String(renamedPath))).toBe(path.dirname(f.paths.memoryPlus));
+        expect(renamedPath).not.toBe(originalPath);
+        expect(remove).toHaveBeenCalledExactlyOnceWith(renamedPath, { recursive: true });
+        expect(fs.existsSync(renamedPath)).toBe(false);
+        expect(fs.readdirSync(f.paths.root).filter((entry) => entry.startsWith('.memory-plus-removing-'))).toEqual([]);
         expect(fs.existsSync(f.paths.memoryPlus)).toBe(false);
         expect(fs.readFileSync(model, 'utf8')).toBe('cached model');
         expect(fs.readFileSync(path.join(external, 'keep'), 'utf8')).toBe('unrelated');
@@ -219,16 +228,73 @@ describe('Memory-Plus disable and runtime uninstall', () => {
         expect(f.vectors()).toEqual(f.originalVectors);
     });
 
+    it.each(['dev', 'ino', 'non-directory', 'symlink', 'stat failure'] as const)(
+        'removes nothing when identity after rename fails: %s, and reports the recovery path',
+        async (failure) => {
+            const f = await fixture();
+            f.installRuntime();
+            const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+            const stat = actualFs.lstatSync(f.paths.memoryPlus);
+            let renamedPath = '';
+            vi.spyOn(fs, 'renameSync').mockImplementation((source, destination) => {
+                actualFs.renameSync(source, destination);
+                renamedPath = String(destination);
+                // Change only the result of the check after the move; no ancestor swap.
+                vi.spyOn(fs, 'lstatSync').mockImplementationOnce(() => {
+                    if (failure === 'stat failure') throw new Error('stat failed');
+                    return Object.assign(Object.create(stat), {
+                        dev: failure === 'dev' ? stat.dev + 1 : stat.dev,
+                        ino: failure === 'ino' ? stat.ino + 1 : stat.ino,
+                        isDirectory: () => failure !== 'non-directory',
+                        isSymbolicLink: () => failure === 'symlink',
+                    });
+                });
+            });
+            const remove = vi.spyOn(fs, 'rmSync').mockImplementation(() => {});
+            const error = await uninstallMemoryPlus({ confirm: async () => true, log: vi.fn() }).catch((error: unknown) => error);
+            expect(remove).not.toHaveBeenCalled();
+            expect(error).toBeInstanceOf(Error);
+            expect((error as Error).message).toContain(failure === 'stat failure' ? 'stat failed' : 'identity changed after rename');
+            expect((error as Error).message).toContain(memoryPlusRenamedReport(renamedPath));
+            expect(actualFs.lstatSync(renamedPath).ino).toBe(stat.ino);
+            expect(actualFs.readFileSync(path.join(renamedPath, 'package.json'), 'utf8')).toBe('{"private":true}');
+            expect(actualFs.existsSync(f.paths.memoryPlus)).toBe(false);
+            expect(getSetting('memory-plus').value).toBe(false);
+            expect(f.vectors()).toEqual(f.originalVectors);
+        },
+    );
+
+    it('aborts without removing anything if the rename fails', async () => {
+        const f = await fixture();
+        f.installRuntime();
+        const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => {
+            throw new Error('rename denied');
+        });
+        const remove = vi.spyOn(fs, 'rmSync').mockImplementation(() => {});
+        await expect(uninstallMemoryPlus({ confirm: async () => true, log: vi.fn() })).rejects.toThrow(
+            `${memoryPlusRenameFailureReport(f.paths.memoryPlus)} rename denied`,
+        );
+        expect(remove).not.toHaveBeenCalled();
+        expect(fs.readFileSync(path.join(f.paths.memoryPlus, 'package.json'), 'utf8')).toBe('{"private":true}');
+        expect(fs.existsSync(rename.mock.calls[0]![1])).toBe(false);
+        expect(getSetting('memory-plus').value).toBe(false);
+        expect(f.vectors()).toEqual(f.originalVectors);
+    });
+
     it.each(['failure', 'still present'] as const)('keeps the feature off and reports removal %s', async (failure) => {
         const f = await fixture();
         f.installRuntime();
+        const rename = vi.spyOn(fs, 'renameSync');
         vi.spyOn(fs, 'rmSync').mockImplementation(() => {
             expect(getSetting('memory-plus').value).toBe(false);
             if (failure === 'failure') throw new Error('permission denied');
         });
-        await expect(uninstallMemoryPlus({ confirm: async () => true, log: vi.fn() })).rejects.toThrow(
-            failure === 'failure' ? 'permission denied' : 'still exists after removal',
-        );
+        const error = await uninstallMemoryPlus({ confirm: async () => true, log: vi.fn() }).catch((error: unknown) => error);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain(failure === 'failure' ? 'permission denied' : 'still exists after removal');
+        const renamedPath = String(rename.mock.calls[0]![1]);
+        expect((error as Error).message).toContain(memoryPlusRenamedReport(renamedPath));
+        expect(fs.readFileSync(path.join(renamedPath, 'package.json'), 'utf8')).toBe('{"private":true}');
         expect(getSetting('memory-plus').value).toBe(false);
         expect(f.vectors()).toEqual(f.originalVectors);
     });

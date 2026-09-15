@@ -1,6 +1,8 @@
-import { lstatSync, realpathSync, rmSync, type Stats } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { lstatSync, realpathSync, renameSync, rmSync, type Stats } from 'node:fs';
 import path from 'node:path';
 import { elephaPaths } from '../config/paths.js';
+import { errorMessage } from '../util/error.js';
 
 export interface MemoryPlusRemovalPlan {
     path: string;
@@ -8,6 +10,12 @@ export interface MemoryPlusRemovalPlan {
     dev: number;
     ino: number;
 }
+
+export const memoryPlusRenamedReport = (target: string): string =>
+    `Runtime was renamed to ${JSON.stringify(target)}; recover any remaining contents there.`;
+
+export const memoryPlusRenameFailureReport = (target: string): string =>
+    `Could not rename Memory-Plus runtime; nothing removed: ${JSON.stringify(target)}.`;
 
 function statIfPresent(target: string): Stats | undefined {
     try {
@@ -54,10 +62,28 @@ export function assertMemoryPlusRemovalPlan(plan: MemoryPlusRemovalPlan): void {
 
 export function removeMemoryPlusRuntime(plan: MemoryPlusRemovalPlan): void {
     assertMemoryPlusRemovalPlan(plan);
-    // Recursive filesystem removal does not follow child symlinks. No npm,
-    // lifecycle scripts, model cache, or elepha installation teardown is involved.
-    rmSync(plan.physicalPath, { recursive: true });
-    if (statIfPresent(plan.physicalPath) || statIfPresent(plan.path)) {
-        throw new Error(`Memory-Plus runtime still exists after removal: ${JSON.stringify(plan.path)}.`);
+    // An ancestor can change after validation. Atomically move to an unpredictable
+    // sibling name so a replacement cannot be pre-positioned at the deletion path,
+    // then verify the moved object's identity. This mitigates substitution without
+    // claiming to pin ancestors across the remaining pathname operations.
+    const renamedPath = path.join(path.dirname(plan.physicalPath), `.memory-plus-removing-${randomUUID()}`);
+    try {
+        renameSync(plan.physicalPath, renamedPath);
+    } catch (error) {
+        throw new Error(`${memoryPlusRenameFailureReport(plan.physicalPath)} ${errorMessage(error)}`, { cause: error });
+    }
+    try {
+        const stat = lstatSync(renamedPath);
+        if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== plan.dev || stat.ino !== plan.ino) {
+            throw new Error('Memory-Plus runtime identity changed after rename; nothing removed.');
+        }
+        // Recursive filesystem removal does not follow child symlinks. No npm,
+        // lifecycle scripts, model cache, or elepha installation teardown is involved.
+        rmSync(renamedPath, { recursive: true });
+        if (statIfPresent(renamedPath) || statIfPresent(plan.physicalPath) || statIfPresent(plan.path)) {
+            throw new Error(`Memory-Plus runtime still exists after removal: ${JSON.stringify(plan.path)}.`);
+        }
+    } catch (error) {
+        throw new Error(`${errorMessage(error)} ${memoryPlusRenamedReport(renamedPath)}`, { cause: error });
     }
 }

@@ -68,7 +68,8 @@ export async function uninstallMemoryPlus(
         removeMemoryPlusRuntime(plan);
     } catch (error) {
         // Filesystem removal is not a SQLite transaction: a partial removal must
-        // stay disabled and remain visible as a failure, safe to retry explicitly.
+        // stay disabled and remain visible as a failure, including the recovery
+        // path if the runtime was renamed before removal failed.
         throw new Error(`Memory-Plus is off; runtime removal failed: ${errorMessage(error)} ${MEMORY_PLUS_UNINSTALL_RETENTION}`, {
             cause: error,
         });
