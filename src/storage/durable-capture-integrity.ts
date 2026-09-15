@@ -157,6 +157,7 @@ function exactUsage(db: Database): number {
                     `SELECT COALESCE(SUM(
                          length(CAST(user_prompt AS BLOB)) +
                          length(CAST(assistant_response AS BLOB)) +
+                         COALESCE(length(CAST(assistant_structure AS BLOB)), 0) +
                          length(CAST(tool_calls AS BLOB))
                      ), 0) AS total_bytes
                      FROM filtered_turns`,

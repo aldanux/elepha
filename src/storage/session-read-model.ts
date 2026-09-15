@@ -125,13 +125,23 @@ const SERVED_SESSION_SELECT = `SELECT s.*, r.title AS rollup_title, r.summary AS
 
 const SUPPORTED_TOOL_PLACEHOLDERS = SUPPORTED_TOOLS.map(() => '?').join(',');
 
+// Historical guardian rows may retain memories and vectors after their kind
+// is corrected. Exclude them at use time without erasing stored data.
+export const SERVED_SESSION_KIND_ELIGIBILITY = "s.kind IS NOT 'adjudicator'";
+
+// Background derivations also recheck stale work items after awaited reads.
+export function isSessionKindEligible(db: Database.Database, sessionId: number): boolean {
+    return db.prepare(`SELECT 1 FROM sessions s WHERE s.id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}`).get(sessionId) !== undefined;
+}
+
 // The single project-session query used by serving readers, newest activity first.
 export function readProjectSessions(db: Database.Database, projectIds: readonly number[]): ServedSession[] {
     const placeholders = projectIds.map(() => '?').join(',');
     const rows = db
         .prepare(
             `${SERVED_SESSION_SELECT}
-             WHERE s.project_id IN (${placeholders}) AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS}) GROUP BY s.id
+             WHERE s.project_id IN (${placeholders}) AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
+             AND ${SERVED_SESSION_KIND_ELIGIBILITY} GROUP BY s.id
              ORDER BY COALESCE(s.last_turn_at, s.last_ingested_at, s.started_at) DESC, s.id DESC`,
         )
         .all(...projectIds, ...SUPPORTED_TOOLS) as RawServedSession[];
@@ -155,6 +165,7 @@ export function readProjectSessionAggregates(db: Database.Database, projectIds: 
                         ) AS activity_rank
                  FROM sessions s
                  WHERE s.project_id IN (${placeholders}) AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
+                 AND ${SERVED_SESSION_KIND_ELIGIBILITY}
              )
              SELECT project_id, tool, surface, MAX(last_ingested_at) AS last_ingested_at,
                     COUNT(*) AS work_episodes,
@@ -177,7 +188,8 @@ export function readProjectSessionAggregates(db: Database.Database, projectIds: 
 // Indexed session-id lookup sharing the exact hydrated shape used by project reads.
 export function readSessionById(db: Database.Database, id: number): ServedSession | undefined {
     const row = db
-        .prepare(`${SERVED_SESSION_SELECT} WHERE s.id = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS}) GROUP BY s.id`)
+        .prepare(`${SERVED_SESSION_SELECT} WHERE s.id = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
+            AND ${SERVED_SESSION_KIND_ELIGIBILITY} GROUP BY s.id`)
         .get(id, ...SUPPORTED_TOOLS) as RawServedSession | undefined;
     return row === undefined ? undefined : hydrateServedSession(db, row);
 }
@@ -191,6 +203,7 @@ export function readEmbeddingSessionIds(db: Database.Database, before: number, l
 }
 
 const EMBEDDING_SESSION_ELIGIBILITY = `s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
+          AND ${SERVED_SESSION_KIND_ELIGIBILITY}
           AND s.project_id IN (SELECT value FROM json_each(?))
           AND NOT EXISTS (SELECT 1 FROM purged_transcripts p WHERE p.tool = s.tool AND p.native_id = s.native_id)
           AND NOT EXISTS (SELECT 1 FROM incognito_transcripts i WHERE i.tool = s.tool AND i.native_id = s.native_id)`;
@@ -234,7 +247,8 @@ export function readSessionByNaturalKey(
 ): ServedSession | undefined {
     const row = db
         .prepare(
-            `${SERVED_SESSION_SELECT} WHERE s.tool = ? AND s.native_id = ? AND s.segment_index = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS}) GROUP BY s.id`,
+            `${SERVED_SESSION_SELECT} WHERE s.tool = ? AND s.native_id = ? AND s.segment_index = ? AND s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
+            AND ${SERVED_SESSION_KIND_ELIGIBILITY} GROUP BY s.id`,
         )
         .get(key.tool, key.nativeId, key.segmentIndex, ...SUPPORTED_TOOLS) as RawServedSession | undefined;
     return row === undefined ? undefined : hydrateServedSession(db, row);

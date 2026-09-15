@@ -32,7 +32,7 @@ export async function confirmYesNo(question: string): Promise<boolean> {
     return /^(y|yes)$/i.test(answer.trim());
 }
 
-export function printInstallation(result: ReturnType<typeof installElepha>, action: 'install' | 'uninstall'): void {
+export function printInstallation(result: Awaited<ReturnType<typeof installElepha>>, action: 'install' | 'uninstall'): void {
     console.log(`install binary: ${result.bin}`);
     if (result.launcher) {
         console.log(`managed launcher: ${result.launcher}`);

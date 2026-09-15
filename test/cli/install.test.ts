@@ -92,7 +92,7 @@ describe('elepha install progress', () => {
     it('passes no reporter and emits no loader controls when stdout is not a TTY', async () => {
         setTty(false);
         const write = vi.spyOn(process.stdout, 'write').mockReturnValue(true);
-        mocks.installElepha.mockReturnValue(installationResult());
+        mocks.installElepha.mockResolvedValue(installationResult());
 
         await installProgram().parseAsync(['node', 'elepha', 'install']);
 
@@ -101,7 +101,7 @@ describe('elepha install progress', () => {
         expect(mocks.installElepha).toHaveBeenCalledWith(undefined, { approvedRoots: 2, service: mocks.service });
         expect(mocks.service.stop.mock.invocationCallOrder[0]).toBeLessThan(mocks.migrateDatabase.mock.invocationCallOrder[0]);
         expect(mocks.migrateDatabase.mock.invocationCallOrder[0]).toBeLessThan(mocks.openDb.mock.invocationCallOrder[0]);
-        expect(mocks.printInstallation).toHaveBeenCalledOnce();
+        expect(mocks.printInstallation).toHaveBeenCalledWith(installationResult(), 'install');
         expect(write).not.toHaveBeenCalled();
     });
 
@@ -114,7 +114,7 @@ describe('elepha install progress', () => {
             finishMigration = resolve;
         });
         mocks.migrateDatabase.mockImplementationOnce(() => migration);
-        mocks.installElepha.mockReturnValueOnce(installationResult());
+        mocks.installElepha.mockResolvedValueOnce(installationResult());
 
         const installing = installProgram().parseAsync(['node', 'elepha', 'install']);
 
@@ -164,6 +164,22 @@ describe('elepha install progress', () => {
             expect(process.exitCode).toBe(1);
         },
     );
+
+    it('restores the prior service and reports an asynchronous installation failure', async () => {
+        setTty(false);
+        const failure = new Error('capture service did not become healthy');
+        mocks.installElepha.mockRejectedValueOnce(failure);
+        mocks.service.status.mockReturnValueOnce({ loaded: true, disabled: false, unknown: false });
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        await installProgram().parseAsync(['node', 'elepha', 'install']);
+
+        expect(mocks.printInstallation).not.toHaveBeenCalled();
+        expect(mocks.service.start).toHaveBeenCalledOnce();
+        expect(mocks.service.waitForHealthy).toHaveBeenCalledOnce();
+        expect(error).toHaveBeenCalledWith(failure.message);
+        expect(process.exitCode).toBe(1);
+    });
 });
 
 describe('installation database lifetime', () => {

@@ -18,6 +18,7 @@ import {
     MAX_TRANSCRIPT_RECORD_BYTES,
     MAX_UNKNOWN_LINE_DISCRIMINATOR_CHARS,
 } from '../config/constants.js';
+import { type AssistantMessageBoundary, joinedAssistantStructure } from '../rendering/assistant-structure.js';
 import { turnText } from '../security/self-ingestion.js';
 import { containsSentinel } from '../security/sentinel.js';
 import type {
@@ -35,6 +36,8 @@ const TRANSCRIPT_READ_CHUNK_BYTES = 64 * 1024;
 const DISCRIMINATOR_DIGEST_HEX_CHARS = 8;
 const DISCRIMINATOR_DIGEST_SEPARATOR = '…#';
 const UNSAFE_DISCRIMINATOR_CHARACTERS = /[\p{Cc}\u2028\u2029]/gu;
+
+export class TranscriptReadBudgetError extends Error {}
 
 function discriminatorDigest(value: unknown): string {
     let digestInput: string;
@@ -171,6 +174,7 @@ export interface BoundedLine {
 export interface BoundedLineReadOptions {
     start?: number;
     maxRecordBytes?: number;
+    maxReadBytes?: number;
     // Reads from this already-opened file without taking ownership or changing its position.
     handle?: FileHandle;
 }
@@ -195,7 +199,11 @@ export async function* readBoundedLines(filePath: string, options: BoundedLineRe
     try {
         for (;;) {
             const bytesUntilOversized = maxRecordBytes - pendingBytes + 1;
-            const chunk = Buffer.alloc(Math.min(TRANSCRIPT_READ_CHUNK_BYTES, bytesUntilOversized));
+            const remainingBytes = (options.maxReadBytes ?? Number.POSITIVE_INFINITY) - (readOffset - start);
+            if (remainingBytes <= 0) {
+                throw new TranscriptReadBudgetError('Transcript evidence byte budget reached.');
+            }
+            const chunk = Buffer.alloc(Math.min(TRANSCRIPT_READ_CHUNK_BYTES, bytesUntilOversized, remainingBytes));
             const { bytesRead } = await handle.read(chunk, 0, chunk.length, readOffset);
             if (bytesRead === 0) {
                 break;
@@ -350,6 +358,7 @@ async function fingerprintWindow(handle: FileHandle, endOffset: number): Promise
 export interface TurnBuilderState {
     userMessageParts: string[];
     assistantTextParts: string[];
+    assistantMessageBoundaries: AssistantMessageBoundary[];
     toolCalls: ParsedToolCall[];
     openToolCallIds: Set<string>;
     startedAt: string | undefined;
@@ -366,6 +375,7 @@ function freshState(): TurnBuilderState {
     return {
         userMessageParts: [],
         assistantTextParts: [],
+        assistantMessageBoundaries: [],
         toolCalls: [],
         openToolCallIds: new Set(),
         startedAt: undefined,
@@ -578,6 +588,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                     userMessage: state.userMessageParts.join('\n').trim(),
                     aiTitle: state.aiTitle,
                     assistantText: state.assistantTextParts.join('\n').trim(),
+                    assistantStructure: joinedAssistantStructure(state.assistantTextParts, state.assistantMessageBoundaries),
                     toolCalls: state.toolCalls,
                     cursor: formatCursor(endOffset, turnIndex + 1, await fingerprintWindow(handle, endOffset)),
                     surface: state.surface,
@@ -591,7 +602,11 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                 if (options?.signal?.aborted) {
                     return;
                 }
-                const chunk = Buffer.alloc(Math.min(TRANSCRIPT_READ_CHUNK_BYTES, fileStat.size - readOffset));
+                const remainingBytes = (options?.maxReadBytes ?? Number.POSITIVE_INFINITY) - (readOffset - startOffset);
+                if (remainingBytes <= 0) {
+                    throw new TranscriptReadBudgetError('Transcript evidence byte budget reached.');
+                }
+                const chunk = Buffer.alloc(Math.min(TRANSCRIPT_READ_CHUNK_BYTES, fileStat.size - readOffset, remainingBytes));
                 const { bytesRead } = await handle.read(chunk, 0, chunk.length, readOffset);
                 if (bytesRead === 0) {
                     break;

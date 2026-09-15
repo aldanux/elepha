@@ -1,8 +1,11 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { defaultAdapters } from '../../src/adapters/index.js';
 import { FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX, IngestionDaemon } from '../../src/daemon/index.js';
+import * as transcript from '../../src/security/provider-transcript.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
+import { applyFirstPromptSearchBackfill } from '../../src/storage/first-prompt-search-backfill.js';
 import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedProject, seedSession } from '../helpers/db.js';
 
@@ -74,7 +77,90 @@ function seedHistoricalSession(
 }
 
 describe('daemon first-prompt search backfill', () => {
-    afterEach(() => vi.unstubAllEnvs());
+    afterEach(() => {
+        vi.unstubAllEnvs();
+        vi.restoreAllMocks();
+    });
+
+    it.each([false, true])('rejects kind changes during first-prompt derivation or its write transaction (scoped: %s)', async (scoped) => {
+        const fixture = createTestDb('elepha-prompt-kind-race-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const source = path.join(claudeConfigDir, 'projects', 'guardian.jsonl');
+        mkdirSync(path.dirname(source), { recursive: true });
+        writeFileSync(source, '{}\n');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        const id = seedHistoricalSession(fixture, project, source, 'guardian');
+        const parsed: string[] = [];
+        const changeKind = () => {
+            fixture.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(id);
+        };
+        const adapter = adapterFor(new Map([[source, 'Do not index this guardian prompt']]), parsed, scoped ? undefined : changeKind);
+        const result = await applyFirstPromptSearchBackfill(
+            fixture.db,
+            { ...defaultAdapters(), 'claude-code': adapter },
+            scoped
+                ? {
+                      sessionIds: [id],
+                      onlyNull: true,
+                      authorizeWrite: () => {
+                          changeKind();
+                          return true;
+                      },
+                  }
+                : undefined,
+        );
+        expect(result.sessionsWritten).toBe(0);
+        expect(parsed).toEqual([source]);
+        expect(fixture.db.prepare('SELECT first_prompt_search FROM sessions WHERE id = ?').get(id)).toEqual({ first_prompt_search: null });
+        await applyFirstPromptSearchBackfill(fixture.db, { ...defaultAdapters(), 'claude-code': adapter });
+        expect(parsed).toEqual([source]);
+    });
+
+    it.each(['during open', 'during parse'] as const)(
+        'reports zero indexed after kind changes %s and avoids further reads',
+        async (when) => {
+            const fixture = createTestDb('elepha-prompt-kind-open-');
+            const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+            const source = path.join(claudeConfigDir, 'projects', 'guardian.jsonl');
+            mkdirSync(path.dirname(source), { recursive: true });
+            writeFileSync(source, '{}\n');
+            vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+            const project = seedProject(fixture);
+            fixture.store.consent.grant(project.path);
+            const id = seedHistoricalSession(fixture, project, source, 'guardian');
+            const changeKind = () => fixture.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(id);
+            const originalOpen = transcript.openProviderTranscript;
+            if (when === 'during open') {
+                vi.spyOn(transcript, 'openProviderTranscript').mockImplementation(async (...args) => {
+                    const opened = await originalOpen(...args);
+                    changeKind();
+                    return opened;
+                });
+            }
+            const parsed: string[] = [];
+            const adapter = adapterFor(
+                new Map([[source, 'Do not index this guardian prompt']]),
+                parsed,
+                when === 'during parse' ? changeKind : undefined,
+            );
+            const logs: string[] = [];
+            const daemon = new IngestionDaemon({
+                store: fixture.store,
+                adapters: [adapter],
+                watchRoots: [],
+                log: (message) => logs.push(message),
+            });
+            await (daemon as unknown as { backfillFirstPromptSearch(): Promise<void> }).backfillFirstPromptSearch();
+            expect(parsed).toEqual(when === 'during open' ? [] : [source]);
+            expect(fixture.db.prepare('SELECT first_prompt_search FROM sessions WHERE id = ?').get(id)).toEqual({
+                first_prompt_search: null,
+            });
+            expect(fixture.db.prepare('SELECT * FROM first_prompt_search_backfill_skips').all()).toEqual([]);
+            expect(logs).toHaveLength(1);
+            expect(logs[0]).toContain('indexed 0,');
+        },
+    );
 
     it('runs after start returns, fills readable rows in batches, and permanently skips an unavailable transcript', async () => {
         const fixture = createTestDb('elepha-daemon-first-prompt-');

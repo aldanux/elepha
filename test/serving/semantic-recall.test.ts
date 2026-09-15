@@ -3,6 +3,8 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+    AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
+    MAX_TITLE_CHARS,
     SEMANTIC_RECALL_MAX_HITS,
     SEMANTIC_SCAN_BUDGET_MS,
     SEMANTIC_SCAN_MAX_ROWS,
@@ -13,6 +15,8 @@ import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
+import { AUTOMATIC_RECALL_BODY_PREFIX } from '../../src/serving/automatic-recall.js';
+import * as lexicalModule from '../../src/serving/lexical-recall.js';
 import {
     hitIdentity,
     lexicalRecall,
@@ -22,6 +26,7 @@ import {
 } from '../../src/serving/lexical-recall.js';
 import * as semanticModule from '../../src/serving/semantic-recall.js';
 import { renderSemanticUnion, SEMANTIC_DISCOVERY, semanticRecall, unionRecallIds } from '../../src/serving/semantic-recall.js';
+import { publicSessionId } from '../../src/serving/session-id.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { EMBEDDING_SOURCE_CHANGED, EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
@@ -33,7 +38,7 @@ import {
     withMemoryReadGeneration,
 } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
-import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 vi.mock('../../src/config/constants.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../../src/config/constants.js')>()),
@@ -63,11 +68,11 @@ function fixture() {
         dispose: vi.fn(async () => {}),
     };
     const factory = vi.spyOn(providers, 'createEmbeddingProvider').mockResolvedValue(provider);
-    function add(title: string, vector?: number[], model = configuration) {
+    function add(title: string, vector?: number[], model = configuration, nativeId = title) {
         const session = seedSession(f, {
             project,
             title,
-            nativeId: title,
+            nativeId,
             surface: 'cli',
             startedAt: '2026-09-14T00:00:00Z',
             lastTurnAt: '2026-09-14T00:00:00Z',
@@ -84,7 +89,16 @@ function fixture() {
         }
         return session;
     }
-    return { ...f, configPath, project, embeddings, provider, factory, add, log: vi.fn() };
+    function addEvidence(session: ReturnType<typeof seedSession>, why = 'Retries must preserve receipts.') {
+        seedRollup(f, { project, session, decisions: [{ what: 'Preserve payment identifiers.', why }] });
+        embeddings.write(
+            embeddings.source(session.id)!,
+            configuration,
+            [1, 0],
+            withMemoryReadGeneration(f.db, lockedEmbedding, (token) => token),
+        );
+    }
+    return { ...f, configPath, project, embeddings, provider, factory, add, addEvidence, log: vi.fn() };
 }
 
 function projects(f: ReturnType<typeof fixture>) {
@@ -95,7 +109,7 @@ function text(result: { content: Array<{ type: string; text?: string }> }): stri
     return result.content.map((item) => item.text ?? '').join('\n');
 }
 
-async function hookResult(f: ReturnType<typeof fixture>, prompt: string) {
+async function hookResult(f: ReturnType<typeof fixture>, prompt: string, nativeSessionId = 'current') {
     function openDatabase(dbPath: ':memory:'): ReturnType<typeof openUnmanagedDb>;
     function openDatabase(dbPath?: string): Promise<ReturnType<typeof openUnmanagedDb>>;
     function openDatabase(dbPath?: string) {
@@ -104,7 +118,7 @@ async function hookResult(f: ReturnType<typeof fixture>, prompt: string) {
     }
     return runUserPromptSubmit(
         JSON.stringify({
-            session_id: 'current',
+            session_id: nativeSessionId,
             cwd: f.project.path,
             hook_event_name: 'UserPromptSubmit',
             prompt,
@@ -134,6 +148,71 @@ afterEach(() => {
 });
 
 describe('semantic retrieval and explicit search integration', () => {
+    it.each([false, true])('revalidates adjudicator eligibility after awaited lexical recall (Memory-Plus: %s)', async (enabled) => {
+        const f = fixture();
+        const session = f.add('receipt recovery', [1, 0]);
+        f.addEvidence(session, 'Guardian-only receipt rationale');
+        setSetting('memory-plus', String(enabled), f.configPath);
+        const read = lexicalModule.lexicalRecall;
+        vi.spyOn(lexicalModule, 'lexicalRecall').mockImplementation(async (...args) => {
+            const result = await read(...args);
+            expect(result.sessionIds).toContain(session.id);
+            f.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+            return result;
+        });
+        const result = text(await new ElephaMcpService(f.db).recall({ query: 'receipt' }));
+        expect(result).not.toContain(publicSessionId(session));
+        expect(result).not.toContain('receipt recovery');
+        expect(result).not.toContain('Guardian-only receipt rationale');
+    });
+
+    it('skips a reclassified top adjudicator across serving while retaining its stored material and vector', async () => {
+        const f = fixture();
+        const valid = f.add('receipt recovery', [0.98, 0.2]);
+        f.addEvidence(valid);
+        const guardian = f.add('receipt adjudication', [1, 0]);
+        seedMemory(f, { project: f.project, session: guardian, decisions: [{ what: 'Guardian receipt decision', why: 'Safety review' }] });
+        f.addEvidence(guardian);
+        const source = f.embeddings.source(guardian.id)!;
+        const generation = withMemoryReadGeneration(f.db, lockedEmbedding, (token) => token);
+        f.embeddings.write(f.embeddings.source(valid.id)!, configuration, [0.98, 0.2], generation);
+        const stored = () => ({
+            memories: f.db.prepare('SELECT * FROM memories').all(),
+            rollups: f.db.prepare('SELECT * FROM session_rollups').all(),
+            vectors: f.db.prepare('SELECT * FROM session_embeddings').all(),
+        });
+        const before = stored();
+        f.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(guardian.id);
+        expect(f.embeddings.source(guardian.id)).toBeUndefined();
+        expect(() => f.embeddings.write(source, configuration, [1, 0], generation)).toThrow(EMBEDDING_SOURCE_CHANGED);
+        expect(scan(f.embeddings, [f.project.id]).map((vector) => vector.sessionId)).toEqual([valid.id]);
+        expect((await semanticRecall(f.db, [f.project.id], 'receipt')).candidates.map((candidate) => candidate.sessionId)).toEqual([
+            valid.id,
+        ]);
+        const lexical = await lexicalRecall(
+            new SessionReader(f.db),
+            projects(f),
+            tokenizeRecallQuery('receipt')!,
+            'global',
+            undefined,
+            NOW,
+            'lax',
+        );
+        expect(lexical.sessionIds).toEqual([valid.id]);
+        const mcp = new ElephaMcpService(f.db);
+        expect(text(await mcp.listSessions({ project: f.project.path, include_all: true }))).not.toContain(publicSessionId(guardian));
+        for (const query of [undefined, 'receipt']) {
+            expect((await mcp.getSession({ id: publicSessionId(guardian), query })).structuredContent).toMatchObject({
+                reason: 'unknown_session',
+            });
+        }
+        const automatic = await hookResult(f, 'Why do receipt retries preserve payment identifiers?');
+        expect('output' in automatic).toBe(true);
+        expect(JSON.stringify(automatic)).toContain(publicSessionId(valid));
+        expect(JSON.stringify(automatic)).not.toContain(publicSessionId(guardian));
+        expect(stored()).toEqual(before);
+    });
+
     it.each([false, true])('does zero provider or vector work on both off paths (stored vectors: %s)', async (stored) => {
         const f = fixture();
         f.add('receipt shared', stored ? [1, 0] : undefined);
@@ -270,16 +349,63 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(decode).toHaveBeenCalledTimes(SEMANTIC_SCAN_MAX_ROWS * configuration.dimensions);
         expect(result.candidates.some((candidate) => candidate.sessionId === old.id)).toBe(false);
         const marker = semanticModule.semanticScanTruncation('rows');
+        const hitCapMarker = semanticModule.semanticHitCapTruncation(7);
         for (const output of [
             text(await new ElephaMcpService(f.db).recall({ query: 'recovery' })),
             await hook(f, 'elepha:query recovery'),
             await hook(f, 'elepha:query:here recovery'),
-        ])
+        ]) {
             expect(output).toContain(marker);
-        // Both notices push these candidates over the automatic context budget.
-        // Explicit search reports coverage; the automatic gate must abstain.
+            expect(output).toContain(hitCapMarker);
+        }
+    });
+
+    it('serves an eligible fallback with both coverage notices inside the automatic context budget', async () => {
+        const f = fixture();
+        const nativeId = (suffix: number) => `00000000-0000-4000-8000-${suffix.toString().padStart(12, '0')}`;
+        const receivingSessionId = nativeId(13);
+        // One remaining slot isolates the individual fallback's context budget
+        // from the aggregate budget of additional shortlist candidates.
+        for (let index = 0; index < 2; index++) {
+            f.store.recordInjection({
+                tool: 'codex',
+                nativeSessionId: receivingSessionId,
+                injectedAt: new Date(NOW).toISOString(),
+                injectionId: `previous-${index}`,
+                body: `${AUTOMATIC_RECALL_BODY_PREFIX}previous-${index}\nPreviously shown candidate ${index}`,
+            });
+        }
+        f.add('Oldest omitted match', [1, 0], configuration, nativeId(0));
+        for (let index = 1; index <= 10; index++) {
+            f.add(`Qualifying match ${index}`, [1, 0], configuration, nativeId(index));
+        }
+        const fallback = f.add('F'.repeat(MAX_TITLE_CHARS), [1, 0], configuration, nativeId(11));
+        const receiving = f.add('S'.repeat(MAX_TITLE_CHARS), [1, 0], configuration, receivingSessionId);
+        f.addEvidence(fallback, 'Retries must preserve receipts and their original payment identity. '.repeat(11));
+        vi.spyOn(performance, 'now').mockReturnValue(0);
+
+        const result = await hookResult(f, 'Find a previous recovery decision', receivingSessionId);
+
+        expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('discarded reason=automatic_context_budget'));
+        expect(result).toHaveProperty('output');
+        const injections = f.store.injectionsForSession('codex', receivingSessionId, new Date(NOW).toISOString());
+        expect(injections).toHaveLength(4);
+        const body = injections[3].body;
+        expect(body).toContain(publicSessionId(fallback));
+        expect(body).not.toContain(publicSessionId(receiving));
+        expect(body).toContain(semanticModule.semanticScanTruncation('rows'));
+        expect(body).toContain(semanticModule.semanticHitCapTruncation(7));
+        expect(body.length).toBeGreaterThan(2_000);
+        expect(body.length).toBeLessThanOrEqual(AUTOMATIC_RECALL_MAX_CONTEXT_CHARS);
+    });
+
+    it('still abstains when an automatic candidate genuinely exceeds the context budget', async () => {
+        const f = fixture();
+        f.add('O'.repeat(MAX_TITLE_CHARS), [1, 0], configuration, 'a'.repeat(AUTOMATIC_RECALL_MAX_CONTEXT_CHARS));
+
         expect(await hookResult(f, 'Find a previous recovery decision')).toEqual({ reason: 'not_command' });
         expect(f.log).toHaveBeenCalledWith(expect.stringContaining('discarded reason=automatic_context_budget'));
+        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
     });
 
     it('reports empty elapsed-time truncation for explicit recall but abstains automatically', async () => {
@@ -467,6 +593,7 @@ describe('semantic retrieval and explicit search integration', () => {
     it('keeps the newest tied vectors and serves the hit-cap loss on every semantic surface', async () => {
         const f = fixture();
         const sessions = Array.from({ length: SEMANTIC_RECALL_MAX_HITS + 1 }, (_, index) => f.add(`tied ${index}`, [1, 0]));
+        for (const session of sessions) f.addEvidence(session);
         const result = await semanticRecall(f.db, [f.project.id], 'recovery');
         expect.soft(result.candidates.map((candidate) => candidate.sessionId)).toEqual(
             sessions

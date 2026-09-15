@@ -64,6 +64,7 @@ function fakeProvider(): EmbeddingProvider {
 }
 
 function stubLocalRuntime(vector: number[]) {
+    //noinspection JSUnusedGlobalSymbols
     const extractor = Object.assign(
         vi.fn(async (_text: string) => ({ data: vector })),
         {
@@ -182,6 +183,7 @@ describe('Memory-Plus opt-in and provider boundary', () => {
         const f = fixture();
         const provider = fakeProvider();
         const createProvider = vi.fn(async () => provider);
+        //noinspection JSUnusedGlobalSymbols
         const options = {
             configPath: f.configPath,
             openDatabase: async () => openUnmanagedDb(f.dbPath),
@@ -552,11 +554,11 @@ describe('derived vector storage and manual generation', () => {
         expect(provider.embed).toHaveBeenCalledTimes(2);
     });
 
-    it('reports every empty or ineligible session and advances progress without creating a provider', async () => {
+    it('counts empty or ineligible sessions without reporting each one and advances progress without creating a provider', async () => {
         const f = fixture();
         f.db.prepare('UPDATE sessions SET title = NULL WHERE id = ?').run(f.session.id);
         const other = seedProject(f, { path: path.join(f.directory, 'unconsented') });
-        const ineligible = seedSession(f, { project: other, nativeId: 'unconsented', title: 'Unconsented' });
+        seedSession(f, { project: other, nativeId: 'unconsented', title: 'Unconsented' });
         setSetting('memory-plus', 'true', f.configPath);
         const createProvider = vi.fn();
         const report = vi.fn();
@@ -568,10 +570,7 @@ describe('derived vector storage and manual generation', () => {
             sourceChanged: 0,
         });
         expect(createProvider).not.toHaveBeenCalled();
-        expect(report.mock.calls.map(([message]) => message)).toEqual([
-            expect.stringContaining(`Session ${ineligible.id}`),
-            expect.stringContaining(`Session ${f.session.id}`),
-        ]);
+        expect(report).not.toHaveBeenCalled();
         expect(progress).toHaveBeenCalledTimes(2);
     });
 

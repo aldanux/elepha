@@ -287,7 +287,8 @@ function hasNoncanonicalTrigger(db: Database.Database): boolean {
                 `SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND NOT (
                      tbl_name COLLATE NOCASE = 'filtered_turns' AND name COLLATE NOCASE IN
                      ('filtered_turns_ai', 'filtered_turns_ad', 'filtered_turns_au',
-                      'filtered_turns_usage_ai', 'filtered_turns_usage_ad', 'filtered_turns_usage_au')
+                      'filtered_turns_usage_ai', 'filtered_turns_usage_ad', 'filtered_turns_usage_au',
+                      'filtered_turns_structure_au')
                  ) LIMIT 1`,
             )
             .get() !== undefined

@@ -68,7 +68,6 @@ export async function generateEmbeddings(
                     const source = store.source(id, generation);
                     if (source === undefined) {
                         result.ineligibleOrEmpty++;
-                        report(`Session ${id}: skipped (ineligible or empty stored source).`);
                     } else {
                         provider ??= await (options.createProvider ?? createEmbeddingProvider)(true);
                         if (provider === undefined) {

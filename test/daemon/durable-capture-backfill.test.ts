@@ -100,6 +100,132 @@ async function recordCommandBody(dbPath: string, projectPath: string, nativeSess
 describe('daemon durable capture backfill', () => {
     afterEach(() => vi.unstubAllEnvs());
 
+    it('does not parse or mutate a session reclassified while its source is being opened', async () => {
+        const fixture = createTestDb('elepha-durable-kind-open-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const source = path.join(claudeConfigDir, 'projects', 'guardian.jsonl');
+        mkdirSync(path.dirname(source), { recursive: true });
+        writeFileSync(source, '{}\n');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'guardian', sourcePath: source });
+        seedMemory(fixture, { project, session });
+        const parsed: string[] = [];
+        let stateAfterOpen: unknown;
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            adapters: [adapterFor(new Map([[source, [parsedTurn(source, 'guardian', 0)]]]), parsed)],
+            watchRoots: [],
+            readConfig: enabledConfig,
+            openTranscript: async (...args) => {
+                const opened = await openProviderTranscript(...args);
+                expect('reason' in opened).toBe(false);
+                fixture.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+                stateAfterOpen = fixture.db.prepare('SELECT * FROM durable_capture_status').all();
+                return opened;
+            },
+        });
+        await (daemon as unknown as { backfillDurableCapture(): Promise<void> }).backfillDurableCapture();
+        expect(parsed).toEqual([]);
+        expect(fixture.db.prepare('SELECT * FROM filtered_turns').all()).toEqual([]);
+        expect(fixture.db.prepare('SELECT * FROM durable_capture_status').all()).toEqual(stateAfterOpen);
+    });
+
+    it('closes the iterator before another read when a yielded skipped turn becomes ineligible', async () => {
+        const fixture = createTestDb('elepha-durable-kind-next-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const source = path.join(claudeConfigDir, 'projects', 'guardian.jsonl');
+        mkdirSync(path.dirname(source), { recursive: true });
+        writeFileSync(source, '{}\n');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'guardian', sourcePath: source });
+        seedMemory(fixture, { project, session, turnIndex: 0 });
+        let nextCalls = 0;
+        let readCalls = 0;
+        let iteratorClosed = false;
+        let handleClosed = false;
+        let stateAfterExclusion: unknown;
+        const snapshot = () => ({
+            status: fixture.db.prepare('SELECT * FROM durable_capture_status').all(),
+            turns: fixture.db.prepare('SELECT * FROM filtered_turns').all(),
+            memories: fixture.db.prepare('SELECT * FROM memories').all(),
+        });
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            adapters: [
+                {
+                    ...adapterFor(new Map(), []),
+                    parseTurns(_source, _cursor, options) {
+                        const iterator = (async function* () {
+                            try {
+                                // The first turn would continue before persistence:
+                                // only turn zero is missing from durable capture.
+                                for (const index of [99, 0]) {
+                                    readCalls += 1;
+                                    await options!.handle!.read(Buffer.alloc(1), 0, 1, null);
+                                    fixture.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+                                    stateAfterExclusion ??= snapshot();
+                                    yield parsedTurn(source, 'guardian', index);
+                                }
+                            } finally {
+                                iteratorClosed = true;
+                            }
+                        })();
+                        const next = iterator.next.bind(iterator);
+                        iterator.next = (...args) => {
+                            nextCalls += 1;
+                            return next(...args);
+                        };
+                        return iterator;
+                    },
+                },
+            ],
+            watchRoots: [],
+            readConfig: enabledConfig,
+            openTranscript: async (...args) => {
+                const opened = await openProviderTranscript(...args);
+                if (!('reason' in opened)) {
+                    const close = opened.handle.close.bind(opened.handle);
+                    opened.handle.close = async () => {
+                        await close();
+                        handleClosed = true;
+                    };
+                }
+                return opened;
+            },
+        });
+        await (daemon as unknown as { backfillDurableCapture(): Promise<void> }).backfillDurableCapture();
+        expect(nextCalls).toBe(1);
+        expect(readCalls).toBe(1);
+        expect(iteratorClosed).toBe(true);
+        expect(handleClosed).toBe(true);
+        expect(snapshot()).toEqual(stateAfterExclusion);
+    });
+
+    it('rejects a stale reclassified backfill item before recording or evicting retained data', () => {
+        const fixture = createTestDb('elepha-durable-kind-race-');
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'guardian' });
+        seedMemory(fixture, { project, session });
+        const backfill = new DurableCaptureBackfillStore(fixture.db, fixture.store.consent, 1);
+        const candidate = backfill.listCandidates([project.id], 10)[0]!;
+        expect(backfill.begin(candidate, NOW)).toBeDefined();
+        fixture.db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+        const before = fixture.db.prepare('SELECT * FROM durable_capture_status').all();
+        expect(backfill.listCandidates([project.id], 10)).toEqual([]);
+        expect(backfill.begin(candidate, NOW)).toBeUndefined();
+        expect(backfill.record(candidate, 0, filterTurn(parsedTurn(session.source_path, session.native_id, 0)), NOW)).toEqual({
+            state: 'unauthorized',
+        });
+        backfill.finish(candidate, new Set([session.id]), 'success', NOW);
+        expect(fixture.db.prepare('SELECT * FROM durable_capture_status').all()).toEqual(before);
+        expect(fixture.db.prepare('SELECT * FROM filtered_turns').all()).toEqual([]);
+    });
+
     it('suppresses an echoed in-chat command output in both live capture and later backfill', async () => {
         const liveFixture = createTestDb('elepha-live-same-turn-quote-back-');
         const liveProject = seedProject(liveFixture);

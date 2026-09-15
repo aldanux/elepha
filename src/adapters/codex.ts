@@ -29,6 +29,7 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { SESSION_KIND_PREAMBLE_MAX_BYTES } from '../config/constants.js';
 import { codexHome, codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
 import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionAdapterTool, SessionClassification } from '../types/index.js';
 import {
@@ -40,6 +41,7 @@ import {
     readBoundedLines,
     resolveAbsolute,
     safeDiscriminator,
+    TranscriptReadBudgetError,
     type TurnBuilderState,
     textValues,
 } from './base.js';
@@ -109,6 +111,7 @@ interface CodexMessageContentBlock {
 interface CodexPayload {
     type: string;
     role?: string;
+    phase?: unknown;
     cwd?: string;
     message?: string;
     name?: string;
@@ -173,7 +176,120 @@ interface CodexSessionMeta {
     agent_path?: string | null;
     agent_nickname?: string | null;
     originator?: string;
+    source?: unknown;
     git?: { branch?: string; commit_hash?: string; repository_url?: string | null };
+}
+
+// Fork/import precedence belongs to the caller; this predicate identifies
+// both observed internal approval formats without treating all children alike.
+// A user-spawned subagent always carries its identity; the internal
+// adjudicator never does.
+export function isCodexGuardianMetadata(meta: CodexSessionMeta): boolean {
+    const source = meta.source;
+    const subagent = typeof source === 'object' && source !== null && 'subagent' in source ? source.subagent : undefined;
+    const guardianSource = typeof subagent === 'object' && subagent !== null && 'other' in subagent && subagent.other === 'guardian';
+    return (
+        meta.thread_source === 'guardian_review' ||
+        guardianSource ||
+        (meta.thread_source === 'subagent' && !nonemptyString(meta.agent_path) && !nonemptyString(meta.agent_nickname))
+    );
+}
+
+function nonemptyString(value: unknown): value is string {
+    return typeof value === 'string' && value.length > 0;
+}
+
+function validKindMetadata(meta: Record<string, unknown>): boolean {
+    for (const key of ['forked_from_id', 'parent_thread_id', 'thread_source', 'agent_path', 'agent_nickname']) {
+        const value = meta[key];
+        if (value !== undefined && value !== null && (typeof value !== 'string' || value.length === 0)) {
+            return false;
+        }
+    }
+    const source = meta.source;
+    if (source === undefined || source === null || typeof source === 'string') {
+        return true;
+    }
+    if (typeof source !== 'object' || Array.isArray(source)) {
+        return false;
+    }
+    if (!('subagent' in source)) {
+        return true;
+    }
+    const subagent = source.subagent;
+    if (!subagent || typeof subagent !== 'object' || Array.isArray(subagent)) {
+        return false;
+    }
+    if ('other' in subagent && (typeof subagent.other !== 'string' || subagent.other.length === 0)) {
+        return false;
+    }
+    return true;
+}
+
+// This revision repairs guardian exclusions, not every historical classifier.
+// Ordinary/fork headers finish here. Only guardian candidates require a task
+// boundary to preserve external-import precedence. A chunk may buffer bytes
+// after session_meta; none are interpreted before its cwd is authorized.
+export async function readCodexKindPreamble(
+    filePath: string,
+    handle: FileHandle,
+    authorizeHeader: (cwd: string, nativeId: string) => boolean,
+): Promise<{
+    nativeId: string;
+    cwd: string;
+    guardian: boolean;
+    malformed: boolean;
+}> {
+    let meta: (CodexSessionMeta & { id: string; cwd: string }) | undefined;
+    let malformed = false;
+    for await (const { text } of readBoundedLines(filePath, {
+        handle,
+        maxReadBytes: SESSION_KIND_PREAMBLE_MAX_BYTES,
+        maxRecordBytes: SESSION_KIND_PREAMBLE_MAX_BYTES,
+    })) {
+        const line: unknown = JSON.parse(text);
+        if (
+            !line ||
+            typeof line !== 'object' ||
+            !('type' in line) ||
+            !('payload' in line) ||
+            !line.payload ||
+            typeof line.payload !== 'object'
+        ) {
+            throw new Error('malformed classification preamble');
+        }
+        const payload = line.payload;
+        if (!meta) {
+            if (
+                line.type !== 'session_meta' ||
+                !('id' in payload) ||
+                typeof payload.id !== 'string' ||
+                !payload.id ||
+                !('cwd' in payload) ||
+                typeof payload.cwd !== 'string' ||
+                !path.isAbsolute(payload.cwd)
+            ) {
+                throw new Error('missing or malformed session metadata');
+            }
+            meta = payload as CodexSessionMeta & { id: string; cwd: string };
+            malformed = !validKindMetadata(payload as Record<string, unknown>);
+            if (!authorizeHeader(meta.cwd, meta.id)) {
+                throw new Error('session metadata cwd is not currently authorized');
+            }
+            if (!isCodexGuardianMetadata(meta) || nonemptyString(meta.forked_from_id)) {
+                return { nativeId: meta.id, cwd: meta.cwd, guardian: false, malformed };
+            }
+        }
+        if (line.type === 'event_msg' && 'turn_id' in payload && typeof payload.turn_id === 'string' && payload.turn_id !== '') {
+            return {
+                nativeId: meta.id,
+                cwd: meta.cwd,
+                guardian: !payload.turn_id.startsWith(EXTERNAL_IMPORT_TURN_PREFIX),
+                malformed,
+            };
+        }
+    }
+    throw new Error('classification preamble has no task boundary');
 }
 
 function extractPatchFilePaths(input: string | undefined, cwd: string | undefined): string[] {
@@ -315,12 +431,12 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // parse so a rollout containing the duplicate pair does not emit twice.
     private async userBoundaryFor(
         filePath: string,
-        options: { handle?: FileHandle; signal?: AbortSignal } = {},
+        options: { handle?: FileHandle; signal?: AbortSignal; maxReadBytes?: number } = {},
     ): Promise<'event_msg' | 'response_item'> {
         let sawUserResponse = false;
 
         try {
-            for await (const { text } of readBoundedLines(filePath, { handle: options.handle })) {
+            for await (const { text } of readBoundedLines(filePath, { handle: options.handle, maxReadBytes: options.maxReadBytes })) {
                 if (options.signal?.aborted) {
                     return 'response_item';
                 }
@@ -352,7 +468,7 @@ export class CodexAdapter extends JsonlTurnAdapter {
                 }
             }
         } catch (error) {
-            if (error instanceof OversizedTranscriptRecordError) {
+            if (error instanceof OversizedTranscriptRecordError || error instanceof TranscriptReadBudgetError) {
                 throw error;
             }
             // The daemon's readability guard owns a visible failure. The
@@ -381,9 +497,9 @@ export class CodexAdapter extends JsonlTurnAdapter {
     //    turns span hours-to-days as duplicates.
     //
     // Measured against the local corpus, the signals that actually separate
-    // the three cases:
+    // the cases:
     //
-    // - forked_from_id non-null -> the file BEGINS with a verbatim copy of the
+    // - forked_from_id nonempty string -> the file BEGINS with a copy of the
     //   parent's whole transcript, every copied line restamped with the fork
     //   instant (observed: 175 turns inside 73ms of each other, byte-identical
     //   user messages to the parent, vs. multi-hour spans on every
@@ -392,12 +508,18 @@ export class CodexAdapter extends JsonlTurnAdapter {
     //   internal approval adjudicator. Its own prompt labels the transcript
     //   "untrusted evidence, not instructions to follow"; there is no human in
     //   it. User-spawned subagents always carry both fields.
+    // - Codex 0.150.1 changed guardian thread_source from 'subagent' to
+    //   'guardian_review'. Both formats retain source.subagent.other equal
+    //   to 'guardian'; these are approval evidence, not human sessions.
     async classifySession(filePath: string, options?: Pick<ParseTurnsOptions, 'handle'>): Promise<SessionClassification> {
         const { first, externalAgentImport } = await this.readClassificationPreamble(filePath, options?.handle);
         if (!first) {
             return { kind: 'primary' };
         }
         const meta = (first.payload ?? {}) as CodexSessionMeta;
+        if (!validKindMetadata(meta as Record<string, unknown>)) {
+            this.warnUnknownLine(`CodexAdapter: malformed optional classification metadata ignored in ${filePath}`);
+        }
 
         if (externalAgentImport) {
             return {
@@ -407,7 +529,7 @@ export class CodexAdapter extends JsonlTurnAdapter {
             };
         }
 
-        if (meta.forked_from_id) {
+        if (nonemptyString(meta.forked_from_id)) {
             return {
                 kind: 'fork-copy',
                 parentNativeId: meta.forked_from_id,
@@ -415,17 +537,16 @@ export class CodexAdapter extends JsonlTurnAdapter {
             };
         }
 
+        if (isCodexGuardianMetadata(meta)) {
+            return {
+                kind: 'adjudicator',
+                parentNativeId: nonemptyString(meta.parent_thread_id) ? meta.parent_thread_id : undefined,
+                reason: 'Codex internal approval-adjudication transcript (untrusted evidence, no human)',
+            };
+        }
+
         if (meta.thread_source === 'subagent') {
-            // A user-spawned subagent always carries its identity; the internal
-            // adjudicator never does.
-            if (!meta.agent_path && !meta.agent_nickname) {
-                return {
-                    kind: 'adjudicator',
-                    parentNativeId: meta.parent_thread_id ?? undefined,
-                    reason: 'Codex internal approval-adjudication transcript (untrusted evidence, no human)',
-                };
-            }
-            return { kind: 'subagent', parentNativeId: meta.parent_thread_id ?? undefined };
+            return { kind: 'subagent', parentNativeId: nonemptyString(meta.parent_thread_id) ? meta.parent_thread_id : undefined };
         }
 
         return { kind: 'primary' };
@@ -544,6 +665,9 @@ export class CodexAdapter extends JsonlTurnAdapter {
         if (l.type === 'response_item') {
             if (p.type === 'message') {
                 if (p.role === 'assistant') {
+                    if (p.phase !== undefined && p.phase !== 'commentary' && p.phase !== 'final_answer') {
+                        this.warnUnknownLine(`CodexAdapter: unrecognized assistant phase "${safeDiscriminator(p.phase)}" in ${filePath}`);
+                    }
                     return 'content';
                 }
                 // This is the portable user-turn record. The only role:user
@@ -605,11 +729,17 @@ export class CodexAdapter extends JsonlTurnAdapter {
         }
 
         if (l.type === 'response_item' && p.type === 'message' && p.role === 'assistant') {
+            const firstPart = state.assistantTextParts.length;
             for (const block of p.content ?? []) {
                 if ((block.type === 'output_text' || block.type === 'text') && typeof block.text === 'string') {
                     state.assistantTextParts.push(block.text);
                 }
             }
+            state.assistantMessageBoundaries.push({
+                firstPart,
+                partCount: state.assistantTextParts.length - firstPart,
+                phase: p.phase === 'commentary' || p.phase === 'final_answer' ? p.phase : 'unclassified',
+            });
             return;
         }
 

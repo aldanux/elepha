@@ -66,7 +66,7 @@ async function runInstall(): Promise<void> {
             service,
             ...(onPhase ? { onPhase } : {}),
         };
-        printInstallation(installElepha(undefined, runtime), 'install');
+        printInstallation(await installElepha(undefined, runtime), 'install');
     } catch (error) {
         if (service !== undefined && priorService !== undefined) {
             try {

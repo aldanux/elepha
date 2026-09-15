@@ -22,6 +22,9 @@ export const RESUME_TOKEN_BUDGET = 400_000;
 export const RESUME_CHAR_BUDGET = RESUME_TOKEN_BUDGET * CHARS_PER_TOKEN;
 export const DURABLE_CAPTURE_MAX_BYTES = 1024 * 1024 * 1024;
 export const DURABLE_CAPTURE_FILTER_VERSION = 1;
+// Structural offsets retain whole final messages without duplicating their
+// text. Bound metadata independently when a turn contains many messages.
+export const ASSISTANT_STRUCTURE_MAX_FINALS = 256;
 export const DURABLE_CAPTURE_STATES = [
     'complete',
     'complete_truncated',
@@ -164,6 +167,12 @@ export const FINGERPRINT_WINDOW_BYTES = 4096;
 export const MAX_TRANSCRIPT_RECORD_BYTES = 64 * 1024 * 1024;
 export const MAX_METADATA_SCAN_BYTES = 4 * 1024 * 1024;
 export const MAX_METADATA_SCAN_LINES = 2_048;
+// Revision of historical guardian exclusion, not full reclassification.
+// Repair consumes a bounded preamble, never turns.
+export const SESSION_KIND_REVISION = 1;
+export const SESSION_KIND_RECONCILIATION_BATCH_SIZE = 25;
+export const SESSION_KIND_RECONCILIATION_BUDGET_MS = 5_000;
+export const SESSION_KIND_PREAMBLE_MAX_BYTES = 1024 * 1024;
 export const MAX_JSON_VALUE_DEPTH = 64;
 export const MAX_JSON_VALUE_NODES = 100_000;
 export const REFUSED_HOME_PROJECT_ROOTS = ['', 'Documents', 'Desktop', 'Downloads'] as const;
@@ -204,7 +213,16 @@ export const AUTOMATIC_RECALL_MAX_PER_CHAT = 3;
 // Match today's semantic shortlist while keeping hook work bounded if retrieval grows.
 export const AUTOMATIC_RECALL_MAX_CANDIDATES = 5;
 export const AUTOMATIC_RECALL_MAX_PROMPT_CHARS = 4_000;
-export const AUTOMATIC_RECALL_MAX_CONTEXT_CHARS = 2_000;
+// A complete production payload measured 2,854 characters and needed a
+// 2,855-character cap because selection reserves one character. A 3,000
+// cap provides bounded headroom without truncating structural finals.
+export const AUTOMATIC_RECALL_MAX_CONTEXT_CHARS = 3_000;
+// Query-aware expansion shares the automatic evidence source selection.
+export const SESSION_EVIDENCE_MAX_CONTEXT_CHARS = 4_000;
+export const SESSION_EVIDENCE_MAX_QUERY_CHARS = 4_000;
+export const SESSION_EVIDENCE_EXCERPT_CHARS = 800;
+// A directed first-interaction read stops once found, or at this byte ceiling.
+export const SESSION_EVIDENCE_SOURCE_MAX_BYTES = 4 * 1024 * 1024;
 export const EMBEDDING_LOCAL_MAX_TOKENS = 512;
 export const EMBEDDING_CHUNK_CHARACTERS = 1000;
 export const EMBEDDING_API_TIMEOUT_MS = 30_000;

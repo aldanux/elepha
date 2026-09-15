@@ -4,9 +4,11 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { sessionAdapterFor } from '../adapters/index.js';
 import { isReadableProviderSource } from '../config/paths.js';
+import { openProviderTranscript } from '../security/provider-transcript.js';
 import type { SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 import { firstPromptSearch } from './first-prompt-search.js';
+import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 
 export interface FirstPromptSearchChange {
     sessionId: number;
@@ -41,15 +43,37 @@ interface SessionSeed {
     first_prompt_search: string | null;
 }
 
-async function deriveFirstPrompt(session: SessionSeed, adapter: SessionAdapter, firstStoredIndex: number): Promise<string | undefined> {
+async function deriveFirstPrompt(
+    db: Database,
+    session: SessionSeed,
+    adapter: SessionAdapter,
+    firstStoredIndex: number,
+): Promise<string | undefined> {
     if (!isReadableProviderSource(session.tool, session.source_path)) {
         return undefined;
     }
     try {
-        for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
-            if (turn.turnIndex === firstStoredIndex) {
-                return firstPromptSearch(turn.userMessage);
+        const opened = await openProviderTranscript(session.tool, session.source_path);
+        if ('reason' in opened) {
+            return undefined;
+        }
+        try {
+            if (!isSessionKindEligible(db, session.id)) {
+                return undefined;
             }
+            for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
+                closeTrailingOnIdle: true,
+                handle: opened.handle,
+            })) {
+                if (!isSessionKindEligible(db, session.id)) {
+                    return undefined;
+                }
+                if (turn.turnIndex === firstStoredIndex) {
+                    return firstPromptSearch(turn.userMessage);
+                }
+            }
+        } finally {
+            await opened.handle.close();
         }
     } catch {
         return undefined;
@@ -60,20 +84,27 @@ async function deriveFirstPrompt(session: SessionSeed, adapter: SessionAdapter, 
 const deriver: BackfillDeriver<SessionSeed, FirstPromptSearchChange, Map<number, number>> = {
     load(db) {
         const sessions = db
-            .prepare('SELECT id, tool, native_id, source_path, first_prompt_search FROM sessions ORDER BY id')
+            .prepare(`SELECT id, tool, native_id, source_path, first_prompt_search FROM sessions s
+                WHERE ${SERVED_SESSION_KIND_ELIGIBILITY} ORDER BY id`)
             .all() as SessionSeed[];
         const firstIndexes = db
             .prepare('SELECT session_id, MIN(turn_index) AS turn_index FROM memories GROUP BY session_id')
             .all() as Array<{ session_id: number; turn_index: number }>;
         return { sessions, state: new Map(firstIndexes.map((row) => [row.session_id, row.turn_index])) };
     },
-    async derive({ adapters, session, state }) {
+    async derive({ db, adapters, session, state }) {
+        if (!isSessionKindEligible(db, session.id)) {
+            return undefined;
+        }
         const firstStoredIndex = state.get(session.id);
         if (firstStoredIndex === undefined) {
             return undefined;
         }
         const adapter = sessionAdapterFor(adapters, session.tool);
-        const after = adapter ? await deriveFirstPrompt(session, adapter, firstStoredIndex) : undefined;
+        const after = adapter ? await deriveFirstPrompt(db, session, adapter, firstStoredIndex) : undefined;
+        if (!isSessionKindEligible(db, session.id)) {
+            return undefined;
+        }
         if (after === undefined) {
             return {
                 sessionId: session.id,
@@ -100,8 +131,10 @@ const deriver: BackfillDeriver<SessionSeed, FirstPromptSearchChange, Map<number,
     },
     shouldWrite: (change) => !change.transcriptMissing,
     write(db, change) {
-        db.prepare('UPDATE sessions SET first_prompt_search = ? WHERE id = ?').run(change.after, change.sessionId);
-        return {};
+        const result = db
+            .prepare(`UPDATE sessions AS s SET first_prompt_search = ? WHERE id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}`)
+            .run(change.after, change.sessionId);
+        return { sessionsSkippedConcurrent: result.changes === 0 ? 1 : 0 };
     },
 };
 
@@ -119,8 +152,8 @@ function daemonBatchDeriver(
             const sessions = db
                 .prepare(
                     `SELECT id, tool, native_id, source_path, first_prompt_search
-                     FROM sessions
-                     WHERE id IN (${placeholders})${nullClause}
+                     FROM sessions s
+                     WHERE id IN (${placeholders})${nullClause} AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                      ORDER BY id`,
                 )
                 .all(...scope.sessionIds) as SessionSeed[];
@@ -136,11 +169,15 @@ function daemonBatchDeriver(
         },
         write(db, change) {
             if (scope.authorizeWrite?.(db, change.sessionId) === false) {
-                return {};
+                return { sessionsSkippedConcurrent: 1 };
             }
             const nullClause = scope.onlyNull ? ' AND first_prompt_search IS NULL' : '';
-            db.prepare(`UPDATE sessions SET first_prompt_search = ? WHERE id = ?${nullClause}`).run(change.after, change.sessionId);
-            return {};
+            const result = db
+                .prepare(
+                    `UPDATE sessions AS s SET first_prompt_search = ? WHERE id = ?${nullClause} AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
+                )
+                .run(change.after, change.sessionId);
+            return { sessionsSkippedConcurrent: result.changes === 0 ? 1 : 0 };
         },
     };
 }
@@ -158,6 +195,18 @@ export async function applyFirstPromptSearchBackfill(
     db: Database,
     adapters: SessionAdapterMap,
     scope?: FirstPromptSearchBackfillScope,
-): Promise<FirstPromptSearchPlan> {
-    return applyBackfill(db, adapters, scope === undefined ? deriver : daemonBatchDeriver(scope));
+): Promise<FirstPromptSearchPlan & { sessionsWritten: number }> {
+    const selected = scope === undefined ? deriver : daemonBatchDeriver(scope);
+    let sessionsWritten = 0;
+    const plan = await applyBackfill(db, adapters, {
+        ...selected,
+        write(database, change) {
+            const result = selected.write(database, change);
+            if (!result.sessionsSkippedConcurrent) {
+                sessionsWritten++;
+            }
+            return result;
+        },
+    });
+    return { ...plan, sessionsWritten };
 }

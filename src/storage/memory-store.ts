@@ -522,6 +522,7 @@ export class MemoryStore {
             `SELECT ft.memory_id,
                     length(CAST(ft.user_prompt AS BLOB))
                       + length(CAST(ft.assistant_response AS BLOB))
+                      + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0)
                       + length(CAST(ft.tool_calls AS BLOB)) AS bytes
              FROM filtered_turns ft
              JOIN memories m ON m.id = ft.memory_id

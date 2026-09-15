@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   surface          TEXT CHECK (surface IN ('cli','desktop')),
   git_branch       TEXT,
   kind             TEXT CHECK (kind IN ('main','subagent','fork','adjudicator')),
+  kind_revision    INTEGER NOT NULL DEFAULT 0,
   last_turn_at     TEXT,
   trailing_branch  TEXT,
   trailing_files   TEXT NOT NULL DEFAULT '[]',
@@ -140,7 +141,8 @@ CREATE TABLE IF NOT EXISTS filtered_turns (
   dropped_tool_ref_count  INTEGER NOT NULL DEFAULT 0,
   omitted_before_chars    INTEGER NOT NULL DEFAULT 0,
   filter_version          INTEGER NOT NULL,
-  captured_at             TEXT NOT NULL
+  captured_at             TEXT NOT NULL,
+  assistant_structure     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS durable_capture_status (
@@ -325,10 +327,19 @@ function migrate(db: Database.Database): void {
     if (!sessionColumns.includes('git_commit_count')) {
         db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
     }
+    if (!sessionColumns.includes('kind_revision')) {
+        db.exec('ALTER TABLE sessions ADD COLUMN kind_revision INTEGER NOT NULL DEFAULT 0');
+    }
     migrateSessionsToolConstraint(db);
     migrateShownSessionListsToolConstraint(db);
 
     const columns = (db.pragma('table_info(memories)') as Array<{ name: string }>).map((c) => c.name);
+    const filteredColumns = (db.pragma('table_info(filtered_turns)') as Array<{ name: string }>).map((c) => c.name);
+    if (!filteredColumns.includes('assistant_structure')) {
+        // NULL preserves historical uncertainty; no transcript is inferred
+        // from the old concatenated assistant field during migration.
+        db.exec('ALTER TABLE filtered_turns ADD COLUMN assistant_structure TEXT');
+    }
     if (!columns.includes('summarizer_status')) {
         db.exec(`ALTER TABLE memories ADD COLUMN summarizer_status TEXT NOT NULL DEFAULT 'unknown'`);
     }
@@ -400,6 +411,12 @@ function migrateDurableCaptureStatus(db: Database.Database): void {
 function migrateDurableCaptureFts(db: Database.Database): void {
     const existed = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'filtered_turns_fts'").get() !== undefined;
     const apply = db.transaction(() => {
+        const updateTrigger = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'filtered_turns_au'").get() as
+            | { sql: string }
+            | undefined;
+        if (updateTrigger !== undefined && !updateTrigger.sql.includes('AFTER UPDATE OF')) {
+            db.exec('DROP TRIGGER filtered_turns_au');
+        }
         db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS filtered_turns_fts USING fts5(
         user_prompt,
@@ -419,7 +436,7 @@ function migrateDurableCaptureFts(db: Database.Database): void {
         VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
       END;
 
-      CREATE TRIGGER IF NOT EXISTS filtered_turns_au AFTER UPDATE ON filtered_turns BEGIN
+      CREATE TRIGGER IF NOT EXISTS filtered_turns_au AFTER UPDATE OF user_prompt, assistant_response, tool_calls ON filtered_turns BEGIN
         INSERT INTO filtered_turns_fts(filtered_turns_fts, rowid, user_prompt, assistant_response, tool_calls)
         VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
         INSERT INTO filtered_turns_fts(rowid, user_prompt, assistant_response, tool_calls)
@@ -438,6 +455,20 @@ function migrateDurableCaptureFts(db: Database.Database): void {
 
 function migrateDurableCaptureUsage(db: Database.Database): void {
     const apply = db.transaction(() => {
+        const trigger = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'filtered_turns_usage_ai'").get() as
+            | { sql: string }
+            | undefined;
+        const legacyUsage = trigger !== undefined && !trigger.sql.includes('assistant_structure');
+        if (legacyUsage) {
+            db.exec(`DROP TRIGGER filtered_turns_usage_ai;
+                DROP TRIGGER IF EXISTS filtered_turns_usage_ad;
+                DROP TRIGGER IF EXISTS filtered_turns_usage_au;`);
+            // A legacy writer can reopen the expanded schema. Measure once
+            // when upgrading its old ledger triggers, then resume deltas.
+            db.prepare(
+                'UPDATE durable_capture_usage SET total_bytes = total_bytes + (SELECT COALESCE(SUM(length(CAST(assistant_structure AS BLOB))), 0) FROM filtered_turns) WHERE id = 1',
+            ).run();
+        }
         const initialized = db.prepare('SELECT 1 FROM durable_capture_usage WHERE id = 1').get() !== undefined;
         if (!initialized) {
             // Existing databases pay for one full measurement here. Every
@@ -448,6 +479,7 @@ function migrateDurableCaptureUsage(db: Database.Database): void {
               SELECT 1, COALESCE(SUM(
                 length(CAST(user_prompt AS BLOB)) +
                 length(CAST(assistant_response AS BLOB)) +
+                COALESCE(length(CAST(assistant_structure AS BLOB)), 0) +
                 length(CAST(tool_calls AS BLOB))
               ), 0)
               FROM filtered_turns;
@@ -459,6 +491,7 @@ function migrateDurableCaptureUsage(db: Database.Database): void {
             SET total_bytes = total_bytes +
                 length(CAST(new.user_prompt AS BLOB)) +
                 length(CAST(new.assistant_response AS BLOB)) +
+                COALESCE(length(CAST(new.assistant_structure AS BLOB)), 0) +
                 length(CAST(new.tool_calls AS BLOB))
             WHERE id = 1;
           END;
@@ -468,20 +501,29 @@ function migrateDurableCaptureUsage(db: Database.Database): void {
             SET total_bytes = total_bytes -
                 length(CAST(old.user_prompt AS BLOB)) -
                 length(CAST(old.assistant_response AS BLOB)) -
+                COALESCE(length(CAST(old.assistant_structure AS BLOB)), 0) -
                 length(CAST(old.tool_calls AS BLOB))
             WHERE id = 1;
           END;
 
-          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_au AFTER UPDATE OF user_prompt, assistant_response, tool_calls ON filtered_turns BEGIN
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_au AFTER UPDATE OF user_prompt, assistant_response, tool_calls, assistant_structure ON filtered_turns BEGIN
             UPDATE durable_capture_usage
             SET total_bytes = total_bytes -
                 length(CAST(old.user_prompt AS BLOB)) -
                 length(CAST(old.assistant_response AS BLOB)) -
+                COALESCE(length(CAST(old.assistant_structure AS BLOB)), 0) -
                 length(CAST(old.tool_calls AS BLOB)) +
                 length(CAST(new.user_prompt AS BLOB)) +
                 length(CAST(new.assistant_response AS BLOB)) +
+                COALESCE(length(CAST(new.assistant_structure AS BLOB)), 0) +
                 length(CAST(new.tool_calls AS BLOB))
             WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS filtered_turns_structure_au AFTER UPDATE OF assistant_response ON filtered_turns
+          WHEN new.assistant_structure IS NOT NULL AND new.assistant_response <> old.assistant_response AND new.assistant_structure IS old.assistant_structure
+          BEGIN
+            UPDATE filtered_turns SET assistant_structure = NULL WHERE memory_id = new.memory_id;
           END;
         `);
     });
@@ -573,6 +615,7 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
             surface             TEXT CHECK (surface IN ('cli','desktop')),
             git_branch          TEXT,
             kind                TEXT CHECK (kind IN ('main','subagent','fork','adjudicator')),
+            kind_revision       INTEGER NOT NULL DEFAULT 0,
             last_turn_at        TEXT,
             trailing_branch     TEXT,
             trailing_files      TEXT NOT NULL DEFAULT '[]',
@@ -586,10 +629,10 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
           );
           INSERT INTO sessions_new
             (id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
-             surface, git_branch, kind, last_turn_at, trailing_branch, trailing_files, rendered_chars,
+             surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, rendered_chars,
              rendered_turns, title, custom_title, first_prompt_search, git_commit_count)
           SELECT id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
-                 surface, git_branch, kind, last_turn_at, trailing_branch, trailing_files, rendered_chars,
+                 surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, rendered_chars,
                  rendered_turns, title, custom_title, first_prompt_search, git_commit_count
           FROM sessions;
           DROP TABLE sessions;

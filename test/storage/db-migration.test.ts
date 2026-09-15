@@ -5,6 +5,71 @@ import { openUnmanagedDb, SQLITE_SOURCE_WATERMARK_SCHEMA } from '../../src/stora
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 describe('sessions table migration', () => {
+    it('adds compact assistant structure to a populated prior durable schema and keeps mixed writers and reopen idempotent', () => {
+        const directory = withGrantableTestDir('elepha-assistant-structure-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/legacy', '2026-01-01', '2026-01-01');
+          INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
+          VALUES ('codex', 'legacy', 1, '/legacy.jsonl', '2026-01-01', '2026-01-01');
+          INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at)
+          VALUES (1, 1, 0, 'codex', '2026-01-01', '[]', '[]', '[]', '2026-01-01');
+          INSERT INTO filtered_turns (memory_id, included, user_prompt, assistant_response, filter_version, captured_at)
+          VALUES (1, 1, 'Legacy question', 'Original response', 1, '2026-01-01');
+          DROP TRIGGER filtered_turns_structure_au;
+          DROP TRIGGER filtered_turns_usage_ai;
+          DROP TRIGGER filtered_turns_usage_ad;
+          DROP TRIGGER filtered_turns_usage_au;
+          ALTER TABLE filtered_turns DROP COLUMN assistant_structure;
+          CREATE TRIGGER filtered_turns_usage_ai AFTER INSERT ON filtered_turns BEGIN
+            UPDATE durable_capture_usage SET total_bytes = total_bytes + length(CAST(new.user_prompt AS BLOB)) + length(CAST(new.assistant_response AS BLOB)) + length(CAST(new.tool_calls AS BLOB)) WHERE id = 1;
+          END;
+          CREATE TRIGGER filtered_turns_usage_ad AFTER DELETE ON filtered_turns BEGIN
+            UPDATE durable_capture_usage SET total_bytes = total_bytes - length(CAST(old.user_prompt AS BLOB)) - length(CAST(old.assistant_response AS BLOB)) - length(CAST(old.tool_calls AS BLOB)) WHERE id = 1;
+          END;
+          CREATE TRIGGER filtered_turns_usage_au AFTER UPDATE OF user_prompt, assistant_response, tool_calls ON filtered_turns BEGIN
+            UPDATE durable_capture_usage SET total_bytes = total_bytes - length(CAST(old.user_prompt AS BLOB)) - length(CAST(old.assistant_response AS BLOB)) - length(CAST(old.tool_calls AS BLOB)) + length(CAST(new.user_prompt AS BLOB)) + length(CAST(new.assistant_response AS BLOB)) + length(CAST(new.tool_calls AS BLOB)) WHERE id = 1;
+          END;
+          DROP TRIGGER filtered_turns_au;
+          CREATE TRIGGER filtered_turns_au AFTER UPDATE ON filtered_turns BEGIN
+            INSERT INTO filtered_turns_fts(filtered_turns_fts, rowid, user_prompt, assistant_response, tool_calls)
+            VALUES ('delete', old.memory_id, old.user_prompt, old.assistant_response, old.tool_calls);
+            INSERT INTO filtered_turns_fts(rowid, user_prompt, assistant_response, tool_calls)
+            VALUES (new.memory_id, new.user_prompt, new.assistant_response, new.tool_calls);
+          END;
+        `);
+        const before = prior.prepare('SELECT * FROM filtered_turns').get();
+        const initialUsage = prior.prepare('SELECT total_bytes FROM durable_capture_usage').get();
+        prior.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect(migrated.prepare('SELECT * FROM filtered_turns').get()).toEqual({ ...(before as object), assistant_structure: null });
+        expect(migrated.prepare('SELECT total_bytes FROM durable_capture_usage').get()).toEqual(initialUsage);
+        const metadata = JSON.stringify({ unclassified: false, finals: [[0, 17]], omitted: 0 });
+        migrated.prepare('UPDATE filtered_turns SET assistant_structure = ?').run(metadata);
+        const afterStructure = migrated.prepare('SELECT total_bytes FROM durable_capture_usage').get();
+        expect(afterStructure).toEqual({
+            total_bytes: (initialUsage as { total_bytes: number }).total_bytes + Buffer.byteLength(metadata),
+        });
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT total_bytes FROM durable_capture_usage').get()).toEqual(afterStructure);
+        expect(reopened.prepare('SELECT assistant_structure FROM filtered_turns').get()).toEqual({ assistant_structure: metadata });
+        // A writer from before the new column still updates ordinary content.
+        reopened.prepare('UPDATE filtered_turns SET assistant_response = ?').run('Replacement response');
+        expect(reopened.prepare('SELECT assistant_structure FROM filtered_turns').get()).toEqual({ assistant_structure: null });
+        expect(reopened.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'Replacement'").all()).toEqual([
+            { rowid: 1 },
+        ]);
+        expect(reopened.prepare('SELECT total_bytes FROM durable_capture_usage').get()).toEqual({
+            total_bytes: Buffer.byteLength('Legacy questionReplacement response[]'),
+        });
+        expect(reopened.pragma('foreign_key_check')).toEqual([]);
+        reopened.close();
+    });
+
     it('a fresh :memory: DB has the final schema with no migration needed', () => {
         const db = openUnmanagedDb(':memory:');
         const projectCols = (db.pragma('table_info(projects)') as Array<{ name: string }>).map((c) => c.name);
@@ -76,6 +141,7 @@ describe('sessions table migration', () => {
             'omitted_before_chars',
             'filter_version',
             'captured_at',
+            'assistant_structure',
         ]);
         expect((db.pragma('table_info(durable_capture_status)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
             'session_id',

@@ -1,8 +1,47 @@
 import { describe, expect, it, vi } from 'vitest';
-import { isSubstantive, readProjectSessions, readSessionById } from '../../src/storage/session-read-model.js';
+import {
+    isSubstantive,
+    readEligibleEmbeddingSessionIds,
+    readEmbeddingSession,
+    readProjectSessionAggregates,
+    readProjectSessions,
+    readSessionById,
+    readSessionByNaturalKey,
+} from '../../src/storage/session-read-model.js';
 import { createTestDb, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 describe('session read model', () => {
+    it('excludes historical adjudicators from every served lookup while preserving other kinds and stored rows', () => {
+        const fixture = createTestDb('elepha-kind-read-');
+        const project = seedProject(fixture, { path: fixture.directory });
+        const sessions = ([null, 'main', 'subagent', 'fork', 'adjudicator'] as const).map((kind) =>
+            seedSession(fixture, { project, nativeId: `kind-${kind}`, kind }),
+        );
+        const eligible = sessions.slice(0, -1).map((session) => session.id);
+        expect(
+            readProjectSessions(fixture.db, [project.id])
+                .map((session) => session.id)
+                .sort(),
+        ).toEqual(eligible);
+        expect(readProjectSessionAggregates(fixture.db, [project.id]).reduce((count, row) => count + row.work_episodes, 0)).toBe(4);
+        expect(
+            readEligibleEmbeddingSessionIds(
+                fixture.db,
+                sessions.map((session) => session.id),
+                [project.id],
+            ),
+        ).toEqual(eligible);
+        for (const session of sessions) {
+            const expected = session.kind === 'adjudicator' ? undefined : expect.objectContaining({ id: session.id });
+            expect(readSessionById(fixture.db, session.id)).toEqual(expected);
+            expect(readEmbeddingSession(fixture.db, session.id, [project.id])).toEqual(expected);
+            expect(readSessionByNaturalKey(fixture.db, { tool: session.tool, nativeId: session.native_id, segmentIndex: 0 })).toEqual(
+                expected,
+            );
+        }
+        expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM sessions').get()).toEqual({ count: 5 });
+    });
+
     it('exposes instructions through both readers and treats an instruction-only rollup as substantive', () => {
         const fixture = createTestDb('elepha-instruction-read-');
         const project = seedProject(fixture, { path: fixture.directory });

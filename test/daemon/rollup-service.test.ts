@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { RollupService, watermarkStillMatches } from '../../src/daemon/rollup-service.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore, type SessionRow } from '../../src/storage/memory-store.js';
@@ -77,6 +77,49 @@ describe('RollupService', () => {
             pending_items: [],
             status: 'ok',
         });
+
+    it.each([null, 'main', 'subagent', 'fork', 'adjudicator'])('selects and rolls up only eligible current kinds: %s', async (kind) => {
+        record(0);
+        db.prepare('UPDATE sessions SET kind = ? WHERE id = ?').run(kind, session.id);
+        const eligible = kind !== 'adjudicator';
+        expect(store.listOpenSessions().some((row) => row.id === session.id)).toBe(eligible);
+        expect(store.listSessionsForRollupRebuild(ROLLUP_VERSION).some((row) => row.id === session.id)).toBe(eligible);
+        expect((await service.rollupSession(session, 'primary', null, 'live')).wrote).toBe(eligible);
+        expect(provider.rollupCalls.length).toBe(eligible ? 1 : 0);
+    });
+
+    it('does not write a rollup after kind changes during awaited summarization', async () => {
+        record(0);
+        vi.spyOn(provider, 'rollup').mockImplementation(async () => {
+            db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+            return provider.result;
+        });
+        expect(await service.rollupSession(session, 'primary', null, 'live')).toEqual({ wrote: false, complete: false });
+        expect(rollups.get(session.id)).toBeUndefined();
+    });
+
+    it('rechecks kind inside the rollup writer after the service check', async () => {
+        record(0);
+        const write = rollups.write.bind(rollups);
+        vi.spyOn(rollups, 'write').mockImplementation((...args) => {
+            db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+            return write(...args);
+        });
+        expect((await service.rollupSession(session, 'primary', null, 'live')).wrote).toBe(false);
+        expect(rollups.get(session.id)).toBeUndefined();
+    });
+
+    it('keeps an existing final rollup untouched after guardian reclassification', async () => {
+        record(0);
+        await service.rollupSession(session, 'primary', null, 'final');
+        const before = rollups.get(session.id);
+        db.prepare("UPDATE sessions SET kind = 'adjudicator' WHERE id = ?").run(session.id);
+        service.noteActivity(session.id);
+        expect(await service.rollupSession(session, 'primary', null, 'live')).toEqual({ wrote: false, complete: false });
+        expect(provider.rollupCalls).toHaveLength(1);
+        expect(provider.mergeCalls).toHaveLength(0);
+        expect(rollups.get(session.id)).toEqual(before);
+    });
 
     it('creates a rollup from scratch on first pass, then merges only new turns', async () => {
         record(0, ['/repo/a.ts']);

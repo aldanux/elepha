@@ -1,6 +1,7 @@
 // Fail-open UserPromptSubmit hook. Historical turns are rendered exclusively
 // by SessionReader; this hook never reads a transcript itself.
 
+import { randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import {
@@ -18,7 +19,9 @@ import { getSetting } from '../config/settings.js';
 import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
-import { AUTOMATIC_RECALL_BODY_PREFIX, automaticRecallCandidate } from '../serving/automatic-recall.js';
+import { escapeShellSyntax } from '../security/sanitize.js';
+import { buildInjectionId, wrap } from '../security/sentinel.js';
+import { AUTOMATIC_RECALL_BODY_PREFIX, automaticRecallBody, automaticRecallCandidate } from '../serving/automatic-recall.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
     HELP,
@@ -30,6 +33,7 @@ import {
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
 import { currentRecallHits, renderSemanticUnion, semanticRecall, semanticRecallNotices } from '../serving/semantic-recall.js';
+import { selectSessionEvidence } from '../serving/session-evidence.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
@@ -344,39 +348,115 @@ export async function runUserPromptSubmit(
                         candidates.map((candidate) => candidate.sessionId),
                     ).map((hit) => [hit.session.id, hit]),
                 );
-                let selected: { sessionId: number; body: string } | undefined;
+                const selected: { sessionId: number; prefix: string; body: string }[] = [];
+                const nonce = randomUUID();
+                const contextBudget = AUTOMATIC_RECALL_MAX_CONTEXT_CHARS - wrap('brief', buildInjectionId(), '').length;
+                const evidenceQuery = tokenizeRecallQuery(payload.prompt);
+                const evidenceSignal = AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+                const remaining =
+                    AUTOMATIC_RECALL_MAX_PER_CHAT - store.countInjectionBodyPrefix(tool, payload.session_id, AUTOMATIC_RECALL_BODY_PREFIX);
                 for (const candidate of candidates) {
+                    if (selected.length >= remaining) {
+                        break;
+                    }
                     const hit = hits.get(candidate.sessionId);
                     if (hit === undefined || (hit.session.tool === tool && hit.session.native_id === payload.session_id)) {
                         continue;
                     }
                     const rendered = automaticRecallCandidate(hit, candidate.similarity);
                     const prefix = rendered.prefix;
-                    const body = notice === undefined ? rendered.body : `${rendered.body}\n${notice}`;
-                    if (body.length > AUTOMATIC_RECALL_MAX_CONTEXT_CHARS) {
+                    if (
+                        store.hasInjectionBodyPrefix(tool, payload.session_id, prefix) ||
+                        store.isTranscriptIncognito(hit.session.tool, hit.session.native_id)
+                    ) {
+                        continue;
+                    }
+                    const evidenceBudget =
+                        contextBudget - escapeShellSyntax(automaticRecallBody([...selected, rendered], nonce, notice)).length - 2;
+                    if (evidenceBudget <= 0) {
                         log(promptLogLine(tool, payload, 'discarded reason=automatic_context_budget'));
                         continue;
                     }
-                    if (store.hasInjectionBodyPrefix(tool, payload.session_id, prefix)) {
+                    const evidence = await selectSessionEvidence(reader, hit.session, evidenceQuery, evidenceBudget, evidenceSignal);
+                    if (Date.now() >= deadline || evidenceSignal.aborted) {
+                        return { reason: 'not_command' };
+                    }
+                    if (evidence.text.length === 0) {
+                        log(promptLogLine(tool, payload, `discarded reason=automatic_evidence_unavailable detail=${evidence.coverage}`));
+                        continue;
+                    }
+                    rendered.body += `\n${evidence.text}\n${evidence.coverage}`;
+                    const body = rendered.body;
+                    if (escapeShellSyntax(automaticRecallBody([...selected, rendered], nonce, notice)).length > contextBudget) {
+                        log(promptLogLine(tool, payload, 'discarded reason=automatic_context_budget'));
+                        continue;
+                    }
+                    if (selected.some((entry) => entry.prefix === prefix)) {
                         continue;
                     }
                     if (store.isTranscriptIncognito(hit.session.tool, hit.session.native_id)) {
                         continue;
                     }
-                    selected = { sessionId: candidate.sessionId, body };
-                    break;
+                    selected.push({ sessionId: candidate.sessionId, prefix, body });
                 }
-                if (selected === undefined) {
+                if (selected.length === 0) {
                     return { reason: 'not_command' };
                 }
                 if (
                     !getSetting('memory-plus', {}, dependencies.configPath).value ||
-                    !contributingSessionsStillConsented(db, new SessionReader(db), [selected.sessionId])
+                    !contributingSessionsStillConsented(
+                        db,
+                        new SessionReader(db),
+                        selected.map((entry) => entry.sessionId),
+                    )
                 ) {
                     log(promptLogLine(tool, payload, 'discarded reason=project_unavailable_or_unconsented'));
                     return { reason: 'not_command' };
                 }
-                const result = emit(selected.body);
+                // Candidate receipts and the shared injection commit together. A
+                // failed receipt must not spend chat budget for unseen material.
+                let result: UserPromptSubmitResult;
+                try {
+                    result = db.transaction(() => {
+                        if (
+                            !contributingSessionsStillConsented(
+                                db,
+                                new SessionReader(db),
+                                selected.map((entry) => entry.sessionId),
+                            )
+                        ) {
+                            return { reason: 'not_command' } as UserPromptSubmitResult;
+                        }
+                        if (
+                            store.countInjectionBodyPrefix(tool, payload.session_id, AUTOMATIC_RECALL_BODY_PREFIX) + selected.length >
+                                AUTOMATIC_RECALL_MAX_PER_CHAT ||
+                            selected.some((entry) => store.hasInjectionBodyPrefix(tool, payload.session_id, entry.prefix))
+                        ) {
+                            return { reason: 'not_command' } as UserPromptSubmitResult;
+                        }
+                        for (const entry of selected) {
+                            const receipt = recordHookOutput({
+                                store,
+                                tool,
+                                nativeSessionId: payload.session_id,
+                                injectedAt: new Date(clock()).toISOString(),
+                                body: entry.body,
+                                kind: 'brief',
+                                writeInjection: dependencies.writeInjection,
+                            });
+                            if (receipt === undefined) {
+                                throw new Error('Automatic candidate receipt failed.');
+                            }
+                        }
+                        const emitted = emit(automaticRecallBody(selected, nonce, notice));
+                        if (!('output' in emitted)) {
+                            throw new Error('Automatic injection record failed.');
+                        }
+                        return emitted;
+                    })();
+                } catch {
+                    return { reason: 'injection_record_failed' };
+                }
                 if ('output' in result) {
                     log(promptLogLine(tool, payload, 'served automatic_candidate'));
                 }
