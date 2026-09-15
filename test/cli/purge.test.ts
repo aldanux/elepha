@@ -150,7 +150,9 @@ describe('elepha purge orphan project scope', () => {
         const directory = withTempDir('elepha-purge-');
         const projectDirectory = mkdtempSync(path.join(testScratchRoot, 'purge-'));
         const dbPath = path.join(directory, 'elepha.db');
-        // The OS-temp project is the refused-root subject; database scratch stays in-repo.
+        // Keep temporary projects in-repo, with their own Git-discovery boundary
+        // so they cannot be registered as the surrounding repository instead.
+        vi.stubEnv('TMPDIR', withGrantableTestDir('purge-tmp-'));
         const tempPath = mkdtempSync(path.join(tmpdir(), 'elepha-purge-temp-project-'));
         const missingPath = path.join(projectDirectory, 'missing-project');
         const livePath = path.join(projectDirectory, 'live-project');
@@ -158,6 +160,7 @@ describe('elepha purge orphan project scope', () => {
         const db = openUnmanagedDb(dbPath);
         const store = new MemoryStore(db);
         const temp = store.upsertProject(tempPath);
+        expect(temp.path).toBe(tempPath);
         const missing = store.upsertProject(missingPath);
         const live = store.upsertProject(livePath);
         const tempSession = store.upsertSession('codex', 'temp-session', temp.id, path.join(directory, 'temp.jsonl'));
@@ -200,6 +203,7 @@ describe('elepha purge orphan project scope', () => {
             removeDirectory(directory);
             removeDirectory(projectDirectory);
             removeDirectory(tempPath);
+            vi.unstubAllEnvs();
         }
     }, 15000);
 
