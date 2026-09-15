@@ -86,11 +86,19 @@ describe('Memory-Plus disable and runtime uninstall', () => {
     it('treats already off as a successful no-op without rewriting configuration or vectors', async () => {
         const f = await fixture();
         setSetting('memory-plus', 'false');
+        const beforeContent = fs.readFileSync(f.paths.config, 'utf8');
         const before = fs.statSync(f.paths.config);
         const log = vi.fn();
         disableMemoryPlus({ log });
         expect(getSetting('memory-plus').value).toBe(false);
-        expect(fs.statSync(f.paths.config)).toEqual(before);
+        expect(fs.readFileSync(f.paths.config, 'utf8')).toBe(beforeContent);
+        expect(fs.statSync(f.paths.config)).toMatchObject({
+            dev: before.dev,
+            ino: before.ino,
+            size: before.size,
+            mtimeMs: before.mtimeMs,
+            ctimeMs: before.ctimeMs,
+        });
         expect(f.vectors()).toEqual(f.originalVectors);
         expect(log).toHaveBeenCalledWith(expect.stringMatching(/already off.*vectors.*retained/i));
     });
