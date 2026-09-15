@@ -131,5 +131,6 @@ Advanced repair command; normal setup and ongoing indexing are automatic.
 Manually generate versioned vectors from currently permitted stored session
 metadata. Requires Memory-Plus to be enabled and memory to be unlocked.
 Existing current vectors are skipped; `--rebuild` regenerates all eligible vectors
-without changing source material. API mode always requires confirmation before
-sending session content to OpenAI. Neither command changes hooks or search ranking.
+without changing source material. Embeddings are generated locally with the bundled
+model; session content is not sent to an external provider, and ambient API keys
+are not used. The command does not change hook or search-ranking settings.
