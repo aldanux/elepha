@@ -77,7 +77,7 @@ function fixture() {
         }
         return session;
     }
-    return { ...f, configPath, project, embeddings, provider, factory, add };
+    return { ...f, configPath, project, embeddings, provider, factory, add, log: vi.fn() };
 }
 
 function projects(f: ReturnType<typeof fixture>) {
@@ -88,14 +88,14 @@ function text(result: { content: Array<{ type: string; text?: string }> }): stri
     return result.content.map((item) => item.text ?? '').join('\n');
 }
 
-async function hook(f: ReturnType<typeof fixture>, prompt = 'elepha:query receipt') {
+async function hookResult(f: ReturnType<typeof fixture>, prompt: string) {
     function openDatabase(dbPath: ':memory:'): ReturnType<typeof openUnmanagedDb>;
     function openDatabase(dbPath?: string): Promise<ReturnType<typeof openUnmanagedDb>>;
     function openDatabase(dbPath?: string) {
         const db = openUnmanagedDb(dbPath);
         return dbPath === ':memory:' ? db : Promise.resolve(db);
     }
-    const result = await runUserPromptSubmit(
+    return runUserPromptSubmit(
         JSON.stringify({
             session_id: 'current',
             cwd: f.project.path,
@@ -110,9 +110,13 @@ async function hook(f: ReturnType<typeof fixture>, prompt = 'elepha:query receip
             configPath: f.configPath,
             openDatabase,
             now: () => NOW,
-            log: vi.fn(),
+            log: f.log,
         },
     );
+}
+
+async function hook(f: ReturnType<typeof fixture>, prompt = 'elepha:query receipt') {
+    const result = await hookResult(f, prompt);
     if (!('output' in result)) throw new Error(result.reason);
     return (result.output.hookSpecificOutput as { additionalContext: string }).additionalContext;
 }
@@ -207,6 +211,24 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(peak).toBe(1);
     });
 
+    it('applies an optional strict similarity floor before counting hit-cap omissions', async () => {
+        const f = fixture();
+        f.add('below floor', [-1, 0]);
+        f.add('at floor', [0, 1]);
+        f.add('first qualifying', [1, 0]);
+        const options = { minSimilarity: 0 };
+        const first = await semanticRecall(f.db, [f.project.id], 'recovery', options);
+        expect(first.candidates).toHaveLength(1);
+        expect(first.hitCapOmitted).toBe(0);
+        for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) f.add(`qualifying ${index}`, [1, 0]);
+        const capped = await semanticRecall(f.db, [f.project.id], 'recovery', options);
+        expect(capped.candidates).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
+        expect(capped.candidates.every((candidate) => candidate.similarity > options.minSimilarity)).toBe(true);
+        expect(capped.hitCapOmitted).toBe(1);
+        // Explicit recall still ranks the full compatible set without a floor.
+        expect((await semanticRecall(f.db, [f.project.id], 'recovery')).hitCapOmitted).toBe(3);
+    });
+
     it.each([1, 10])('caps decoded rows, omits oldest stored sessions and serves the loss at %s times the row budget', async (multiple) => {
         const f = fixture();
         const old = f.add('old best match', [1, 0]);
@@ -221,12 +243,15 @@ describe('semantic retrieval and explicit search integration', () => {
             text(await new ElephaMcpService(f.db).recall({ query: 'recovery' })),
             await hook(f, 'elepha:query recovery'),
             await hook(f, 'elepha:query:here recovery'),
-            await hook(f, 'Find a previous recovery decision'),
         ])
             expect(output).toContain(marker);
+        // Both notices push these candidates over the automatic context budget.
+        // Explicit search reports coverage; the automatic gate must abstain.
+        expect(await hookResult(f, 'Find a previous recovery decision')).toEqual({ reason: 'not_command' });
+        expect(f.log).toHaveBeenCalledWith(expect.stringContaining('discarded reason=automatic_context_budget'));
     });
 
-    it('reports elapsed-time truncation even when no compatible candidates were found', async () => {
+    it('reports empty elapsed-time truncation for explicit recall but abstains automatically', async () => {
         const f = fixture();
         f.add('older match', [1, 0]);
         f.add('new incompatible', [1, 0], { ...configuration, revision: 'old' });
@@ -241,7 +266,7 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(output).not.toContain('Title: older match');
         expect(output).toContain(semanticModule.semanticScanTruncation('time'));
         elapsed = 0;
-        expect(await hook(f, 'Find a previous recovery decision')).toContain(semanticModule.semanticScanTruncation('time'));
+        expect(await hookResult(f, 'Find a previous recovery decision')).toEqual({ reason: 'not_command' });
     });
 
     it('rejects oversized stored vectors before decoding their elements', async () => {

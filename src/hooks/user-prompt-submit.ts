@@ -312,6 +312,7 @@ export async function runUserPromptSubmit(
                 const deadline = Date.now() + HOOK_WATCHDOG_TIMEOUT_MS;
                 const semantic = await semanticRecall(db, project.projectIds, payload.prompt, {
                     configPath: dependencies.configPath,
+                    minSimilarity: AUTOMATIC_RECALL_MIN_SIMILARITY,
                     beforeUse: () => {
                         if (Date.now() >= deadline) {
                             throw new Error('Automatic recall deadline exceeded.');
@@ -323,9 +324,11 @@ export async function runUserPromptSubmit(
                 if (belowFloor !== -1) {
                     candidates.length = belowFloor;
                 }
+                // Coverage qualifies a candidate that earns an injection. It must
+                // never bypass abstention or the candidate's deduplication gate.
                 const notice = semanticRecallNotices(semantic);
                 if (candidates.length === 0) {
-                    return notice === undefined ? { reason: 'not_command' } : emit(notice);
+                    return { reason: 'not_command' };
                 }
                 // Resolve current projects and consent once for the bounded shortlist.
                 const hits = new Map(
@@ -358,7 +361,7 @@ export async function runUserPromptSubmit(
                     break;
                 }
                 if (selected === undefined) {
-                    return notice === undefined ? { reason: 'not_command' } : emit(notice);
+                    return { reason: 'not_command' };
                 }
                 if (
                     !getSetting('memory-plus', {}, dependencies.configPath).value ||

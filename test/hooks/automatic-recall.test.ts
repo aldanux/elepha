@@ -7,6 +7,7 @@ import {
     AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
     AUTOMATIC_RECALL_MIN_SIMILARITY,
     HOOK_WATCHDOG_TIMEOUT_MS,
+    SEMANTIC_RECALL_MAX_HITS,
 } from '../../src/config/constants.js';
 import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
@@ -163,6 +164,50 @@ describe('automatic Memory-Plus candidates', () => {
         expect(context(await f.run())).toContain('Revised payment recovery');
     });
 
+    it('stays silent across prompts when an indexed corpus has no qualifying candidate', async () => {
+        const f = fixture(0.5);
+        for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) {
+            f.writeVector(seedSession(f, { project: f.project, nativeId: `irrelevant-${index}`, title: `Irrelevant ${index}` }), 0.5);
+        }
+        expect(await f.run()).toEqual({ reason: 'not_command' });
+        expect(await f.run('Continue the change')).toEqual({ reason: 'not_command' });
+        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
+    });
+
+    it('qualifies emitted candidates with relevant cap loss and stays silent once the shortlist is deduplicated', async () => {
+        const f = fixture();
+        for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) {
+            f.writeVector(seedSession(f, { project: f.project, nativeId: `relevant-${index}`, title: `Relevant ${index}` }), 1);
+        }
+        f.writeVector(seedSession(f, { project: f.project, nativeId: 'irrelevant', title: 'Irrelevant' }), 0.5);
+        for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) {
+            const output = context(await f.run());
+            expect(output).toContain('get_session(');
+            expect(output).toContain(semantic.semanticHitCapTruncation(1));
+        }
+        expect(await f.run()).toEqual({ reason: 'not_command' });
+        expect(await f.run('Continue the change')).toEqual({ reason: 'not_command' });
+        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
+    });
+
+    it.each(['rows', 'time'] as const)(
+        'never emits a standalone %s scan notice for an empty or self-only shortlist',
+        async (truncation) => {
+            const f = fixture();
+            const recall = vi.spyOn(semantic, 'semanticRecall').mockResolvedValue({ candidates: [], truncation });
+            expect(await f.run()).toEqual({ reason: 'not_command' });
+            recall.mockResolvedValue({ candidates: [{ sessionId: f.session.id, similarity: 1 }], truncation });
+            expect(await f.run(undefined, 'codex', f.session.native_id)).toEqual({ reason: 'not_command' });
+            expect(await f.run(undefined, 'codex', f.session.native_id)).toEqual({ reason: 'not_command' });
+            expect(f.store.injectionsForSession('codex', f.session.native_id, new Date(NOW).toISOString())).toEqual([]);
+            expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
+            const output = context(await f.run(undefined, 'codex', 'notice-chat'));
+            expect(output).toContain(publicSessionId(f.session));
+            expect(output).toContain(semantic.semanticScanTruncation(truncation));
+            expect(await f.run(undefined, 'codex', 'notice-chat')).toEqual({ reason: 'not_command' });
+        },
+    );
+
     it.each(['revoke', 'incognito'] as const)('rechecks after vector scan: %s', async (action) => {
         const f = fixture();
         const scan = EmbeddingStore.prototype.scan;
@@ -187,23 +232,34 @@ describe('automatic Memory-Plus candidates', () => {
     });
 
     it.each(['codex', 'claude-code', 'opencode'] as const)(
-        'does not emit a candidate that becomes incognito after hydration: %s',
+        'rechecks final eligibility when a candidate becomes incognito after the shortlist check: %s',
         async (tool) => {
             const f = fixture();
             const candidate = vi.spyOn(automatic, 'automaticRecallCandidate');
-            const deduplicate = vi.spyOn(MemoryStore.prototype, 'hasInjectionBodyPrefix').mockImplementation(() => {
-                f.store.recordIncognitoTranscript(f.session.tool, f.session.native_id);
-                return false;
+            const deduplicate = vi.spyOn(MemoryStore.prototype, 'hasInjectionBodyPrefix');
+            const isIncognito = MemoryStore.prototype.isTranscriptIncognito;
+            const eligibility = vi.spyOn(MemoryStore.prototype, 'isTranscriptIncognito').mockImplementation(function (
+                this: MemoryStore,
+                ...args
+            ) {
+                const incognito = isIncognito.apply(this, args);
+                if (deduplicate.mock.calls.length > 0 && !incognito) {
+                    // Return the real shortlist decision, then change eligibility
+                    // on another connection before the final use-time recheck.
+                    f.store.recordIncognitoTranscript(f.session.tool, f.session.native_id);
+                }
+                return incognito;
             });
 
             const result = await f.run(undefined, tool);
 
-            // The real renderer already held the private title and pointer before
-            // the deduplication lookup changed eligibility on another connection.
+            // The shortlist accepted the hydrated candidate; only the final
+            // recheck can now prevent its private title and pointer being emitted.
             expect(candidate).toHaveBeenCalledOnce();
             expect(candidate.mock.results[0].value.body).toContain(`Title: ${f.session.title}`);
             expect(candidate.mock.results[0].value.body).toContain(publicSessionId(f.session));
             expect(deduplicate).toHaveBeenCalledOnce();
+            expect.soft(eligibility.mock.results.map((result) => result.value)).toEqual([false, true]);
             expect(f.store.isTranscriptIncognito(f.session.tool, f.session.native_id)).toBe(true);
             expect(f.db.prepare('SELECT id FROM sessions WHERE id = ?').get(f.session.id)).toBeDefined();
             expect(f.db.prepare('SELECT session_id FROM session_embeddings').all()).toEqual([]);
@@ -215,6 +271,23 @@ describe('automatic Memory-Plus candidates', () => {
             expect(f.store.injectionsForSession(tool, 'current', new Date(NOW).toISOString())).toEqual([]);
         },
     );
+
+    it('skips a candidate made incognito during deduplication and serves the eligible fallback', async () => {
+        const f = fixture();
+        const fallback = seedSession(f, { project: f.project, nativeId: 'eligible-fallback', title: 'Eligible fallback' });
+        f.writeVector(fallback, 0.98);
+        const lookup = MemoryStore.prototype.hasInjectionBodyPrefix;
+        vi.spyOn(MemoryStore.prototype, 'hasInjectionBodyPrefix').mockImplementation(function (this: MemoryStore, ...args) {
+            const duplicate = lookup.apply(this, args);
+            f.store.recordIncognitoTranscript(f.session.tool, f.session.native_id);
+            return duplicate;
+        });
+        const output = context(await f.run());
+        expect(output).toContain(publicSessionId(fallback));
+        expect(output).not.toContain(publicSessionId(f.session));
+        expect(output).not.toContain(f.session.title);
+        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toHaveLength(1);
+    });
 
     it('does not recall the receiving chat or a different project', async () => {
         const f = fixture();

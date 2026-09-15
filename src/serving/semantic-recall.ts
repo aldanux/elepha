@@ -55,6 +55,8 @@ export async function semanticRecall(
         configPath?: string;
         createProvider?: typeof createEmbeddingProvider;
         beforeUse?: () => void;
+        // Strict floor for automatic recall; explicit search keeps all similarities.
+        minSimilarity?: number;
     } = {},
 ): Promise<SemanticRecallResult> {
     // Keep all embedding imports, provider configuration and vector reads behind
@@ -90,7 +92,7 @@ export async function semanticRecall(
     // Read fresh after inference and disposal: no consent, eligibility or source
     // snapshot from before awaited work can authorize returned candidates.
     const candidates: SemanticCandidate[] = [];
-    let compatibleMatches = 0;
+    let qualifyingMatches = 0;
     const truncation = store.scan(
         projectIds,
         (stored) => {
@@ -98,9 +100,12 @@ export async function semanticRecall(
             if (stored.model !== model.model || stored.revision !== model.revision || stored.dimensions !== model.dimensions) {
                 return;
             }
-            compatibleMatches++;
             const dot = stored.vector.reduce((total, value, index) => total + value * queryVector[index], 0);
             const similarity = Math.max(-1, Math.min(1, dot / (queryNorm * Math.hypot(...stored.vector))));
+            if (options.minSimilarity !== undefined && similarity <= options.minSimilarity) {
+                return;
+            }
+            qualifyingMatches++;
             const candidate = { sessionId: stored.sessionId, similarity };
             const position = candidates.findIndex(
                 (current) => current.similarity < similarity || (current.similarity === similarity && current.sessionId < stored.sessionId),
@@ -119,7 +124,7 @@ export async function semanticRecall(
         generation,
     );
     options.beforeUse?.();
-    return { candidates, truncation, hitCapOmitted: compatibleMatches - candidates.length };
+    return { candidates, truncation, hitCapOmitted: qualifyingMatches - candidates.length };
 }
 
 // Preserve both candidate sets. A lexical match also found semantically retains
