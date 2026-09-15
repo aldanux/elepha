@@ -5,9 +5,9 @@ import type { createEmbeddingProvider } from '../embeddings/provider-config.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { ConsentStore } from '../storage/consent-store.js';
 import type { EmbeddingScanTruncation } from '../storage/embedding-store.js';
-import { withMemoryReadGeneration } from '../storage/paranoid-gate.js';
+import { LOCKED_CONTENT_COVERAGE, LOCKED_MEMORY_MESSAGE, withMemoryReadGeneration } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
-import { readEmbeddingSession } from '../storage/session-read-model.js';
+import { readEligibleEmbeddingSessionIds, readEmbeddingSession } from '../storage/session-read-model.js';
 import { hitIdentity, type LexicalRecallResult, type RecallQuery, type RecallScope, renderRecallBody } from './lexical-recall.js';
 
 export interface SemanticCandidate {
@@ -18,7 +18,7 @@ export interface SemanticCandidate {
 export interface SemanticRecallResult {
     candidates: SemanticCandidate[];
     truncation?: EmbeddingScanTruncation;
-    hitCapOmitted?: number;
+    hitCapOmittedSessionIds?: number[];
 }
 
 export function semanticScanTruncation(reason: EmbeddingScanTruncation): string {
@@ -30,11 +30,16 @@ export function semanticHitCapTruncation(omitted: number): string {
     return `Partial semantic search: ${omitted} compatible semantic matches omitted by the ${SEMANTIC_RECALL_MAX_HITS}-hit cap; lowest similarities dropped first, oldest stored sessions first on ties.`;
 }
 
-export function semanticRecallNotices(result: SemanticRecallResult): string | undefined {
+export function semanticRecallNotices(
+    result: SemanticRecallResult,
+    displayedIds: readonly number[] = result.candidates.map((candidate) => candidate.sessionId),
+): string | undefined {
+    const displayed = new Set(displayedIds);
+    const omitted = result.hitCapOmittedSessionIds?.filter((id) => !displayed.has(id)).length ?? 0;
     return (
         [
             result.truncation === undefined ? undefined : semanticScanTruncation(result.truncation),
-            result.hitCapOmitted ? semanticHitCapTruncation(result.hitCapOmitted) : undefined,
+            omitted ? semanticHitCapTruncation(omitted) : undefined,
         ]
             .filter((notice) => notice !== undefined)
             .join('\n') || undefined
@@ -92,7 +97,7 @@ export async function semanticRecall(
     // Read fresh after inference and disposal: no consent, eligibility or source
     // snapshot from before awaited work can authorize returned candidates.
     const candidates: SemanticCandidate[] = [];
-    let qualifyingMatches = 0;
+    const qualifyingSessionIds: number[] = [];
     const truncation = store.scan(
         projectIds,
         (stored) => {
@@ -105,7 +110,7 @@ export async function semanticRecall(
             if (options.minSimilarity !== undefined && similarity <= options.minSimilarity) {
                 return;
             }
-            qualifyingMatches++;
+            qualifyingSessionIds.push(stored.sessionId);
             const candidate = { sessionId: stored.sessionId, similarity };
             const position = candidates.findIndex(
                 (current) => current.similarity < similarity || (current.similarity === similarity && current.sessionId < stored.sessionId),
@@ -124,13 +129,19 @@ export async function semanticRecall(
         generation,
     );
     options.beforeUse?.();
-    return { candidates, truncation, hitCapOmitted: qualifyingMatches - candidates.length };
+    const selected = new Set(candidates.map((candidate) => candidate.sessionId));
+    return { candidates, truncation, hitCapOmittedSessionIds: qualifyingSessionIds.filter((id) => !selected.has(id)) };
 }
 
 // Preserve both candidate sets. A lexical match also found semantically retains
 // its semantic position; lexical-only matches keep their existing relative order.
 export function unionRecallIds(lexicalIds: readonly number[], semantic: readonly SemanticCandidate[]): number[] {
     return [...new Set([...semantic.map((candidate) => candidate.sessionId), ...lexicalIds])];
+}
+
+function currentRecallProjectIds(db: Database, projects: ProjectSet[]): number[] {
+    const allowed = new Set(new ProjectResolver(db).listConsentedStored(new ConsentStore(db)).flatMap((project) => project.projectIds));
+    return projects.flatMap((project) => project.projectIds).filter((id) => allowed.has(id));
 }
 
 // Hydrate both candidate sets afresh after inference; the lexical reader's memo
@@ -140,10 +151,7 @@ export function currentRecallHits(db: Database, projects: ProjectSet[], sessionI
         db,
         () => [],
         () => {
-            const allowed = new Set(
-                new ProjectResolver(db).listConsentedStored(new ConsentStore(db)).flatMap((project) => project.projectIds),
-            );
-            const projectIds = projects.flatMap((project) => project.projectIds).filter((id) => allowed.has(id));
+            const projectIds = currentRecallProjectIds(db, projects);
             return sessionIds.flatMap((id) => {
                 const session = readEmbeddingSession(db, id, projectIds);
                 const project =
@@ -166,39 +174,58 @@ export function renderSemanticUnion(
     if (lexical.state === 'locked') {
         return lexical;
     }
-    const scores = new Map(semantic.candidates.map((candidate) => [candidate.sessionId, candidate.similarity]));
-    const selectedIds = new Set(unionRecallIds(lexical.sessionIds, semantic.candidates));
-    // Retain the uncapped lexical identities for an exact, deduplicated total.
-    // Revalidate omitted matches too: stale eligibility must not inflate that total.
-    const current = currentRecallHits(db, projects, unionRecallIds(lexical.matchedSessionIds, semantic.candidates));
-    const hits = current
-        .filter(({ session }) => selectedIds.has(session.id))
-        .map(({ project, session }) => {
-            const similarity = scores.get(session.id);
-            return {
-                ...hitIdentity({ project, session }),
-                discovery: similarity === undefined ? undefined : semanticDiscovery(similarity),
-            };
-        });
-    const semanticNotice = semanticRecallNotices(semantic);
-    if (
-        semanticNotice === undefined &&
-        semantic.candidates.length === 0 &&
-        hits.length === lexical.sessionIds.length &&
-        current.length === lexical.matchedSessionIds.length
-    ) {
-        return lexical;
-    }
-    const coverage = [lexical.coverage, semanticNotice].filter((notice) => notice !== undefined).join('\n') || undefined;
-    return renderRecallBody(
-        query,
-        hits,
-        coverage,
-        now,
-        scope,
-        projects[0],
-        lexical.usedLaxFallback,
-        hits.length,
-        current.map(({ session }) => session.id),
+    return withMemoryReadGeneration(
+        db,
+        (): LexicalRecallResult => ({
+            body: LOCKED_MEMORY_MESSAGE,
+            sessionIds: [],
+            state: 'locked',
+            content_coverage: LOCKED_CONTENT_COVERAGE,
+        }),
+        () => {
+            const scores = new Map(semantic.candidates.map((candidate) => [candidate.sessionId, candidate.similarity]));
+            const selectedIds = new Set(unionRecallIds(lexical.sessionIds, semantic.candidates));
+            // Retain the uncapped lexical identities for an exact, deduplicated total.
+            // Revalidate omitted matches too: stale eligibility must not inflate that total.
+            const current = currentRecallHits(db, projects, [...selectedIds]);
+            const omittedIds = lexical.matchedSessionIds.filter((id) => !selectedIds.has(id));
+            const eligibleIds = [
+                ...current.map(({ session }) => session.id),
+                ...readEligibleEmbeddingSessionIds(db, omittedIds, currentRecallProjectIds(db, projects)),
+            ];
+            const hits = current.map(({ project, session }) => {
+                const similarity = scores.get(session.id);
+                return {
+                    ...hitIdentity({ project, session }),
+                    discovery: similarity === undefined ? undefined : semanticDiscovery(similarity),
+                };
+            });
+            const semanticNotice = semanticRecallNotices(semantic);
+            if (
+                semanticNotice === undefined &&
+                semantic.candidates.length === 0 &&
+                hits.length === lexical.sessionIds.length &&
+                eligibleIds.length === lexical.matchedSessionIds.length
+            ) {
+                return lexical;
+            }
+            const render = (notice: string | undefined, maxHits: number) =>
+                renderRecallBody(
+                    query,
+                    hits,
+                    [lexical.coverage, notice].filter((value) => value !== undefined).join('\n') || undefined,
+                    now,
+                    scope,
+                    projects[0],
+                    lexical.usedLaxFallback,
+                    maxHits,
+                    eligibleIds,
+                );
+            // Reserve the full cap notice before applying the output budget. Reconcile
+            // against the rendered identities without adding back budget-omitted hits.
+            const rendered = render(semanticNotice, hits.length);
+            const displayedNotice = semanticRecallNotices(semantic, rendered.sessionIds);
+            return displayedNotice === semanticNotice ? rendered : render(displayedNotice, rendered.sessionIds.length);
+        },
     );
 }

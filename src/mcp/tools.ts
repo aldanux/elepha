@@ -280,22 +280,26 @@ export class ElephaMcpService implements McpToolHandlers {
         semantic: SemanticRecallResult,
     ): string {
         const nonce = randomUUID();
-        const semanticNotice = semanticRecallNotices(semantic);
-        const opening = [
-            servedContextInstructions(nonce),
-            '',
-            dataBlockOpen(nonce),
-            hits.length === 0
-                ? `No recall matches found for “${escapeShellSyntax(query.display)}”.`
-                : `Recall material for “${escapeShellSyntax(query.display)}” (${hits.length} matching episode(s)):`,
-            ...(semanticNotice === undefined ? [] : [semanticNotice]),
-        ].join('\n');
+        const opening = (semanticNotice: string | undefined) =>
+            [
+                servedContextInstructions(nonce),
+                '',
+                dataBlockOpen(nonce),
+                hits.length === 0
+                    ? `No recall matches found for “${escapeShellSyntax(query.display)}”.`
+                    : `Recall material for “${escapeShellSyntax(query.display)}” (${hits.length} matching episode(s)):`,
+                ...(semanticNotice === undefined ? [] : [semanticNotice]),
+            ].join('\n');
         const closing = dataBlockClose(nonce);
         const truncation = 'Recall material was truncated to fit the 4k-token response budget.';
         const sections: string[] = [];
         let materialShortened = 0;
         let omittedHits = 0;
-        let body = opening;
+        // Reserve the maximum cap notice while fitting sections; recompute it
+        // from the sessions actually displayed once the response budget binds.
+        let body = opening(semanticRecallNotices(semantic, []));
+        const openingLength = body.length;
+        const displayedIds: number[] = [];
         const scores = new Map(semantic.candidates.map((candidate) => [candidate.sessionId, candidate.similarity]));
         for (const hit of hits) {
             const section = this.recallSection(
@@ -311,12 +315,14 @@ export class ElephaMcpService implements McpToolHandlers {
                 continue;
             }
             if (section.text.length > available) {
+                displayedIds.push(hit.session.id);
                 sections.push(section.text.slice(0, available));
                 body += `\n\n${sections.at(-1)}`;
                 materialShortened += 1;
                 omittedHits += hits.length - sections.length;
                 break;
             }
+            displayedIds.push(hit.session.id);
             sections.push(section.text);
             body += `\n\n${section.text}`;
         }
@@ -327,6 +333,7 @@ export class ElephaMcpService implements McpToolHandlers {
             materialShortened > 0 || omittedHits > 0
                 ? ` ${materialShortened} episode material section(s) shortened; ${omittedHits} matching episode(s) omitted.`
                 : '';
+        body = opening(semanticRecallNotices(semantic, displayedIds)) + body.slice(openingLength);
         return assertNoShellSyntax(`${body}${loss}\n${closing}`, 'mcp:recall').text;
     }
 

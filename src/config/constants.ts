@@ -185,6 +185,8 @@ export const SYSTEMD_UMASK = '0077';
 
 // Manual embedding jobs keep one source and one model input resident at a time.
 export const EMBEDDING_SESSION_PAGE_SIZE = 100;
+// Leave room for the fixed tool and project parameters under SQLite's variable limit.
+export const SESSION_ELIGIBILITY_BATCH_SIZE = 500;
 // Retrieval was evaluated by presence among the five nearest sessions.
 export const SEMANTIC_RECALL_MAX_HITS = 5;
 // Bound synchronous cache traversal, including stale and out-of-scope rows.

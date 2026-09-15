@@ -493,6 +493,36 @@ describe('derived vector storage and manual generation', () => {
         expect(await generateEmbeddings(f.db, options)).toMatchObject({ generated: 1, current: 1, sourceChanged: 0, failed: 0 });
     });
 
+    it('aborts malformed source classification after concurrent project authorization loss', async () => {
+        const f = fixture();
+        seedRollup(f, { project: f.project, session: f.session });
+        f.db.prepare('UPDATE session_rollups SET decisions = ? WHERE session_id = ?').run('{broken', f.session.id);
+        const denied = seedProject(f, { path: path.join(f.directory, 'denied') });
+        seedConsentRoot(f, { path: denied.path, state: 'denied' });
+        f.db.prepare('UPDATE projects SET git_remote = ? WHERE id = ?').run('shared-remote', denied.id);
+        setSetting('memory-plus', 'true', f.configPath);
+        const other = openUnmanagedDb(f.dbPath);
+        const original = ProjectResolver.prototype.listConsentedStored;
+        vi.spyOn(ProjectResolver.prototype, 'listConsentedStored').mockImplementationOnce(function (this: ProjectResolver, consent) {
+            const projects = original.call(this, consent);
+            other.prepare('UPDATE projects SET git_remote = ? WHERE id = ?').run('shared-remote', f.project.id);
+            return projects;
+        });
+        const report = vi.fn();
+        const progress = vi.fn();
+        const createProvider = vi.fn();
+        try {
+            await expect(generateEmbeddings(f.db, { configPath: f.configPath, createProvider, report, progress })).rejects.toThrow(
+                /source or authorization changed.*0 failed/,
+            );
+            expect(report).not.toHaveBeenCalled();
+            expect(progress).not.toHaveBeenCalled();
+            expect(createProvider).not.toHaveBeenCalled();
+        } finally {
+            other.close();
+        }
+    });
+
     it('reports repeated malformed sources without inference and resumes automatically after repair', async () => {
         const f = fixture();
         const newer = seedSession(f, { project: f.project, nativeId: 'malformed', title: 'Malformed session' });

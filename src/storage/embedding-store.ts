@@ -3,7 +3,7 @@ import { SEMANTIC_SCAN_BUDGET_MS, SEMANTIC_SCAN_MAX_ROWS, SEMANTIC_SCAN_MAX_VECT
 import { getSetting } from '../config/settings.js';
 import { validateEmbedding } from '../embeddings/provider.js';
 import type { EmbeddingModel } from '../embeddings/provider-config.js';
-import { embeddingSourceHash, embeddingSourceText } from '../embeddings/source.js';
+import { embeddingSourceHash, embeddingSourceText, MalformedEmbeddingSourceError } from '../embeddings/source.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { ConsentStore } from './consent-store.js';
 import {
@@ -126,16 +126,20 @@ export class EmbeddingStore {
                 let scanned = 0;
                 let truncation: EmbeddingScanTruncation | undefined;
                 for (const identity of rows as Iterable<{ session_id: number; project_id: number }>) {
-                    // One identity of lookahead distinguishes exhaustion from loss,
-                    // without hydrating or decoding a row beyond the budget.
-                    if (scanned >= SEMANTIC_SCAN_MAX_ROWS || performance.now() - started >= SEMANTIC_SCAN_BUDGET_MS) {
-                        truncation = scanned >= SEMANTIC_SCAN_MAX_ROWS ? 'rows' : 'time';
+                    if (performance.now() - started >= SEMANTIC_SCAN_BUDGET_MS) {
+                        truncation = 'time';
                         break;
                     }
-                    scanned++;
                     if (!allowedSet.has(identity.project_id)) {
                         continue;
                     }
+                    // One in-scope identity of lookahead distinguishes exhaustion
+                    // from loss without hydrating a row beyond the budget.
+                    if (scanned >= SEMANTIC_SCAN_MAX_ROWS) {
+                        truncation = 'rows';
+                        break;
+                    }
+                    scanned++;
                     const row = {
                         ...identity,
                         ...(read.get(SEMANTIC_SCAN_MAX_VECTOR_BYTES, identity.session_id) as {
@@ -190,10 +194,10 @@ export class EmbeddingStore {
         return withMemoryReadGeneration(
             this.db,
             lockedEmbedding,
-            () => {
+            (token) => {
                 const authority = this.consentIdentity();
                 const session = readEmbeddingSession(this.db, sessionId, this.projectIds());
-                const source = session === undefined ? undefined : sourceFor(session);
+                const source = session === undefined ? undefined : this.readSource(session, token, authority);
                 if (authority !== this.consentIdentity()) {
                     throw new Error(EMBEDDING_SOURCE_CHANGED);
                 }
@@ -209,7 +213,7 @@ export class EmbeddingStore {
             throw new Error(EMBEDDING_SOURCE_CHANGED);
         }
         if (JSON.stringify(current) !== JSON.stringify(source)) {
-            throw new EmbeddingSourceChangedError();
+            this.rejectSource(source.sessionId, new EmbeddingSourceChangedError(), generation);
         }
     }
 
@@ -248,46 +252,80 @@ export class EmbeddingStore {
             this.db,
             lockedEmbedding,
             () => {
-                this.db
-                    .transaction(() => {
-                        if (!memoryReadAuthorityMatchesGenerationInTransaction(this.db, generation)) {
-                            lockedEmbedding();
-                        }
-                        if (authority !== this.consentIdentity()) {
-                            throw new Error(EMBEDDING_SOURCE_CHANGED);
-                        }
-                        const row = readEmbeddingSession(this.db, source.sessionId, projectIds);
-                        const current = row === undefined ? undefined : sourceFor(row);
-                        if (current === undefined || current.identity !== source.identity) {
-                            throw new Error(EMBEDDING_SOURCE_CHANGED);
-                        }
-                        if (JSON.stringify(current) !== JSON.stringify(source)) {
-                            throw new EmbeddingSourceChangedError();
-                        }
-                        this.db
-                            .prepare(`INSERT INTO session_embeddings
+                const write = this.db.transaction(() => {
+                    if (!memoryReadAuthorityMatchesGenerationInTransaction(this.db, generation)) {
+                        lockedEmbedding();
+                    }
+                    if (authority !== this.consentIdentity()) {
+                        throw new Error(EMBEDDING_SOURCE_CHANGED);
+                    }
+                    const row = readEmbeddingSession(this.db, source.sessionId, projectIds);
+                    const current = row === undefined ? undefined : sourceFor(row);
+                    if (current === undefined || current.identity !== source.identity) {
+                        throw new Error(EMBEDDING_SOURCE_CHANGED);
+                    }
+                    if (JSON.stringify(current) !== JSON.stringify(source)) {
+                        throw new EmbeddingSourceChangedError();
+                    }
+                    this.db
+                        .prepare(`INSERT INTO session_embeddings
                     (session_id, rollup_session_id, project_id, source_hash, model, model_revision, dimensions, vector, computed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(session_id) DO UPDATE SET
                         rollup_session_id = excluded.rollup_session_id, project_id = excluded.project_id,
                         source_hash = excluded.source_hash, model = excluded.model, model_revision = excluded.model_revision,
                         dimensions = excluded.dimensions, vector = excluded.vector, computed_at = excluded.computed_at`)
-                            .run(
-                                source.sessionId,
-                                source.rollupSessionId,
-                                source.projectId,
-                                source.hash,
-                                escapeShellSyntax(model.model),
-                                escapeShellSyntax(model.revision),
-                                model.dimensions,
-                                bytes,
-                                new Date().toISOString(),
-                            );
-                    })
-                    .immediate();
+                        .run(
+                            source.sessionId,
+                            source.rollupSessionId,
+                            source.projectId,
+                            source.hash,
+                            escapeShellSyntax(model.model),
+                            escapeShellSyntax(model.revision),
+                            model.dimensions,
+                            bytes,
+                            new Date().toISOString(),
+                        );
+                });
+                try {
+                    write.immediate();
+                } catch (error) {
+                    // Re-authenticate only after rollback releases the writer.
+                    this.rejectSource(source.sessionId, error, generation, authority);
+                }
             },
             generation,
         );
+    }
+
+    private readSource(session: ServedSession, generation?: AuthenticatedReadGeneration, authority?: string): EmbeddingSource | undefined {
+        try {
+            return sourceFor(session);
+        } catch (error) {
+            return this.rejectSource(session.id, error, generation, authority);
+        }
+    }
+
+    // Only the store may classify a source error as skippable. Parsing failures
+    // must not hide a concurrent project regrouping or session eligibility loss.
+    private rejectSource(sessionId: number, error: unknown, generation?: AuthenticatedReadGeneration, authority?: string): never {
+        if (error instanceof MalformedEmbeddingSourceError || error instanceof EmbeddingSourceChangedError) {
+            this.assertEnabled();
+            withMemoryReadGeneration(
+                this.db,
+                lockedEmbedding,
+                () => {
+                    if (
+                        readEmbeddingSession(this.db, sessionId, this.projectIds()) === undefined ||
+                        (authority !== undefined && authority !== this.consentIdentity())
+                    ) {
+                        throw new Error(EMBEDDING_SOURCE_CHANGED);
+                    }
+                },
+                generation,
+            );
+        }
+        throw error;
     }
 
     private consentRoots(): unknown[] {

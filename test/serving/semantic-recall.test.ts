@@ -7,12 +7,19 @@ import {
     SEMANTIC_SCAN_BUDGET_MS,
     SEMANTIC_SCAN_MAX_ROWS,
     SEMANTIC_SCAN_MAX_VECTOR_BYTES,
+    SESSION_ELIGIBILITY_BATCH_SIZE,
 } from '../../src/config/constants.js';
 import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
-import { lexicalRecall, STRICT_RECALL_FALLBACK_NOTICE, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
+import {
+    hitIdentity,
+    lexicalRecall,
+    renderRecallBody,
+    STRICT_RECALL_FALLBACK_NOTICE,
+    tokenizeRecallQuery,
+} from '../../src/serving/lexical-recall.js';
 import * as semanticModule from '../../src/serving/semantic-recall.js';
 import { renderSemanticUnion, SEMANTIC_DISCOVERY, semanticRecall, unionRecallIds } from '../../src/serving/semantic-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
@@ -219,14 +226,38 @@ describe('semantic retrieval and explicit search integration', () => {
         const options = { minSimilarity: 0 };
         const first = await semanticRecall(f.db, [f.project.id], 'recovery', options);
         expect(first.candidates).toHaveLength(1);
-        expect(first.hitCapOmitted).toBe(0);
+        expect(first.hitCapOmittedSessionIds).toHaveLength(0);
         for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) f.add(`qualifying ${index}`, [1, 0]);
         const capped = await semanticRecall(f.db, [f.project.id], 'recovery', options);
         expect(capped.candidates).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
         expect(capped.candidates.every((candidate) => candidate.similarity > options.minSimilarity)).toBe(true);
-        expect(capped.hitCapOmitted).toBe(1);
+        expect(capped.hitCapOmittedSessionIds).toHaveLength(1);
         // Explicit recall still ranks the full compatible set without a floor.
-        expect((await semanticRecall(f.db, [f.project.id], 'recovery')).hitCapOmitted).toBe(3);
+        expect((await semanticRecall(f.db, [f.project.id], 'recovery')).hitCapOmittedSessionIds).toHaveLength(3);
+    });
+
+    it('reaches an older scoped vector beyond a row budget of unrelated projects', async () => {
+        const f = fixture();
+        const own = f.add('own older match', [1, 0]);
+        const other = seedProject(f, { path: path.join(f.directory, 'other') });
+        seedConsentRoot(f, { path: other.path });
+        for (let index = 0; index <= SEMANTIC_SCAN_MAX_ROWS; index++) {
+            const session = seedSession(f, { project: other, nativeId: `other-${index}`, title: 'Unrelated' });
+            f.embeddings.write(
+                f.embeddings.source(session.id)!,
+                configuration,
+                [1, 0],
+                withMemoryReadGeneration(f.db, lockedEmbedding, (token) => token),
+            );
+        }
+        vi.spyOn(performance, 'now').mockReturnValue(0);
+        const result = await semanticRecall(f.db, [f.project.id], 'recovery');
+        expect(result.candidates.map((candidate) => candidate.sessionId)).toEqual([own.id]);
+        expect(result.truncation).toBeUndefined();
+        const decode = vi.spyOn(Buffer.prototype, 'readFloatLE');
+        vi.mocked(performance.now).mockReturnValueOnce(0).mockReturnValue(SEMANTIC_SCAN_BUDGET_MS);
+        expect((await semanticRecall(f.db, [f.project.id], 'recovery')).truncation).toBe('time');
+        expect(decode).not.toHaveBeenCalled();
     });
 
     it.each([1, 10])('caps decoded rows, omits oldest stored sessions and serves the loss at %s times the row budget', async (multiple) => {
@@ -355,6 +386,82 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(recovered.body).toContain('(7 shown of 7)');
         expect(recovered.body).not.toContain('+1 more matches');
         expect(recovered.body).toContain(STRICT_RECALL_FALLBACK_NOTICE);
+    });
+
+    it.each([false, true])('counts capped semantic matches absent from the displayed union (hidden match: %s)', async (hidden) => {
+        const f = fixture();
+        if (hidden) f.add('unmatched older session', [1, 0]);
+        for (let index = 0; index < 6; index++) f.add(`receipt ${index}`, [1, 0]);
+        const query = tokenizeRecallQuery('receipt')!;
+        const lexical = await lexicalRecall(new SessionReader(f.db), projects(f), query, 'global', undefined, NOW, 'lax');
+        const semantic = await semanticRecall(f.db, [f.project.id], query.display);
+        // Without a lexical union, the semantic shortlist still omits its capped matches.
+        expect(semanticModule.semanticRecallNotices(semantic)).toContain(semanticModule.semanticHitCapTruncation(hidden ? 2 : 1));
+        const union = renderSemanticUnion(f.db, projects(f), query, 'global', lexical, semantic, NOW);
+        expect(union.sessionIds).toHaveLength(6);
+        for (const output of [union.body, text(await new ElephaMcpService(f.db).recall({ query: 'receipt' }))]) {
+            if (hidden) expect(output).toContain(semanticModule.semanticHitCapTruncation(1));
+            else expect(output).not.toContain('compatible semantic matches omitted');
+        }
+    });
+
+    it('revalidates thousands of omitted lexical matches in bounded statements and excludes withdrawn eligibility', async () => {
+        const f = fixture();
+        const count = SESSION_ELIGIBILITY_BATCH_SIZE * 3 + 7;
+        const insert = f.db.prepare(`INSERT INTO sessions
+            (tool, native_id, project_id, source_path, started_at, last_ingested_at, title)
+            VALUES ('codex', ?, ?, ?, ?, ?, ?)`);
+        const sessions = f.db.transaction(() =>
+            Array.from({ length: count }, (_, index) => {
+                const nativeId = `receipt ${index}`;
+                const id = Number(
+                    insert.run(
+                        nativeId,
+                        f.project.id,
+                        path.join(f.directory, `${index}.jsonl`),
+                        new Date(NOW).toISOString(),
+                        new Date(NOW).toISOString(),
+                        nativeId,
+                    ).lastInsertRowid,
+                );
+                return { id, tool: 'codex' as const, native_id: nativeId };
+            }),
+        )();
+        const requestedProjects = projects(f);
+        const query = tokenizeRecallQuery('receipt')!;
+        const lexical = renderRecallBody(
+            query,
+            semanticModule
+                .currentRecallHits(
+                    f.db,
+                    requestedProjects,
+                    sessions.slice(0, 5).map((session) => session.id),
+                )
+                .map(hitIdentity),
+            undefined,
+            NOW,
+            'global',
+            requestedProjects[0],
+            false,
+            5,
+            sessions.map((session) => session.id),
+        );
+        expect(lexical.sessionIds).toHaveLength(5);
+        if (lexical.state === 'locked') throw new Error('Unexpected locked fixture');
+        expect(lexical.matchedSessionIds).toHaveLength(count);
+        const omitted = sessions.filter((session) => !lexical.sessionIds.includes(session.id));
+        f.store.recordIncognitoTranscript(omitted[0].tool, omitted[0].native_id);
+        const denied = seedProject(f, { path: path.join(f.directory, 'denied') });
+        seedConsentRoot(f, { path: denied.path, state: 'denied' });
+        f.db.prepare('UPDATE sessions SET project_id = ? WHERE id = ?').run(denied.id, omitted[1].id);
+        const statements = vi.spyOn(f.db, 'prepare');
+        const union = renderSemanticUnion(f.db, requestedProjects, query, 'global', lexical, { candidates: [] }, NOW);
+        expect(union.body).toContain(`(5 shown of ${count - 2})`);
+        if (union.state === 'locked') throw new Error('Unexpected locked result');
+        expect(union.matchedSessionIds).not.toContain(omitted[0].id);
+        expect(union.matchedSessionIds).not.toContain(omitted[1].id);
+        // Fixed authorization/shortlist work plus one statement per identity batch.
+        expect(statements.mock.calls.length).toBeLessThanOrEqual(30 + Math.ceil(count / SESSION_ELIGIBILITY_BATCH_SIZE));
     });
 
     it('keeps the newest tied vectors and serves the hit-cap loss on every semantic surface', async () => {
