@@ -34,6 +34,11 @@ export interface ServedSession {
     turn_count: number;
     has_files_touched: number;
     has_external_content: number;
+    // Separate from canonical turn/rollup fields. Present only after the
+    // failed-EOF grace has elapsed and the unchanged candidate was staged.
+    open_turn_staged_at?: string | null;
+    open_turn_failed_at?: string | null;
+    open_turn_receipt_coverage?: 'complete' | 'incomplete' | null;
 }
 
 export interface ProjectSessionAggregate {
@@ -103,8 +108,14 @@ export function jsonArrayLength(value: string | null): number | null {
 // instructions, or files is substantive; otherwise stored capture is substantive from two
 // turns onward or when a turn touched files.
 export function isSubstantive(
-    session: Pick<ServedSession, 'rollup_state' | 'rollup_decisions' | 'rollup_instructions' | 'turn_count' | 'has_files_touched'>,
+    session: Pick<
+        ServedSession,
+        'rollup_state' | 'rollup_decisions' | 'rollup_instructions' | 'turn_count' | 'has_files_touched' | 'open_turn_staged_at'
+    >,
 ): boolean {
+    if (session.open_turn_staged_at != null) {
+        return true;
+    }
     if (session.rollup_state !== null) {
         return (
             (jsonArrayLength(session.rollup_decisions) ?? 0) > 0 ||
@@ -119,9 +130,12 @@ export function isSubstantive(
 // diverged from the project query would silently split the canonical shape.
 const SERVED_SESSION_SELECT = `SELECT s.*, r.title AS rollup_title, r.summary AS rollup_summary, r.decisions AS rollup_decisions, r.instructions AS rollup_instructions,
         r.pending_items AS rollup_pending_items, r.files_touched AS rollup_files_touched, r.rollup_state,
+        ot.staged_at AS open_turn_staged_at, ot.failed_at AS open_turn_failed_at,
+        ot.receipt_coverage AS open_turn_receipt_coverage,
         COUNT(m.id) AS turn_count, MAX(CASE WHEN m.files_touched <> '[]' THEN 1 ELSE 0 END) AS has_files_touched,
         MAX(CASE WHEN m.has_external_content = 1 THEN 1 ELSE 0 END) AS has_external_content
- FROM sessions s LEFT JOIN session_rollups r ON r.session_id = s.id LEFT JOIN memories m ON m.session_id = s.id`;
+ FROM sessions s LEFT JOIN session_rollups r ON r.session_id = s.id LEFT JOIN memories m ON m.session_id = s.id
+ LEFT JOIN open_turns ot ON ot.session_id = s.id AND ot.staged_at IS NOT NULL AND ot.validated_epoch = ot.validation_epoch`;
 
 const SUPPORTED_TOOL_PLACEHOLDERS = SUPPORTED_TOOLS.map(() => '?').join(',');
 

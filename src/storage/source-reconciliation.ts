@@ -2,6 +2,7 @@ import { statSync } from 'node:fs';
 import type { OpenedProviderTranscript } from '../security/provider-transcript.js';
 import { validateOpenedProviderTranscriptIdentitySync } from '../security/provider-transcript.js';
 import type { ParsedTurn, ToolName } from '../types/index.js';
+import { InjectionStore } from './injection-store.js';
 import type { MemoryStore } from './memory-store.js';
 import { sourceTurnDigest } from './source-turn-digest.js';
 
@@ -34,6 +35,8 @@ export class SourceReconciliation {
     private lastIndex = -1;
     private readonly generation: number;
     private readonly lookup;
+    private readonly injections: InjectionStore;
+    private readonly mcpReceiptTurns: ParsedTurn[] = [];
 
     constructor(
         private readonly store: MemoryStore,
@@ -43,12 +46,32 @@ export class SourceReconciliation {
         private readonly validate: () => boolean,
     ) {
         this.generation = sourceGeneration(store, tool, nativeId);
+        // A full-source replay must judge only receipts encountered in this
+        // generation. Persisted receipts describe the previous source shape.
+        this.injections = new InjectionStore(store.database, { includePersistedMcp: false });
         this.lookup = store.database.prepare(`SELECT m.source_digest FROM memories m JOIN sessions s ON s.id = m.session_id
             WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ? LIMIT 1`);
     }
 
     observe(turn: ParsedTurn): void {
         this.lastIndex = turn.turnIndex;
+        turn.validateSource = this.validate;
+        if (turn.droppedReason !== undefined) {
+            if (turn.droppedReason === 'elepha-mcp') {
+                if (!this.injections.rememberElephaMcpReceipts(turn)) {
+                    throw new Error('Source reconciliation Elepha MCP receipt protection incomplete');
+                }
+                this.mcpReceiptTurns.push(turn);
+            }
+            return;
+        }
+        const quoteBackStatus = this.injections.quoteBackStatus(turn);
+        if (quoteBackStatus === 'incomplete') {
+            throw new Error('Source reconciliation quote-back protection incomplete');
+        }
+        if (quoteBackStatus === 'match') {
+            return;
+        }
         const stored = this.lookup.get(this.tool, this.nativeId, turn.turnIndex) as { source_digest: string | null } | undefined;
         if (stored && stored.source_digest !== sourceTurnDigest(turn)) {
             this.firstChanged = Math.min(this.firstChanged, turn.turnIndex);
@@ -67,7 +90,17 @@ export class SourceReconciliation {
             ) {
                 throw new Error('Source reconciliation authorization or generation changed; retry required');
             }
+            const nextGeneration = this.generation + 1;
+            const durableReceipts = new InjectionStore(this.store.database);
+            for (const turn of this.mcpReceiptTurns) {
+                if (!durableReceipts.recordElephaMcpReceipts(turn, nextGeneration)) {
+                    throw new Error('Source reconciliation Elepha MCP receipt protection incomplete');
+                }
+            }
             const db = this.store.database;
+            db.prepare(`INSERT INTO source_generations (tool, native_id, generation) VALUES (?, ?, ?)
+                ON CONFLICT(tool, native_id) DO UPDATE SET generation = excluded.generation`).run(this.tool, this.nativeId, nextGeneration);
+            db.prepare('DELETE FROM open_turns WHERE tool = ? AND native_session_id = ?').run(this.tool, this.nativeId);
             const scope = 'SELECT id FROM sessions WHERE tool = ? AND native_id = ?';
             const count = (
                 db
@@ -86,8 +119,6 @@ export class SourceReconciliation {
                 title = CASE WHEN EXISTS (SELECT 1 FROM memories WHERE session_id = sessions.id) THEN title ELSE NULL END,
                 first_prompt_search = CASE WHEN EXISTS (SELECT 1 FROM memories WHERE session_id = sessions.id) THEN first_prompt_search ELSE NULL END
                 WHERE tool = ? AND native_id = ?`).run(this.tool, this.nativeId);
-            db.prepare(`INSERT INTO source_generations (tool, native_id, generation) VALUES (?, ?, 1)
-                ON CONFLICT(tool, native_id) DO UPDATE SET generation = generation + 1`).run(this.tool, this.nativeId);
             return count;
         })();
     }

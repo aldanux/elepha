@@ -100,6 +100,7 @@ describe('OpenCode daemon ingestion', () => {
             injectionId: '01J00000000000000000000000',
             body,
         });
+        expect(fixture.store.findSession('opencode', 'ses_primary')).toBeUndefined();
         const logs: string[] = [];
         const summarize = vi.fn(async () => ({ decisions: [], pending_items: [], status: 'ok' as const }));
         const daemon = new IngestionDaemon({

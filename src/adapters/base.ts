@@ -5,13 +5,19 @@
 // This file owns the one piece of logic that must not be duplicated per
 // adapter: turn-boundary assembly. A turn is only emitted once provably
 // closed (a subsequent turn-opening line was parsed, or the caller asserts
-// the file has been idle past its debounce window). Getting this wrong is
-// not self-correcting.
+// the file has been idle past its debounce window). Providers with explicit
+// turn lifecycle markers must also finish that lifecycle before an idle close.
+// Getting this wrong is not self-correcting.
 
 import { createHash } from 'node:crypto';
 import { type FileHandle, open, stat } from 'node:fs/promises';
 import path from 'node:path';
 import {
+    ELEPHA_MCP_RESULT_MAX_BYTES,
+    ELEPHA_MCP_RESULTS_PER_TURN_MAX,
+    ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES,
+    ELEPHA_MCP_UNMATCHED_RESULT_ID_BYTES_MAX,
+    ELEPHA_MCP_UNMATCHED_RESULT_IDS_MAX,
     FINGERPRINT_WINDOW_BYTES,
     MAX_JSON_VALUE_DEPTH,
     MAX_JSON_VALUE_NODES,
@@ -22,7 +28,9 @@ import { type AssistantMessageBoundary, joinedAssistantStructure } from '../rend
 import { turnText } from '../security/self-ingestion.js';
 import { containsSentinel } from '../security/sentinel.js';
 import type {
+    ElephaMcpResultReceipt,
     EmptySessionAnalysis,
+    OpenTailObservation,
     ParsedToolCall,
     ParsedTurn,
     ParseTurnsOptions,
@@ -314,7 +322,7 @@ export function resolveAbsolute(filePath: string, baseDir: string): string {
     return path.isAbsolute(filePath) ? path.normalize(filePath) : path.normalize(path.resolve(baseDir, filePath));
 }
 
-function normalizeTimestamp(ts: string): string {
+export function normalizeTimestamp(ts: string): string {
     const d = new Date(ts);
     return Number.isNaN(d.getTime()) ? ts : d.toISOString();
 }
@@ -369,6 +377,131 @@ export interface TurnBuilderState {
     aiTitle: string | undefined;
     hasExternalContent: boolean;
     resumeMarkerBefore: boolean;
+    elephaMcpCallIds: Set<string>;
+    elephaMcpUnmatchedResultIds: Set<string>;
+    elephaMcpUnmatchedResultBytes: number;
+    elephaMcpUnmatchedCoverageIncomplete: boolean;
+    elephaMcpResultReceipts: ElephaMcpResultReceipt[];
+    elephaMcpResultBytes: number;
+    elephaMcpCoverageFailure?: ElephaMcpCoverageFailureReason;
+    explicitLifecycleStarted: boolean;
+    explicitLifecycleId: string | undefined;
+    explicitLifecycleFinished: boolean;
+    explicitLifecycleAborted: boolean;
+    explicitLifecycleFailedAt: string | undefined;
+}
+
+export interface TurnLifecycleSignal {
+    phase: 'started' | 'finished' | 'failed' | 'aborted';
+    id: string | undefined;
+}
+
+export type ElephaMcpCoverageFailureReason =
+    | 'missing-call-id'
+    | 'oversized-call-id'
+    | 'duplicate-call-id'
+    | 'incomplete-correlation'
+    | 'out-of-order-result'
+    | 'oversized-call-set'
+    | 'missing-result'
+    | 'unsupported-result'
+    | 'oversized-result';
+
+export class ElephaMcpCoverageError extends Error {
+    constructor(readonly reason: ElephaMcpCoverageFailureReason) {
+        super(`Elepha MCP self-ingestion coverage incomplete: ${reason}`);
+        this.name = 'ElephaMcpCoverageError';
+    }
+}
+
+export type BoundedMcpResult =
+    | { state: 'complete'; body: string; bytes: number }
+    | { state: 'incomplete'; reason: ElephaMcpCoverageFailureReason };
+
+function mcpTextParts(value: unknown): string[] | undefined {
+    if (typeof value === 'string') {
+        try {
+            const decoded = JSON.parse(value) as unknown;
+            if (decoded && typeof decoded === 'object' && 'content' in decoded) {
+                const content = (decoded as { content: unknown }).content;
+                if (Array.isArray(content)) {
+                    return mcpTextParts(content);
+                }
+            }
+        } catch {
+            // A plain MCP text result is already the receipt body.
+        }
+        return [value];
+    }
+    if (!Array.isArray(value)) {
+        return undefined;
+    }
+    const parts: string[] = [];
+    for (const block of value) {
+        if (!block || typeof block !== 'object') {
+            return undefined;
+        }
+        const candidate = block as { type?: unknown; text?: unknown; content?: unknown };
+        if (candidate.type === 'text' && typeof candidate.text === 'string') {
+            parts.push(candidate.text);
+            continue;
+        }
+        if (typeof candidate.content === 'string') {
+            parts.push(candidate.content);
+            continue;
+        }
+        return undefined;
+    }
+    return parts;
+}
+
+export function boundedMcpResult(value: unknown): BoundedMcpResult {
+    // A provider can JSON-encode an MCP envelope inside a string. Enforce
+    // the raw bound before JSON.parse allocates decoded objects or strings.
+    if (typeof value === 'string' && Buffer.byteLength(value) > ELEPHA_MCP_RESULT_MAX_BYTES) {
+        return { state: 'incomplete', reason: 'oversized-result' };
+    }
+    const parts = mcpTextParts(value);
+    if (parts === undefined || parts.length === 0) {
+        return { state: 'incomplete', reason: 'unsupported-result' };
+    }
+    let bytes = 0;
+    for (const [index, part] of parts.entries()) {
+        bytes += Buffer.byteLength(part) + (index === 0 ? 0 : 1);
+        if (bytes > ELEPHA_MCP_RESULT_MAX_BYTES) {
+            return { state: 'incomplete', reason: 'oversized-result' };
+        }
+    }
+    return { state: 'complete', body: parts.join('\n'), bytes };
+}
+
+export function canonicalTimestamp(...candidates: Array<string | undefined>): string | undefined {
+    for (const candidate of candidates) {
+        if (candidate === undefined) {
+            continue;
+        }
+        const parsed = new Date(candidate);
+        if (!Number.isNaN(parsed.getTime())) {
+            return parsed.toISOString();
+        }
+    }
+    return undefined;
+}
+
+export function rememberUnmatchedElephaMcpResult(state: TurnBuilderState, callId: string): void {
+    if (state.elephaMcpUnmatchedResultIds.has(callId)) {
+        return;
+    }
+    const bytes = Buffer.byteLength(callId);
+    if (
+        state.elephaMcpUnmatchedResultIds.size >= ELEPHA_MCP_UNMATCHED_RESULT_IDS_MAX ||
+        state.elephaMcpUnmatchedResultBytes + bytes > ELEPHA_MCP_UNMATCHED_RESULT_ID_BYTES_MAX
+    ) {
+        state.elephaMcpUnmatchedCoverageIncomplete = true;
+        return;
+    }
+    state.elephaMcpUnmatchedResultIds.add(callId);
+    state.elephaMcpUnmatchedResultBytes += bytes;
 }
 
 function freshState(): TurnBuilderState {
@@ -386,6 +519,17 @@ function freshState(): TurnBuilderState {
         aiTitle: undefined,
         hasExternalContent: false,
         resumeMarkerBefore: false,
+        elephaMcpCallIds: new Set(),
+        elephaMcpUnmatchedResultIds: new Set(),
+        elephaMcpUnmatchedResultBytes: 0,
+        elephaMcpUnmatchedCoverageIncomplete: false,
+        elephaMcpResultReceipts: [],
+        elephaMcpResultBytes: 0,
+        explicitLifecycleStarted: false,
+        explicitLifecycleId: undefined,
+        explicitLifecycleFinished: false,
+        explicitLifecycleAborted: false,
+        explicitLifecycleFailedAt: undefined,
     };
 }
 
@@ -501,6 +645,15 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
     // Updates transient assembly bookkeeping without making a skipped plumbing line part of the turn payload.
     protected observeToolCallState(_state: TurnBuilderState, _line: unknown): void {}
 
+    // Provider adapters inspect only their verified raw call/result envelopes.
+    protected observeElephaMcp(_state: TurnBuilderState, _line: unknown): void {}
+
+    // Providers with explicit task lifecycle events can keep a quiet but live
+    // turn open until its matching completion or abort event is observed.
+    protected turnLifecycleSignal(_line: unknown): TurnLifecycleSignal | undefined {
+        return undefined;
+    }
+
     // Folds a 'boundary' or 'content' line's data into the in-progress turn.
     protected abstract fold(state: TurnBuilderState, line: unknown): void;
 
@@ -567,6 +720,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
             // turn, not a running session-wide state like currentBranch.
             let pendingResumeMarker = false;
             let currentTurn: TurnBuilderState | null = null;
+            let pendingLifecycleStart: { signal: TurnLifecycleSignal; byteStart: number } | undefined;
             let nextTurnIndex = startTurnIndex;
             let pendingChunks: Buffer[] = [];
             let pendingBytes = 0;
@@ -577,7 +731,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
 
             const parsedTurn = async (state: TurnBuilderState, endOffset: number): Promise<ParsedTurn> => {
                 const turnIndex = nextTurnIndex++;
-                return {
+                const turn: ParsedTurn = {
                     tool: this.tool,
                     sessionId,
                     sourcePath: filePath,
@@ -595,6 +749,37 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                     gitBranch: state.gitBranch,
                     hasExternalContent: state.hasExternalContent,
                     resumeMarkerBefore: state.resumeMarkerBefore,
+                };
+                if (
+                    state.elephaMcpCallIds.size === 0 &&
+                    state.elephaMcpResultReceipts.length === 0 &&
+                    state.elephaMcpCoverageFailure === undefined
+                ) {
+                    return turn;
+                }
+                if (state.elephaMcpCoverageFailure !== undefined) {
+                    throw new ElephaMcpCoverageError(state.elephaMcpCoverageFailure);
+                }
+                if (state.elephaMcpCallIds.size > 0) {
+                    throw new ElephaMcpCoverageError('missing-result');
+                }
+                if (state.elephaMcpResultReceipts.length > ELEPHA_MCP_RESULTS_PER_TURN_MAX) {
+                    throw new ElephaMcpCoverageError('oversized-result');
+                }
+                if (state.elephaMcpResultBytes > ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES) {
+                    throw new ElephaMcpCoverageError('oversized-result');
+                }
+                return {
+                    ...turn,
+                    userMessage: '',
+                    aiTitle: undefined,
+                    assistantText: '',
+                    assistantStructure: undefined,
+                    toolCalls: [],
+                    hasExternalContent: false,
+                    resumeMarkerBefore: false,
+                    droppedReason: 'elepha-mcp',
+                    elephaMcpResultReceipts: state.elephaMcpResultReceipts,
                 };
             };
 
@@ -689,23 +874,95 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                     if (this.isResumeMarkerLine(parsed)) {
                         pendingResumeMarker = true;
                     }
+                    const lifecycle = this.turnLifecycleSignal(parsed);
+                    const cls = this.classify(parsed, filePath);
+                    if (lifecycle?.phase === 'started') {
+                        // Codex writes task_started immediately before its user
+                        // boundary. Latch it for the state that boundary opens,
+                        // never onto the preceding turn that may still be held.
+                        pendingLifecycleStart = { signal: lifecycle, byteStart: line.byteStart };
+                    } else if (lifecycle?.phase === 'failed' && currentTurn) {
+                        // A provider failure ends one attempt, not the user's
+                        // conversational turn. Keep it open even if an older
+                        // cursor omitted the matching start marker.
+                        const pendingLifecycleMatches =
+                            pendingLifecycleStart !== undefined && pendingLifecycleStart.signal.id === lifecycle.id;
+                        if (
+                            pendingLifecycleMatches ||
+                            !currentTurn.explicitLifecycleStarted ||
+                            currentTurn.explicitLifecycleId === lifecycle.id
+                        ) {
+                            currentTurn.explicitLifecycleStarted = true;
+                            currentTurn.explicitLifecycleId = lifecycle.id;
+                            currentTurn.explicitLifecycleFinished = false;
+                            currentTurn.explicitLifecycleAborted = false;
+                            currentTurn.explicitLifecycleFailedAt =
+                                canonicalTimestamp(this.timestampOf(parsed), currentTurn.endedAt) ?? new Date(0).toISOString();
+                            if (pendingLifecycleMatches) {
+                                pendingLifecycleStart = undefined;
+                            }
+                        }
+                    } else if ((lifecycle?.phase === 'finished' || lifecycle?.phase === 'aborted') && currentTurn) {
+                        const pendingLifecycleMatches =
+                            pendingLifecycleStart !== undefined && pendingLifecycleStart.signal.id === lifecycle.id;
+                        if (pendingLifecycleMatches) {
+                            // A retry can abort before contributing content. Its
+                            // lifecycle still belongs to the open user turn.
+                            currentTurn.explicitLifecycleStarted = true;
+                            currentTurn.explicitLifecycleId = lifecycle.id;
+                            currentTurn.explicitLifecycleFinished = true;
+                            currentTurn.explicitLifecycleAborted = lifecycle.phase === 'aborted';
+                            currentTurn.explicitLifecycleFailedAt = undefined;
+                            pendingLifecycleStart = undefined;
+                        } else if (
+                            currentTurn.explicitLifecycleStarted &&
+                            currentTurn.explicitLifecycleId !== undefined &&
+                            lifecycle.id === currentTurn.explicitLifecycleId
+                        ) {
+                            currentTurn.explicitLifecycleFinished = true;
+                            currentTurn.explicitLifecycleAborted = lifecycle.phase === 'aborted';
+                            currentTurn.explicitLifecycleFailedAt = undefined;
+                        }
+                    }
+                    if (pendingLifecycleStart && currentTurn && cls === 'content') {
+                        // An automatic retry starts a new provider attempt with
+                        // no user boundary. The first assistant contribution
+                        // proves it continues the current conversational turn.
+                        currentTurn.explicitLifecycleStarted = true;
+                        currentTurn.explicitLifecycleId = pendingLifecycleStart.signal.id;
+                        currentTurn.explicitLifecycleFinished = false;
+                        currentTurn.explicitLifecycleAborted = false;
+                        currentTurn.explicitLifecycleFailedAt = undefined;
+                        pendingLifecycleStart = undefined;
+                    }
                     if (currentTurn) {
                         this.observeToolCallState(currentTurn, parsed);
+                        this.observeElephaMcp(currentTurn, parsed);
                     }
 
-                    const cls = this.classify(parsed, filePath);
                     if (cls === 'skip') {
                         continue;
                     }
 
                     if (cls === 'boundary') {
                         const closed = currentTurn;
+                        const lifecycleStart = pendingLifecycleStart;
                         currentTurn = freshState();
                         currentTurn.aiTitle = sessionAiTitle;
                         currentTurn.resumeMarkerBefore = pendingResumeMarker;
+                        if (lifecycleStart) {
+                            currentTurn.explicitLifecycleStarted = true;
+                            currentTurn.explicitLifecycleId = lifecycleStart.signal.id;
+                            pendingLifecycleStart = undefined;
+                        }
                         pendingResumeMarker = false;
                         if (closed && !isEmptyTurn(closed)) {
-                            const turn = await parsedTurn(closed, line.byteStart);
+                            // task_started belongs to the turn this boundary
+                            // opens. Keep it after the previous turn's cursor
+                            // so an incremental resume reconstructs the same
+                            // explicit lifecycle instead of mistaking it for a
+                            // legacy idle-close turn.
+                            const turn = await parsedTurn(closed, lifecycleStart?.byteStart ?? line.byteStart);
                             if (containsSentinel(turnText(turn))) {
                                 this.warnUnknownLine(
                                     `[elepha] dropped turn ${turn.turnIndex} of ${sessionId}: self-injected content (sentinel)`,
@@ -746,16 +1003,81 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                 currentTurn &&
                 lastCompleteLineEnd !== undefined &&
                 options?.closeTrailingOnIdle &&
-                hasAssistantContribution(currentTurn) &&
-                currentTurn.openToolCallIds.size === 0
+                (!currentTurn.explicitLifecycleStarted || currentTurn.explicitLifecycleFinished) &&
+                (currentTurn.explicitLifecycleAborted ||
+                    (hasAssistantContribution(currentTurn) && currentTurn.openToolCallIds.size === 0) ||
+                    currentTurn.elephaMcpCoverageFailure !== undefined ||
+                    currentTurn.elephaMcpCallIds.size > 0)
             ) {
-                const turn = await parsedTurn(currentTurn, lastCompleteLineEnd);
+                const parsed = await parsedTurn(currentTurn, lastCompleteLineEnd);
+                const turn =
+                    currentTurn.explicitLifecycleAborted &&
+                    !hasAssistantContribution(currentTurn) &&
+                    currentTurn.toolCalls.length === 0 &&
+                    currentTurn.elephaMcpCallIds.size === 0 &&
+                    currentTurn.elephaMcpResultReceipts.length === 0
+                        ? { ...parsed, droppedReason: 'empty' as const }
+                        : parsed;
                 if (containsSentinel(turnText(turn))) {
                     this.warnUnknownLine(`[elepha] dropped turn ${turn.turnIndex} of ${sessionId}: self-injected content (sentinel)`);
                     yield { ...turn, droppedReason: 'sentinel' };
                 } else {
                     yield turn;
                 }
+            }
+
+            if (
+                currentTurn &&
+                lastCompleteLineEnd !== undefined &&
+                currentTurn.explicitLifecycleStarted &&
+                !currentTurn.explicitLifecycleFinished &&
+                currentTurn.explicitLifecycleFailedAt !== undefined &&
+                pendingLifecycleStart === undefined &&
+                !isEmptyTurn(currentTurn)
+            ) {
+                let receiptCoverage: OpenTailObservation['receiptCoverage'];
+                try {
+                    receiptCoverage = { state: 'complete', turn: await parsedTurn(currentTurn, lastCompleteLineEnd) };
+                } catch (error) {
+                    if (!(error instanceof ElephaMcpCoverageError)) {
+                        throw error;
+                    }
+                    const candidate = await (async (): Promise<ParsedTurn> => ({
+                        tool: this.tool,
+                        sessionId,
+                        sourcePath: filePath,
+                        projectPath: currentTurn?.projectPath ?? '',
+                        turnIndex: nextTurnIndex - 1,
+                        startedAt: currentTurn?.startedAt ?? new Date(0).toISOString(),
+                        endedAt: currentTurn?.endedAt ?? currentTurn?.startedAt ?? new Date(0).toISOString(),
+                        userMessage: currentTurn?.userMessageParts.join('\n').trim() ?? '',
+                        aiTitle: currentTurn?.aiTitle,
+                        assistantText: currentTurn?.assistantTextParts.join('\n').trim() ?? '',
+                        assistantStructure: currentTurn
+                            ? joinedAssistantStructure(currentTurn.assistantTextParts, currentTurn.assistantMessageBoundaries)
+                            : undefined,
+                        toolCalls: currentTurn?.toolCalls ?? [],
+                        cursor: formatCursor(lastCompleteLineEnd, nextTurnIndex, await fingerprintWindow(handle, lastCompleteLineEnd)),
+                        surface: currentTurn?.surface,
+                        gitBranch: currentTurn?.gitBranch,
+                        hasExternalContent: currentTurn?.hasExternalContent ?? false,
+                        resumeMarkerBefore: currentTurn?.resumeMarkerBefore ?? false,
+                    }))();
+                    receiptCoverage = { state: 'incomplete', reason: error.reason, turn: candidate };
+                }
+                if (containsSentinel(turnText(receiptCoverage.turn))) {
+                    this.warnUnknownLine(
+                        `[elepha] dropped turn ${receiptCoverage.turn.turnIndex} of ${sessionId}: self-injected content (sentinel)`,
+                    );
+                    return;
+                }
+                options?.onOpenTail?.({
+                    kind: 'failed-eof',
+                    anchorCursor: sinceCursor,
+                    candidateCursor: receiptCoverage.turn.cursor,
+                    failedAt: currentTurn.explicitLifecycleFailedAt,
+                    receiptCoverage,
+                });
             }
         } finally {
             if (!suppliedHandle) {

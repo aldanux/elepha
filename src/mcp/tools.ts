@@ -397,6 +397,27 @@ export class ElephaMcpService implements McpToolHandlers {
             return this.responses.textResult(sessionEvidence(evidence, publicSessionId(session), nonce));
         }
         if (read?.episode === undefined) {
+            const snapshot = reader.incompleteLastObservedFor(session);
+            if (snapshot !== undefined) {
+                const nonce = randomUUID();
+                const title = assertNoShellSyntax(titleOf(session), 'mcp:get-session-title').text;
+                const body = assertNoShellSyntax(
+                    JSON.stringify({
+                        complete: false,
+                        failed_at: snapshot.failedAt,
+                        decisions: snapshot.decisions,
+                        pending_items: snapshot.pendingItems,
+                        summarizer_status: snapshot.summarizerStatus,
+                        filtered_interaction: snapshot.durableProjection,
+                    }),
+                    'mcp:get-session-incomplete-snapshot',
+                ).text;
+                return this.responses.textResult(
+                    `${servedContextInstructions(nonce)}\n\n# ${title}\n\n` +
+                        'Incomplete last-observed snapshot: the provider attempt failed at transcript EOF and may still be retried or superseded.\n\n' +
+                        `${dataBlockOpen(nonce)}\n${body}\n${dataBlockClose(nonce)}`,
+                );
+            }
             return this.transcriptMissing(input.id, project);
         }
         const rendered = read.episode;
@@ -474,6 +495,7 @@ export class ElephaMcpService implements McpToolHandlers {
             instruction_count: hasRollup ? jsonArrayLength(session.rollup_instructions) : null,
             pending_count: hasRollup ? jsonArrayLength(session.rollup_pending_items ?? null) : null,
             substantive: isSubstantive(session),
+            ...(session.open_turn_staged_at != null ? { incomplete_last_observed: true } : {}),
         };
     }
 
@@ -486,7 +508,8 @@ export class ElephaMcpService implements McpToolHandlers {
     }
 
     private sessionLine(session: Record<string, unknown>): string {
-        return `${session.id} — ${session.title}; ${session.ended_at}; ${session.surface}; ${session.turn_count} turns; ~${session.token_estimate ?? 'unknown'} tokens`;
+        const incomplete = session.incomplete_last_observed === true ? '; incomplete last-observed snapshot' : '';
+        return `${session.id} — ${session.title}; ${session.ended_at}; ${session.surface}; ${session.turn_count} turns; ~${session.token_estimate ?? 'unknown'} tokens${incomplete}`;
     }
 
     private unknownSession(id: string): McpToolResult {

@@ -481,11 +481,14 @@ describe('MemoryStore', () => {
             ).toBe(false);
             expect(store.listRecentMemories(project.id, 10)[0]!.decisions).toEqual([]);
 
-            store.reingestTurn(turn, session.id, project.id, {
-                decisions: [{ what: 'recovered', why: null }],
-                pending_items: [],
-                status: 'ok',
-            });
+            store.consent.grant('/Users/test/demo-project');
+            expect(
+                store.reingestTurn(turn, session.id, project.id, {
+                    decisions: [{ what: 'recovered', why: null }],
+                    pending_items: [],
+                    status: 'ok',
+                }),
+            ).toBe(true);
 
             const rows = store.listRecentMemories(project.id, 10);
             expect(rows).toHaveLength(1);
@@ -504,11 +507,14 @@ describe('MemoryStore', () => {
             expect(cursorAfterRecord).toBe('100|1');
 
             // Reingest a turn carrying a different (stale, re-derived) cursor value.
-            store.reingestTurn(makeTurn({ cursor: '999|9' }), session.id, project.id, {
-                decisions: [{ what: 'x', why: null }],
-                pending_items: [],
-                status: 'ok',
-            });
+            store.consent.grant('/Users/test/demo-project');
+            expect(
+                store.reingestTurn(makeTurn({ cursor: '999|9' }), session.id, project.id, {
+                    decisions: [{ what: 'x', why: null }],
+                    pending_items: [],
+                    status: 'ok',
+                }),
+            ).toBe(true);
 
             expect(store.getSessionCursor('claude-code', 'sess-1')).toBe(cursorAfterRecord);
         });

@@ -182,6 +182,9 @@ export class TurnStore {
         durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
         evictionPlan?: DurableEvictionPlan,
     ): boolean {
+        if (turn.droppedReason !== undefined) {
+            return false;
+        }
         if (this.stmts.isTranscriptPurged.get(turn.tool, turn.sessionId) !== undefined) {
             return false;
         }
@@ -247,6 +250,9 @@ export class TurnStore {
     // gone - a crash mid-reingest leaves either the old or the new value,
     // never neither.
     reingestTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): void {
+        if (turn.droppedReason !== undefined) {
+            throw new Error('dropped turns cannot be written as memories');
+        }
         const now = new Date().toISOString();
         this.stmts.reingestMemory.run({
             project_id: projectId,

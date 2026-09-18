@@ -8,6 +8,7 @@ import { isReadableProviderSource } from '../config/paths.js';
 import { renderedChars, renderedTurns } from '../rendering/raw-turn-renderer.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
+import { InjectionQuoteBackIncompleteError, InjectionStore } from './injection-store.js';
 
 export interface RenderedCharsChange {
     sessionId: number;
@@ -38,6 +39,7 @@ interface SessionSeed {
 }
 
 async function countSession(
+    db: Database,
     session: SessionSeed,
     adapter: SessionAdapter,
     turnIndexes: Set<number>,
@@ -47,13 +49,26 @@ async function countSession(
     }
 
     const turns: ParsedTurn[] = [];
+    const injections = new InjectionStore(db, { includePersistedMcp: false });
     try {
         for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
+            if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                throw new InjectionQuoteBackIncompleteError(`Rendered chars backfill for ${session.native_id}`);
+            }
+            if (
+                turn.droppedReason !== undefined ||
+                injections.isQuoteBackOrThrow(turn, `Rendered chars backfill for ${session.native_id}`)
+            ) {
+                continue;
+            }
             if (turnIndexes.has(turn.turnIndex)) {
                 turns.push(turn);
             }
         }
-    } catch {
+    } catch (error) {
+        if (error instanceof InjectionQuoteBackIncompleteError) {
+            throw error;
+        }
         return null;
     }
 
@@ -83,9 +98,9 @@ const deriver: BackfillDeriver<SessionSeed, RenderedCharsChange, Map<number, Set
         }
         return { sessions, state: indexesBySession };
     },
-    async derive({ adapters, session, state }) {
+    async derive({ db, adapters, session, state }) {
         const adapter = sessionAdapterFor(adapters, session.tool);
-        const counted = adapter ? await countSession(session, adapter, state.get(session.id) ?? new Set()) : null;
+        const counted = adapter ? await countSession(db, session, adapter, state.get(session.id) ?? new Set()) : null;
         const transcriptMissing = counted === null;
         if (!transcriptMissing && session.rendered_chars === counted.renderedChars && session.rendered_turns === counted.renderedTurns) {
             return undefined;

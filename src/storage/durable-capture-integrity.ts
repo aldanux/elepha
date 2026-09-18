@@ -12,10 +12,10 @@ interface SchemaObjectRow {
 }
 
 const DURABLE_SCHEMA_OBJECTS = `
-    name IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'session_embeddings')
+    name IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'session_embeddings', 'open_turns')
     OR lower(name) GLOB 'filtered_turns_fts*'
     OR lower(tbl_name) GLOB 'filtered_turns_fts*'
-    OR lower(tbl_name) IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage')
+    OR lower(tbl_name) IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'open_turns')
     OR lower(tbl_name) = 'session_embeddings'
     OR (type IN ('trigger', 'index') AND lower(tbl_name) IN ('memories', 'session_rollups'))
 `;
@@ -50,7 +50,7 @@ function schemaTokens(sql: string | null): string[] {
         .map((token) => (token.startsWith("'") ? token : normalizeIdentifier(token)));
 }
 
-const LEGACY_SESSION_FK_CHILDREN = new Set(['memories', 'session_rollups', 'first_prompt_search_backfill_skips']);
+const LEGACY_SESSION_FK_CHILDREN = new Set(['memories', 'session_rollups', 'first_prompt_search_backfill_skips', 'open_turns']);
 
 export function tableClauseSignature(sql: string | null, table: string, allowLegacySessionForeignKeys = false): string {
     const tokens = schemaTokens(sql);
@@ -105,10 +105,51 @@ export function tableClauseSignature(sql: string | null, table: string, allowLeg
     return JSON.stringify(normalized.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0)));
 }
 
-function objectSignature(rows: readonly SchemaObjectRow[]): string {
+function objectSignature(rows: readonly SchemaObjectRow[], normalizeLegacyOpenTurnSessionForeignKey = false): string {
     return JSON.stringify(
-        rows.map((row) => [row.type.toLowerCase(), row.name.toLowerCase(), row.tbl_name.toLowerCase(), schemaTokens(row.sql).join(' ')]),
+        rows.map((row) => {
+            const tokens = schemaTokens(row.sql);
+            if (normalizeLegacyOpenTurnSessionForeignKey && row.type === 'table' && row.name === 'open_turns') {
+                const reference = tokens.findIndex(
+                    (token, index) => index > 0 && tokens[index - 1] === 'references' && token === 'sessions_old',
+                );
+                if (reference >= 0) {
+                    tokens[reference] = 'sessions';
+                }
+            }
+            return [row.type.toLowerCase(), row.name.toLowerCase(), row.tbl_name.toLowerCase(), tokens.join(' ')];
+        }),
     );
+}
+
+interface OpenTurnForeignKeyRow {
+    table: string;
+    from: string;
+    to: string;
+    on_update: string;
+    on_delete: string;
+    match: string;
+}
+
+function openTurnForeignKeySignature(db: Database): string {
+    const rows = db.prepare('PRAGMA foreign_key_list(open_turns)').all() as OpenTurnForeignKeyRow[];
+    return JSON.stringify(
+        rows
+            .map((row) => [row.table, row.from, row.to, row.on_update, row.on_delete, row.match])
+            .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+    );
+}
+
+function hasRepairableLegacyOpenTurnSessionForeignKey(db: Database): boolean {
+    const expected = JSON.stringify(
+        [
+            ['projects', 'project_id', 'id', 'NO ACTION', 'CASCADE', 'NONE'],
+            ['sessions_old', 'session_id', 'id', 'NO ACTION', 'CASCADE', 'NONE'],
+        ].sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
+    );
+    const parentExists = db.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND lower(name) = 'sessions_old'").get();
+    const hasRows = db.prepare('SELECT 1 FROM open_turns LIMIT 1').get();
+    return parentExists === undefined && hasRows === undefined && openTurnForeignKeySignature(db) === expected;
 }
 
 function canonicalObjects(db: Database): SchemaObjectRow[] {
@@ -136,21 +177,52 @@ function boundedCandidateObjects(db: Database, objectLimit: number, sqlCharacter
         .all(sqlCharacterLimit, objectLimit) as SchemaObjectRow[];
 }
 
-export function assertCanonicalDurableCaptureSchema(candidate: Database, canonical: Database): void {
+export function assertCanonicalDurableCaptureSchema(
+    candidate: Database,
+    canonical: Database,
+    options: { allowRepairableLegacyOpenTurnSessionForeignKey?: boolean } = {},
+): void {
     const expected = canonicalObjects(canonical);
     const sqlCharacterLimit = expected.reduce((sum, object) => sum + (object.sql?.length ?? 0), 0) + 1;
     const actual = boundedCandidateObjects(candidate, expected.length + 1, sqlCharacterLimit);
+    const normalizeLegacyOpenTurnSessionForeignKey =
+        options.allowRepairableLegacyOpenTurnSessionForeignKey === true && hasRepairableLegacyOpenTurnSessionForeignKey(candidate);
     if (
         actual.length !== expected.length ||
         actual.some((object) => (object.sql_length ?? 0) > sqlCharacterLimit) ||
-        objectSignature(actual) !== objectSignature(expected)
+        objectSignature(actual, normalizeLegacyOpenTurnSessionForeignKey) !== objectSignature(expected)
     ) {
         throw new Error(DURABLE_CAPTURE_SCHEMA_MISMATCH);
     }
 }
 
+export function repairLegacyOpenTurnSessionForeignKey(candidate: Database, canonical: Database): boolean {
+    if (!hasRepairableLegacyOpenTurnSessionForeignKey(candidate)) {
+        return false;
+    }
+    const canonicalOpenTurnObjects = canonicalObjects(canonical).filter(
+        (object) => object.name === 'open_turns' || object.tbl_name === 'open_turns',
+    );
+    const table = canonicalOpenTurnObjects.find((object) => object.type === 'table' && object.name === 'open_turns');
+    if (table?.sql === null || table?.sql === undefined) {
+        throw new Error(DURABLE_CAPTURE_SCHEMA_MISMATCH);
+    }
+    candidate
+        .transaction(() => {
+            candidate.exec('DROP TABLE open_turns');
+            candidate.exec(table.sql as string);
+            for (const object of canonicalOpenTurnObjects) {
+                if (object !== table && object.sql !== null) {
+                    candidate.exec(object.sql);
+                }
+            }
+        })
+        .immediate();
+    return true;
+}
+
 function exactUsage(db: Database): number {
-    return Number(
+    const filtered = Number(
         (
             db
                 .prepare(
@@ -160,11 +232,28 @@ function exactUsage(db: Database): number {
                          COALESCE(length(CAST(assistant_structure AS BLOB)), 0) +
                          length(CAST(tool_calls AS BLOB))
                      ), 0) AS total_bytes
-                     FROM filtered_turns`,
+                 FROM filtered_turns`,
                 )
                 .get() as { total_bytes: number }
         ).total_bytes,
     );
+    const staged = Number(
+        (
+            db
+                .prepare(
+                    `SELECT COALESCE(SUM(
+                         length(CAST(durable_user_prompt AS BLOB)) +
+                         length(CAST(durable_assistant_response AS BLOB)) +
+                         COALESCE(length(CAST(durable_assistant_structure AS BLOB)), 0) +
+                         length(CAST(durable_tool_calls AS BLOB))
+                     ), 0) AS total_bytes
+                 FROM open_turns
+                 WHERE durable_user_prompt IS NOT NULL`,
+                )
+                .get() as { total_bytes: number }
+        ).total_bytes,
+    );
+    return filtered + staged;
 }
 
 // Private restore stages and exclusively-owned installed candidates are the

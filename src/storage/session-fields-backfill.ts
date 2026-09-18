@@ -23,6 +23,7 @@ import { TRAILING_FILES_CAP } from '../config/constants.js';
 import { dedupePaths, isReadableProviderSource } from '../config/paths.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
+import { InjectionQuoteBackIncompleteError, InjectionStore } from './injection-store.js';
 
 export interface SessionFieldsBefore {
     surface: string | null;
@@ -42,6 +43,7 @@ export interface SessionFieldsChange {
     after: SessionFieldsBefore;
     // Count of memories rows whose has_external_content flipped for this session.
     memoryFlagsChanged: number;
+    memoryFlagUpdates: Array<{ turnIndex: number; hasExternalContent: number }>;
 }
 
 export interface SessionFieldsPlan {
@@ -78,6 +80,7 @@ function unreadableResult(session: SessionSeed): { after: SessionFieldsBefore; t
 }
 
 async function deriveForSession(
+    db: Database,
     session: SessionSeed,
     adapter: SessionAdapter,
 ): Promise<{ after: SessionFieldsBefore; turns: ParsedTurn[]; transcriptMissing: boolean }> {
@@ -96,12 +99,25 @@ async function deriveForSession(
     // missing file: NULL-preserving, reported, never a manufactured value.
     let classification: Awaited<ReturnType<SessionAdapter['classifySession']>>;
     const turns: ParsedTurn[] = [];
+    const injections = new InjectionStore(db, { includePersistedMcp: false });
     try {
         classification = await adapter.classifySession(session.source_path);
         for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
+            if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                throw new InjectionQuoteBackIncompleteError(`Session fields backfill for ${session.native_id}`);
+            }
+            if (
+                turn.droppedReason !== undefined ||
+                injections.isQuoteBackOrThrow(turn, `Session fields backfill for ${session.native_id}`)
+            ) {
+                continue;
+            }
             turns.push(turn);
         }
-    } catch {
+    } catch (error) {
+        if (error instanceof InjectionQuoteBackIncompleteError) {
+            throw error;
+        }
         return unreadableResult(session);
     }
     const kind = toSessionRowKind(classification.kind);
@@ -144,7 +160,7 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
     },
     async derive({ db, adapters, session }) {
         const adapter = sessionAdapterFor(adapters, session.tool);
-        const result = adapter ? await deriveForSession(session, adapter) : unreadableResult(session);
+        const result = adapter ? await deriveForSession(db, session, adapter) : unreadableResult(session);
         const { after, turns, transcriptMissing } = result;
         const before: SessionFieldsBefore = {
             surface: session.surface,
@@ -154,7 +170,7 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
             trailing_files: session.trailing_files,
         };
 
-        let memoryFlagsChanged = 0;
+        const memoryFlagUpdates: Array<{ turnIndex: number; hasExternalContent: number }> = [];
         if (!transcriptMissing) {
             const existingMemories = db
                 .prepare('SELECT turn_index, has_external_content FROM memories WHERE session_id = ?')
@@ -164,10 +180,11 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
                 const want = turn.hasExternalContent ? 1 : 0;
                 const have = byIndex.get(turn.turnIndex);
                 if (have !== undefined && have !== want) {
-                    memoryFlagsChanged++;
+                    memoryFlagUpdates.push({ turnIndex: turn.turnIndex, hasExternalContent: want });
                 }
             }
         }
+        const memoryFlagsChanged = memoryFlagUpdates.length;
 
         // transcriptMissing sessions are always reported, even though `after`
         // mirrors `before` verbatim (there's nothing to derive without the
@@ -196,6 +213,7 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
             before,
             after,
             memoryFlagsChanged,
+            memoryFlagUpdates,
         };
     },
     shouldWrite: () => true,
@@ -208,49 +226,11 @@ const deriver: BackfillDeriver<SessionSeed, SessionFieldsChange> = {
             change.after.trailing_files,
             change.sessionId,
         );
-        return {};
-    },
-    async afterApply({ db, adapters, plan }) {
-        // has_external_content flips need the actual per-turn values, not just a
-        // count - re-derive per changed session inside its own pass rather than
-        // carrying every ParsedTurn through the plan object (memory footprint on
-        // a large corpus). Still one DB transaction per session's memory rows.
-        for (const change of plan.changes) {
-            if (change.memoryFlagsChanged === 0 || change.transcriptMissing) {
-                continue;
-            }
-            const session = db
-                .prepare('SELECT id, tool, native_id, source_path FROM sessions WHERE id = ?')
-                .get(change.sessionId) as SessionSeed;
-            const adapter = sessionAdapterFor(adapters, session.tool);
-            if (!adapter) {
-                continue;
-            }
-            const updateFlag = db.prepare('UPDATE memories SET has_external_content = ? WHERE session_id = ? AND turn_index = ?');
-            const writeFlags = db.transaction((turns: ParsedTurn[]) => {
-                for (const turn of turns) {
-                    updateFlag.run(turn.hasExternalContent ? 1 : 0, change.sessionId, turn.turnIndex);
-                }
-            });
-            // A file that became unreadable between planning and this second
-            // pass (a delete/permission race, or a directory path) must
-            // not abort the rest of the batch. The sessions-table fields for this
-            // session were already written by apply() above; skipping just this
-            // session's has_external_content flips leaves them stale rather than
-            // manufacturing anything.
-            const turns: ParsedTurn[] = [];
-            if (!isReadableProviderSource(session.tool, session.source_path)) {
-                continue;
-            }
-            try {
-                for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
-                    turns.push(turn);
-                }
-            } catch {
-                continue;
-            }
-            writeFlags(turns);
+        const updateFlag = db.prepare('UPDATE memories SET has_external_content = ? WHERE session_id = ? AND turn_index = ?');
+        for (const update of change.memoryFlagUpdates) {
+            updateFlag.run(update.hasExternalContent, change.sessionId, update.turnIndex);
         }
+        return {};
     },
 };
 

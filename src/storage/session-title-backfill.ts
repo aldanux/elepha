@@ -7,6 +7,7 @@ import { sessionAdapterFor } from '../adapters/index.js';
 import { isReadableProviderSource } from '../config/paths.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
+import { InjectionQuoteBackIncompleteError, InjectionStore } from './injection-store.js';
 import { distinctSessionTitles, titleCandidatesForSegment, UNTITLED_EPISODE } from './session-title.js';
 
 export interface SessionTitleChange {
@@ -50,13 +51,29 @@ async function turnsForSession(db: Database, session: SessionSeed, adapter: Sess
         ).map((row) => row.turn_index),
     );
     const turns: ParsedTurn[] = [];
+    const injections = new InjectionStore(db, { includePersistedMcp: false });
     try {
         for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
+            if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                throw new InjectionQuoteBackIncompleteError(`Session title backfill for ${session.native_id}`);
+            }
+            if (
+                turn.droppedReason !== undefined ||
+                injections.isQuoteBackOrThrow(turn, `Session title backfill for ${session.native_id}`)
+            ) {
+                continue;
+            }
             if (indexes.has(turn.turnIndex)) {
                 turns.push(turn);
             }
         }
-    } catch {
+    } catch (error) {
+        if (error instanceof InjectionQuoteBackIncompleteError) {
+            throw error;
+        }
+        return undefined;
+    }
+    if (turns.length !== indexes.size) {
         return undefined;
     }
     return turns;

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
-import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
+import type { OpenTailObservation, ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 interface IdleCloseFixture {
@@ -269,3 +269,271 @@ describe.each(fixtures)(
         });
     },
 );
+
+describe('Codex explicit lifecycle completion', () => {
+    function transcript(lines: unknown[]): string {
+        const directory = withTempDir('elepha-codex-lifecycle-');
+        const file = path.join(directory, 'rollout-lifecycle.jsonl');
+        writeFileSync(file, jsonl(lines.map((line) => JSON.stringify(line))));
+        return file;
+    }
+
+    const failedAttempt = (sessionId = 'failed-eof') => [
+        {
+            timestamp: '2026-09-18T08:46:00.000Z',
+            type: 'session_meta',
+            payload: { id: sessionId, cwd, originator: 'codex-desktop' },
+        },
+        {
+            timestamp: '2026-09-18T08:46:01.000Z',
+            type: 'event_msg',
+            payload: { type: 'task_started', turn_id: 'provider-attempt-1' },
+        },
+        {
+            timestamp: '2026-09-18T08:46:02.000Z',
+            type: 'response_item',
+            payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Investigate the issue.' }] },
+        },
+        {
+            timestamp: '2026-09-18T08:46:03.000Z',
+            type: 'response_item',
+            payload: {
+                type: 'message',
+                role: 'assistant',
+                phase: 'commentary',
+                content: [{ type: 'output_text', text: 'Partial investigation.' }],
+            },
+        },
+        {
+            timestamp: '2026-09-18T08:47:17.715Z',
+            type: 'event_msg',
+            payload: {
+                type: 'task_complete',
+                turn_id: 'provider-attempt-1',
+                last_agent_message: null,
+                error: { message: 'Selected model is at capacity.', codex_error_info: 'server_overloaded' },
+            },
+        },
+    ];
+
+    it('reports a failed EOF through the deferred contract without emitting a final turn', async () => {
+        const file = transcript(failedAttempt());
+        let observed: OpenTailObservation | undefined;
+
+        const turns = await collect(
+            new CodexAdapter().parseTurns(file, undefined, {
+                closeTrailingOnIdle: true,
+                onOpenTail: (observation) => {
+                    observed = observation;
+                },
+            }),
+        );
+
+        expect(turns).toEqual([]);
+        expect(observed).toMatchObject({
+            kind: 'failed-eof',
+            anchorCursor: undefined,
+            failedAt: '2026-09-18T08:47:17.715Z',
+            receiptCoverage: {
+                state: 'complete',
+                turn: { turnIndex: 0, userMessage: 'Investigate the issue.', assistantText: 'Partial investigation.' },
+            },
+        });
+    });
+
+    it('reports a user-only terminal failure but still drops a sentinel-bearing failed tail', async () => {
+        const userOnly = failedAttempt('failed-before-response').filter((_, index) => index !== 3);
+        const userOnlyFile = transcript(userOnly);
+        let observed: OpenTailObservation | undefined;
+        await collect(
+            new CodexAdapter().parseTurns(userOnlyFile, undefined, {
+                closeTrailingOnIdle: true,
+                onOpenTail: (candidate) => {
+                    observed = candidate;
+                },
+            }),
+        );
+        expect(observed?.receiptCoverage.turn).toMatchObject({
+            userMessage: 'Investigate the issue.',
+            assistantText: '',
+        });
+
+        const sentinelTail = failedAttempt('failed-sentinel');
+        const user = sentinelTail[2] as { payload: { content: Array<{ text: string }> } };
+        user.payload.content[0]!.text = '[[elepha:brief:01J00000000000000000000000]] injected';
+        const sentinelFile = transcript(sentinelTail);
+        let sentinelObserved = false;
+        await collect(
+            new CodexAdapter(() => {}).parseTurns(sentinelFile, undefined, {
+                closeTrailingOnIdle: true,
+                onOpenTail: () => {
+                    sentinelObserved = true;
+                },
+            }),
+        );
+        expect(sentinelObserved).toBe(false);
+    });
+
+    it('reparses a late automatic retry from the canonical anchor and emits one complete logical turn', async () => {
+        const file = transcript(failedAttempt('late-retry'));
+        const first = await collect(new CodexAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+        expect(first).toEqual([]);
+        appendFileSync(
+            file,
+            jsonl(
+                [
+                    {
+                        timestamp: '2026-09-18T09:00:00.000Z',
+                        type: 'event_msg',
+                        payload: { type: 'task_started', turn_id: 'provider-attempt-2' },
+                    },
+                    {
+                        timestamp: '2026-09-18T09:00:01.000Z',
+                        type: 'response_item',
+                        payload: {
+                            type: 'message',
+                            role: 'assistant',
+                            phase: 'final_answer',
+                            content: [{ type: 'output_text', text: 'Recovered final answer.' }],
+                        },
+                    },
+                    {
+                        timestamp: '2026-09-18T09:00:02.000Z',
+                        type: 'event_msg',
+                        payload: { type: 'task_complete', turn_id: 'provider-attempt-2', last_agent_message: 'Recovered final answer.' },
+                    },
+                ].map((line) => JSON.stringify(line)),
+            ),
+        );
+        let observed = false;
+
+        const completed = await collect(
+            new CodexAdapter().parseTurns(file, undefined, {
+                closeTrailingOnIdle: true,
+                onOpenTail: () => {
+                    observed = true;
+                },
+            }),
+        );
+
+        expect(observed).toBe(false);
+        expect(completed).toHaveLength(1);
+        expect(completed[0]).toMatchObject({
+            turnIndex: 0,
+            userMessage: 'Investigate the issue.',
+            assistantText: 'Partial investigation.\nRecovered final answer.',
+        });
+    });
+
+    it('suppresses the failed tail as soon as an automatic retry starts', async () => {
+        const file = transcript([
+            ...failedAttempt('retry-started'),
+            {
+                timestamp: '2026-09-18T09:00:00.000Z',
+                type: 'event_msg',
+                payload: { type: 'task_started', turn_id: 'provider-attempt-2' },
+            },
+        ]);
+        let observed = false;
+
+        const turns = await collect(
+            new CodexAdapter().parseTurns(file, undefined, {
+                closeTrailingOnIdle: true,
+                onOpenTail: () => {
+                    observed = true;
+                },
+            }),
+        );
+
+        expect(turns).toEqual([]);
+        expect(observed).toBe(false);
+    });
+
+    it('closes a user-only failed turn on abort as an empty drop with an advancing cursor', async () => {
+        const file = transcript([
+            ...failedAttempt('user-only-aborted').filter((_, index) => index !== 3),
+            {
+                timestamp: '2026-09-18T08:48:00.000Z',
+                type: 'event_msg',
+                payload: { type: 'turn_aborted', turn_id: 'provider-attempt-1', reason: 'interrupted' },
+            },
+        ]);
+        let observed = false;
+
+        const turns = await collect(
+            new CodexAdapter().parseTurns(file, undefined, {
+                closeTrailingOnIdle: true,
+                onOpenTail: () => {
+                    observed = true;
+                },
+            }),
+        );
+
+        expect(observed).toBe(false);
+        expect(turns).toHaveLength(1);
+        expect(turns[0]).toMatchObject({
+            userMessage: 'Investigate the issue.',
+            assistantText: '',
+            droppedReason: 'empty',
+            cursor: expect.any(String),
+        });
+    });
+
+    it('closes the same logical turn when an automatic retry aborts before contributing content', async () => {
+        const file = transcript([
+            {
+                timestamp: '2026-09-18T08:46:00.000Z',
+                type: 'session_meta',
+                payload: { id: 'retry-aborted', cwd, originator: 'codex-desktop' },
+            },
+            {
+                timestamp: '2026-09-18T08:46:01.000Z',
+                type: 'event_msg',
+                payload: { type: 'task_started', turn_id: 'provider-attempt-1' },
+            },
+            {
+                timestamp: '2026-09-18T08:46:02.000Z',
+                type: 'response_item',
+                payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Investigate the issue.' }] },
+            },
+            {
+                timestamp: '2026-09-18T08:46:03.000Z',
+                type: 'response_item',
+                payload: {
+                    type: 'message',
+                    role: 'assistant',
+                    phase: 'commentary',
+                    content: [{ type: 'output_text', text: 'Partial investigation.' }],
+                },
+            },
+            {
+                timestamp: '2026-09-18T08:47:17.715Z',
+                type: 'event_msg',
+                payload: {
+                    type: 'task_complete',
+                    turn_id: 'provider-attempt-1',
+                    last_agent_message: null,
+                    error: { message: 'Selected model is at capacity.', codex_error_info: 'server_overloaded' },
+                },
+            },
+            {
+                timestamp: '2026-09-18T08:47:59.427Z',
+                type: 'event_msg',
+                payload: { type: 'task_started', turn_id: 'provider-attempt-2' },
+            },
+            {
+                timestamp: '2026-09-18T08:48:00.000Z',
+                type: 'event_msg',
+                payload: { type: 'turn_aborted', turn_id: 'provider-attempt-2', reason: 'interrupted' },
+            },
+        ]);
+
+        const turns = await collect(new CodexAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+
+        expect(turns).toHaveLength(1);
+        expect(turns[0]).toMatchObject({
+            userMessage: 'Investigate the issue.',
+            assistantText: 'Partial investigation.',
+        });
+    });
+});

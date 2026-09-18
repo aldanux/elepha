@@ -18,14 +18,23 @@
 // apply_patch call.
 
 import path from 'node:path';
+import {
+    ELEPHA_MCP_CALL_ID_MAX_BYTES,
+    ELEPHA_MCP_NAMESPACE,
+    ELEPHA_MCP_RESULTS_PER_TURN_MAX,
+    ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES,
+} from '../config/constants.js';
 import { claudeProjectsRoot, isWithin, toPosix } from '../config/paths.js';
 import type { EmptySessionAnalysis, ParsedToolCall, SessionAdapterTool, SessionClassification } from '../types/index.js';
 import {
+    boundedMcpResult,
+    canonicalTimestamp,
     classifyEmptyJsonlSession,
     type EmptySessionSignals,
     JsonlTurnAdapter,
     type LineClass,
     readBoundedLines,
+    rememberUnmatchedElephaMcpResult,
     resolveAbsolute,
     safeDiscriminator,
     type TurnBuilderState,
@@ -95,6 +104,7 @@ interface CCToolUseBlock {
 interface CCToolResultBlock {
     type: 'tool_result';
     tool_use_id?: string;
+    content?: unknown;
 }
 
 type CCContentBlock = CCTextBlock | CCThinkingBlock | CCToolUseBlock | CCToolResultBlock | { type: string };
@@ -293,6 +303,90 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
                     state.openToolCallIds.delete(id);
                 }
             }
+        }
+    }
+
+    protected observeElephaMcp(state: TurnBuilderState, line: unknown): void {
+        const l = line as CCLine;
+        const content = l.message?.content;
+        if (!Array.isArray(content)) {
+            return;
+        }
+        for (const block of content) {
+            if (block.type === 'tool_use') {
+                const call = block as CCToolUseBlock;
+                if (!call.name.startsWith(`${ELEPHA_MCP_NAMESPACE}__`)) {
+                    continue;
+                }
+                if (typeof call.id !== 'string' || call.id === '') {
+                    state.elephaMcpCoverageFailure = 'missing-call-id';
+                    continue;
+                }
+                if (Buffer.byteLength(call.id) > ELEPHA_MCP_CALL_ID_MAX_BYTES) {
+                    state.elephaMcpCoverageFailure = 'oversized-call-id';
+                    continue;
+                }
+                if (state.elephaMcpCallIds.has(call.id) || state.elephaMcpResultReceipts.some((receipt) => receipt.callId === call.id)) {
+                    state.elephaMcpCoverageFailure = 'duplicate-call-id';
+                    continue;
+                }
+                if (state.elephaMcpUnmatchedResultIds.has(call.id)) {
+                    state.elephaMcpCoverageFailure = 'out-of-order-result';
+                } else if (state.elephaMcpUnmatchedCoverageIncomplete) {
+                    state.elephaMcpCoverageFailure = 'incomplete-correlation';
+                }
+                if (state.elephaMcpCallIds.size + state.elephaMcpResultReceipts.length >= ELEPHA_MCP_RESULTS_PER_TURN_MAX) {
+                    state.elephaMcpCoverageFailure = 'oversized-call-set';
+                    continue;
+                }
+                state.elephaMcpCallIds.add(call.id);
+                continue;
+            }
+            if (block.type !== 'tool_result') {
+                continue;
+            }
+            const resultBlock = block as CCToolResultBlock;
+            const callId = resultBlock.tool_use_id;
+            if (typeof callId === 'string' && Buffer.byteLength(callId) > ELEPHA_MCP_CALL_ID_MAX_BYTES) {
+                if (state.elephaMcpCallIds.has(callId)) {
+                    state.elephaMcpCoverageFailure = 'oversized-call-id';
+                }
+                continue;
+            }
+            if (typeof callId === 'string' && state.elephaMcpResultReceipts.some((receipt) => receipt.callId === callId)) {
+                state.elephaMcpCoverageFailure = 'duplicate-call-id';
+                continue;
+            }
+            if (typeof callId !== 'string' || !state.elephaMcpCallIds.has(callId)) {
+                if (typeof callId === 'string') {
+                    rememberUnmatchedElephaMcpResult(state, callId);
+                }
+                continue;
+            }
+            const result = boundedMcpResult(resultBlock.content);
+            if (result.state === 'incomplete') {
+                state.elephaMcpCoverageFailure = result.reason;
+                continue;
+            }
+            state.elephaMcpCallIds.delete(callId);
+            if (state.elephaMcpResultReceipts.length >= ELEPHA_MCP_RESULTS_PER_TURN_MAX) {
+                state.elephaMcpCoverageFailure = 'oversized-result';
+                continue;
+            }
+            if (state.elephaMcpResultBytes + result.bytes > ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES) {
+                state.elephaMcpCoverageFailure = 'oversized-result';
+                continue;
+            }
+            // Structural order, not this diagnostic time, controls
+            // eligibility. Prefer turn state so clock anomalies do not
+            // make the diagnostic chronology misleading.
+            const observedAt = canonicalTimestamp(state.endedAt, state.startedAt, l.timestamp) ?? null;
+            state.elephaMcpResultBytes += result.bytes;
+            state.elephaMcpResultReceipts.push({
+                callId,
+                body: result.body,
+                observedAt,
+            });
         }
     }
 

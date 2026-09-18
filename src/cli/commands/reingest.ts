@@ -1,13 +1,16 @@
 import type { Command } from 'commander';
 import { defaultAdapters, sessionAdapterFor } from '../../adapters/index.js';
 import { isWithinProviderStore } from '../../config/paths.js';
+import { openProviderTranscript } from '../../security/provider-transcript.js';
 import { openDb } from '../../storage/db.js';
+import { InjectionStore } from '../../storage/injection-store.js';
 import { MemoryStore } from '../../storage/memory-store.js';
+import { sourceGeneration, sourceSnapshotValidator } from '../../storage/source-reconciliation.js';
 import { parseSince } from '../../storage/stats.js';
 import { SummarizerCallLog } from '../../summarizer/call-log.js';
 import { estimateCostUsd } from '../../summarizer/pricing.js';
 import { createConfiguredSynthesisProviders } from '../../summarizer/provider-config.js';
-import type { SessionAdapterMap } from '../../types/index.js';
+import type { ParsedTurn, SessionAdapterMap } from '../../types/index.js';
 
 export function registerReingest(program: Command): void {
     program
@@ -54,21 +57,99 @@ export function registerReingest(program: Command): void {
                     console.log(`skipped ${session.native_id}: no JSONL adapter for ${session.tool}`);
                     continue;
                 }
+                const opened = await openProviderTranscript(session.tool, session.source_path);
+                if ('reason' in opened) {
+                    console.log(`skipped ${session.native_id}: source unavailable (${opened.reason})`);
+                    continue;
+                }
                 let sessionHadReingest = false;
+                const validateSource = sourceSnapshotValidator(session.tool, session.source_path, opened);
+                const expectedSourceGeneration = sourceGeneration(store, session.tool, session.native_id);
+                const mcpReceiptTurns: ParsedTurn[] = [];
                 // Re-walks the whole file from byte 0 - cheap/local, no API cost.
                 // Turns before the cutoff are re-derived but skipped, never
                 // re-summarized or re-written; only in-window turns cost a call.
-                for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
-                    if (turn.startedAt < cutoffIso) {
-                        continue;
+                try {
+                    const sourcePreflight = new InjectionStore(store.database, { includePersistedMcp: false });
+                    const receiptPreflight = new InjectionStore(store.database);
+                    for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
+                        closeTrailingOnIdle: true,
+                        handle: opened.handle,
+                    })) {
+                        turn.validateSource = validateSource;
+                        if (turn.tool !== session.tool || turn.sessionId !== session.native_id) {
+                            throw new Error(`Transcript identity changed during reingest for ${session.native_id}`);
+                        }
+                        if (turn.droppedReason !== undefined) {
+                            if (turn.droppedReason === 'elepha-mcp') {
+                                if (
+                                    !sourcePreflight.rememberElephaMcpReceipts(turn) ||
+                                    !receiptPreflight.rememberElephaMcpReceipts(turn, expectedSourceGeneration)
+                                ) {
+                                    throw new Error(
+                                        `Elepha MCP receipt protection incomplete for ${session.native_id} turn ${turn.turnIndex}`,
+                                    );
+                                }
+                                mcpReceiptTurns.push(turn);
+                            }
+                            continue;
+                        }
+                        const quoteBackStatus = sourcePreflight.quoteBackStatus(turn);
+                        if (quoteBackStatus === 'incomplete') {
+                            throw new Error(`Quote-back protection incomplete for ${session.native_id} turn ${turn.turnIndex}`);
+                        }
                     }
-                    if (limit > 0 && turnsReprocessed >= limit) {
-                        break;
+                    if (
+                        !validateSource() ||
+                        !receiptPreflight.validateCompleteMcpReceiptLedger(session.tool, session.native_id, expectedSourceGeneration) ||
+                        !store.publishElephaMcpReceiptBatch(
+                            mcpReceiptTurns,
+                            session.id,
+                            session.tool,
+                            session.native_id,
+                            expectedSourceGeneration,
+                        )
+                    ) {
+                        throw new Error(`Elepha MCP receipt reconciliation required for ${session.native_id}`);
                     }
-                    const summary = await summarizer.summarize({ userMessage: turn.userMessage, assistantText: turn.assistantText });
-                    store.reingestTurn(turn, session.id, session.project_id, summary);
-                    turnsReprocessed++;
-                    sessionHadReingest = true;
+
+                    const replayInjections = new InjectionStore(store.database, { includePersistedMcp: false });
+                    for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
+                        closeTrailingOnIdle: true,
+                        handle: opened.handle,
+                    })) {
+                        turn.validateSource = validateSource;
+                        if (turn.tool !== session.tool || turn.sessionId !== session.native_id) {
+                            throw new Error(`Transcript identity changed during reingest for ${session.native_id}`);
+                        }
+                        if (turn.droppedReason !== undefined) {
+                            if (turn.droppedReason === 'elepha-mcp' && !replayInjections.rememberElephaMcpReceipts(turn)) {
+                                throw new Error(`Elepha MCP receipt protection incomplete for ${session.native_id} turn ${turn.turnIndex}`);
+                            }
+                            continue;
+                        }
+                        const quoteBackStatus = replayInjections.quoteBackStatus(turn);
+                        if (quoteBackStatus === 'incomplete') {
+                            throw new Error(`Quote-back protection incomplete for ${session.native_id} turn ${turn.turnIndex}`);
+                        }
+                        if (quoteBackStatus === 'match' || turn.startedAt < cutoffIso) {
+                            continue;
+                        }
+                        if (limit > 0 && turnsReprocessed >= limit) {
+                            break;
+                        }
+                        const summary = await summarizer.summarize({ userMessage: turn.userMessage, assistantText: turn.assistantText });
+                        if (!store.reingestTurn(turn, session.id, session.project_id, summary, true)) {
+                            throw new Error(`Turn protection changed during reingest for ${session.native_id} turn ${turn.turnIndex}`);
+                        }
+                        turnsReprocessed++;
+                        sessionHadReingest = true;
+                    }
+                    if (!validateSource()) {
+                        throw new Error(`Elepha MCP receipt reconciliation required for ${session.native_id}`);
+                    }
+                } finally {
+                    await opened.handle.close();
                 }
                 if (sessionHadReingest) {
                     sessionsTouched++;

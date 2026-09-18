@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
     closeSync,
@@ -27,6 +28,7 @@ import {
     RESTORE_ENCRYPTION_CHANGED_ERROR,
     RESTORE_EVICTIONS_CHANGED_ERROR,
     RESTORE_INJECTIONS_CHANGED_ERROR,
+    RESTORE_MCP_RECEIPTS_CHANGED_ERROR,
     RESTORE_PARANOID_CHANGED_ERROR,
     RESTORE_STAGE_CHANGED_ERROR,
     RESTORE_TOMBSTONES_CHANGED_ERROR,
@@ -75,6 +77,7 @@ import {
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
 import { applyManualSplit, planManualSplit } from '../../src/storage/resegmentation.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
+import { sourceTurnDigest } from '../../src/storage/source-turn-digest.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
@@ -665,7 +668,62 @@ describe('elepha restore', () => {
         const candidate = createTestDb('elepha-restore-encrypted-candidate-');
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
+        const openProject = candidate.store.upsertProject(path.join(candidate.directory, 'encrypted-open-project'));
+        candidate.store.consent.grant(openProject.path);
+        const openSession = candidate.store.upsertSession(
+            'codex',
+            'encrypted-open-turn',
+            openProject.id,
+            path.join(candidate.directory, 'encrypted-open-turn.jsonl'),
+        );
+        const openTurn: ParsedTurn = {
+            tool: 'codex',
+            sessionId: openSession.native_id,
+            sourcePath: openSession.source_path,
+            projectPath: openProject.path,
+            turnIndex: 0,
+            startedAt: '2026-08-01T00:01:00.000Z',
+            endedAt: '2026-08-01T00:01:01.000Z',
+            userMessage: 'encrypted open prompt',
+            assistantText: 'encrypted open response',
+            toolCalls: [{ name: 'Read', filePaths: [path.join(openProject.path, 'source.ts')] }],
+            cursor: 'encrypted-open-cursor',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+        expect(
+            candidate.store.observeOpenTurn(
+                {
+                    kind: 'failed-eof',
+                    candidateCursor: openTurn.cursor,
+                    failedAt: openTurn.endedAt,
+                    receiptCoverage: { state: 'complete', turn: openTurn },
+                },
+                { kind: 'main' },
+                0,
+                { dev: '1', ino: '2', size: 3, mtimeMs: 4, revision: 'encrypted-open-revision' },
+                '2026-08-01T00:01:02.000Z',
+            ),
+        ).toBeDefined();
+        expect(
+            candidate.store.stageOpenTurnSummary(
+                'codex',
+                openSession.native_id,
+                'encrypted-open-revision',
+                sourceTurnDigest(openTurn),
+                {
+                    decisions: [{ what: 'preserve encrypted staging', why: 'restore remains restart-safe' }],
+                    pending_items: ['resume after recovery'],
+                    status: 'ok',
+                },
+                '2026-08-01T00:06:02.000Z',
+                filterTurn(openTurn),
+            ),
+        ).toBe(true);
         active.db.exec('DELETE FROM purged_transcripts; DELETE FROM injections');
+        const expectedActiveConsentRoots = Number(
+            (active.db.prepare('SELECT COUNT(*) AS count FROM consent_roots').get() as { count: number }).count,
+        );
         active.close();
         candidate.close();
         const runtime = encryptionRuntime();
@@ -674,12 +732,16 @@ describe('elepha restore', () => {
         const backup = path.join(candidate.directory, 'full-encrypted.db');
         const candidateDb = openKeyedDatabase(candidate.dbPath, FIXED_KEY);
         const expectedSchema = candidateDb.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all();
+        const expectedOpenTurn = candidateDb.prepare("SELECT * FROM open_turns WHERE native_session_id = 'encrypted-open-turn'").get();
+        const expectedUsage = candidateDb.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get();
         const expectedCounts = Object.fromEntries(
             REQUIRED_RESTORE_TABLES.map((table) => [
                 table,
                 table === 'injections'
                     ? 0
-                    : Number((candidateDb.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
+                    : table === 'consent_roots'
+                      ? expectedActiveConsentRoots
+                      : Number((candidateDb.prepare(`SELECT COUNT(*) AS count FROM "${table}"`).get() as { count: number }).count),
             ]),
         );
         exportAll(candidateDb, backup, FIXED_KEY);
@@ -698,6 +760,29 @@ describe('elepha restore', () => {
         const restored = openKeyedDatabase(active.dbPath, FIXED_KEY, { readonly: true });
         expect(restored.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
         expect(restored.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all()).toEqual(expectedSchema);
+        expect(restored.prepare("SELECT * FROM open_turns WHERE native_session_id = 'encrypted-open-turn'").get()).toEqual(
+            expectedOpenTurn,
+        );
+        expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual(expectedUsage);
+        expect(
+            restored
+                .prepare(
+                    `SELECT
+                         (SELECT COALESCE(SUM(
+                              length(CAST(user_prompt AS BLOB)) +
+                              length(CAST(assistant_response AS BLOB)) +
+                              COALESCE(length(CAST(assistant_structure AS BLOB)), 0) +
+                              length(CAST(tool_calls AS BLOB))
+                          ), 0) FROM filtered_turns) +
+                         (SELECT COALESCE(SUM(
+                              COALESCE(length(CAST(durable_user_prompt AS BLOB)), 0) +
+                              COALESCE(length(CAST(durable_assistant_response AS BLOB)), 0) +
+                              COALESCE(length(CAST(durable_assistant_structure AS BLOB)), 0) +
+                              COALESCE(length(CAST(durable_tool_calls AS BLOB)), 0)
+                          ), 0) FROM open_turns) AS total_bytes`,
+                )
+                .get(),
+        ).toEqual(expectedUsage);
         expect(
             Object.fromEntries(
                 REQUIRED_RESTORE_TABLES.map((table) => [
@@ -841,6 +926,82 @@ describe('elepha restore', () => {
 
         expect.soft(rows).toEqual([expect.objectContaining({ body, tool: 'codex', native_session_id: 'current-hook-session' })]);
         expect.soft(quoteBack).toBe(true);
+    });
+
+    it('preserves active MCP generations and every retained receipt together through restore', async () => {
+        const active = createTestDb('elepha-current-mcp-receipt-active-');
+        populate(active.dbPath, 'mcp-receipt-restore');
+        active.close();
+        const encryption = encryptionRuntime();
+        await encryptDatabase(active.dbPath, encryption);
+        const current = await openDb(active.dbPath, { encryption });
+        const backup = path.join(active.directory, 'before-current-mcp-receipt.db');
+        exportAll(current, backup, FIXED_KEY);
+        const inactiveBody = 'Retained receipt from the inactive source generation.';
+        const activeBody = 'Current receipt that must remain active after restore.';
+        current
+            .prepare('INSERT INTO source_generations (tool, native_id, generation) VALUES (?, ?, ?)')
+            .run('codex', 'current-mcp-session', 1);
+        const insertReceipt = current.prepare(
+            `INSERT INTO mcp_receipts
+             (tool, native_session_id, source_generation, source_turn_index, call_id, observed_at, body_hash, body)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        );
+        insertReceipt.run(
+            'codex',
+            'current-mcp-session',
+            0,
+            0,
+            'old-call',
+            null,
+            createHash('sha256').update(inactiveBody).digest('hex'),
+            inactiveBody,
+        );
+        insertReceipt.run(
+            'codex',
+            'current-mcp-session',
+            1,
+            1,
+            'current-call',
+            '2026-09-06T01:00:00.000Z',
+            createHash('sha256').update(activeBody).digest('hex'),
+            activeBody,
+        );
+        current.close();
+
+        await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            encryption,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+        });
+
+        const restored = await openDb(active.dbPath, { encryption });
+        const store = new MemoryStore(restored);
+        expect(restored.prepare('SELECT * FROM source_generations').all()).toEqual([
+            { tool: 'codex', native_id: 'current-mcp-session', generation: 1 },
+        ]);
+        expect(restored.prepare('SELECT source_generation, call_id, body FROM mcp_receipts ORDER BY source_generation').all()).toEqual([
+            { source_generation: 0, call_id: 'old-call', body: inactiveBody },
+            { source_generation: 1, call_id: 'current-call', body: activeBody },
+        ]);
+        expect(
+            store.injectionQuoteBackStatus({
+                tool: 'codex',
+                sessionId: 'current-mcp-session',
+                sourcePath: path.join(active.directory, 'current-mcp-session.jsonl'),
+                projectPath: active.directory,
+                turnIndex: 2,
+                startedAt: 'invalid',
+                endedAt: 'invalid',
+                userMessage: activeBody,
+                assistantText: '',
+                toolCalls: [],
+                cursor: '2',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            }),
+        ).toBe('match');
+        restored.close();
     });
 
     it('preserves current terminal eviction through restore so backfill and search cannot resurrect it', async () => {
@@ -1066,6 +1227,7 @@ describe('elepha restore', () => {
     it.each([
         ['paranoid', RESTORE_PARANOID_CHANGED_ERROR],
         ['injection', RESTORE_INJECTIONS_CHANGED_ERROR],
+        ['MCP receipt', RESTORE_MCP_RECEIPTS_CHANGED_ERROR],
         ['eviction', RESTORE_EVICTIONS_CHANGED_ERROR],
     ] as const)('aborts before snapshot when active %s control changes during confirmation', async (control, expectedError) => {
         const active = createTestDb(`elepha-${control}-control-stale-`);
@@ -1098,7 +1260,20 @@ describe('elepha restore', () => {
                             injectionId: 'stale',
                             body: 'stale',
                         });
-                    else
+                    else if (control === 'MCP receipt') {
+                        const body = 'concurrent MCP receipt';
+                        changed
+                            .prepare('INSERT INTO source_generations (tool, native_id, generation) VALUES (?, ?, 0)')
+                            .run('codex', 'stale-mcp');
+                        changed
+                            .prepare(
+                                `INSERT INTO mcp_receipts
+                                 (tool, native_session_id, source_generation, source_turn_index,
+                                  call_id, observed_at, body_hash, body)
+                                 VALUES (?, ?, 0, 0, 'call', NULL, ?, ?)`,
+                            )
+                            .run('codex', 'stale-mcp', createHash('sha256').update(body).digest('hex'), body);
+                    } else
                         expect(
                             changed
                                 .prepare(
@@ -1722,6 +1897,78 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
     });
 
+    it('rejects a same-name malicious open-turn trigger before it can erase an active purge tombstone', async () => {
+        const active = createTestDb('elepha-restore-open-trigger-active-');
+        const candidate = createTestDb('elepha-restore-open-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'open-trigger.db');
+        const nativeId = 'must-stay-purged-open-turn';
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        active.db
+            .prepare('INSERT INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)')
+            .run('codex', nativeId, '2026-08-02T00:00:00.000Z');
+        const project = candidate.store.upsertProject(path.join(candidate.directory, 'open-trigger-project'));
+        candidate.store.consent.grant(project.path);
+        const session = candidate.store.upsertSession('codex', nativeId, project.id, path.join(candidate.directory, 'open-trigger.jsonl'));
+        const turn: ParsedTurn = {
+            tool: 'codex',
+            sessionId: nativeId,
+            sourcePath: session.source_path,
+            projectPath: project.path,
+            turnIndex: 0,
+            startedAt: '2026-08-01T00:00:00.000Z',
+            endedAt: '2026-08-01T00:00:01.000Z',
+            userMessage: 'pending purge overlay',
+            assistantText: 'must not execute candidate trigger',
+            toolCalls: [],
+            cursor: '0',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+        expect(
+            candidate.store.observeOpenTurn(
+                {
+                    kind: 'failed-eof',
+                    candidateCursor: turn.cursor,
+                    failedAt: turn.endedAt,
+                    receiptCoverage: { state: 'complete', turn },
+                },
+                { kind: 'main' },
+                0,
+                { dev: '1', ino: '2', size: 3, mtimeMs: 4, revision: 'malicious-trigger-revision' },
+                '2026-08-01T00:00:02.000Z',
+            ),
+        ).toBeDefined();
+        candidate.db.exec(`
+            DROP TRIGGER open_turns_usage_ad;
+            CREATE TRIGGER open_turns_usage_ad AFTER DELETE ON open_turns
+            BEGIN DELETE FROM purged_transcripts; END;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toBe(DURABLE_CAPTURE_SCHEMA_MISMATCH);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+        const restored = openUnmanagedDb(active.dbPath);
+        try {
+            expect(
+                restored.prepare('SELECT tool, native_id FROM purged_transcripts WHERE tool = ? AND native_id = ?').get('codex', nativeId),
+            ).toEqual({ tool: 'codex', native_id: nativeId });
+        } finally {
+            restored.close();
+        }
+    });
+
     it('accepts ALTER-derived clause order and identifier quoting', async () => {
         const active = createTestDb('elepha-restore-clause-order-active-');
         const candidate = createTestDb('elepha-restore-clause-order-candidate-');
@@ -1782,6 +2029,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
         const project = candidate.store.upsertProject(path.join(candidate.directory, 'durable-project'));
+        candidate.store.consent.grant(project.path);
         for (const [nativeId, needle] of [
             ['restored-purged-copy', 'restorepurgedneedle'],
             ['restored-incognito-copy', 'restoreincognitoneedle'],
@@ -1792,27 +2040,47 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                 project.id,
                 path.join(candidate.directory, `${nativeId}.jsonl`),
             );
-            candidate.store.recordTurn(
+            const turn: ParsedTurn = {
+                tool: 'codex',
+                sessionId: nativeId,
+                sourcePath: session.source_path,
+                projectPath: project.path,
+                turnIndex: 0,
+                startedAt: '2026-08-01T00:00:00.000Z',
+                endedAt: '2026-08-01T00:00:01.000Z',
+                userMessage: needle,
+                assistantText: 'restored sensitive response',
+                toolCalls: [],
+                cursor: '0',
+                hasExternalContent: false,
+                resumeMarkerBefore: false,
+            };
+            candidate.store.recordTurn(turn, session.id, project.id, { decisions: [], pending_items: [], status: 'ok' }, true);
+            const openTurn = { ...turn, turnIndex: 1, cursor: '1', userMessage: `${needle}-open` };
+            candidate.store.observeOpenTurn(
                 {
-                    tool: 'codex',
-                    sessionId: nativeId,
-                    sourcePath: session.source_path,
-                    projectPath: project.path,
-                    turnIndex: 0,
-                    startedAt: '2026-08-01T00:00:00.000Z',
-                    endedAt: '2026-08-01T00:00:01.000Z',
-                    userMessage: needle,
-                    assistantText: 'restored sensitive response',
-                    toolCalls: [],
-                    cursor: '0',
-                    hasExternalContent: false,
-                    resumeMarkerBefore: false,
+                    kind: 'failed-eof',
+                    anchorCursor: '0',
+                    candidateCursor: '1',
+                    failedAt: openTurn.endedAt,
+                    receiptCoverage: { state: 'complete', turn: openTurn },
                 },
-                session.id,
-                project.id,
-                { decisions: [], pending_items: [], status: 'ok' },
-                true,
+                { kind: 'main' },
+                0,
+                { dev: '1', ino: '2', size: 3, mtimeMs: 4, revision: `revision-${nativeId}` },
+                '2026-08-01T00:00:02.000Z',
             );
+            expect(
+                candidate.store.stageOpenTurnSummary(
+                    'codex',
+                    nativeId,
+                    `revision-${nativeId}`,
+                    sourceTurnDigest(openTurn),
+                    { decisions: [], pending_items: [], status: 'ok' },
+                    '2026-08-01T00:05:02.000Z',
+                    filterTurn(openTurn),
+                ),
+            ).toBe(true);
         }
         fullBackup(candidate.dbPath, backup);
         active.db
@@ -1861,6 +2129,8 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
                     )
                     .get(),
             ).toEqual({ count: 2 });
+            expect(restored.prepare('SELECT COUNT(*) AS count FROM open_turns').get()).toEqual({ count: 0 });
+            expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
         } finally {
             restored.close();
         }
@@ -1959,10 +2229,11 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const active = createTestDb('elepha-restore-sanitize-active-');
         const candidate = createTestDb('elepha-restore-sanitize-candidate-');
         const backup = path.join(candidate.directory, 'full.db');
-        const tainted = (label: string) => `${label}\n\\|| active\u0085control`;
+        const tainted = (label: string) => `${label} with \`backticks\` and $(command)\n\\|| active\u0085control`;
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
         const project = candidate.store.upsertProject(path.join(candidate.directory, 'sanitize-project'));
+        candidate.store.consent.grant(project.path);
         const session = candidate.store.upsertSession(
             'codex',
             'legacy-sanitize-session',
@@ -2028,12 +2299,85 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             ]),
             memoryId,
         );
+        const openTurn: ParsedTurn = {
+            tool: 'codex',
+            sessionId: session.native_id,
+            sourcePath: session.source_path,
+            projectPath: project.path,
+            turnIndex: 1,
+            startedAt: '2026-08-01T00:01:00.000Z',
+            endedAt: '2026-08-01T00:01:01.000Z',
+            userMessage: 'safe open prompt',
+            assistantText: 'safe open response',
+            assistantStructure: { unclassified: false, finals: [[0, 18]], omitted: 0 },
+            toolCalls: [{ name: 'Read', filePaths: [path.join(project.path, 'open.ts')] }],
+            cursor: '1',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+        expect(
+            candidate.store.observeOpenTurn(
+                {
+                    kind: 'failed-eof',
+                    anchorCursor: '0',
+                    candidateCursor: openTurn.cursor,
+                    failedAt: openTurn.endedAt,
+                    receiptCoverage: { state: 'complete', turn: openTurn },
+                },
+                { kind: 'main' },
+                0,
+                { dev: '1', ino: '2', size: 3, mtimeMs: 4, revision: 'sanitize-open-revision' },
+                '2026-08-01T00:01:02.000Z',
+            ),
+        ).toBeDefined();
+        expect(
+            candidate.store.stageOpenTurnSummary(
+                'codex',
+                session.native_id,
+                'sanitize-open-revision',
+                sourceTurnDigest(openTurn),
+                { decisions: [], pending_items: [], status: 'ok' },
+                '2026-08-01T00:06:02.000Z',
+                filterTurn(openTurn),
+            ),
+        ).toBe(true);
+        const taintedOpenResponse = tainted('open response');
+        candidate.db
+            .prepare(
+                `UPDATE open_turns SET
+                     decisions = ?, pending_items = ?, summarizer_status = ?,
+                     durable_user_prompt = ?, durable_assistant_response = ?,
+                     durable_assistant_structure = ?, durable_tool_calls = ?
+                 WHERE session_id = ?`,
+            )
+            .run(
+                JSON.stringify([{ what: tainted('open decision'), why: tainted('open reason') }]),
+                JSON.stringify([tainted('open pending')]),
+                tainted('open status'),
+                tainted('open prompt'),
+                taintedOpenResponse,
+                JSON.stringify({
+                    unclassified: false,
+                    finals: [[0, taintedOpenResponse.length]],
+                    omitted: 0,
+                    legacy: tainted('open structure'),
+                }),
+                JSON.stringify([{ name: tainted('open tool'), filePaths: [tainted('open path')] }]),
+                session.id,
+            );
         expect([...new Set(verifySanitize(candidate.db).map(({ table, field }) => `${table}.${field}`))].sort()).toEqual([
             'filtered_turns.assistant_response',
             'filtered_turns.tool_calls',
             'filtered_turns.user_prompt',
             'memories.decisions',
             'memories.pending_items',
+            'open_turns.decisions',
+            'open_turns.durable_assistant_response',
+            'open_turns.durable_assistant_structure',
+            'open_turns.durable_tool_calls',
+            'open_turns.durable_user_prompt',
+            'open_turns.pending_items',
+            'open_turns.summarizer_status',
             'session_rollups.decisions',
             'session_rollups.pending_items',
             'session_rollups.summary',
@@ -2055,6 +2399,28 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         try {
             expect.soft(verifySanitize(restored)).toEqual([]);
             expect.soft(planSanitize(restored).changes).toEqual([]);
+            const restoredSession = restored
+                .prepare("SELECT id FROM sessions WHERE tool = 'codex' AND native_id = 'legacy-sanitize-session'")
+                .get() as { id: number };
+            const storedOpenTurn = restored
+                .prepare('SELECT durable_assistant_response, durable_assistant_structure FROM open_turns WHERE session_id = ?')
+                .get(restoredSession.id) as { durable_assistant_response: string; durable_assistant_structure: string };
+            expect.soft(JSON.parse(storedOpenTurn.durable_assistant_structure)).toEqual({
+                unclassified: false,
+                finals: [[0, storedOpenTurn.durable_assistant_response.length]],
+                omitted: 0,
+            });
+            const snapshot = new SessionReader(restored).incompleteLastObservedFor(restoredSession);
+            expect.soft(snapshot).toBeDefined();
+            const servedStrings = [
+                snapshot?.summarizerStatus,
+                ...(snapshot?.decisions.flatMap((decision) => [decision.what, decision.why]) ?? []),
+                ...(snapshot?.pendingItems ?? []),
+                snapshot?.durableProjection?.userPrompt,
+                snapshot?.durableProjection?.assistantResponse,
+                ...(snapshot?.durableProjection?.toolCalls.flatMap((call) => [call.name, ...call.filePaths]) ?? []),
+            ].filter((value): value is string => typeof value === 'string');
+            expect.soft(servedStrings.every((value) => !detectShellSyntax(value))).toBe(true);
         } finally {
             restored.close();
         }

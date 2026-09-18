@@ -8,6 +8,7 @@ import { openProviderTranscript } from '../security/provider-transcript.js';
 import type { SessionAdapter, SessionAdapterMap, ToolName } from '../types/index.js';
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 import { firstPromptSearch } from './first-prompt-search.js';
+import { InjectionQuoteBackIncompleteError, InjectionStore } from './injection-store.js';
 import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 
 export interface FirstPromptSearchChange {
@@ -53,6 +54,7 @@ async function deriveFirstPrompt(
         return undefined;
     }
     try {
+        const injections = new InjectionStore(db, { includePersistedMcp: false });
         const opened = await openProviderTranscript(session.tool, session.source_path);
         if ('reason' in opened) {
             return undefined;
@@ -68,6 +70,15 @@ async function deriveFirstPrompt(
                 if (!isSessionKindEligible(db, session.id)) {
                     return undefined;
                 }
+                if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                    throw new InjectionQuoteBackIncompleteError(`First prompt backfill for ${session.native_id}`);
+                }
+                if (
+                    turn.droppedReason !== undefined ||
+                    injections.isQuoteBackOrThrow(turn, `First prompt backfill for ${session.native_id}`)
+                ) {
+                    continue;
+                }
                 if (turn.turnIndex === firstStoredIndex) {
                     return firstPromptSearch(turn.userMessage);
                 }
@@ -75,7 +86,10 @@ async function deriveFirstPrompt(
         } finally {
             await opened.handle.close();
         }
-    } catch {
+    } catch (error) {
+        if (error instanceof InjectionQuoteBackIncompleteError) {
+            throw error;
+        }
         return undefined;
     }
     return undefined;

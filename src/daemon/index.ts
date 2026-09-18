@@ -13,6 +13,7 @@
 // per-file mutex a second scan could re-read a cursor the first is still
 // advancing.
 
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { stat as fsStat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
@@ -35,6 +36,7 @@ import {
     FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
+    OPEN_TURN_SUMMARY_GRACE_MS,
     PACKAGE_VERSION,
     readInstalledPackageVersion,
     SWEEP_INTERVAL_MS,
@@ -66,7 +68,9 @@ import type { ConsentState } from '../storage/consent-store.js';
 import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
 import { type DurableEvictionPlan, withValidatedDurableEvictionSources } from '../storage/durable-capture-store.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
+import { InjectionStore } from '../storage/injection-store.js';
 import type { IngestedTurnWritePreparation, MemoryStore } from '../storage/memory-store.js';
+import type { OpenTurnSourceSnapshot } from '../storage/open-turn-store.js';
 import { isMemoryLocked } from '../storage/paranoid-gate.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
@@ -77,9 +81,10 @@ import {
     settleSessionKindReconciliation,
 } from '../storage/session-kind-reconciliation.js';
 import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from '../storage/session-read-model.js';
-import { SourceReconciliation, sourceSnapshotValidator } from '../storage/source-reconciliation.js';
+import { SourceReconciliation, sourceGeneration, sourceSnapshotValidator } from '../storage/source-reconciliation.js';
 import type {
     EmptySessionKind,
+    OpenTailObservation,
     ParsedTurn,
     SessionAdapter,
     SessionAdapterMap,
@@ -87,6 +92,7 @@ import type {
     SqliteSourceAdapter,
     SummarizationProvider,
     SummarizerStatus,
+    ToolName,
 } from '../types/index.js';
 import { FailureWindow } from './failure-window.js';
 import { clearHeartbeat, defaultHeartbeatPath, writeHeartbeat } from './heartbeat.js';
@@ -216,11 +222,24 @@ export interface DaemonOptions {
     durableCaptureBackfillBatchSize?: number;
     // Deterministic budget exhaustion without timing-dependent fixture sleeps.
     sessionKindReconciliationNow?: () => number;
+    // Fake-clock seam for the failed-EOF synthesis grace.
+    now?: () => number;
 }
 
 function formatDaemonLog(message: string, context: { tool?: string; sessionId?: string } = {}): string {
     const fields = [context.tool && `tool=${context.tool}`, context.sessionId && `session_id=${context.sessionId}`].filter(Boolean);
     return fields.length === 0 ? message : `${message} ${fields.join(' ')}`;
+}
+
+function openTurnSourceSnapshot(opened: {
+    stat: { dev: number | bigint; ino: number | bigint; size: number; mtimeMs: number };
+}): OpenTurnSourceSnapshot {
+    const dev = String(opened.stat.dev);
+    const ino = String(opened.stat.ino);
+    const revision = createHash('sha256')
+        .update(JSON.stringify([dev, ino, opened.stat.size, opened.stat.mtimeMs]))
+        .digest('hex');
+    return { dev, ino, size: opened.stat.size, mtimeMs: opened.stat.mtimeMs, revision };
 }
 
 export class IngestionDaemon {
@@ -256,6 +275,7 @@ export class IngestionDaemon {
     private readonly openTranscript: ProviderTranscriptOpener;
     private readonly firstPromptSearchBackfillBatchSize: number;
     private readonly durableCaptureBackfillBatchSize: number;
+    private readonly now: () => number;
     private sweepTimer: NodeJS.Timeout | undefined;
     private initialUpdateCheckTimer: NodeJS.Timeout | undefined;
     private updateCheckTimer: NodeJS.Timeout | undefined;
@@ -271,6 +291,8 @@ export class IngestionDaemon {
     private watcher: FSWatcher | undefined;
     private heartbeatTimer: NodeJS.Timeout | undefined;
     private readonly idleTimers = new Map<string, NodeJS.Timeout>();
+    private readonly openTurnTimers = new Map<string, NodeJS.Timeout>();
+    private readonly openTurnValidationEpochs = new Map<string, number>();
     private readonly processing = new Set<string>();
     private readonly workQueue: WorkQueue;
     private readonly opencodeAdapter: SqliteSourceAdapter;
@@ -340,6 +362,7 @@ export class IngestionDaemon {
         this.firstPromptSearchBackfillBatchSize = options.firstPromptSearchBackfillBatchSize ?? FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE;
         this.durableCaptureBackfillBatchSize = options.durableCaptureBackfillBatchSize ?? DURABLE_CAPTURE_BACKFILL_BATCH_SIZE;
         this.sessionKindReconciliationNow = options.sessionKindReconciliationNow;
+        this.now = options.now ?? Date.now;
     }
 
     start(): void {
@@ -601,6 +624,10 @@ export class IngestionDaemon {
             clearTimeout(timer);
         }
         this.idleTimers.clear();
+        for (const timer of this.openTurnTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.openTurnTimers.clear();
         await this.watcher?.close();
         await this.startupSweepPromise;
         await this.kindReconciliationPromise;
@@ -652,14 +679,23 @@ export class IngestionDaemon {
                 let parseFailed = false;
                 let writeUnauthorized = false;
                 let writeEvicted = false;
+                const validateSource = sourceSnapshotValidator(session.tool, session.sourcePath, opened);
+                const expectedSourceGeneration = sourceGeneration(this.store, session.tool, session.nativeId);
+                const sourceReplayInjections = new InjectionStore(this.store.database, { includePersistedMcp: false });
+                const receiptPreflight = new InjectionStore(this.store.database);
+                const mcpReceiptTurns: ParsedTurn[] = [];
                 try {
                     if (!isSessionKindEligible(this.store.database, session.id)) {
                         continue;
                     }
+                    // Complete Rule 4 and receipt-identity preflight before any
+                    // filtered turn is written. A conflict near EOF must not
+                    // leave an earlier durable row behind.
                     for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
                         closeTrailingOnIdle: true,
                         handle: opened.handle,
                     })) {
+                        turn.validateSource = validateSource;
                         // Eligibility may change while the iterator reads.
                         // Check before skipped turns can request another read.
                         if (!isSessionKindEligible(this.store.database, session.id)) {
@@ -673,44 +709,124 @@ export class IngestionDaemon {
                             parseFailed = true;
                             break;
                         }
-                        if (!work.missingTurnIndexes.has(turn.turnIndex)) {
-                            continue;
-                        }
                         if (turn.droppedReason !== undefined) {
+                            if (turn.droppedReason === 'elepha-mcp') {
+                                if (
+                                    !sourceReplayInjections.rememberElephaMcpReceipts(turn) ||
+                                    !receiptPreflight.rememberElephaMcpReceipts(turn, expectedSourceGeneration)
+                                ) {
+                                    parseFailed = true;
+                                    this.log(
+                                        formatDaemonLog(
+                                            `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} stopped at turn ${turn.turnIndex}: MCP receipt protection incomplete`,
+                                            turn,
+                                        ),
+                                    );
+                                    break;
+                                }
+                                mcpReceiptTurns.push(turn);
+                            }
                             continue;
                         }
-                        if (this.store.isInjectionQuoteBack(turn)) {
+                        const quoteBackStatus = sourceReplayInjections.quoteBackStatus(turn);
+                        if (quoteBackStatus === 'incomplete') {
+                            parseFailed = true;
                             this.log(
                                 formatDaemonLog(
-                                    `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} suppressed turn ${turn.turnIndex}: self-injected content (quote-back)`,
+                                    `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} stopped at turn ${turn.turnIndex}: quote-back protection incomplete`,
                                     turn,
                                 ),
                             );
-                            continue;
-                        }
-                        const projection = filterTurn(turn);
-                        const result = await withValidatedDurableEvictionSources(
-                            this.store.database,
-                            projection,
-                            this.durableCaptureMaxBytes,
-                            { sessionId: session.id, tool: session.tool, sourcePath: session.sourcePath },
-                            (evictionPlan) => backfill.record(session, turn.turnIndex, projection, new Date().toISOString(), evictionPlan),
-                            { openTranscript: this.openTranscript },
-                        );
-                        if (result.state === 'unauthorized') {
-                            writeUnauthorized = true;
                             break;
                         }
-                        if (result.state === 'evicted') {
-                            writeEvicted = true;
-                            break;
+                    }
+                    if (
+                        this.stopping ||
+                        writeUnauthorized ||
+                        parseFailed ||
+                        !validateSource() ||
+                        !receiptPreflight.validateCompleteMcpReceiptLedger(session.tool, session.nativeId, expectedSourceGeneration) ||
+                        !this.store.publishElephaMcpReceiptBatch(
+                            mcpReceiptTurns,
+                            session.id,
+                            session.tool,
+                            session.nativeId,
+                            expectedSourceGeneration,
+                        )
+                    ) {
+                        parseFailed = true;
+                    }
+
+                    const replayInjections = new InjectionStore(this.store.database, { includePersistedMcp: false });
+                    if (!parseFailed && !writeUnauthorized && !this.stopping) {
+                        for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
+                            closeTrailingOnIdle: true,
+                            handle: opened.handle,
+                        })) {
+                            turn.validateSource = validateSource;
+                            if (!isSessionKindEligible(this.store.database, session.id)) {
+                                writeUnauthorized = true;
+                                break;
+                            }
+                            if (this.stopping) {
+                                break;
+                            }
+                            if (turn.tool !== session.tool || turn.sessionId !== session.nativeId) {
+                                parseFailed = true;
+                                break;
+                            }
+                            if (turn.droppedReason !== undefined) {
+                                if (turn.droppedReason === 'elepha-mcp' && !replayInjections.rememberElephaMcpReceipts(turn)) {
+                                    parseFailed = true;
+                                    break;
+                                }
+                                continue;
+                            }
+                            const quoteBackStatus = replayInjections.quoteBackStatus(turn);
+                            if (quoteBackStatus === 'incomplete') {
+                                parseFailed = true;
+                                break;
+                            }
+                            if (quoteBackStatus === 'match') {
+                                this.log(
+                                    formatDaemonLog(
+                                        `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} suppressed turn ${turn.turnIndex}: self-injected content (quote-back)`,
+                                        turn,
+                                    ),
+                                );
+                                continue;
+                            }
+                            if (!work.missingTurnIndexes.has(turn.turnIndex)) {
+                                continue;
+                            }
+                            const projection = filterTurn(turn);
+                            const result = await withValidatedDurableEvictionSources(
+                                this.store.database,
+                                projection,
+                                this.durableCaptureMaxBytes,
+                                { sessionId: session.id, tool: session.tool, sourcePath: session.sourcePath },
+                                (evictionPlan) =>
+                                    backfill.record(session, turn.turnIndex, projection, new Date().toISOString(), evictionPlan),
+                                { openTranscript: this.openTranscript },
+                            );
+                            if (result.state === 'unauthorized') {
+                                writeUnauthorized = true;
+                                break;
+                            }
+                            if (result.state === 'evicted') {
+                                writeEvicted = true;
+                                break;
+                            }
+                            if (result.state === 'memory_missing') {
+                                parseFailed = true;
+                                break;
+                            }
+                            work.missingTurnIndexes.delete(turn.turnIndex);
+                            affectedSessionIds.add(result.sessionId);
                         }
-                        if (result.state === 'memory_missing') {
-                            parseFailed = true;
-                            break;
-                        }
-                        work.missingTurnIndexes.delete(turn.turnIndex);
-                        affectedSessionIds.add(result.sessionId);
+                    }
+                    if (!validateSource()) {
+                        parseFailed = true;
                     }
                 } catch (error) {
                     parseFailed = true;
@@ -880,9 +996,29 @@ export class IngestionDaemon {
             return;
         }
 
+        this.beginOpenTurnValidation(adapter.tool, adapter.nativeSessionId(filePath));
+
+        const openTurnTimer = this.openTurnTimers.get(filePath);
+        if (openTurnTimer) {
+            clearTimeout(openTurnTimer);
+            this.openTurnTimers.delete(filePath);
+        }
+
         this.enqueueScan(adapter, filePath, false);
 
         this.scheduleIdleScan(adapter, filePath);
+    }
+
+    private beginOpenTurnValidation(tool: ToolName, nativeId: string): number {
+        const key = `${tool}\0${nativeId}`;
+        const minimumEpoch = (this.openTurnValidationEpochs.get(key) ?? 0) + 1;
+        const epoch = this.store.beginOpenTurnValidation(tool, nativeId, minimumEpoch);
+        this.openTurnValidationEpochs.set(key, epoch);
+        return epoch;
+    }
+
+    private isCurrentOpenTurnValidation(tool: ToolName, nativeId: string, epoch: number): boolean {
+        return this.openTurnValidationEpochs.get(`${tool}\0${nativeId}`) === epoch;
     }
 
     private scheduleIdleScan(adapter: SessionAdapter, filePath: string): void {
@@ -903,6 +1039,23 @@ export class IngestionDaemon {
         this.workQueue.enqueue(async () => {
             await this.scanFile(adapter, filePath, closeTrailingOnIdle);
         });
+    }
+
+    private scheduleOpenTurnScan(adapter: SessionAdapter, filePath: string, delayMs: number): void {
+        const existing = this.openTurnTimers.get(filePath);
+        if (existing) {
+            clearTimeout(existing);
+        }
+        this.openTurnTimers.set(
+            filePath,
+            setTimeout(
+                () => {
+                    this.openTurnTimers.delete(filePath);
+                    this.enqueueScan(adapter, filePath, true);
+                },
+                Math.max(0, delayMs),
+            ),
+        );
     }
 
     private opencodeDatabaseForEvent(filePath: string): string | undefined {
@@ -1310,6 +1463,10 @@ export class IngestionDaemon {
             };
         }
         const { handle, resolvedPath: real, stat: openedStat } = opened;
+        const nativeId = adapter.nativeSessionId(real);
+        const openTurnSource = openTurnSourceSnapshot(opened);
+        const openTurnGeneration = sourceGeneration(this.store, adapter.tool, nativeId);
+        const openTurnValidationEpoch = this.beginOpenTurnValidation(adapter.tool, nativeId);
 
         // A second scan could read a cursor the first has not advanced yet and
         // re-emit a turn already in flight. Retry after the idle debounce so
@@ -1323,6 +1480,10 @@ export class IngestionDaemon {
         let fileStat: { size: number; mtimeMs: number } | undefined;
         try {
             fileStat = { size: openedStat.size, mtimeMs: openedStat.mtimeMs };
+            // Hide a staged snapshot as soon as a source append/replacement is
+            // visible, before classification or any provider/model await can
+            // let stale incomplete content escape concurrently.
+            this.store.invalidateOpenTurnIfSourceChanged(adapter.tool, nativeId, openTurnGeneration, openTurnSource);
             const oversizedCached = this.oversizedFileSkipCache.get(real);
             if (oversizedCached && fileStat && fileStat.size === oversizedCached.size && fileStat.mtimeMs === oversizedCached.mtimeMs) {
                 return { ingested: 0, skipped: oversizedCached.skipped };
@@ -1356,7 +1517,6 @@ export class IngestionDaemon {
                     ),
                 };
             }
-            const nativeId = adapter.nativeSessionId(real);
             if (onlyProjectRoots !== undefined) {
                 const selectedRoots = typeof onlyProjectRoots === 'string' ? [canonicalizeExisting(onlyProjectRoots)] : onlyProjectRoots;
                 const canonicalCwd = canonicalizeExisting(metadata.cwd);
@@ -1480,6 +1640,7 @@ export class IngestionDaemon {
             const sourceMetadata = await adapter.readSourceMetadata?.(real);
             const customTitle = sourceMetadata?.customTitle ?? (await this.readCustomTitle(adapter, real));
             let validateSource: (() => boolean) | undefined;
+            const validateOpenTurnSource = sourceSnapshotValidator(adapter.tool, filePath, opened);
             let retracted = 0;
             const storedCursor = this.store.getSessionCursor(adapter.tool, nativeId);
             let reconcile = false;
@@ -1503,7 +1664,14 @@ export class IngestionDaemon {
             const cursor = reconcile ? undefined : storedCursor;
             let ingested = 0;
             let parsedTurns = 0;
-            for await (const turn of adapter.parseTurns(real, cursor, { closeTrailingOnIdle, handle })) {
+            let openTail: OpenTailObservation | undefined;
+            for await (const turn of adapter.parseTurns(real, cursor, {
+                closeTrailingOnIdle,
+                handle,
+                onOpenTail: (observation) => {
+                    openTail = observation;
+                },
+            })) {
                 parsedTurns++;
                 turn.validateSource = validateSource;
                 const consentState = this.consentStateForTurn(turn);
@@ -1526,6 +1694,18 @@ export class IngestionDaemon {
                 }
             }
 
+            if (openTail !== undefined) {
+                await this.handleOpenTail(
+                    adapter,
+                    openTail,
+                    classification,
+                    openTurnGeneration,
+                    openTurnSource,
+                    validateOpenTurnSource,
+                    openTurnValidationEpoch,
+                );
+            }
+
             // Mid-task handoff can't wait for session close - that's the whole
             // wedge - so the rollup refreshes as each batch lands, not only at
             // the end. Incremental by construction, so this
@@ -1533,7 +1713,12 @@ export class IngestionDaemon {
             if (ingested > 0 || retracted > 0) {
                 await this.refreshRollup(adapter, real, nativeId, 'live');
             }
-            if (sourceMetadata && validateSource?.() && this.store.consent.consentState(sourceMetadata.cwd) === 'approved') {
+            if (
+                ingested > 0 &&
+                sourceMetadata &&
+                validateSource?.() &&
+                this.store.consent.consentState(sourceMetadata.cwd) === 'approved'
+            ) {
                 const stored = this.store.findSession(adapter.tool, nativeId);
                 if (stored) {
                     this.store.updateSessionTitle(stored.id, { aiTitle: sourceMetadata.title, userMessage: '' });
@@ -1545,7 +1730,7 @@ export class IngestionDaemon {
             // Alert only before a cursor exists: a steady-state scan with no
             // bytes after its cursor is normal, and a genuinely empty file is
             // not a format-migration signal.
-            if (cursor === undefined && parsedTurns === 0 && (await handle.stat()).size > 0) {
+            if (cursor === undefined && parsedTurns === 0 && openTail === undefined && (await handle.stat()).size > 0) {
                 const emptySession = await adapter.classifyEmptySession(real);
                 if (emptySession) {
                     return { ingested: 0, emptySession: emptySession.kind };
@@ -1608,6 +1793,102 @@ export class IngestionDaemon {
         return customTitle;
     }
 
+    private async handleOpenTail(
+        adapter: SessionAdapter,
+        observation: OpenTailObservation,
+        classification: SessionClassification,
+        sourceGenerationValue: number,
+        source: OpenTurnSourceSnapshot,
+        validateSource: () => boolean,
+        validationEpoch: number,
+    ): Promise<void> {
+        const turn = observation.receiptCoverage.turn;
+        turn.validateSource = validateSource;
+        if (!this.isCurrentOpenTurnValidation(turn.tool, turn.sessionId, validationEpoch)) {
+            return;
+        }
+        if (isRefusedProjectRoot(turn.projectPath)) {
+            return;
+        }
+        const consentState = this.consentStateForTurn(turn);
+        if (consentState === 'denied') {
+            this.store.recordIncognitoTranscript(turn.tool, turn.sessionId);
+            return;
+        }
+        if (consentState !== 'approved') {
+            return;
+        }
+        const meta = {
+            surface: sessionSurface(turn.tool, turn.surface),
+            gitBranch: turn.gitBranch ?? null,
+            kind: toSessionRowKind(classification.kind),
+        };
+        const observedAt = new Date(this.now()).toISOString();
+        const staged = this.store.observeOpenTurn(observation, meta, sourceGenerationValue, source, observedAt, validationEpoch);
+        if (staged === undefined) {
+            return;
+        }
+        if (observation.receiptCoverage.state === 'incomplete') {
+            this.log(
+                formatDaemonLog(
+                    `[elepha] failed-EOF turn ${turn.turnIndex} not staged: MCP receipt coverage incomplete (${observation.receiptCoverage.reason})`,
+                    turn,
+                ),
+            );
+            return;
+        }
+        if (turn.droppedReason === 'elepha-mcp' || staged.staged_at !== null) {
+            return;
+        }
+        const failedAtMs = Date.parse(observation.failedAt);
+        const eligibleAt = (Number.isFinite(failedAtMs) ? failedAtMs : this.now()) + OPEN_TURN_SUMMARY_GRACE_MS;
+        const remaining = eligibleAt - this.now();
+        if (remaining > 0) {
+            this.scheduleOpenTurnScan(adapter, turn.sourcePath, remaining);
+            return;
+        }
+
+        const summary = this.summarizer
+            ? await this.summarizer.summarize({ userMessage: turn.userMessage, assistantText: turn.assistantText })
+            : { decisions: [], pending_items: [], status: 'not_configured' as const };
+        if (this.summarizer) {
+            this.trackOutcome(summary.status);
+        }
+        if (!validateSource() || sourceGeneration(this.store, turn.tool, turn.sessionId) !== sourceGenerationValue) {
+            return;
+        }
+        const stagedAt = new Date(this.now()).toISOString();
+        const projection = this.durableCapture ? filterTurn(turn) : undefined;
+        const stage = (evictionPlan?: DurableEvictionPlan) =>
+            this.store.stageOpenTurnSummary(
+                turn.tool,
+                turn.sessionId,
+                source.revision,
+                staged.source_digest,
+                summary,
+                stagedAt,
+                projection,
+                turn.projectPath,
+                validateSource,
+                this.durableCaptureMaxBytes,
+                validationEpoch,
+                evictionPlan,
+            );
+        const inserted = projection
+            ? await withValidatedDurableEvictionSources(
+                  this.store.database,
+                  projection,
+                  this.durableCaptureMaxBytes,
+                  { kind: 'open-turn', sessionId: staged.session_id, tool: turn.tool, sourcePath: turn.sourcePath },
+                  stage,
+                  { openTranscript: this.openTranscript },
+              )
+            : stage(undefined);
+        if (inserted) {
+            this.log(formatDaemonLog(`[elepha] staged incomplete failed-EOF turn ${turn.turnIndex}`, turn));
+        }
+    }
+
     private async persistTurn(
         adapter: SessionAdapter | SqliteSourceAdapter,
         turn: ParsedTurn,
@@ -1642,8 +1923,15 @@ export class IngestionDaemon {
         // summarizer: adapters stay DB-free, while a match must have no memory
         // side effects. The existing session's cursor is the sole exception,
         // otherwise this complete source turn would be re-read forever.
-        if (this.store.isInjectionQuoteBack(turn)) {
-            this.store.advanceExistingSessionCursor(turn.tool, turn.sessionId, turn.cursor);
+        const quoteBackStatus = this.store.injectionQuoteBackStatus(turn);
+        if (quoteBackStatus === 'incomplete') {
+            this.log(formatDaemonLog(`[elepha] refused turn ${turn.turnIndex}: self-ingestion protection incomplete`, turn));
+            return false;
+        }
+        if (quoteBackStatus === 'match') {
+            if (!this.store.recordQuoteBackTurn(turn)) {
+                return false;
+            }
             this.log(
                 formatDaemonLog(`[elepha] dropped turn ${turn.turnIndex} of ${turn.sessionId}: self-injected content (quote-back)`, turn),
             );
@@ -1803,6 +2091,9 @@ export class IngestionDaemon {
         };
         if (!this.store.recordDroppedTurn(turn, meta)) {
             return;
+        }
+        if (turn.droppedReason === 'elepha-mcp') {
+            this.log(formatDaemonLog(`[elepha] dropped turn ${turn.turnIndex} of ${turn.sessionId}: Elepha MCP output`, turn));
         }
     }
 
