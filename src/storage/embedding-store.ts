@@ -46,6 +46,9 @@ export interface StoredEmbedding extends EmbeddingModel {
 }
 
 function sourceFor(session: ServedSession): EmbeddingSource | undefined {
+    if (session.open_turn_staged_at != null && session.turn_count === 0 && session.rollup_state === null) {
+        return undefined;
+    }
     const text = embeddingSourceText(session);
     if (!text) {
         return undefined;

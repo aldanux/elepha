@@ -153,6 +153,28 @@ describe('sessions table migration', () => {
             'id',
             'total_bytes',
         ]);
+        expect((db.pragma('table_info(open_turns)') as Array<{ name: string }>).map((column) => column.name)).toEqual(
+            expect.arrayContaining([
+                'tool',
+                'native_session_id',
+                'session_id',
+                'project_id',
+                'source_generation',
+                'turn_index',
+                'anchor_cursor',
+                'candidate_cursor',
+                'source_revision',
+                'source_digest',
+                'failed_at',
+                'staged_at',
+                'validation_epoch',
+                'validated_epoch',
+                'receipt_coverage',
+                'decisions',
+                'durable_user_prompt',
+                'durable_filter_version',
+            ]),
+        );
         expect(
             (db.pragma(`table_info(${SQLITE_SOURCE_WATERMARK_SCHEMA.table})`) as Array<{ name: string }>).map((column) => column.name),
         ).toEqual([
@@ -161,6 +183,140 @@ describe('sessions table migration', () => {
             SQLITE_SOURCE_WATERMARK_SCHEMA.watermark,
         ]);
         db.close();
+    });
+
+    it('adds MCP receipts to an existing database and leaves the migration idempotent on reopen', () => {
+        const directory = withGrantableTestDir('elepha-mcp-receipts-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const legacy = openUnmanagedDb(dbPath);
+        legacy.exec('DROP TABLE mcp_receipts');
+        legacy.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect((migrated.pragma('table_info(mcp_receipts)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+            'id',
+            'tool',
+            'native_session_id',
+            'source_generation',
+            'source_turn_index',
+            'call_id',
+            'observed_at',
+            'body_hash',
+            'body',
+        ]);
+        expect(
+            migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_mcp_receipts_source_order'").get(),
+        ).toEqual({
+            name: 'idx_mcp_receipts_source_order',
+        });
+        migrated
+            .prepare(
+                `INSERT INTO mcp_receipts
+                 (tool, native_session_id, source_generation, source_turn_index, call_id, observed_at, body_hash, body)
+                 VALUES ('codex', 'legacy-session', 0, 4, 'call-1', NULL, 'hash', 'body')`,
+            )
+            .run();
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT source_generation, source_turn_index, call_id, observed_at, body FROM mcp_receipts').all()).toEqual(
+            [{ source_generation: 0, source_turn_index: 4, call_id: 'call-1', observed_at: null, body: 'body' }],
+        );
+        reopened.close();
+    });
+
+    it('adds open-turn staging to a real prior database and leaves the migration idempotent on reopen', () => {
+        const directory = withGrantableTestDir('elepha-open-turns-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          DROP TRIGGER open_turns_usage_ai;
+          DROP TRIGGER open_turns_usage_ad;
+          DROP TRIGGER open_turns_usage_au;
+          DROP TABLE open_turns;
+          CREATE TABLE open_turns (
+            tool TEXT NOT NULL,
+            native_session_id TEXT NOT NULL,
+            session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_generation INTEGER NOT NULL,
+            turn_index INTEGER NOT NULL,
+            anchor_cursor TEXT,
+            candidate_cursor TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_dev TEXT NOT NULL,
+            source_ino TEXT NOT NULL,
+            source_size INTEGER NOT NULL,
+            source_mtime_ms REAL NOT NULL,
+            source_revision TEXT NOT NULL,
+            source_digest TEXT NOT NULL,
+            failed_at TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            staged_at TEXT,
+            receipt_coverage TEXT NOT NULL CHECK (receipt_coverage IN ('complete','incomplete')),
+            receipt_failure TEXT,
+            decisions TEXT,
+            pending_items TEXT,
+            summarizer_status TEXT,
+            durable_included INTEGER CHECK (durable_included IN (0,1)),
+            durable_user_prompt TEXT,
+            durable_assistant_response TEXT,
+            durable_assistant_structure TEXT,
+            durable_tool_calls TEXT,
+            durable_omitted_tool_call_count INTEGER,
+            durable_dropped_tool_ref_count INTEGER,
+            durable_omitted_before_chars INTEGER,
+            durable_filter_version INTEGER,
+            PRIMARY KEY (tool, native_session_id)
+          );
+        `);
+        prior.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        const columns = migrated.pragma('table_info(open_turns)') as Array<{ name: string; dflt_value: string | null }>;
+        expect(columns.map((column) => column.name)).toEqual(
+            expect.arrayContaining(['source_revision', 'validation_epoch', 'validated_epoch']),
+        );
+        expect(columns.find((column) => column.name === 'validation_epoch')?.dflt_value).toBe('0');
+        expect(columns.find((column) => column.name === 'validated_epoch')?.dflt_value).toBe('0');
+        expect(
+            migrated
+                .prepare(
+                    `SELECT name FROM sqlite_master
+                     WHERE type = 'trigger' AND name LIKE 'open_turns_usage_%'
+                     ORDER BY name`,
+                )
+                .all(),
+        ).toEqual([{ name: 'open_turns_usage_ad' }, { name: 'open_turns_usage_ai' }, { name: 'open_turns_usage_au' }]);
+        expect(migrated.pragma('foreign_key_check')).toEqual([]);
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect((reopened.pragma('table_info(open_turns)') as Array<{ name: string }>).map((column) => column.name)).toEqual(
+            expect.arrayContaining(['validation_epoch', 'validated_epoch']),
+        );
+        expect(reopened.pragma('foreign_key_check')).toEqual([]);
+        reopened.close();
+    });
+
+    it('adds the hook quote-back ordering index to an existing database idempotently', () => {
+        const directory = withGrantableTestDir('elepha-hook-order-index-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const legacy = openUnmanagedDb(dbPath);
+        legacy.exec('DROP INDEX idx_injections_session_order');
+        legacy.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect(
+            migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_injections_session_order'").get(),
+        ).toEqual({ name: 'idx_injections_session_order' });
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(
+            reopened.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_injections_session_order'").get(),
+        ).toEqual({ name: 'idx_injections_session_order' });
+        reopened.close();
     });
 
     it('adds the SQLite source watermark table to a legacy DB and leaves it unchanged on reopen', () => {

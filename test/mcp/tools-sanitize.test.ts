@@ -124,6 +124,7 @@ describe('MCP response shell-syntax net', () => {
         if (structured === undefined) throw new Error('list_sessions returned no structured content');
 
         expect(leafStrings(structured).every((value) => !detectShellSyntax(value))).toBe(true);
+        expect((structured.sessions as Array<Record<string, unknown>>)[0]).not.toHaveProperty('incomplete_last_observed');
         expect(structured).toEqual({
             project: {
                 name: 'normal project',

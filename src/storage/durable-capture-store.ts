@@ -20,6 +20,7 @@ import { detectShellSyntax, escapeShellSyntax } from '../security/sanitize.js';
 import type { ToolName } from '../types/index.js';
 
 interface EvictionCandidate {
+    kind: 'session' | 'open-turn';
     id: number;
     tool: ToolName;
     source_path: string;
@@ -30,6 +31,7 @@ interface FrozenEvictionCandidate extends EvictionCandidate {
 }
 
 interface FrozenCurrentEvictionCandidate {
+    kind: 'session' | 'open-turn';
     id?: number;
     tool: ToolName;
     source_path: string;
@@ -37,6 +39,7 @@ interface FrozenCurrentEvictionCandidate {
 }
 
 export interface DurableEvictionCurrentSource {
+    kind?: 'session' | 'open-turn';
     sessionId?: number;
     tool: ToolName;
     sourcePath: string;
@@ -44,22 +47,23 @@ export interface DurableEvictionCurrentSource {
 
 export class DurableEvictionPlan {
     private constructor(
-        private readonly candidates: ReadonlyMap<number, FrozenEvictionCandidate>,
+        private readonly candidates: ReadonlyMap<string, FrozenEvictionCandidate>,
         private readonly current: FrozenCurrentEvictionCandidate,
     ) {}
 
-    static from(candidates: ReadonlyMap<number, FrozenEvictionCandidate>, current: FrozenCurrentEvictionCandidate): DurableEvictionPlan {
+    static from(candidates: ReadonlyMap<string, FrozenEvictionCandidate>, current: FrozenCurrentEvictionCandidate): DurableEvictionPlan {
         return new DurableEvictionPlan(candidates, current);
     }
 
     isRecoverable(candidate: EvictionCandidate): boolean {
-        const frozen = this.candidates.get(candidate.id);
+        const frozen = this.candidates.get(`${candidate.kind}:${candidate.id}`);
         return frozen?.recoverable === true && frozen.tool === candidate.tool && frozen.source_path === candidate.source_path;
     }
 
     isCurrentRecoverable(candidate: EvictionCandidate): boolean {
         return (
             this.current.recoverable &&
+            this.current.kind === candidate.kind &&
             (this.current.id === undefined || this.current.id === candidate.id) &&
             this.current.tool === candidate.tool &&
             this.current.source_path === candidate.source_path
@@ -107,17 +111,28 @@ export async function withValidatedDurableEvictionSources<T>(
     const validateIdentity = dependencies.validateIdentity ?? validateOpenedProviderTranscriptIdentitySync;
     const candidates = db
         .prepare(
-            `SELECT DISTINCT s.id, s.tool, s.source_path
-             FROM sessions s
-             JOIN memories m ON m.session_id = s.id
-             JOIN filtered_turns ft ON ft.memory_id = m.id
-             ORDER BY s.last_ingested_at, s.id`,
+            `SELECT kind, id, tool, source_path FROM (
+                 SELECT 'session' AS kind, s.id, s.tool, s.source_path, s.last_ingested_at AS durable_at
+                 FROM sessions s
+                 JOIN memories m ON m.session_id = s.id
+                 JOIN filtered_turns ft ON ft.memory_id = m.id
+                 GROUP BY s.id
+                 UNION ALL
+                 SELECT 'open-turn' AS kind, ot.session_id AS id, ot.tool, ot.source_path, ot.staged_at AS durable_at
+                 FROM open_turns ot
+                 WHERE ot.durable_user_prompt IS NOT NULL
+             )
+             ORDER BY durable_at, id, kind`,
         )
         .all() as EvictionCandidate[];
-    const historicalCandidates = candidates.filter((candidate) => candidate.id !== currentSource.sessionId);
+    const currentKind = currentSource.kind ?? 'session';
+    const historicalCandidates = candidates.filter(
+        (candidate) => candidate.id !== currentSource.sessionId || candidate.kind !== currentKind,
+    );
     const opened: Array<{ candidate: EvictionCandidate; handle: FileHandle; stat: Stats }> = [];
-    const frozen = new Map<number, FrozenEvictionCandidate>();
+    const frozen = new Map<string, FrozenEvictionCandidate>();
     const currentCandidate = {
+        kind: currentKind,
         id: currentSource.sessionId,
         tool: currentSource.tool,
         source_path: currentSource.sourcePath,
@@ -132,7 +147,7 @@ export async function withValidatedDurableEvictionSources<T>(
         for (const candidate of historicalCandidates) {
             const result = await openTranscript(candidate.tool, candidate.source_path);
             if ('reason' in result) {
-                frozen.set(candidate.id, { ...candidate, recoverable: false });
+                frozen.set(`${candidate.kind}:${candidate.id}`, { ...candidate, recoverable: false });
             } else {
                 opened.push({ candidate, handle: result.handle, stat: result.stat });
             }
@@ -144,7 +159,10 @@ export async function withValidatedDurableEvictionSources<T>(
         dependencies.beforeFinalIdentityCheck?.();
         for (const source of opened) {
             const identity = validateIdentity(source.candidate.tool, source.candidate.source_path, source);
-            frozen.set(source.candidate.id, { ...source.candidate, recoverable: !('reason' in identity) });
+            frozen.set(`${source.candidate.kind}:${source.candidate.id}`, {
+                ...source.candidate,
+                recoverable: !('reason' in identity),
+            });
         }
         if (currentOpened) {
             const identity = validateIdentity(currentCandidate.tool, currentCandidate.source_path, currentOpened);
@@ -185,7 +203,7 @@ interface ToolEntry {
 
 type ProjectionEntry = MutableTextEntry | ToolEntry;
 
-interface StoredProjection {
+export interface StoredProjection {
     userPrompt: string;
     assistantResponse: string;
     assistantStructure: string | null;
@@ -196,7 +214,7 @@ interface StoredProjection {
 
 export type DurableCaptureRecordResult = 'retained' | 'not_retained';
 
-function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredProjection {
+export function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredProjection {
     const entries: ProjectionEntry[] = [];
     let retainedChars = 0;
     let omittedBeforeChars = 0;
@@ -279,7 +297,7 @@ function boundedSanitizedProjection(projection: FilteredTurnProjection): StoredP
     };
 }
 
-function storedProjectionBytes(projection: FilteredTurnProjection): number {
+export function storedProjectionBytes(projection: FilteredTurnProjection): number {
     const stored = projection.included
         ? boundedSanitizedProjection(projection)
         : { userPrompt: '', assistantResponse: '', assistantStructure: null, toolCalls: [], omittedBeforeChars: 0, droppedToolRefCount: 0 };
@@ -299,6 +317,7 @@ export class DurableCaptureStore {
     private readonly totalBytes: Statement;
     private readonly evictionCandidates: Statement;
     private readonly deleteSessionTurns: Statement;
+    private readonly clearOpenTurn: Statement;
 
     constructor(db: Database) {
         this.insertFilteredTurn = db.prepare(
@@ -334,14 +353,34 @@ export class DurableCaptureStore {
         this.statusForSession = db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?');
         this.totalBytes = db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1');
         this.evictionCandidates = db.prepare(
-            `SELECT DISTINCT s.id, s.tool, s.source_path
-             FROM sessions s
-             JOIN memories m ON m.session_id = s.id
-             JOIN filtered_turns ft ON ft.memory_id = m.id
-             ORDER BY s.last_ingested_at, s.id`,
+            `SELECT kind, id, tool, source_path FROM (
+                 SELECT 'session' AS kind, s.id, s.tool, s.source_path, s.last_ingested_at AS durable_at
+                 FROM sessions s
+                 JOIN memories m ON m.session_id = s.id
+                 JOIN filtered_turns ft ON ft.memory_id = m.id
+                 GROUP BY s.id
+                 UNION ALL
+                 SELECT 'open-turn' AS kind, ot.session_id AS id, ot.tool, ot.source_path, ot.staged_at AS durable_at
+                 FROM open_turns ot
+                 WHERE ot.durable_user_prompt IS NOT NULL
+             )
+             ORDER BY durable_at, id, kind`,
         );
         this.deleteSessionTurns = db.prepare(
             'DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)',
+        );
+        this.clearOpenTurn = db.prepare(
+            `UPDATE open_turns SET
+               durable_included = NULL,
+               durable_user_prompt = NULL,
+               durable_assistant_response = NULL,
+               durable_assistant_structure = NULL,
+               durable_tool_calls = NULL,
+               durable_omitted_tool_call_count = NULL,
+               durable_dropped_tool_ref_count = NULL,
+               durable_omitted_before_chars = NULL,
+               durable_filter_version = NULL
+             WHERE session_id = ? AND tool = ?`,
         );
     }
 
@@ -390,6 +429,15 @@ export class DurableCaptureStore {
         return this.enforceMaxBytes(sessionId, maxBytes, capturedAt, evictionPlan);
     }
 
+    enforceOpenTurnMaxBytes(
+        sessionId: number,
+        maxBytes: number,
+        updatedAt: string,
+        evictionPlan?: DurableEvictionPlan,
+    ): DurableCaptureRecordResult {
+        return this.enforceMaxBytes({ kind: 'open-turn', id: sessionId }, maxBytes, updatedAt, evictionPlan);
+    }
+
     setStatus(sessionId: number, state: DurableCaptureState, updatedAt: string): void {
         this.upsertStatus.run(sessionId, state, DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
     }
@@ -401,7 +449,7 @@ export class DurableCaptureStore {
     }
 
     private enforceMaxBytes(
-        currentSessionId: number,
+        current: { kind: 'session' | 'open-turn'; id: number } | number,
         maxBytes: number,
         updatedAt: string,
         evictionPlan?: DurableEvictionPlan,
@@ -410,6 +458,7 @@ export class DurableCaptureStore {
         if (totalBytes <= maxBytes) {
             return 'retained';
         }
+        const currentCandidate = typeof current === 'number' ? { kind: 'session' as const, id: current } : current;
         const candidates = this.evictionCandidates.all() as EvictionCandidate[];
         const recoverable: EvictionCandidate[] = [];
         const unavailable: EvictionCandidate[] = [];
@@ -419,7 +468,7 @@ export class DurableCaptureStore {
         // recoverable list first protects copies whose provider transcript
         // has already disappeared and therefore cannot be rebuilt.
         for (const candidate of candidates) {
-            if (candidate.id === currentSessionId) {
+            if (candidate.id === currentCandidate.id && candidate.kind === currentCandidate.kind) {
                 if (evictionPlan?.isCurrentRecoverable(candidate) === true) {
                     recoverableCurrent = candidate;
                 } else {
@@ -430,16 +479,14 @@ export class DurableCaptureStore {
             (evictionPlan?.isRecoverable(candidate) === true ? recoverable : unavailable).push(candidate);
         }
         for (const victim of recoverable) {
-            this.deleteSessionTurns.run(victim.id);
-            this.upsertStatus.run(victim.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
+            this.evict(victim, updatedAt);
             totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
             if (totalBytes <= maxBytes) {
                 return 'retained';
             }
         }
         if (recoverableCurrent) {
-            this.deleteSessionTurns.run(recoverableCurrent.id);
-            this.upsertStatus.run(recoverableCurrent.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
+            this.evict(recoverableCurrent, updatedAt);
             currentEvicted = true;
             totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
             if (totalBytes <= maxBytes) {
@@ -447,14 +494,22 @@ export class DurableCaptureStore {
             }
         }
         for (const victim of unavailable) {
-            this.deleteSessionTurns.run(victim.id);
-            this.upsertStatus.run(victim.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
-            currentEvicted ||= victim.id === currentSessionId;
+            this.evict(victim, updatedAt);
+            currentEvicted ||= victim.id === currentCandidate.id && victim.kind === currentCandidate.kind;
             totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
             if (totalBytes <= maxBytes) {
                 return currentEvicted ? 'not_retained' : 'retained';
             }
         }
         return 'not_retained';
+    }
+
+    private evict(candidate: EvictionCandidate, updatedAt: string): void {
+        if (candidate.kind === 'open-turn') {
+            this.clearOpenTurn.run(candidate.id, candidate.tool);
+            return;
+        }
+        this.deleteSessionTurns.run(candidate.id);
+        this.upsertStatus.run(candidate.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
     }
 }

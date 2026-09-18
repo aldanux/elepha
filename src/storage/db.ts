@@ -157,6 +157,48 @@ CREATE TABLE IF NOT EXISTS durable_capture_usage (
   total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0)
 );
 
+-- Failed-at-EOF turns remain outside canonical memories until a provider
+-- boundary proves closure. One mutable row per native session is enough: each
+-- retry replaces the previous candidate while the canonical cursor stays put.
+CREATE TABLE IF NOT EXISTS open_turns (
+  tool                    TEXT NOT NULL,
+  native_session_id       TEXT NOT NULL,
+  session_id              INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  project_id              INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  source_generation       INTEGER NOT NULL,
+  turn_index              INTEGER NOT NULL,
+  anchor_cursor           TEXT,
+  candidate_cursor        TEXT NOT NULL,
+  source_path             TEXT NOT NULL,
+  source_dev              TEXT NOT NULL,
+  source_ino              TEXT NOT NULL,
+  source_size             INTEGER NOT NULL,
+  source_mtime_ms         REAL NOT NULL,
+  source_revision         TEXT NOT NULL,
+  source_digest           TEXT NOT NULL,
+  failed_at               TEXT NOT NULL,
+  observed_at             TEXT NOT NULL,
+  staged_at               TEXT,
+  validation_epoch        INTEGER NOT NULL DEFAULT 0,
+  validated_epoch         INTEGER NOT NULL DEFAULT 0,
+  receipt_coverage        TEXT NOT NULL CHECK (receipt_coverage IN ('complete','incomplete')),
+  receipt_failure         TEXT,
+  decisions               TEXT,
+  pending_items           TEXT,
+  summarizer_status       TEXT,
+  durable_included        INTEGER CHECK (durable_included IN (0,1)),
+  durable_user_prompt     TEXT,
+  durable_assistant_response TEXT,
+  durable_assistant_structure TEXT,
+  durable_tool_calls      TEXT,
+  durable_omitted_tool_call_count INTEGER,
+  durable_dropped_tool_ref_count INTEGER,
+  durable_omitted_before_chars INTEGER,
+  durable_filter_version  INTEGER,
+  PRIMARY KEY (tool, native_session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_open_turns_project ON open_turns(project_id, failed_at);
+
 -- Session-level rollups. Additive: turn rows in memories are never deleted
 -- after rollup, and a rollup can always be rebuilt from them.
 --
@@ -221,6 +263,26 @@ CREATE TABLE IF NOT EXISTS injections (
   UNIQUE (tool, native_session_id, body_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_injections_session ON injections(tool, native_session_id);
+CREATE INDEX IF NOT EXISTS idx_injections_session_order
+ON injections(tool, native_session_id, injected_at, id);
+
+-- Structural Elepha MCP result receipts are source-ordered evidence, not
+-- hook emissions. Generation + turn index keeps rewritten transcripts from
+-- inheriting receipts that belonged to an older source snapshot.
+CREATE TABLE IF NOT EXISTS mcp_receipts (
+  id                  INTEGER PRIMARY KEY,
+  tool                TEXT NOT NULL,
+  native_session_id   TEXT NOT NULL,
+  source_generation   INTEGER NOT NULL,
+  source_turn_index   INTEGER NOT NULL,
+  call_id             TEXT NOT NULL,
+  observed_at         TEXT,
+  body_hash           TEXT NOT NULL,
+  body                TEXT NOT NULL,
+  UNIQUE (tool, native_session_id, source_generation, call_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_receipts_source_order
+ON mcp_receipts(tool, native_session_id, source_generation, source_turn_index);
 
 -- The ordered session ids behind elepha:resume:<n>. One row is the complete
 -- last list shown to one native chat, including an intentionally empty list.
@@ -276,6 +338,64 @@ function migrate(db: Database.Database): void {
         tool TEXT NOT NULL, native_id TEXT NOT NULL, generation INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (tool, native_id)
     )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS open_turns (
+        tool TEXT NOT NULL,
+        native_session_id TEXT NOT NULL,
+        session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        source_generation INTEGER NOT NULL,
+        turn_index INTEGER NOT NULL,
+        anchor_cursor TEXT,
+        candidate_cursor TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        source_dev TEXT NOT NULL,
+        source_ino TEXT NOT NULL,
+        source_size INTEGER NOT NULL,
+        source_mtime_ms REAL NOT NULL,
+        source_revision TEXT NOT NULL,
+        source_digest TEXT NOT NULL,
+        failed_at TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        staged_at TEXT,
+        validation_epoch INTEGER NOT NULL DEFAULT 0,
+        validated_epoch INTEGER NOT NULL DEFAULT 0,
+        receipt_coverage TEXT NOT NULL CHECK (receipt_coverage IN ('complete','incomplete')),
+        receipt_failure TEXT,
+        decisions TEXT,
+        pending_items TEXT,
+        summarizer_status TEXT,
+        durable_included INTEGER CHECK (durable_included IN (0,1)),
+        durable_user_prompt TEXT,
+        durable_assistant_response TEXT,
+        durable_assistant_structure TEXT,
+        durable_tool_calls TEXT,
+        durable_omitted_tool_call_count INTEGER,
+        durable_dropped_tool_ref_count INTEGER,
+        durable_omitted_before_chars INTEGER,
+        durable_filter_version INTEGER,
+        PRIMARY KEY (tool, native_session_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_open_turns_project ON open_turns(project_id, failed_at)`);
+    const openTurnColumns = (db.pragma('table_info(open_turns)') as Array<{ name: string }>).map((column) => column.name);
+    for (const column of ['validation_epoch', 'validated_epoch']) {
+        if (!openTurnColumns.includes(column)) {
+            db.exec(`ALTER TABLE open_turns ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+        }
+    }
+    db.exec(`CREATE TABLE IF NOT EXISTS mcp_receipts (
+        id INTEGER PRIMARY KEY,
+        tool TEXT NOT NULL,
+        native_session_id TEXT NOT NULL,
+        source_generation INTEGER NOT NULL,
+        source_turn_index INTEGER NOT NULL,
+        call_id TEXT NOT NULL,
+        observed_at TEXT,
+        body_hash TEXT NOT NULL,
+        body TEXT NOT NULL,
+        UNIQUE (tool, native_session_id, source_generation, call_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mcp_receipts_source_order
+    ON mcp_receipts(tool, native_session_id, source_generation, source_turn_index)`);
 
     const projectColumns = (db.pragma('table_info(projects)') as Array<{ name: string }>).map((c) => c.name);
     if (!projectColumns.includes('git_root_commit')) {
@@ -485,6 +605,21 @@ function migrateDurableCaptureUsage(db: Database.Database): void {
               FROM filtered_turns;
             `);
         }
+        const openTurnUsageTrigger = db
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'open_turns_usage_ai'")
+            .get();
+        if (openTurnUsageTrigger === undefined) {
+            db.prepare(
+                `UPDATE durable_capture_usage SET total_bytes = total_bytes + (
+                   SELECT COALESCE(SUM(
+                     COALESCE(length(CAST(durable_user_prompt AS BLOB)), 0) +
+                     COALESCE(length(CAST(durable_assistant_response AS BLOB)), 0) +
+                     COALESCE(length(CAST(durable_assistant_structure AS BLOB)), 0) +
+                     COALESCE(length(CAST(durable_tool_calls AS BLOB)), 0)
+                   ), 0) FROM open_turns
+                 ) WHERE id = 1`,
+            ).run();
+        }
         db.exec(`
           CREATE TRIGGER IF NOT EXISTS filtered_turns_usage_ai AFTER INSERT ON filtered_turns BEGIN
             UPDATE durable_capture_usage
@@ -524,6 +659,37 @@ function migrateDurableCaptureUsage(db: Database.Database): void {
           WHEN new.assistant_structure IS NOT NULL AND new.assistant_response <> old.assistant_response AND new.assistant_structure IS old.assistant_structure
           BEGIN
             UPDATE filtered_turns SET assistant_structure = NULL WHERE memory_id = new.memory_id;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS open_turns_usage_ai AFTER INSERT ON open_turns BEGIN
+            UPDATE durable_capture_usage SET total_bytes = total_bytes +
+              COALESCE(length(CAST(new.durable_user_prompt AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_assistant_response AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_assistant_structure AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_tool_calls AS BLOB)), 0)
+            WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS open_turns_usage_ad AFTER DELETE ON open_turns BEGIN
+            UPDATE durable_capture_usage SET total_bytes = total_bytes -
+              COALESCE(length(CAST(old.durable_user_prompt AS BLOB)), 0) -
+              COALESCE(length(CAST(old.durable_assistant_response AS BLOB)), 0) -
+              COALESCE(length(CAST(old.durable_assistant_structure AS BLOB)), 0) -
+              COALESCE(length(CAST(old.durable_tool_calls AS BLOB)), 0)
+            WHERE id = 1;
+          END;
+
+          CREATE TRIGGER IF NOT EXISTS open_turns_usage_au AFTER UPDATE OF durable_user_prompt, durable_assistant_response, durable_assistant_structure, durable_tool_calls ON open_turns BEGIN
+            UPDATE durable_capture_usage SET total_bytes = total_bytes -
+              COALESCE(length(CAST(old.durable_user_prompt AS BLOB)), 0) -
+              COALESCE(length(CAST(old.durable_assistant_response AS BLOB)), 0) -
+              COALESCE(length(CAST(old.durable_assistant_structure AS BLOB)), 0) -
+              COALESCE(length(CAST(old.durable_tool_calls AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_user_prompt AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_assistant_response AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_assistant_structure AS BLOB)), 0) +
+              COALESCE(length(CAST(new.durable_tool_calls AS BLOB)), 0)
+            WHERE id = 1;
           END;
         `);
     });

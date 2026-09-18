@@ -598,6 +598,41 @@ describe('P2.8 bounded shared episode reader', () => {
         });
     });
 
+    it('suppresses a source quote-back using an earlier structural MCP receipt without persisting it', async () => {
+        const fixture = createTestDb('elepha-session-reader-rule4-source-');
+        await withCodexStore(fixture.directory, async (storeRoot) => {
+            const sourcePath = `${storeRoot}/rule4-source.jsonl`;
+            writeFileSync(sourcePath, '{}\n');
+            const project = seedProject(fixture, { path: '/tmp/project' });
+            const storedSession = seedSession(fixture, { project, nativeId: 'rule4-source', sourcePath });
+            seedMemory(fixture, { project, session: storedSession, turnIndex: 1 });
+            const receiptBody = 'This verified Elepha MCP result must not be reconstructed from a later transcript quote-back.';
+            const receipt: ParsedTurn = {
+                ...turn(0, ''),
+                sessionId: storedSession.native_id,
+                sourcePath,
+                userMessage: '',
+                assistantText: '',
+                droppedReason: 'elepha-mcp',
+                elephaMcpResultReceipts: [{ callId: 'source-receipt', body: receiptBody, observedAt: '2026-08-17T00:00:00.000Z' }],
+            };
+            const quoteBack: ParsedTurn = {
+                ...turn(1, `As Elepha reported: ${receiptBody}`),
+                sessionId: storedSession.native_id,
+                sourcePath,
+            };
+            const reader = readerWithParseTurns(fixture.db, async function* (): AsyncIterable<ParsedTurn> {
+                yield receipt;
+                yield quoteBack;
+            });
+            const servedSession = reader.sessionById(storedSession.id);
+            if (!servedSession) throw new Error('seeded Rule 4 session was not found');
+
+            await expect(reader.render(servedSession)).resolves.toEqual({ reason: 'transcript_reparse_empty' });
+            expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM injections').get()).toEqual({ count: 0 });
+        });
+    });
+
     it.each([
         {
             name: 'a missing filtered row',

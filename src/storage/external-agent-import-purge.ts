@@ -192,6 +192,37 @@ export async function planExternalAgentImportPurge(
 
 function assertPlanStillMatches(db: Database.Database, plan: ExternalImportPurgePlan): void {
     const sessionIds = plan.sessions.map((session) => session.id);
+    const exactSession = db.prepare(
+        `SELECT s.id, s.tool, s.native_id, s.segment_index, s.project_id,
+                p.path AS project_path, s.source_path
+         FROM sessions s
+         JOIN projects p ON p.id = s.project_id
+         WHERE s.id = ?`,
+    );
+    for (const planned of plan.sessions) {
+        const current = exactSession.get(planned.id) as
+            | {
+                  id: number;
+                  tool: string;
+                  native_id: string;
+                  segment_index: number;
+                  project_id: number;
+                  project_path: string;
+                  source_path: string;
+              }
+            | undefined;
+        if (
+            current === undefined ||
+            current.tool !== 'codex' ||
+            current.native_id !== planned.nativeId ||
+            current.segment_index !== planned.segmentIndex ||
+            current.project_id !== planned.projectId ||
+            current.project_path !== planned.projectPath ||
+            current.source_path !== planned.sourcePath
+        ) {
+            throw new Error('session rows changed after preview');
+        }
+    }
     const currentSessionIds =
         plan.importedSourcePaths.length === 0
             ? []
@@ -233,8 +264,15 @@ export function applyExternalAgentImportPurge(db: Database.Database, plan: Exter
         return;
     }
     const marks = placeholders(sessionIds);
+    const deleteMcpReceipts = db.prepare("DELETE FROM mcp_receipts WHERE tool = 'codex' AND native_session_id = ?");
+    const deleteSourceGeneration = db.prepare("DELETE FROM source_generations WHERE tool = 'codex' AND native_id = ?");
     const apply = db.transaction(() => {
         assertPlanStillMatches(db, plan);
+        const nativeIds = [...new Set(plan.sessions.map((session) => session.nativeId))];
+        for (const nativeId of nativeIds) {
+            deleteMcpReceipts.run(nativeId);
+            deleteSourceGeneration.run(nativeId);
+        }
         db.prepare(`DELETE FROM session_rollups WHERE session_id IN (${marks}) OR parent_session_id IN (${marks})`).run(
             ...sessionIds,
             ...sessionIds,

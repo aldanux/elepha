@@ -322,7 +322,7 @@ describe('daemon durable capture backfill', () => {
             liveFiltered: { count: 0 },
             liveFts: [],
             liveUsage: { total_bytes: 0 },
-            backfillParsed: [backfillSource],
+            backfillParsed: [backfillSource, backfillSource],
             backfillState: { state: 'parse_error' },
             backfillFiltered: { count: 0 },
             backfillFts: [],
@@ -509,7 +509,7 @@ describe('daemon durable capture backfill', () => {
         await daemon.stop();
 
         expect(summarize).not.toHaveBeenCalled();
-        expect(parsed).toEqual([sourcePath]);
+        expect(parsed).toEqual([sourcePath, sourcePath]);
         expect(
             fixture.db
                 .prepare(
@@ -571,9 +571,26 @@ describe('daemon durable capture backfill', () => {
         const secondTurnGate = new Promise<void>((resolve) => {
             releaseSecondTurn = resolve;
         });
+        let pass = 0;
         const first = new IngestionDaemon({
             store: fixture.store,
-            adapters: [adapterFor(new Map([[sourcePath, turns]]), [], (turn) => (turn.turnIndex === 1 ? secondTurnGate : undefined))],
+            adapters: [
+                {
+                    ...adapterFor(new Map(), []),
+                    async *parseTurns(openedPath, sinceCursor, options) {
+                        expect(openedPath).toBe(sourcePath);
+                        expect(sinceCursor).toBeUndefined();
+                        expect(options?.handle).toBeDefined();
+                        pass++;
+                        for (const turn of turns) {
+                            if (pass === 2 && turn.turnIndex === 1) {
+                                await secondTurnGate;
+                            }
+                            yield turn;
+                        }
+                    },
+                },
+            ],
             watchRoots: [],
             heartbeatPath: path.join(fixture.directory, 'first-heartbeat.json'),
             updateCheck: () => undefined,
@@ -646,19 +663,21 @@ describe('daemon durable capture backfill', () => {
                 adapters: [
                     {
                         ...adapterFor(new Map(), []),
+                        passes: 0,
                         async *parseTurns(openedPath, sinceCursor, options) {
                             expect(openedPath).toBe(sourcePath);
                             expect(sinceCursor).toBeUndefined();
                             expect(options?.handle).toBeDefined();
+                            this.passes++;
                             yield parsedTurn(sourcePath, 'complete', 0);
-                            if (boundary !== 'handle close') {
+                            if (this.passes === 2 && boundary !== 'handle close') {
                                 requestStop();
                             }
-                            if (boundary === 'extra streamed turn') {
+                            if (this.passes === 2 && boundary === 'extra streamed turn') {
                                 yield parsedTurn(sourcePath, 'complete', 1);
                             }
                         },
-                    },
+                    } as SessionAdapter & { passes: number },
                 ],
                 openTranscript: async (tool, source) => {
                     const opened = await openProviderTranscript(tool, source);
@@ -879,6 +898,194 @@ describe('daemon durable capture backfill', () => {
         await daemon.stop();
 
         expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+    });
+
+    it('learns MCP receipts before missing-index filtering and suppresses their later quote-back', async () => {
+        const fixture = createTestDb('elepha-durable-backfill-mcp-receipt-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const sourcePath = path.join(providerRoot, 'mcp-receipt.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'mcp-receipt', sourcePath });
+        seedMemory(fixture, { project, session, turnIndex: 0 });
+        const receiptBody = 'The durable backfill records this verified Elepha MCP result before applying its missing-index filter.';
+        const receipt: ParsedTurn = {
+            ...parsedTurn(sourcePath, session.native_id, 99),
+            projectPath: project.path,
+            userMessage: '',
+            assistantText: '',
+            toolCalls: [],
+            droppedReason: 'elepha-mcp',
+            elephaMcpResultReceipts: [{ callId: 'call-99', body: receiptBody, observedAt: NOW }],
+        };
+        const quoteBack: ParsedTurn = {
+            ...parsedTurn(sourcePath, session.native_id, 98),
+            projectPath: project.path,
+            userMessage: `As the MCP result stated: ${receiptBody}`,
+        };
+        const missing: ParsedTurn = { ...parsedTurn(sourcePath, session.native_id, 0), projectPath: project.path };
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            adapters: [adapterFor(new Map([[sourcePath, [receipt, quoteBack, missing]]]), [])],
+            watchRoots: [],
+            readConfig: enabledConfig,
+        });
+
+        await (daemon as unknown as { backfillDurableCapture(): Promise<void> }).backfillDurableCapture();
+
+        expect(fixture.store.mcpReceiptsForSession('claude-code', session.native_id, 0)).toMatchObject([{ body: receiptBody }]);
+        expect(
+            fixture.db
+                .prepare('SELECT m.turn_index FROM filtered_turns f JOIN memories m ON m.id = f.memory_id WHERE m.session_id = ?')
+                .all(session.id),
+        ).toEqual([{ turn_index: 0 }]);
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+            state: 'complete',
+        });
+    });
+
+    it('rolls back all MCP receipts when the opened source changes after the first receipt', async () => {
+        const fixture = createTestDb('elepha-durable-backfill-mcp-source-change-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const sourcePath = path.join(providerRoot, 'mcp-source-change.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'mcp-source-change', sourcePath });
+        seedMemory(fixture, { project, session, turnIndex: 0 });
+        const receipt: ParsedTurn = {
+            ...parsedTurn(sourcePath, session.native_id, 99),
+            projectPath: project.path,
+            userMessage: '',
+            assistantText: '',
+            toolCalls: [],
+            droppedReason: 'elepha-mcp',
+            elephaMcpResultReceipts: [
+                { callId: 'source-changed', body: 'This receipt must not survive a changed source.', observedAt: NOW },
+            ],
+        };
+        const secondReceipt: ParsedTurn = {
+            ...receipt,
+            turnIndex: 100,
+            cursor: '100|101',
+            elephaMcpResultReceipts: [
+                { callId: 'after-change', body: 'This later receipt must not be persisted either.', observedAt: NOW },
+            ],
+        };
+        let turnsVisited = 0;
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            adapters: [
+                adapterFor(new Map([[sourcePath, [receipt, secondReceipt]]]), [], () => {
+                    turnsVisited++;
+                    if (turnsVisited === 2) {
+                        writeFileSync(sourcePath, '{"changed":true}\n');
+                    }
+                }),
+            ],
+            watchRoots: [],
+            readConfig: enabledConfig,
+        });
+
+        await (daemon as unknown as { backfillDurableCapture(): Promise<void> }).backfillDurableCapture();
+
+        expect(fixture.db.prepare('SELECT * FROM mcp_receipts').all()).toEqual([]);
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+            state: 'parse_error',
+        });
+    });
+
+    it('discovers a receipt conflict near EOF before writing an earlier filtered turn', async () => {
+        const fixture = createTestDb('elepha-durable-backfill-mcp-receipt-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const sourcePath = path.join(providerRoot, 'mcp-conflict.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'mcp-conflict', sourcePath });
+        seedMemory(fixture, { project, session, turnIndex: 0 });
+        fixture.db.exec(`
+            INSERT INTO source_generations (tool, native_id, generation) VALUES ('claude-code', 'mcp-conflict', 0);
+            INSERT INTO mcp_receipts
+                (tool, native_session_id, source_generation, source_turn_index, call_id, observed_at, body_hash, body)
+            VALUES ('claude-code', 'mcp-conflict', 0, 2, 'bound-call', NULL, 'seed-hash', 'Original exact body.');
+        `);
+        const ordinary = { ...parsedTurn(sourcePath, session.native_id, 0), projectPath: project.path };
+        const firstReceipt: ParsedTurn = {
+            ...parsedTurn(sourcePath, session.native_id, 1),
+            projectPath: project.path,
+            userMessage: '',
+            assistantText: '',
+            toolCalls: [],
+            droppedReason: 'elepha-mcp',
+            elephaMcpResultReceipts: [{ callId: 'new-call', body: 'Must roll back.', observedAt: null }],
+        };
+        const conflict: ParsedTurn = {
+            ...firstReceipt,
+            turnIndex: 2,
+            cursor: '2|3',
+            elephaMcpResultReceipts: [{ callId: 'bound-call', body: 'Conflicting exact body.', observedAt: null }],
+        };
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            adapters: [adapterFor(new Map([[sourcePath, [ordinary, firstReceipt, conflict]]]), [])],
+            watchRoots: [],
+            readConfig: enabledConfig,
+        });
+
+        await (daemon as unknown as { backfillDurableCapture(): Promise<void> }).backfillDurableCapture();
+
+        expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(fixture.db.prepare('SELECT call_id, body FROM mcp_receipts').all()).toEqual([
+            { call_id: 'bound-call', body: 'Original exact body.' },
+        ]);
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+            state: 'parse_error',
+        });
+    });
+
+    it('requires reconciliation before writing when an active receipt disappeared from the source', async () => {
+        const fixture = createTestDb('elepha-durable-backfill-mcp-receipt-');
+        const claudeConfigDir = path.join(fixture.directory, 'claude-home');
+        const providerRoot = path.join(claudeConfigDir, 'projects');
+        mkdirSync(providerRoot, { recursive: true });
+        vi.stubEnv('CLAUDE_CONFIG_DIR', claudeConfigDir);
+        const project = seedProject(fixture);
+        fixture.store.consent.grant(project.path);
+        const sourcePath = path.join(providerRoot, 'mcp-missing.jsonl');
+        writeFileSync(sourcePath, '{}\n');
+        const session = seedSession(fixture, { project, tool: 'claude-code', nativeId: 'mcp-missing', sourcePath });
+        seedMemory(fixture, { project, session, turnIndex: 0 });
+        fixture.db.exec(`
+            INSERT INTO source_generations (tool, native_id, generation) VALUES ('claude-code', 'mcp-missing', 0);
+            INSERT INTO mcp_receipts
+                (tool, native_session_id, source_generation, source_turn_index, call_id, observed_at, body_hash, body)
+            VALUES ('claude-code', 'mcp-missing', 0, 1, 'missing-call', NULL, 'seed-hash', 'Receipt missing from source.');
+        `);
+        const ordinary = { ...parsedTurn(sourcePath, session.native_id, 0), projectPath: project.path };
+        const daemon = new IngestionDaemon({
+            store: fixture.store,
+            adapters: [adapterFor(new Map([[sourcePath, [ordinary]]]), [])],
+            watchRoots: [],
+            readConfig: enabledConfig,
+        });
+
+        await (daemon as unknown as { backfillDurableCapture(): Promise<void> }).backfillDurableCapture();
+
+        expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
+        expect(fixture.db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
+            state: 'parse_error',
+        });
     });
 
     it('marks a readable transcript parse failure without writing a partial row', async () => {

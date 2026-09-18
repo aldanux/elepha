@@ -26,6 +26,7 @@ import {
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { matchesFirstPromptSearch } from '../storage/first-prompt-search.js';
+import { InjectionStore } from '../storage/injection-store.js';
 import {
     type AuthenticatedReadGeneration,
     isMemoryLocked,
@@ -43,9 +44,18 @@ import {
     readSessionById,
     SERVED_SESSION_KIND_ELIGIBILITY,
     type ServedSession,
+    safeStringArray,
 } from '../storage/session-read-model.js';
 import { UNTITLED_EPISODE } from '../storage/session-title.js';
-import { type ParsedTurn, type SessionAdapterMap, SUPPORTED_TOOLS, TOOL_METADATA, type ToolName } from '../types/index.js';
+import { hydrateTurnDecisions } from '../storage/turn-store.js';
+import {
+    type ParsedTurn,
+    type SessionAdapterMap,
+    SUPPORTED_TOOLS,
+    TOOL_METADATA,
+    type ToolName,
+    type TurnDecision,
+} from '../types/index.js';
 import { dataBlockClose, dataBlockOpen } from './instructions.js';
 
 export type { ServedSession } from '../storage/session-read-model.js';
@@ -72,6 +82,18 @@ export interface EvidenceWindow {
     omitted: number;
     total: number;
     reason?: string;
+}
+
+export interface IncompleteLastObservedSnapshot {
+    complete: false;
+    turnIndex: number;
+    failedAt: string;
+    observedAt: string;
+    stagedAt: string;
+    decisions: TurnDecision[];
+    pendingItems: string[];
+    summarizerStatus: string;
+    durableProjection?: FilteredTurnProjection;
 }
 
 export interface StoredTurnRecallFields {
@@ -215,7 +237,10 @@ export function titleOf(session: Pick<ServedSession, 'title'>): string {
     return session.title?.trim() || UNTITLED_EPISODE;
 }
 
-export function hasRealContent(session: Pick<ServedSession, 'title' | 'custom_title'>): boolean {
+export function hasRealContent(session: Pick<ServedSession, 'title' | 'custom_title' | 'open_turn_staged_at'>): boolean {
+    if (session.open_turn_staged_at != null) {
+        return true;
+    }
     if (session.custom_title?.trim()) {
         return true;
     }
@@ -497,8 +522,9 @@ export class SessionReader {
             () => {
                 const rows = this.db
                     .prepare(
-                        `SELECT project_id, title, custom_title FROM sessions s
-                         WHERE tool IN (${SUPPORTED_TOOLS.map(() => '?').join(',')}) AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
+                        `SELECT s.project_id, s.title, s.custom_title, ot.staged_at AS open_turn_staged_at FROM sessions s
+                         LEFT JOIN open_turns ot ON ot.session_id = s.id AND ot.staged_at IS NOT NULL AND ot.validated_epoch = ot.validation_epoch
+                         WHERE s.tool IN (${SUPPORTED_TOOLS.map(() => '?').join(',')}) AND ${SERVED_SESSION_KIND_ELIGIBILITY}`,
                     )
                     .all(...SUPPORTED_TOOLS) as Array<Pick<ServedSession, 'project_id' | 'title' | 'custom_title'>>;
                 const counts = new Map<number, number>();
@@ -514,6 +540,75 @@ export class SessionReader {
         return this.withReadGeneration(
             () => undefined,
             () => readSessionById(this.db, id),
+        );
+    }
+
+    incompleteLastObservedFor(session: Pick<ServedSession, 'id'>): IncompleteLastObservedSnapshot | undefined {
+        return this.withReadGeneration(
+            () => undefined,
+            () => {
+                const row = this.db
+                    .prepare(
+                        `SELECT turn_index, failed_at, observed_at, staged_at, decisions, pending_items, summarizer_status,
+                                durable_included, durable_user_prompt, durable_assistant_response,
+                                durable_assistant_structure, durable_tool_calls,
+                                durable_omitted_tool_call_count, durable_filter_version
+                         FROM open_turns
+                         WHERE session_id = ? AND staged_at IS NOT NULL AND validated_epoch = validation_epoch
+                           AND receipt_coverage = 'complete'`,
+                    )
+                    .get(session.id) as
+                    | {
+                          turn_index: number;
+                          failed_at: string;
+                          observed_at: string;
+                          staged_at: string;
+                          decisions: string;
+                          pending_items: string;
+                          summarizer_status: string;
+                          durable_included: number | null;
+                          durable_user_prompt: string | null;
+                          durable_assistant_response: string | null;
+                          durable_assistant_structure: string | null;
+                          durable_tool_calls: string | null;
+                          durable_omitted_tool_call_count: number | null;
+                          durable_filter_version: number | null;
+                      }
+                    | undefined;
+                if (row === undefined) {
+                    return undefined;
+                }
+                const toolCalls = row.durable_tool_calls === null ? undefined : decodedToolCalls(row.durable_tool_calls);
+                const durableProjection =
+                    row.durable_included === null || row.durable_filter_version === null || toolCalls === undefined
+                        ? undefined
+                        : {
+                              included: row.durable_included === 1,
+                              userPrompt: row.durable_user_prompt ?? '',
+                              assistantResponse: row.durable_assistant_response ?? '',
+                              assistantStructure:
+                                  row.durable_assistant_structure === null
+                                      ? undefined
+                                      : decodeAssistantStructure(
+                                            row.durable_assistant_structure,
+                                            (row.durable_assistant_response ?? '').length,
+                                        ),
+                              toolCalls,
+                              omittedToolCallCount: row.durable_omitted_tool_call_count ?? 0,
+                              filterVersion: row.durable_filter_version,
+                          };
+                return {
+                    complete: false,
+                    turnIndex: row.turn_index,
+                    failedAt: row.failed_at,
+                    observedAt: row.observed_at,
+                    stagedAt: row.staged_at,
+                    decisions: hydrateTurnDecisions(row.decisions),
+                    pendingItems: safeStringArray(row.pending_items),
+                    summarizerStatus: row.summarizer_status,
+                    durableProjection,
+                };
+            },
         );
     }
 
@@ -932,12 +1027,26 @@ export class SessionReader {
             let retainedRenderedChars = 0;
             let highWaterTurns = 0;
             let highWaterRenderedChars = 0;
+            const replayInjections = new InjectionStore(this.db, { includePersistedMcp: false });
             for await (const turn of opened.turns) {
                 if (isMemoryLocked(this.db)) {
                     return { reason: 'locked' };
                 }
                 if (signal?.aborted) {
                     return { reason: 'deadline' };
+                }
+                if (turn.droppedReason !== undefined) {
+                    if (turn.droppedReason === 'elepha-mcp' && !replayInjections.rememberElephaMcpReceipts(turn)) {
+                        return { reason: 'self_ingestion_protection_incomplete' };
+                    }
+                    continue;
+                }
+                const quoteBackStatus = replayInjections.quoteBackStatus(turn);
+                if (quoteBackStatus === 'incomplete') {
+                    return { reason: 'self_ingestion_protection_incomplete' };
+                }
+                if (quoteBackStatus === 'match') {
+                    continue;
                 }
                 if (indexes.has(turn.turnIndex)) {
                     matchedTurns += 1;

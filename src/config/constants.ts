@@ -16,6 +16,32 @@ export const SQLITE_MINIMUM_DATABASE_BYTES = 512;
 export const CHARS_PER_TOKEN = 4;
 export const SESSION_TOKEN_BUDGET = 20_000;
 export const SESSION_CHAR_BUDGET = SESSION_TOKEN_BUDGET * CHARS_PER_TOKEN;
+export const ELEPHA_MCP_NAMESPACE = 'mcp__elepha';
+// Provider call identifiers are short opaque tokens. Bound their UTF-8
+// bytes before retaining them in correlation sets or durable receipt
+// keys.
+export const ELEPHA_MCP_CALL_ID_MAX_BYTES = 1024;
+export const ELEPHA_MCP_UNMATCHED_RESULT_IDS_MAX = 64;
+export const ELEPHA_MCP_UNMATCHED_RESULT_ID_BYTES_MAX = ELEPHA_MCP_UNMATCHED_RESULT_IDS_MAX * ELEPHA_MCP_CALL_ID_MAX_BYTES;
+// Canonical MCP responses are already bounded by the session serving budget.
+// Four UTF-8 bytes per served character accepts that complete bound
+// without truncating multibyte text and caps retained security evidence.
+export const ELEPHA_MCP_RESULT_MAX_BYTES = SESSION_CHAR_BUDGET * 4;
+export const ELEPHA_MCP_RESULTS_PER_TURN_MAX = 64;
+// One turn may contain several valid MCP results. Bound their combined body
+// below the quote-back scan budget so recording a valid turn cannot make its
+// own future protection permanently incomplete.
+export const ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES = 4 * 1024 * 1024;
+// Quote-back checks run on the ingestion hot path. These ceilings are well
+// above ordinary per-chat injection volume while making incomplete coverage explicit.
+export const INJECTION_QUOTE_BACK_MAX_ROWS = 512;
+export const INJECTION_QUOTE_BACK_MAX_BYTES = 8 * 1024 * 1024;
+// A quoted MCP result can approach 4 MiB. Twice that keeps room for
+// surrounding conversation while bounding normalization input.
+export const INJECTION_QUOTE_BACK_TURN_MAX_BYTES = 8 * 1024 * 1024;
+// Quote-back runs synchronously during ingestion. A deadline makes
+// repeated high-entropy comparisons fail closed instead of blocking.
+export const INJECTION_QUOTE_BACK_BUDGET_MS = 100;
 // 400k tokens sits far above a typical session while keeping pathological input bounded;
 // this is a safety ceiling for resume, not a presentation budget.
 export const RESUME_TOKEN_BUDGET = 400_000;
@@ -122,6 +148,10 @@ export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const NPM_REGISTRY_LOOKUP_TIMEOUT_MS = 10_000;
 export const NPM_INSTALL_TIMEOUT_MS = 60_000;
 export const DEFAULT_IDLE_DEBOUNCE_MS = 800;
+// Debounces synthesis spend for a failed Codex attempt. It is never evidence
+// that the conversational turn is final; canonical ingestion keeps reparsing
+// from its pre-turn cursor until a real closing boundary arrives.
+export const OPEN_TURN_SUMMARY_GRACE_MS = 5 * 60 * 1000;
 export const DEFAULT_MAX_CONCURRENT = 3;
 export const FAILURE_WINDOW_SIZE = 20;
 export const FAILURE_RATE_THRESHOLD = 0.3;

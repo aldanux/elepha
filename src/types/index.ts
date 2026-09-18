@@ -28,6 +28,26 @@ export interface ParsedToolCall {
     text?: string;
 }
 
+export interface ElephaMcpResultReceipt {
+    callId: string;
+    body: string;
+    observedAt: string | null;
+}
+
+export type OpenTailReceiptCoverage = { state: 'complete'; turn: ParsedTurn } | { state: 'incomplete'; reason: string; turn: ParsedTurn };
+
+// A terminal provider failure at EOF is observable but is not a completed
+// conversational turn. The daemon may stage this candidate after its cost
+// grace, while the canonical cursor remains anchored before the turn so a
+// later retry, user boundary, success, or abort reparses and closes it once.
+export interface OpenTailObservation {
+    kind: 'failed-eof';
+    anchorCursor?: string;
+    candidateCursor: string;
+    failedAt: string;
+    receiptCoverage: OpenTailReceiptCoverage;
+}
+
 // One turn (a user request + the assistant's response, including any tool calls
 // in between) as extracted from a single session's JSONL file, normalized to a
 // tool-agnostic shape.
@@ -75,7 +95,10 @@ export interface ParsedTurn {
     // marker line's own payload is classified as skipped plumbing and never ingested.
     resumeMarkerBefore: boolean;
     // Present only for a complete turn the adapter withheld from persistence.
-    droppedReason?: 'sentinel' | 'empty';
+    droppedReason?: 'sentinel' | 'empty' | 'elepha-mcp';
+    // Private ingestion evidence. It is consumed transactionally with a
+    // dropped cursor and must never enter memories, rendering, or exports.
+    elephaMcpResultReceipts?: ElephaMcpResultReceipt[];
     sourceKey?: string;
     provenance?: { protocolVersion: string; producerVersion: string; modelAliases: string[] };
     // Validated synchronously again inside the ingestion transaction.
@@ -95,6 +118,9 @@ export interface ParseTurnsOptions {
     signal?: AbortSignal;
     // Serving can stop before assembling an oversized historical interaction.
     maxReadBytes?: number;
+    // Receives a failed lifecycle held open at EOF. It is deliberately not an
+    // item in the ParsedTurn iterator: canonical consumers see final turns only.
+    onOpenTail?: (observation: OpenTailObservation) => void;
 }
 
 // What kind of transcript a session file holds. Drives whether it is ingested

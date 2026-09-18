@@ -20,14 +20,15 @@
 // brief.
 
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { decodeAssistantStructure, transformAssistantStructure } from '../rendering/assistant-structure.js';
 import { detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 
 export interface SanitizeChange {
-    table: 'session_rollups' | 'memories' | 'filtered_turns';
+    table: 'session_rollups' | 'memories' | 'filtered_turns' | 'open_turns';
     rowId: number;
     field: string;
     before: string;
-    after: string;
+    after: string | null;
 }
 
 export interface SanitizePlan {
@@ -36,6 +37,7 @@ export interface SanitizePlan {
     rollupRows: number;
     memoryRows: number;
     filteredTurnRows: number;
+    openTurnRows: number;
 }
 
 type JsonMapper = (parsed: unknown) => unknown;
@@ -130,9 +132,35 @@ const FILTERED_TURN_FIELDS: FieldSpec[] = [
     { field: 'tool_calls', json: true, transform: (raw) => mapJsonField(raw, sanitizeStringLeaves) },
 ];
 
+const OPEN_TURN_FIELDS: FieldSpec[] = [
+    { field: 'decisions', json: true, transform: (raw) => mapJsonField(raw, sanitizeDecisionsJson) },
+    { field: 'pending_items', json: true, transform: (raw) => mapJsonField(raw, sanitizeStringsJson) },
+    { field: 'summarizer_status', json: false, transform: stripShellSyntax },
+    { field: 'durable_user_prompt', json: false, transform: escapeShellSyntax },
+    { field: 'durable_assistant_response', json: false, transform: escapeShellSyntax },
+    { field: 'durable_assistant_structure', json: true, transform: (raw) => mapJsonField(raw, sanitizeStringLeaves) },
+    { field: 'durable_tool_calls', json: true, transform: (raw) => mapJsonField(raw, sanitizeStringLeaves) },
+];
+
+function sanitizeOpenTurnStructure(raw: string, assistantResponse: string): string | null {
+    try {
+        const structure = decodeAssistantStructure(raw, assistantResponse.length);
+        const transformed = transformAssistantStructure(assistantResponse, structure, escapeShellSyntax);
+        if (transformed !== undefined) {
+            return JSON.stringify(transformed);
+        }
+    } catch {
+        // Invalid phase metadata cannot be trusted after restore.
+    }
+    // If escaping crosses a declared boundary, preserving the old numeric
+    // offsets would reclassify different text. Match the live stale-metadata
+    // policy and clear structure when it cannot be remapped exactly.
+    return null;
+}
+
 function collect(db: Database, table: SanitizeChange['table'], idColumn: string, fields: FieldSpec[]): SanitizeChange[] {
     const columns = fields.map((f) => f.field).join(', ');
-    const rows = db.prepare(`SELECT ${idColumn} AS __id, ${columns} FROM ${table}`).all() as Array<Record<string, string | number>>;
+    const rows = db.prepare(`SELECT ${idColumn} AS __id, ${columns} FROM ${table}`).all() as Array<Record<string, string | number | null>>;
 
     const changes: SanitizeChange[] = [];
     for (const row of rows) {
@@ -150,17 +178,49 @@ function collect(db: Database, table: SanitizeChange['table'], idColumn: string,
     return changes;
 }
 
+function collectOpenTurns(db: Database): SanitizeChange[] {
+    const changes = collect(
+        db,
+        'open_turns',
+        'session_id',
+        OPEN_TURN_FIELDS.filter((field) => field.field !== 'durable_assistant_structure'),
+    );
+    const rows = db.prepare('SELECT session_id, durable_assistant_response, durable_assistant_structure FROM open_turns').all() as Array<{
+        session_id: number;
+        durable_assistant_response: string | null;
+        durable_assistant_structure: string | null;
+    }>;
+    for (const row of rows) {
+        if (row.durable_assistant_response === null || row.durable_assistant_structure === null) {
+            continue;
+        }
+        const after = sanitizeOpenTurnStructure(row.durable_assistant_structure, row.durable_assistant_response);
+        if (after !== row.durable_assistant_structure) {
+            changes.push({
+                table: 'open_turns',
+                rowId: row.session_id,
+                field: 'durable_assistant_structure',
+                before: row.durable_assistant_structure,
+                after,
+            });
+        }
+    }
+    return changes;
+}
+
 export function planSanitize(db: Database): SanitizePlan {
     const changes = [
         ...collect(db, 'session_rollups', 'session_id', ROLLUP_FIELDS),
         ...collect(db, 'memories', 'id', MEMORY_FIELDS),
         ...collect(db, 'filtered_turns', 'memory_id', FILTERED_TURN_FIELDS),
+        ...collectOpenTurns(db),
     ];
     return {
         changes,
         rollupRows: new Set(changes.filter((c) => c.table === 'session_rollups').map((c) => c.rowId)).size,
         memoryRows: new Set(changes.filter((c) => c.table === 'memories').map((c) => c.rowId)).size,
         filteredTurnRows: new Set(changes.filter((c) => c.table === 'filtered_turns').map((c) => c.rowId)).size,
+        openTurnRows: new Set(changes.filter((c) => c.table === 'open_turns').map((c) => c.rowId)).size,
     };
 }
 
@@ -180,7 +240,12 @@ export function applySanitize(db: Database, options?: GuardedSanitizeApplyOption
             return false;
         }
         for (const c of plan.changes) {
-            const idColumn = c.table === 'session_rollups' ? 'session_id' : c.table === 'filtered_turns' ? 'memory_id' : 'id';
+            const idColumn =
+                c.table === 'session_rollups' || c.table === 'open_turns'
+                    ? 'session_id'
+                    : c.table === 'filtered_turns'
+                      ? 'memory_id'
+                      : 'id';
             db.prepare(`UPDATE ${c.table} SET ${c.field} = ? WHERE ${idColumn} = ?`).run(c.after, c.rowId);
         }
         return true;
@@ -225,6 +290,7 @@ export function verifySanitize(db: Database): SanitizeResidue[] {
     check('session_rollups', 'session_id', ROLLUP_FIELDS);
     check('memories', 'id', MEMORY_FIELDS);
     check('filtered_turns', 'memory_id', FILTERED_TURN_FIELDS);
+    check('open_turns', 'session_id', OPEN_TURN_FIELDS);
     return residue;
 }
 

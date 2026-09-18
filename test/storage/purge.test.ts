@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { printPurgePlan } from '../../src/cli/shared.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
+import { InjectionStore } from '../../src/storage/injection-store.js';
 import { MemoryStore, type PurgeScope } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
@@ -41,7 +42,30 @@ function purgeState(store: MemoryStore): Record<string, unknown[]> {
         rollups: store.database.prepare('SELECT * FROM session_rollups ORDER BY session_id').all(),
         purgedTombstones: store.database.prepare('SELECT * FROM purged_transcripts ORDER BY tool, native_id').all(),
         incognitoTombstones: store.database.prepare('SELECT * FROM incognito_transcripts ORDER BY tool, native_id').all(),
+        mcpReceipts: store.database.prepare('SELECT * FROM mcp_receipts ORDER BY source_generation, call_id').all(),
+        sourceGenerations: store.database.prepare('SELECT * FROM source_generations ORDER BY tool, native_id').all(),
     };
+}
+
+function seedMcpReceiptGenerations(store: MemoryStore, tool: ParsedTurn['tool'], nativeId: string, projectPath: string): void {
+    const receipts = new InjectionStore(store.database);
+    const turn = (generation: number): ParsedTurn => ({
+        ...makeTurn({
+            tool,
+            sessionId: nativeId,
+            projectPath,
+            turnIndex: generation,
+            userMessage: '',
+            assistantText: '',
+            droppedReason: 'elepha-mcp',
+            elephaMcpResultReceipts: [
+                { callId: `call-${generation}`, body: `private purge receipt generation ${generation}`, observedAt: null },
+            ],
+        }),
+    });
+    expect(receipts.recordElephaMcpReceipts(turn(0), 0)).toBe(true);
+    store.database.prepare('UPDATE source_generations SET generation = 1 WHERE tool = ? AND native_id = ?').run(tool, nativeId);
+    expect(receipts.recordElephaMcpReceipts(turn(1), 1)).toBe(true);
 }
 
 describe('purge', () => {
@@ -156,10 +180,15 @@ describe('purge', () => {
         }
         expect(logs).toContain(`Stored conversation copy: 1 filtered turn(s), ${expectedBytes} byte(s).`);
 
+        seedMcpReceiptGenerations(store, session.tool, session.native_id, project.path);
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM mcp_receipts').get()).toEqual({ count: 2 });
+
         expect(store.applyPurgePlan(plan).sessions.map((candidate) => candidate.id)).toEqual([session.id]);
 
         expect(store.database.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
         expect(store.database.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM mcp_receipts').get()).toEqual({ count: 0 });
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM source_generations').get()).toEqual({ count: 0 });
         expect(
             store.database.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'purgeuniqueneedle'").all(),
         ).toEqual([]);
@@ -386,6 +415,7 @@ describe('purge', () => {
         const project = store.upsertProject('/Users/test/reused-purge-id');
         const first = store.upsertSession('codex', 'first-planned', project.id, '/tmp/first-planned.jsonl');
         const replaced = store.upsertSession('codex', 'replaced-planned', project.id, '/tmp/replaced-planned.jsonl');
+        seedMcpReceiptGenerations(store, first.tool, first.native_id, project.path);
         const plan = store.planPurge({ all: true });
         expect(plan.sessions.map((session) => session.nativeId)).toEqual(['first-planned', 'replaced-planned']);
 

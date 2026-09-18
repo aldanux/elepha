@@ -197,13 +197,16 @@ function printSanitizePlan(plan: SanitizePlan, output: CliOutputSink): void {
     }
     output.log(
         `\n${plan.changes.length} field(s) across ${plan.rollupRows} rollup row(s), ${plan.memoryRows} memory row(s), ` +
-            `and ${plan.filteredTurnRows} filtered turn row(s).`,
+            `${plan.filteredTurnRows} filtered turn row(s), and ${plan.openTurnRows} open turn row(s).`,
     );
 }
 
 function truncateForDisplay(s: string | null): string {
-    if (!s) {
-        return '';
+    if (s === null) {
+        return 'NULL';
+    }
+    if (s === '') {
+        return "''";
     }
     const oneLine = s.replace(/\n/g, '\\n');
     return oneLine.length <= 200 ? oneLine : `${oneLine.slice(0, 200)}…`;

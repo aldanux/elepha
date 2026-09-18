@@ -17,6 +17,7 @@ import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionRowKind, Ses
 import { errorMessage } from '../util/error.js';
 import { DurableCaptureStore } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
+import { InjectionQuoteBackIncompleteError, InjectionStore } from './injection-store.js';
 import { assessSegmentBoundary, evaluateSegmentBoundary, type SegmentBoundaryEvidence, type SegmentBoundaryInput } from './segmentation.js';
 import { titleForSegment } from './session-title.js';
 import { newUlid } from './ulid.js';
@@ -154,9 +155,16 @@ function gapHours(previousEndedAt: string, nextStartedAt: string): number {
     return Math.max(0, next - previous) / (60 * 60 * 1000);
 }
 
-async function parseSource(adapter: SessionAdapter, sourcePath: string): Promise<Map<number, ParsedTurn>> {
+async function parseSource(db: Database, adapter: SessionAdapter, sourcePath: string): Promise<Map<number, ParsedTurn>> {
     const turns = new Map<number, ParsedTurn>();
+    const injections = new InjectionStore(db, { includePersistedMcp: false });
     for await (const turn of adapter.parseTurns(sourcePath, undefined, { closeTrailingOnIdle: true })) {
+        if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+            throw new InjectionQuoteBackIncompleteError(`Resegmentation for ${sourcePath}`);
+        }
+        if (turn.droppedReason !== undefined || injections.isQuoteBackOrThrow(turn, `Resegmentation for ${sourcePath}`)) {
+            continue;
+        }
         turns.set(turn.turnIndex, turn);
     }
     return turns;
@@ -406,7 +414,7 @@ export async function planResegmentation(db: Database, adapters: SessionAdapterM
                 continue;
             }
             const classification = await adapter.classifySession(latest.source_path);
-            const parsed = await parseSource(adapter, latest.source_path);
+            const parsed = await parseSource(db, adapter, latest.source_path);
             const existingByIndex = new Map(rows.map((row) => [row.segment_index, row]));
             const { segments, cuts } = buildSegments(
                 memories,
@@ -721,7 +729,7 @@ async function parsedForManual(
         throw new Error(`session ${session.id} has no retained turns`);
     }
     const classification = await adapter.classifySession(session.source_path);
-    const parsed = await parseSource(adapter, session.source_path);
+    const parsed = await parseSource(db, adapter, session.source_path);
     for (const memory of memories) {
         if (!parsed.has(memory.turn_index)) {
             throw new Error(`retained turn ${memory.turn_index} was not produced by the current adapter`);
@@ -854,7 +862,7 @@ export async function planManualMerge(
     if (!adapter) {
         throw new Error(`source type has no JSONL adapter: ${left.tool}`);
     }
-    const parsed = await parseSource(adapter, left.source_path);
+    const parsed = await parseSource(db, adapter, left.source_path);
     const classification = await adapter.classifySession(left.source_path);
     const memories = [...memoriesForSessions(db, [left.id]), ...memoriesForSessions(db, [right.id])].sort(
         (a, b) => a.turn_index - b.turn_index,

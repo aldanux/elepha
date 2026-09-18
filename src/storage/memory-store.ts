@@ -5,10 +5,18 @@ import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
-import type { ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
+import type { OpenTailObservation, ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
-import type { DurableEvictionPlan } from './durable-capture-store.js';
-import { type InjectionRow, InjectionStore, type RecordInjectionInput } from './injection-store.js';
+import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
+import {
+    InjectionQuoteBackIncompleteError,
+    type InjectionQuoteBackResult,
+    type InjectionRow,
+    InjectionStore,
+    type McpReceiptRow,
+    type RecordInjectionInput,
+} from './injection-store.js';
+import { type OpenTurnRow, type OpenTurnSourceSnapshot, OpenTurnStore } from './open-turn-store.js';
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
@@ -96,6 +104,7 @@ export class MemoryStore {
     private readonly sessions: SessionStore;
     private readonly turns: TurnStore;
     private readonly injections: InjectionStore;
+    private readonly openTurns: OpenTurnStore;
     private readonly sqliteSourceWatermarks: SqliteSourceWatermarkStore;
     readonly shownSessionLists: ShownSessionListStore;
 
@@ -106,6 +115,7 @@ export class MemoryStore {
         this.sessions = new SessionStore(db, (id) => this.projects.getProjectById(id), options.resolveGitCommitCount);
         this.turns = new TurnStore(db, this.sessions);
         this.injections = new InjectionStore(db);
+        this.openTurns = new OpenTurnStore(db);
         this.sqliteSourceWatermarks = new SqliteSourceWatermarkStore(db);
         this.shownSessionLists = new ShownSessionListStore(db);
     }
@@ -130,8 +140,16 @@ export class MemoryStore {
         return this.injections.injectionsForSession(tool, nativeSessionId, atOrBefore);
     }
 
+    mcpReceiptsForSession(tool: ToolName, nativeSessionId: string, sourceGeneration: number): McpReceiptRow[] {
+        return this.injections.mcpReceiptsForSession(tool, nativeSessionId, sourceGeneration);
+    }
+
     isInjectionQuoteBack(turn: ParsedTurn): boolean {
-        return this.injections.isQuoteBack(turn);
+        return this.injections.quoteBackStatus(turn) === 'match';
+    }
+
+    injectionQuoteBackStatus(turn: ParsedTurn): InjectionQuoteBackResult {
+        return this.injections.quoteBackStatus(turn);
     }
 
     hasMemoryForNativeTurn(tool: ToolName, nativeId: string, turnIndex: number): boolean {
@@ -183,6 +201,9 @@ export class MemoryStore {
             this.db
                 .prepare('INSERT OR IGNORE INTO incognito_transcripts (tool, native_id, tombstoned_at) VALUES (?, ?, ?)')
                 .run(tool, nativeId, new Date().toISOString());
+            this.db.prepare('DELETE FROM mcp_receipts WHERE tool = ? AND native_session_id = ?').run(tool, nativeId);
+            this.db.prepare('DELETE FROM source_generations WHERE tool = ? AND native_id = ?').run(tool, nativeId);
+            this.db.prepare('DELETE FROM open_turns WHERE tool = ? AND native_session_id = ?').run(tool, nativeId);
             this.db
                 .prepare('DELETE FROM session_embeddings WHERE session_id IN (SELECT id FROM sessions WHERE tool = ? AND native_id = ?)')
                 .run(tool, nativeId);
@@ -236,6 +257,111 @@ export class MemoryStore {
         return this.sessions.getSessionCursor(tool, nativeId);
     }
 
+    findOpenTurn(tool: ToolName, nativeId: string): OpenTurnRow | undefined {
+        return this.openTurns.find(tool, nativeId);
+    }
+
+    beginOpenTurnValidation(tool: ToolName, nativeId: string, minimumEpoch: number): number {
+        return this.openTurns.beginValidation(tool, nativeId, minimumEpoch);
+    }
+
+    invalidateOpenTurnIfSourceChanged(tool: ToolName, nativeId: string, sourceGeneration: number, source: OpenTurnSourceSnapshot): boolean {
+        return this.openTurns.invalidateChangedSource(tool, nativeId, sourceGeneration, source);
+    }
+
+    observeOpenTurn(
+        observation: OpenTailObservation,
+        meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
+        sourceGeneration: number,
+        source: OpenTurnSourceSnapshot,
+        observedAt: string,
+        validationEpoch = 0,
+    ): OpenTurnRow | undefined {
+        const turn = observation.receiptCoverage.turn;
+        const resolved = this.resolveTurnGitValues(turn, false);
+        return this.db.transaction(() => {
+            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
+                return undefined;
+            }
+            const quoteBackStatus = this.injections.quoteBackStatus(turn);
+            if (quoteBackStatus === 'incomplete') {
+                throw new InjectionQuoteBackIncompleteError(`Open-turn observation for ${turn.sessionId}`);
+            }
+            if (quoteBackStatus === 'match') {
+                return undefined;
+            }
+            const project = this.projects.upsertProject(turn.projectPath, resolved.projectIdentity);
+            const session = this.sessions.upsertSession(
+                turn.tool,
+                turn.sessionId,
+                project.id,
+                turn.sourcePath,
+                meta,
+                resolved.gitCommitCount,
+            );
+            if (
+                observation.receiptCoverage.state === 'complete' &&
+                turn.droppedReason === 'elepha-mcp' &&
+                !this.injections.recordElephaMcpReceipts(turn, sourceGeneration)
+            ) {
+                throw new Error('failed to persist open-turn Elepha MCP result receipt');
+            }
+            return this.openTurns.observe(observation, session.id, project.id, sourceGeneration, source, observedAt, validationEpoch);
+        })();
+    }
+
+    stageOpenTurnSummary(
+        tool: ToolName,
+        nativeId: string,
+        sourceRevision: string,
+        sourceDigest: string,
+        summary: SummarizationOutput,
+        stagedAt: string,
+        projection?: Parameters<OpenTurnStore['stageSummary']>[7],
+        projectPath?: string,
+        validateSource?: () => boolean,
+        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
+        validationEpoch?: number,
+        evictionPlan?: DurableEvictionPlan,
+    ): boolean {
+        return this.db.transaction(() => {
+            const row = this.openTurns.find(tool, nativeId);
+            if (
+                row === undefined ||
+                row.source_revision !== sourceRevision ||
+                this.isTranscriptPurged(tool, nativeId) ||
+                this.isTranscriptIncognito(tool, nativeId) ||
+                validateSource?.() === false
+            ) {
+                return false;
+            }
+            const project = projectPath ?? this.projects.getProjectById(row.project_id)?.path;
+            if (project === undefined || this.consent.consentState(project) !== 'approved') {
+                return false;
+            }
+            const expectedValidationEpoch = validationEpoch ?? row.validation_epoch;
+            const staged = this.openTurns.stageSummary(
+                tool,
+                nativeId,
+                sourceRevision,
+                sourceDigest,
+                expectedValidationEpoch,
+                summary,
+                stagedAt,
+                projection,
+            );
+            if (!staged || projection === undefined) {
+                return staged;
+            }
+            new DurableCaptureStore(this.db).enforceOpenTurnMaxBytes(row.session_id, durableCaptureMaxBytes, stagedAt, evictionPlan);
+            return true;
+        })();
+    }
+
+    deleteOpenTurn(tool: ToolName, nativeId: string): boolean {
+        return this.openTurns.delete(tool, nativeId);
+    }
+
     getSqliteSourceWatermark(tool: ToolName, sourcePath: string): number | undefined {
         return this.sqliteSourceWatermarks.get(tool, sourcePath);
     }
@@ -283,6 +409,16 @@ export class MemoryStore {
             if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
                 return undefined;
             }
+            if (turn.droppedReason !== undefined) {
+                return undefined;
+            }
+            const quoteBackStatus = this.injections.quoteBackStatus(turn);
+            if (quoteBackStatus === 'incomplete') {
+                throw new InjectionQuoteBackIncompleteError(`Turn ingestion for ${turn.sessionId}`);
+            }
+            if (quoteBackStatus === 'match') {
+                return undefined;
+            }
             if (this.turns.hasMemoryForNativeTurn(turn.tool, turn.sessionId, turn.turnIndex)) {
                 return undefined;
             }
@@ -298,7 +434,11 @@ export class MemoryStore {
             if (startNextSegment) {
                 session = this.sessions.startNextSegment(session, project.id, turn.sourcePath, meta, resolved.gitCommitCount);
             }
-            return {
+            // The staged projection describes this same logical turn. Remove it
+            // inside the final-write transaction before durable accounting so it
+            // cannot make the canonical replacement evict an unrelated row.
+            this.openTurns.delete(turn.tool, turn.sessionId);
+            const result = {
                 project,
                 session,
                 inserted: this.turns.recordTurnInTransaction(
@@ -311,6 +451,7 @@ export class MemoryStore {
                     evictionPlan,
                 ),
             };
+            return result;
         });
         return write();
     }
@@ -330,6 +471,7 @@ export class MemoryStore {
             }
             this.sessions.advanceSessionCursor(memory.session_id, turn.cursor);
             this.sessions.updateTrailingState(memory.session_id, turn);
+            this.openTurns.delete(turn.tool, turn.sessionId);
         })();
     }
 
@@ -341,6 +483,9 @@ export class MemoryStore {
         turn: ParsedTurn,
         meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
     ): boolean {
+        if (turn.droppedReason === 'elepha-mcp' && (turn.elephaMcpResultReceipts?.length ?? 0) === 0) {
+            return false;
+        }
         const resolved = this.resolveTurnGitValues(turn, false);
         const write = this.db.transaction(() => {
             if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
@@ -355,11 +500,113 @@ export class MemoryStore {
                 meta,
                 resolved.gitCommitCount,
             );
-            this.sessions.updateSessionTitle(session.id, turn);
+            if (!this.injections.recordElephaMcpReceipts(turn)) {
+                throw new Error('failed to persist Elepha MCP result receipt');
+            }
             this.sessions.advanceSessionCursor(session.id, turn.cursor);
+            this.openTurns.delete(turn.tool, turn.sessionId);
             return true;
         });
-        return write();
+        try {
+            return write();
+        } catch (error) {
+            if ((error as Error).message === 'failed to persist Elepha MCP result receipt') {
+                return false;
+            }
+            throw error;
+        }
+    }
+
+    learnElephaMcpReceipts(turn: ParsedTurn, expectedSessionId?: number): boolean {
+        if (turn.droppedReason !== 'elepha-mcp' || (turn.elephaMcpResultReceipts?.length ?? 0) === 0) {
+            return turn.droppedReason !== 'elepha-mcp';
+        }
+        try {
+            return this.db.transaction(() => {
+                if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
+                    return false;
+                }
+                if (expectedSessionId !== undefined) {
+                    const session = this.db
+                        .prepare('SELECT id FROM sessions WHERE id = ? AND tool = ? AND native_id = ?')
+                        .get(expectedSessionId, turn.tool, turn.sessionId) as { id: number } | undefined;
+                    if (session === undefined) {
+                        return false;
+                    }
+                }
+                if (!this.injections.recordElephaMcpReceipts(turn)) {
+                    throw new Error('failed to persist Elepha MCP result receipt');
+                }
+                return true;
+            })();
+        } catch (error) {
+            if ((error as Error).message === 'failed to persist Elepha MCP result receipt') {
+                return false;
+            }
+            throw error;
+        }
+    }
+
+    publishElephaMcpReceiptBatch(
+        turns: ParsedTurn[],
+        expectedSessionId: number,
+        tool: ToolName,
+        nativeSessionId: string,
+        expectedSourceGeneration: number,
+    ): boolean {
+        try {
+            return this.db.transaction(() => {
+                const session = this.db
+                    .prepare('SELECT id FROM sessions WHERE id = ? AND tool = ? AND native_id = ?')
+                    .get(expectedSessionId, tool, nativeSessionId) as { id: number } | undefined;
+                if (session === undefined || this.injections.currentSourceGeneration(tool, nativeSessionId) !== expectedSourceGeneration) {
+                    throw new Error('failed to persist Elepha MCP result receipt batch');
+                }
+                for (const turn of turns) {
+                    if (
+                        turn.tool !== tool ||
+                        turn.sessionId !== nativeSessionId ||
+                        turn.droppedReason !== 'elepha-mcp' ||
+                        (turn.elephaMcpResultReceipts?.length ?? 0) === 0 ||
+                        this.recordIncognitoIfWriteBlocked(turn) ||
+                        turn.validateSource?.() === false
+                    ) {
+                        throw new Error('failed to persist Elepha MCP result receipt batch');
+                    }
+                }
+                for (const turn of turns) {
+                    if (!this.injections.recordElephaMcpReceipts(turn, expectedSourceGeneration)) {
+                        throw new Error('failed to persist Elepha MCP result receipt batch');
+                    }
+                }
+                if (turns.some((turn) => turn.validateSource?.() === false)) {
+                    throw new Error('failed to persist Elepha MCP result receipt batch');
+                }
+                return true;
+            })();
+        } catch (error) {
+            if ((error as Error).message === 'failed to persist Elepha MCP result receipt batch') {
+                return false;
+            }
+            throw error;
+        }
+    }
+
+    recordQuoteBackTurn(turn: ParsedTurn): boolean {
+        return this.db.transaction(() => {
+            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
+                return false;
+            }
+            if (turn.droppedReason !== undefined || this.injections.quoteBackStatus(turn) !== 'match') {
+                return false;
+            }
+            const session = this.sessions.findSession(turn.tool, turn.sessionId);
+            if (session) {
+                this.sessions.advanceSessionCursor(session.id, turn.cursor);
+            }
+            this.openTurns.delete(turn.tool, turn.sessionId);
+            return true;
+        })();
     }
 
     private resolveTurnGitValues(turn: ParsedTurn, startNextSegment: boolean): IngestedTurnWritePreparation {
@@ -387,8 +634,29 @@ export class MemoryStore {
         return consentState !== 'approved' || mustRecordIncognito;
     }
 
-    reingestTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): void {
-        this.turns.reingestTurn(turn, sessionDbId, projectId, summary);
+    reingestTurn(
+        turn: ParsedTurn,
+        sessionDbId: number,
+        projectId: number,
+        summary: SummarizationOutput,
+        quoteBackPrevalidated = false,
+    ): boolean {
+        return this.db.transaction(() => {
+            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false || turn.droppedReason !== undefined) {
+                return false;
+            }
+            if (!quoteBackPrevalidated) {
+                const quoteBackStatus = this.injections.quoteBackStatus(turn);
+                if (quoteBackStatus === 'incomplete') {
+                    throw new InjectionQuoteBackIncompleteError(`Reingest for ${turn.sessionId}`);
+                }
+                if (quoteBackStatus === 'match') {
+                    return false;
+                }
+            }
+            this.turns.reingestTurn(turn, sessionDbId, projectId, summary);
+            return true;
+        })();
     }
 
     listSessionsWithMemoriesSince(sinceIso: string): SessionRow[] {
@@ -454,6 +722,7 @@ export class MemoryStore {
                     this.db.prepare('UPDATE memories SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE sessions SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE session_rollups SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
+                    this.db.prepare('UPDATE open_turns SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('DELETE FROM projects WHERE id = ?').run(victim.id);
                 }
                 if (plan.gitRoot !== null) {
@@ -529,8 +798,17 @@ export class MemoryStore {
              WHERE m.session_id = ?
              ORDER BY m.turn_index`,
         );
+        const stagedFiltered = this.db.prepare(
+            `SELECT CASE WHEN durable_included IS NULL THEN 0 ELSE 1 END AS count,
+                    COALESCE(length(CAST(durable_user_prompt AS BLOB)), 0)
+                      + COALESCE(length(CAST(durable_assistant_response AS BLOB)), 0)
+                      + COALESCE(length(CAST(durable_assistant_structure AS BLOB)), 0)
+                      + COALESCE(length(CAST(durable_tool_calls AS BLOB)), 0) AS bytes
+             FROM open_turns WHERE session_id = ?`,
+        );
         const sessions: PurgeSessionPreview[] = sessionRows.map((s) => {
             const filtered = filteredRows.all(s.id) as Array<{ memory_id: number; bytes: number }>;
+            const staged = stagedFiltered.get(s.id) as { count: number; bytes: number } | undefined;
             return {
                 id: s.id,
                 nativeId: s.native_id,
@@ -541,8 +819,8 @@ export class MemoryStore {
                 startedAt: s.started_at,
                 lastIngestedAt: s.last_ingested_at,
                 turnCount: (countTurns.get(s.id) as { c: number }).c,
-                filteredTurnCount: filtered.length,
-                filteredBytes: filtered.reduce((sum, row) => sum + row.bytes, 0),
+                filteredTurnCount: filtered.length + (staged?.count ?? 0),
+                filteredBytes: filtered.reduce((sum, row) => sum + row.bytes, staged?.bytes ?? 0),
                 filteredMemoryIds: filtered.map((row) => row.memory_id),
             };
         });
@@ -575,6 +853,8 @@ export class MemoryStore {
             'DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)',
         );
         const deleteDurableCaptureStatus = this.db.prepare('DELETE FROM durable_capture_status WHERE session_id = ?');
+        const deleteMcpReceipts = this.db.prepare('DELETE FROM mcp_receipts WHERE tool = ? AND native_session_id = ?');
+        const deleteSourceGeneration = this.db.prepare('DELETE FROM source_generations WHERE tool = ? AND native_id = ?');
         const deleteMemories = this.db.prepare('DELETE FROM memories WHERE session_id = ?');
         const deleteSession = this.db.prepare('DELETE FROM sessions WHERE id = ?');
         const countProjectSessions = this.db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE project_id = ?');
@@ -591,6 +871,8 @@ export class MemoryStore {
                     throw new Error(`Purge plan session id ${s.id} no longer matches the previewed session.`);
                 }
                 tombstone.run(identity.tool, identity.native_id, purgedAt);
+                deleteMcpReceipts.run(identity.tool, identity.native_id);
+                deleteSourceGeneration.run(identity.tool, identity.native_id);
                 deleteRollup.run(s.id);
                 deleteFilteredTurns.run(s.id);
                 deleteDurableCaptureStatus.run(s.id);

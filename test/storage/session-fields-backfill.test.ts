@@ -3,10 +3,12 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CodexAdapter } from '../../src/adapters/codex.js';
+import { INJECTION_QUOTE_BACK_MAX_ROWS } from '../../src/config/constants.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
+import { InjectionQuoteBackIncompleteError } from '../../src/storage/injection-store.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { applySessionFieldsBackfill, planSessionFieldsBackfill } from '../../src/storage/session-fields-backfill.js';
-import type { SessionAdapterMap } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 const FIXTURE = `{"type":"attachment","uuid":"u0","timestamp":"2026-08-01T10:00:01.000Z","entrypoint":"cli","cwd":"/tmp/proj","sessionId":"sess-1","gitBranch":"main"}
@@ -88,6 +90,60 @@ describe('session-fields-backfill', () => {
         db.close();
     });
 
+    it('writes session fields and planned memory flags atomically without reparsing after commit', async () => {
+        const db = openUnmanagedDb(':memory:');
+        const session = seedSession(db, filePath);
+        const turn: ParsedTurn = {
+            tool: 'claude-code',
+            sessionId: session.native_id,
+            sourcePath: filePath,
+            projectPath: '/tmp/proj',
+            turnIndex: 0,
+            startedAt: '2026-08-01T10:00:02.000Z',
+            endedAt: '2026-08-01T10:00:03.000Z',
+            userMessage: 'hello',
+            assistantText: 'external answer',
+            toolCalls: [],
+            cursor: '0',
+            hasExternalContent: true,
+            resumeMarkerBefore: false,
+            surface: 'cli',
+            gitBranch: 'main',
+        };
+        const parseTurns = vi.fn(async function* () {
+            yield turn;
+        });
+        const adapter: SessionAdapter = {
+            tool: 'claude-code',
+            watchGlobs: [],
+            matches: () => true,
+            nativeSessionId: () => session.native_id,
+            classifySession: async () => ({ kind: 'primary' }),
+            classifyEmptySession: async () => undefined,
+            parseTurns,
+        };
+        db.exec(`
+            CREATE TRIGGER fail_memory_flag_update
+            BEFORE UPDATE OF has_external_content ON memories
+            BEGIN
+                SELECT RAISE(ABORT, 'forced memory flag failure');
+            END;
+        `);
+
+        await expect(applySessionFieldsBackfill(db, { ...adapters, 'claude-code': adapter })).rejects.toThrow('forced memory flag failure');
+
+        expect(parseTurns).toHaveBeenCalledTimes(1);
+        expect(db.prepare('SELECT surface, git_branch, kind FROM sessions WHERE id = ?').get(session.id)).toEqual({
+            surface: null,
+            git_branch: null,
+            kind: null,
+        });
+        expect(db.prepare('SELECT has_external_content FROM memories WHERE session_id = ?').get(session.id)).toEqual({
+            has_external_content: 0,
+        });
+        db.close();
+    });
+
     it('unavailable transcripts leave fields NULL without aborting the rest of the batch', async () => {
         const db = openUnmanagedDb(':memory:');
         const missingPath = path.join(claudeProjects, 'does-not-exist.jsonl');
@@ -158,6 +214,94 @@ describe('session-fields-backfill', () => {
         expect(row.kind).toBe('main');
         expect(row.git_branch).toBe('feature/codex-coverage');
 
+        db.close();
+    });
+
+    it('fails explicitly without mutating metadata when quote-back coverage is incomplete', async () => {
+        const db = openUnmanagedDb(':memory:');
+        const session = seedSession(db, filePath);
+        const insert = db.prepare(
+            `INSERT INTO injections (tool, native_session_id, injected_at, injection_id, body_hash, body)
+             VALUES ('claude-code', ?, '2026-08-01T09:00:00.000Z', ?, ?, ?)`,
+        );
+        for (let index = 0; index <= INJECTION_QUOTE_BACK_MAX_ROWS; index++) {
+            insert.run(
+                session.native_id,
+                `bounded-${index}`,
+                `legacy-hash-${index}`,
+                `Distinct historical injection ${index} that cannot match this fixture.`,
+            );
+        }
+
+        await expect(applySessionFieldsBackfill(db, adapters)).rejects.toBeInstanceOf(InjectionQuoteBackIncompleteError);
+        expect(db.prepare('SELECT surface, git_branch, kind FROM sessions WHERE id = ?').get(session.id)).toEqual({
+            surface: null,
+            git_branch: null,
+            kind: null,
+        });
+        db.close();
+    });
+
+    it('uses structural MCP receipts locally to suppress a later quote-back in the same planning pass', async () => {
+        const db = openUnmanagedDb(':memory:');
+        const receiptBody = 'This verified Elepha MCP result is long enough to be recognized when the next turn quotes it verbatim.';
+        const replayPath = path.join(claudeProjects, 'same-pass-rule4.jsonl');
+        writeFileSync(
+            replayPath,
+            `${[
+                {
+                    type: 'user',
+                    cwd: '/tmp/proj',
+                    timestamp: '2026-08-01T10:00:01.000Z',
+                    entrypoint: 'cli',
+                    gitBranch: 'must-not-be-derived',
+                    message: { role: 'user', content: 'Ask Elepha' },
+                },
+                {
+                    type: 'assistant',
+                    cwd: '/tmp/proj',
+                    timestamp: '2026-08-01T10:00:02.000Z',
+                    message: {
+                        role: 'assistant',
+                        content: [{ type: 'tool_use', id: 'call-1', name: 'mcp__elepha__recall', input: {} }],
+                    },
+                },
+                {
+                    type: 'user',
+                    cwd: '/tmp/proj',
+                    timestamp: '2026-08-01T10:00:03.000Z',
+                    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-1', content: receiptBody }] },
+                },
+                {
+                    type: 'assistant',
+                    cwd: '/tmp/proj',
+                    timestamp: '2026-08-01T10:00:04.000Z',
+                    message: { role: 'assistant', content: [{ type: 'text', text: 'Immediate synthesis.' }] },
+                },
+                {
+                    type: 'user',
+                    cwd: '/tmp/proj',
+                    timestamp: '2026-08-01T10:00:05.000Z',
+                    entrypoint: 'cli',
+                    gitBranch: 'also-must-not-be-derived',
+                    message: { role: 'user', content: `As Elepha said: ${receiptBody}` },
+                },
+                {
+                    type: 'assistant',
+                    cwd: '/tmp/proj',
+                    timestamp: '2026-08-01T10:00:06.000Z',
+                    message: { role: 'assistant', content: [{ type: 'text', text: 'Quoted response.' }] },
+                },
+            ]
+                .map((line) => JSON.stringify(line))
+                .join('\n')}\n`,
+        );
+        const session = seedSession(db, replayPath, 'same-pass-rule4');
+
+        const plan = await planSessionFieldsBackfill(db, adapters);
+        const change = plan.changes.find((candidate) => candidate.sessionId === session.id);
+        expect(change?.after).toMatchObject({ surface: null, git_branch: null, trailing_branch: null, trailing_files: '[]' });
+        expect(db.prepare('SELECT * FROM injections').all()).toEqual([]);
         db.close();
     });
 });

@@ -7,6 +7,7 @@ import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
+import { SessionReader } from '../../src/serving/session-reader.js';
 import { openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { enableParanoidMode, LOCKED_MEMORY_MESSAGE, lockMemory, unlockMemory } from '../../src/storage/paranoid-gate.js';
@@ -65,6 +66,24 @@ function turn(turnIndex: number): ParsedTurn {
     };
 }
 
+function insertCrossBoundaryOpenTurn(db: Database, nativeSessionId = 's1', summarizerStatus = 'ok'): void {
+    db.prepare(
+        `INSERT INTO open_turns
+         (tool, native_session_id, session_id, project_id, source_generation, turn_index,
+          anchor_cursor, candidate_cursor, source_path, source_dev, source_ino, source_size,
+          source_mtime_ms, source_revision, source_digest, failed_at, observed_at, staged_at,
+          validation_epoch, validated_epoch, receipt_coverage, decisions, pending_items, summarizer_status,
+          durable_included, durable_user_prompt, durable_assistant_response, durable_assistant_structure,
+          durable_tool_calls, durable_omitted_tool_call_count, durable_dropped_tool_ref_count,
+          durable_omitted_before_chars, durable_filter_version)
+         VALUES
+         ('claude-code', ?, 1, 1, 0, 1, 'c0', 'c1', '/tmp/s1.jsonl', '1', '2', 3, 4,
+          'revision', 'digest', '2026-08-01T01:00:00.000Z', '2026-08-01T01:00:01.000Z',
+          '2026-08-01T01:05:01.000Z', 0, 0, 'complete', '[]', '[]', ?, 1, 'safe', '$(',
+          '{"unclassified":false,"finals":[[1,2]],"omitted":0}', '[]', 0, 0, 0, 1)`,
+    ).run(nativeSessionId, summarizerStatus);
+}
+
 describe('Rule 3 choke points', () => {
     let db: Database;
     let store: MemoryStore;
@@ -121,7 +140,14 @@ describe('Rule 3 choke points', () => {
 
     it('escapes on the reingest path too - a maintenance rewrite is still a write', () => {
         store.recordTurn(turn(0), 1, 1, { decisions: [{ what: 'a', why: null }], pending_items: [], status: 'ok' });
-        store.reingestTurn(turn(0), 1, 1, { decisions: [{ what: 're-derived `x`', why: null }], pending_items: [], status: 'ok' });
+        store.consent.grant('/repo');
+        expect(
+            store.reingestTurn(turn(0), 1, 1, {
+                decisions: [{ what: 're-derived `x`', why: null }],
+                pending_items: [],
+                status: 'ok',
+            }),
+        ).toBe(true);
         expect(store.listMemoriesForSession(1)[0].decisions).toEqual([{ what: 're-derived \\`x\\`', why: null }]);
     });
 
@@ -295,6 +321,24 @@ describe('Rule 3 backfill', () => {
         expect(verifySanitize(db)).toEqual([]);
     });
 
+    it('clears staged assistant structure when escaping cannot preserve its boundaries', () => {
+        insertCrossBoundaryOpenTurn(db);
+
+        const plan = applySanitize(db);
+        expect(plan.changes).toContainEqual(
+            expect.objectContaining({ table: 'open_turns', field: 'durable_assistant_structure', before: expect.any(String), after: null }),
+        );
+        expect(
+            db.prepare('SELECT durable_assistant_response, durable_assistant_structure FROM open_turns WHERE session_id = 1').get(),
+        ).toEqual({ durable_assistant_response: '$\\(', durable_assistant_structure: null });
+        expect(planSanitize(db).changes).toEqual([]);
+        expect(verifySanitize(db)).toEqual([]);
+
+        const snapshot = new SessionReader(db).incompleteLastObservedFor({ id: 1 });
+        expect(snapshot?.durableProjection).toMatchObject({ assistantResponse: '$\\(' });
+        expect(snapshot?.durableProjection?.assistantStructure).toBeUndefined();
+    });
+
     it('repairs filtered turns while preserving JSON and exact FTS and usage maintenance', () => {
         db.exec('CREATE VIRTUAL TABLE temp.sanitize_terms USING fts5vocab(main, filtered_turns_fts, instance)');
         const termsBefore = db.prepare('SELECT term, doc, col, offset FROM temp.sanitize_terms ORDER BY term, doc, col, offset').all();
@@ -448,6 +492,22 @@ describe('sanitize paranoid read gate', () => {
         vi.doUnmock('../../src/storage/db.js');
         vi.doUnmock('../../src/storage/sanitize-backfill.js');
         vi.unstubAllEnvs();
+    });
+
+    it('previews a cleared structure as NULL and an empty sanitized value distinctly', async () => {
+        const fixture = await createManagedSanitizeFixture();
+        insertCrossBoundaryOpenTurn(fixture.db, 'sanitize-session', '$(');
+
+        const output = await runRegisteredSanitize(fixture.db);
+
+        expect(output.errors).toEqual([]);
+        expect(output.warnings).toEqual([]);
+        expect(output.logs).toContain('    after:  NULL');
+        expect(output.logs).toContain("    after:  ''");
+        expect(fixture.db.prepare('SELECT durable_assistant_structure FROM open_turns WHERE session_id = 1').get()).toEqual({
+            durable_assistant_structure: '{"unclassified":false,"finals":[[1,2]],"omitted":0}',
+        });
+        fixture.db.close();
     });
 
     it('prints only the standard locked response during a locked dry run', async () => {

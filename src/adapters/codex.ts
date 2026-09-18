@@ -18,9 +18,11 @@
 // assumed function_call/arguments without a real sample and missed every
 // apply_patch call as a result. Versioned real-sample fixtures guard the shape.
 //
-// function_call/function_call_output IS the real envelope for genuine
-// OpenAI-style tool calls (MCP servers, read_file, exec_command, ...) -
-// arguments there really is a JSON-encoded string.
+// Genuine MCP calls have two observed envelopes. CLI rollouts use
+// response_item function_call/function_call_output. Codex Desktop can wrap
+// dispatch in a custom `exec` call and emit the completed MCP call as an
+// event_msg item_completed/McpToolCall carrying server, id, and result.
+// The function_call arguments field really is a JSON-encoded string.
 //
 // Every payload.type/top-level type this adapter treats as skip is listed
 // explicitly below (KNOWN_*). Anything not in one of those sets triggers
@@ -29,26 +31,37 @@
 
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
-import { SESSION_KIND_PREAMBLE_MAX_BYTES } from '../config/constants.js';
+import {
+    ELEPHA_MCP_CALL_ID_MAX_BYTES,
+    ELEPHA_MCP_NAMESPACE,
+    ELEPHA_MCP_RESULTS_PER_TURN_MAX,
+    ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES,
+    SESSION_KIND_PREAMBLE_MAX_BYTES,
+} from '../config/constants.js';
 import { codexHome, codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
 import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionAdapterTool, SessionClassification } from '../types/index.js';
 import {
+    boundedMcpResult,
+    canonicalTimestamp,
     classifyEmptyJsonlSession,
     type EmptySessionSignals,
     JsonlTurnAdapter,
     type LineClass,
     OversizedTranscriptRecordError,
     readBoundedLines,
+    rememberUnmatchedElephaMcpResult,
     resolveAbsolute,
     safeDiscriminator,
     TranscriptReadBudgetError,
     type TurnBuilderState,
+    type TurnLifecycleSignal,
     textValues,
 } from './base.js';
 import { INTERNAL_COMMAND_NAME, INTERNAL_COMMAND_TAGS } from './internal-command.js';
 
 const ROLLOUT_ID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 const EXTERNAL_IMPORT_TURN_PREFIX = 'external-import-turn-';
+const ELEPHA_MCP_SERVER = ELEPHA_MCP_NAMESPACE.slice('mcp__'.length);
 
 // Top-level line types this adapter has observed and deliberately ignores
 // (none carry turn content; session_meta/turn_context are mined for cwd only).
@@ -115,10 +128,19 @@ interface CodexPayload {
     cwd?: string;
     message?: string;
     name?: string;
+    namespace?: string;
     arguments?: string; // function_call: JSON-encoded string
     input?: string; // custom_tool_call: raw string (real newlines)
     content?: CodexMessageContentBlock[];
     call_id?: string;
+    output?: unknown;
+    item?: {
+        type?: unknown;
+        id?: unknown;
+        server?: unknown;
+        result?: unknown;
+    };
+    error?: unknown;
     turn_id?: string;
     source?: { subagent?: { thread_spawn?: unknown } };
 }
@@ -374,6 +396,7 @@ export class CodexAdapter extends JsonlTurnAdapter {
     readonly tool: SessionAdapterTool = 'codex';
     readonly watchGlobs = ['*/*/*/rollout-*.jsonl'];
     private readonly userBoundaryByFile = new Map<string, 'event_msg' | 'response_item'>();
+    private readonly desktopMcpCallIds = new WeakMap<TurnBuilderState, Set<string>>();
 
     matches(filePath: string): boolean {
         return (
@@ -703,6 +726,183 @@ export class CodexAdapter extends JsonlTurnAdapter {
         } else if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
             state.openToolCallIds.delete(payload.call_id);
         }
+    }
+
+    protected turnLifecycleSignal(line: unknown): TurnLifecycleSignal | undefined {
+        const l = line as CodexLine;
+        const payload = l.payload;
+        if (l.type !== 'event_msg' || !payload) {
+            return undefined;
+        }
+        if (payload.type === 'task_started') {
+            return { phase: 'started', id: typeof payload.turn_id === 'string' ? payload.turn_id : undefined };
+        }
+        if (payload.type === 'task_complete') {
+            return {
+                phase: payload.error === undefined || payload.error === null ? 'finished' : 'failed',
+                id: typeof payload.turn_id === 'string' ? payload.turn_id : undefined,
+            };
+        }
+        if (payload.type === 'turn_aborted') {
+            return { phase: 'aborted', id: typeof payload.turn_id === 'string' ? payload.turn_id : undefined };
+        }
+        return undefined;
+    }
+
+    protected observeElephaMcp(state: TurnBuilderState, line: unknown): void {
+        const l = line as CodexLine;
+        const payload = l.payload;
+        if (!payload) {
+            return;
+        }
+        if (l.type === 'event_msg' && payload.type === 'item_completed') {
+            const item = payload.item;
+            if (item?.type !== 'McpToolCall' || item.server !== ELEPHA_MCP_SERVER) {
+                return;
+            }
+            const callId = item.id;
+            if (typeof callId === 'string' && this.desktopCallsFor(state).has(callId)) {
+                state.elephaMcpCoverageFailure = 'duplicate-call-id';
+                return;
+            }
+            const existingReceipt =
+                typeof callId === 'string' ? state.elephaMcpResultReceipts.find((receipt) => receipt.callId === callId) : undefined;
+            const resultValue = this.desktopMcpResultValue(item.result);
+            if (existingReceipt) {
+                const duplicate = boundedMcpResult(resultValue);
+                if (duplicate.state === 'incomplete') {
+                    state.elephaMcpCoverageFailure = duplicate.reason;
+                } else if (duplicate.body !== existingReceipt.body) {
+                    state.elephaMcpCoverageFailure = 'duplicate-call-id';
+                } else {
+                    this.desktopCallsFor(state).add(callId as string);
+                }
+                return;
+            }
+            if (typeof callId === 'string' && state.elephaMcpCallIds.has(callId)) {
+                this.desktopCallsFor(state).add(callId);
+                this.recordElephaMcpResult(state, callId, resultValue, l.timestamp);
+                return;
+            }
+            const registered = this.registerElephaMcpCall(state, callId);
+            if (registered === undefined) {
+                return;
+            }
+            this.desktopCallsFor(state).add(registered);
+            this.recordElephaMcpResult(state, registered, resultValue, l.timestamp);
+            return;
+        }
+        if (l.type !== 'response_item') {
+            return;
+        }
+        if (payload.type === 'function_call' && payload.namespace === ELEPHA_MCP_NAMESPACE) {
+            const callId = payload.call_id;
+            if (typeof callId === 'string' && this.desktopCallsFor(state).has(callId)) {
+                return;
+            }
+            this.registerElephaMcpCall(state, callId);
+            return;
+        }
+        if (payload.type !== 'function_call_output') {
+            return;
+        }
+        const callId = payload.call_id;
+        if (typeof callId === 'string' && this.desktopCallsFor(state).has(callId)) {
+            const receipt = state.elephaMcpResultReceipts.find((candidate) => candidate.callId === callId);
+            const duplicate = boundedMcpResult(payload.output);
+            if (duplicate.state === 'incomplete') {
+                state.elephaMcpCoverageFailure = duplicate.reason;
+            } else if (!receipt || duplicate.body !== receipt.body) {
+                state.elephaMcpCoverageFailure = 'duplicate-call-id';
+            }
+            return;
+        }
+        this.recordElephaMcpResult(state, callId, payload.output, l.timestamp);
+    }
+
+    private desktopCallsFor(state: TurnBuilderState): Set<string> {
+        let calls = this.desktopMcpCallIds.get(state);
+        if (!calls) {
+            calls = new Set();
+            this.desktopMcpCallIds.set(state, calls);
+        }
+        return calls;
+    }
+
+    private desktopMcpResultValue(result: unknown): unknown {
+        if (result && typeof result === 'object' && !Array.isArray(result) && 'content' in result) {
+            return (result as { content: unknown }).content;
+        }
+        return result;
+    }
+
+    private registerElephaMcpCall(state: TurnBuilderState, callId: unknown): string | undefined {
+        if (typeof callId !== 'string' || callId === '') {
+            state.elephaMcpCoverageFailure = 'missing-call-id';
+            return undefined;
+        }
+        if (Buffer.byteLength(callId) > ELEPHA_MCP_CALL_ID_MAX_BYTES) {
+            state.elephaMcpCoverageFailure = 'oversized-call-id';
+            return undefined;
+        }
+        if (state.elephaMcpCallIds.has(callId) || state.elephaMcpResultReceipts.some((receipt) => receipt.callId === callId)) {
+            state.elephaMcpCoverageFailure = 'duplicate-call-id';
+            return undefined;
+        }
+        if (state.elephaMcpUnmatchedResultIds.has(callId)) {
+            state.elephaMcpCoverageFailure = 'out-of-order-result';
+        } else if (state.elephaMcpUnmatchedCoverageIncomplete) {
+            state.elephaMcpCoverageFailure = 'incomplete-correlation';
+        }
+        if (state.elephaMcpCallIds.size + state.elephaMcpResultReceipts.length >= ELEPHA_MCP_RESULTS_PER_TURN_MAX) {
+            state.elephaMcpCoverageFailure = 'oversized-call-set';
+            return undefined;
+        }
+        state.elephaMcpCallIds.add(callId);
+        return callId;
+    }
+
+    private recordElephaMcpResult(state: TurnBuilderState, callId: unknown, value: unknown, timestamp: string | undefined): void {
+        if (typeof callId === 'string' && Buffer.byteLength(callId) > ELEPHA_MCP_CALL_ID_MAX_BYTES) {
+            if (state.elephaMcpCallIds.has(callId)) {
+                state.elephaMcpCoverageFailure = 'oversized-call-id';
+            }
+            return;
+        }
+        if (typeof callId === 'string' && state.elephaMcpResultReceipts.some((receipt) => receipt.callId === callId)) {
+            state.elephaMcpCoverageFailure = 'duplicate-call-id';
+            return;
+        }
+        if (typeof callId !== 'string' || !state.elephaMcpCallIds.has(callId)) {
+            if (typeof callId === 'string') {
+                rememberUnmatchedElephaMcpResult(state, callId);
+            }
+            return;
+        }
+        const result = boundedMcpResult(value);
+        if (result.state === 'incomplete') {
+            state.elephaMcpCoverageFailure = result.reason;
+            return;
+        }
+        state.elephaMcpCallIds.delete(callId);
+        if (state.elephaMcpResultReceipts.length >= ELEPHA_MCP_RESULTS_PER_TURN_MAX) {
+            state.elephaMcpCoverageFailure = 'oversized-result';
+            return;
+        }
+        if (state.elephaMcpResultBytes + result.bytes > ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES) {
+            state.elephaMcpCoverageFailure = 'oversized-result';
+            return;
+        }
+        // Structural order, not this diagnostic time, controls
+        // eligibility. Prefer turn state so clock anomalies do not make
+        // the diagnostic chronology misleading.
+        const observedAt = canonicalTimestamp(state.endedAt, state.startedAt, timestamp) ?? null;
+        state.elephaMcpResultBytes += result.bytes;
+        state.elephaMcpResultReceipts.push({
+            callId,
+            body: result.body,
+            observedAt,
+        });
     }
 
     protected fold(state: TurnBuilderState, line: unknown): void {

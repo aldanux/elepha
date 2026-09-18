@@ -9,6 +9,7 @@ import {
     planExternalAgentImportPurge,
     verifyExternalAgentImportPurge,
 } from '../../src/storage/external-agent-import-purge.js';
+import { InjectionStore } from '../../src/storage/injection-store.js';
 import { MemoryStore, type SessionRow } from '../../src/storage/memory-store.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
@@ -34,6 +35,22 @@ function turn(session: SessionRow, projectPath: string, turnIndex: number): Pars
         hasExternalContent: false,
         resumeMarkerBefore: false,
     };
+}
+
+function seedMcpReceiptGenerations(db: ReturnType<typeof openUnmanagedDb>, session: SessionRow, projectPath: string): void {
+    const receipts = new InjectionStore(db);
+    const structural = (generation: number): ParsedTurn => ({
+        ...turn(session, projectPath, generation),
+        userMessage: '',
+        assistantText: '',
+        droppedReason: 'elepha-mcp',
+        elephaMcpResultReceipts: [
+            { callId: `call-${generation}`, body: `${session.native_id} private receipt generation ${generation}`, observedAt: null },
+        ],
+    });
+    expect(receipts.recordElephaMcpReceipts(structural(0), 0)).toBe(true);
+    db.prepare("UPDATE source_generations SET generation = 1 WHERE tool = 'codex' AND native_id = ?").run(session.native_id);
+    expect(receipts.recordElephaMcpReceipts(structural(1), 1)).toBe(true);
 }
 
 describe('external-agent import purge', () => {
@@ -82,6 +99,8 @@ describe('external-agent import purge', () => {
             pending_items: [],
             status: 'ok',
         });
+        seedMcpReceiptGenerations(db, importedFirst, projectPath);
+        seedMcpReceiptGenerations(db, native, projectPath);
 
         rollups.write(
             {
@@ -188,6 +207,12 @@ describe('external-agent import purge', () => {
         });
         expect(store.findSession('codex', 'external-native-id')).toBeUndefined();
         expect(store.findSession('codex', 'native-id')).toBeDefined();
+        expect(db.prepare("SELECT source_generation FROM mcp_receipts WHERE native_session_id = 'external-native-id'").all()).toEqual([]);
+        expect(db.prepare("SELECT generation FROM source_generations WHERE native_id = 'external-native-id'").get()).toBeUndefined();
+        expect(
+            db.prepare("SELECT source_generation FROM mcp_receipts WHERE native_session_id = 'native-id' ORDER BY source_generation").all(),
+        ).toEqual([{ source_generation: 0 }, { source_generation: 1 }]);
+        expect(db.prepare("SELECT generation FROM source_generations WHERE native_id = 'native-id'").get()).toEqual({ generation: 1 });
     });
 
     it('refuses a stale preview and leaves every row intact', async () => {
@@ -202,5 +227,56 @@ describe('external-agent import purge', () => {
         expect((db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number }).count).toBe(3);
         expect((db.prepare('SELECT COUNT(*) AS count FROM memories').get() as { count: number }).count).toBe(4);
         expect((db.prepare('SELECT COUNT(*) AS count FROM session_rollups').get() as { count: number }).count).toBe(2);
+        expect((db.prepare('SELECT COUNT(*) AS count FROM mcp_receipts').get() as { count: number }).count).toBe(4);
+        expect((db.prepare('SELECT COUNT(*) AS count FROM source_generations').get() as { count: number }).count).toBe(2);
+    });
+
+    it('rejects an exact-identity substitution before deleting any planned or provenance state', async () => {
+        const plan = await planExternalAgentImportPurge(db, new CodexAdapter(() => {}));
+        db.prepare('UPDATE sessions SET native_id = ? WHERE id = ?').run('replacement-native-id', importedFirst.id);
+        seedMcpReceiptGenerations(db, { ...importedFirst, native_id: 'replacement-native-id' }, projectPath);
+        const before = {
+            sessions: db.prepare('SELECT * FROM sessions ORDER BY id').all(),
+            memories: db.prepare('SELECT * FROM memories ORDER BY id').all(),
+            receipts: db.prepare('SELECT * FROM mcp_receipts ORDER BY native_session_id, source_generation').all(),
+            generations: db.prepare('SELECT * FROM source_generations ORDER BY native_id').all(),
+            purged: db.prepare('SELECT * FROM purged_transcripts ORDER BY tool, native_id').all(),
+            incognito: db.prepare('SELECT * FROM incognito_transcripts ORDER BY tool, native_id').all(),
+        };
+
+        expect(() => applyExternalAgentImportPurge(db, plan)).toThrow('session rows changed after preview');
+
+        expect(db.prepare('SELECT * FROM sessions ORDER BY id').all()).toEqual(before.sessions);
+        expect(db.prepare('SELECT * FROM memories ORDER BY id').all()).toEqual(before.memories);
+        expect(db.prepare('SELECT * FROM mcp_receipts ORDER BY native_session_id, source_generation').all()).toEqual(before.receipts);
+        expect(db.prepare('SELECT * FROM source_generations ORDER BY native_id').all()).toEqual(before.generations);
+        expect(db.prepare('SELECT * FROM purged_transcripts ORDER BY tool, native_id').all()).toEqual(before.purged);
+        expect(db.prepare('SELECT * FROM incognito_transcripts ORDER BY tool, native_id').all()).toEqual(before.incognito);
+    });
+
+    it('rolls back MCP receipt deletion when a later planned session delete fails', async () => {
+        const plan = await planExternalAgentImportPurge(db, new CodexAdapter(() => {}));
+        db.exec(`
+            CREATE TRIGGER fail_external_import_session_delete
+            BEFORE DELETE ON sessions
+            WHEN OLD.native_id = 'external-native-id'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced external import delete failure');
+            END;
+        `);
+
+        expect(() => applyExternalAgentImportPurge(db, plan)).toThrow('forced external import delete failure');
+        expect(store.findSession('codex', 'external-native-id')).toBeDefined();
+        expect((db.prepare('SELECT COUNT(*) AS count FROM memories').get() as { count: number }).count).toBe(3);
+        expect(
+            db
+                .prepare(
+                    "SELECT source_generation FROM mcp_receipts WHERE native_session_id = 'external-native-id' ORDER BY source_generation",
+                )
+                .all(),
+        ).toEqual([{ source_generation: 0 }, { source_generation: 1 }]);
+        expect(db.prepare("SELECT generation FROM source_generations WHERE native_id = 'external-native-id'").get()).toEqual({
+            generation: 1,
+        });
     });
 });

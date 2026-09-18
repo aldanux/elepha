@@ -34,6 +34,7 @@ import {
 import {
     assertCanonicalDurableCaptureSchema,
     normalizeAndVerifyDurableCapture,
+    repairLegacyOpenTurnSessionForeignKey,
     tableClauseSignature,
 } from '../../storage/durable-capture-integrity.js';
 import {
@@ -45,7 +46,7 @@ import {
     inspectPrivateEmptyDatabaseDescriptor,
     writeEncryptedDatabaseImport,
 } from '../../storage/encrypted-database-export.js';
-import type { InjectionRow } from '../../storage/injection-store.js';
+import type { InjectionRow, McpReceiptRow } from '../../storage/injection-store.js';
 import { type ParanoidControlState, readParanoidControlState } from '../../storage/paranoid-gate.js';
 import { isToolName } from '../../types/index.js';
 import { errorMessage } from '../../util/error.js';
@@ -70,6 +71,8 @@ export const RESTORE_PARANOID_CHANGED_ERROR =
     'Restore preview is stale because active paranoid authority changed. Run restore again to review the current state.';
 export const RESTORE_INJECTIONS_CHANGED_ERROR =
     'Restore preview is stale because active injection provenance changed. Run restore again to review the current state.';
+export const RESTORE_MCP_RECEIPTS_CHANGED_ERROR =
+    'Restore preview is stale because active MCP receipt provenance changed. Run restore again to review the current state.';
 export const RESTORE_EVICTIONS_CHANGED_ERROR =
     'Restore preview is stale because active terminal evictions changed. Run restore again to review the current state.';
 export const RESTORE_ENCRYPTION_CHANGED_ERROR =
@@ -128,15 +131,19 @@ type ConsentPlan = { roots: ConsentRoot[]; fingerprint: string };
 type LogicalPlan<T> = { rows: T[]; fingerprint: string };
 type TerminalEvictionPlan = LogicalPlan<TerminalEvictionAnchor>;
 type InjectionPlanRow = Omit<InjectionRow, 'id'>;
+type McpReceiptPlanRow = Omit<McpReceiptRow, 'id'>;
+type SourceGenerationPlanRow = { tool: string; native_id: string; generation: number };
 type RestoreControls = {
     paranoid?: ParanoidControlState;
     paranoidFingerprint?: string;
     injections: LogicalPlan<InjectionPlanRow>;
+    mcpReceipts: LogicalPlan<McpReceiptPlanRow>;
+    sourceGenerations: LogicalPlan<SourceGenerationPlanRow>;
     evictions: TerminalEvictionPlan;
 };
 type ActiveEncryption = { metadata: EncryptionMetadata; key: Buffer };
 
-const LEGACY_SESSION_FK_CHILDREN = new Set(['memories', 'session_rollups', 'first_prompt_search_backfill_skips']);
+const LEGACY_SESSION_FK_CHILDREN = new Set(['memories', 'session_rollups', 'first_prompt_search_backfill_skips', 'open_turns']);
 
 interface RestoreCommandOptions {
     skipConfirmation: boolean;
@@ -289,6 +296,8 @@ function hasNoncanonicalTrigger(db: Database.Database): boolean {
                      ('filtered_turns_ai', 'filtered_turns_ad', 'filtered_turns_au',
                       'filtered_turns_usage_ai', 'filtered_turns_usage_ad', 'filtered_turns_usage_au',
                       'filtered_turns_structure_au')
+                     OR tbl_name COLLATE NOCASE = 'open_turns' AND name COLLATE NOCASE IN
+                     ('open_turns_usage_ai', 'open_turns_usage_ad', 'open_turns_usage_au')
                  ) LIMIT 1`,
             )
             .get() !== undefined
@@ -417,7 +426,8 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
         if (errors.length > 0) {
             throw new Error(`Backup schema does not match the current elepha schema after migration: ${errors.join('; ')}`);
         }
-        assertCanonicalDurableCaptureSchema(staged, canonical);
+        assertCanonicalDurableCaptureSchema(staged, canonical, { allowRepairableLegacyOpenTurnSessionForeignKey: true });
+        repairLegacyOpenTurnSessionForeignKey(staged, canonical);
         const semanticViolations = validateCandidateSemantics(staged, ['sessions', 'memories', 'session_rollups', 'consent_roots']);
         if (semanticViolations.length > 0) {
             throw new Error(`Backup is semantically invalid: ${semanticViolations.join('; ')}`);
@@ -666,10 +676,18 @@ async function activeRestoreControls(
     const db = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
     try {
         const paranoid = retainParanoid ? readParanoidControlState(db) : undefined;
-        const { injections, evictions } = db.transaction(() => ({
+        const { injections, mcpReceipts, sourceGenerations, evictions } = db.transaction(() => ({
             injections: db
                 .prepare('SELECT tool, native_session_id, injected_at, injection_id, body_hash, body FROM injections')
                 .all() as InjectionPlanRow[],
+            mcpReceipts: db
+                .prepare(
+                    `SELECT tool, native_session_id, source_generation, source_turn_index,
+                            call_id, observed_at, body_hash, body
+                     FROM mcp_receipts`,
+                )
+                .all() as McpReceiptPlanRow[],
+            sourceGenerations: db.prepare('SELECT tool, native_id, generation FROM source_generations').all() as SourceGenerationPlanRow[],
             evictions: terminalEvictionAnchors(db),
         }))();
         for (const row of injections) {
@@ -678,11 +696,38 @@ async function activeRestoreControls(
                 throw new Error('Active injection provenance is invalid.');
             }
         }
+        const activeGenerations = new Map<string, number>();
+        for (const row of sourceGenerations) {
+            if (!isToolName(row.tool) || !Number.isSafeInteger(row.generation) || row.generation < 0) {
+                throw new Error('Active MCP receipt provenance is invalid.');
+            }
+            activeGenerations.set(`${row.tool}\0${row.native_id}`, row.generation);
+        }
+        for (const row of mcpReceipts) {
+            const activeGeneration = activeGenerations.get(`${row.tool}\0${row.native_session_id}`);
+            const observedAt = row.observed_at === null ? null : new Date(row.observed_at);
+            if (
+                !isToolName(row.tool) ||
+                activeGeneration === undefined ||
+                !Number.isSafeInteger(row.source_generation) ||
+                row.source_generation < 0 ||
+                row.source_generation > activeGeneration ||
+                !Number.isSafeInteger(row.source_turn_index) ||
+                row.source_turn_index < 0 ||
+                row.call_id === '' ||
+                row.body_hash !== createHash('sha256').update(row.body).digest('hex') ||
+                (observedAt !== null && (Number.isNaN(observedAt.getTime()) || observedAt.toISOString() !== row.observed_at))
+            ) {
+                throw new Error('Active MCP receipt provenance is invalid.');
+            }
+        }
         return {
             ...(paranoid === undefined
                 ? {}
                 : { paranoid, paranoidFingerprint: createHash('sha256').update(JSON.stringify(paranoid)).digest('hex') }),
             injections: logicalPlan(injections),
+            mcpReceipts: logicalPlan(mcpReceipts),
+            sourceGenerations: logicalPlan(sourceGenerations),
             evictions,
         };
     } finally {
@@ -700,6 +745,12 @@ function assertRestoreControls(
     }
     if (current.injections.fingerprint !== expected.injections.fingerprint) {
         throw new Error(RESTORE_INJECTIONS_CHANGED_ERROR);
+    }
+    if (
+        current.mcpReceipts.fingerprint !== expected.mcpReceipts.fingerprint ||
+        current.sourceGenerations.fingerprint !== expected.sourceGenerations.fingerprint
+    ) {
+        throw new Error(RESTORE_MCP_RECEIPTS_CHANGED_ERROR);
     }
     if (current.evictions.fingerprint !== evictions.fingerprint) {
         throw new Error(RESTORE_EVICTIONS_CHANGED_ERROR);
@@ -805,6 +856,24 @@ function overlayControlState(
                 for (const injection of controls.injections.rows) {
                     insert.run(injection);
                 }
+                restored.prepare('DELETE FROM mcp_receipts').run();
+                restored.prepare('DELETE FROM source_generations').run();
+                const insertGeneration = restored.prepare(
+                    'INSERT INTO source_generations (tool, native_id, generation) VALUES (@tool, @native_id, @generation)',
+                );
+                for (const generation of controls.sourceGenerations.rows) {
+                    insertGeneration.run(generation);
+                }
+                const insertReceipt = restored.prepare(
+                    `INSERT INTO mcp_receipts
+                     (tool, native_session_id, source_generation, source_turn_index,
+                      call_id, observed_at, body_hash, body)
+                     VALUES (@tool, @native_session_id, @source_generation, @source_turn_index,
+                             @call_id, @observed_at, @body_hash, @body)`,
+                );
+                for (const receipt of controls.mcpReceipts.rows) {
+                    insertReceipt.run(receipt);
+                }
                 const hasSession = restored.prepare('SELECT 1 FROM sessions WHERE tool = ? AND native_id = ? LIMIT 1');
                 const insertProject = restored.prepare(
                     `INSERT OR IGNORE INTO projects (path, first_seen_at, last_seen_at)
@@ -858,6 +927,25 @@ function overlayControlState(
                                    SELECT 1 FROM incognito_transcripts i
                                    WHERE i.tool = s.tool AND i.native_id = s.native_id
                                )
+                     )`,
+                )
+                .run();
+            restored
+                .prepare(
+                    `DELETE FROM open_turns
+                     WHERE EXISTS (
+                         SELECT 1 FROM sessions s
+                         WHERE s.id = open_turns.session_id
+                           AND (
+                               EXISTS (
+                                   SELECT 1 FROM purged_transcripts p
+                                   WHERE p.tool = s.tool AND p.native_id = s.native_id
+                               )
+                               OR EXISTS (
+                                   SELECT 1 FROM incognito_transcripts i
+                                   WHERE i.tool = s.tool AND i.native_id = s.native_id
+                               )
+                           )
                      )`,
                 )
                 .run();
