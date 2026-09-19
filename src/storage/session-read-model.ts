@@ -2,7 +2,7 @@
 // here so serving consumers share one shape instead of re-declaring row types.
 
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { SESSION_ELIGIBILITY_BATCH_SIZE } from '../config/constants.js';
+import { DURABLE_CAPTURE_FILTER_VERSION, SESSION_CAPSULE_METADATA_MAX_BYTES, SESSION_ELIGIBILITY_BATCH_SIZE } from '../config/constants.js';
 import { type SessionRowSurface, SUPPORTED_TOOLS, type ToolName } from '../types/index.js';
 
 export interface ServedSession {
@@ -47,6 +47,80 @@ export interface ProjectSessionAggregate {
     surface: SessionRowSurface | null;
     last_ingested_at: string;
     work_episodes: number;
+}
+
+const CAPSULE_TEXT_FIELDS = {
+    native_id: 's.native_id',
+    tool: 's.tool',
+    title: 's.title',
+    project_name: 'p.display_name',
+    project_key: "COALESCE(NULLIF(p.git_remote, ''), NULLIF(p.git_root_commit, ''), NULLIF(p.git_root, ''), p.path)",
+    started_at: 's.started_at',
+    last_activity: 'COALESCE(s.last_turn_at, s.last_ingested_at, s.started_at)',
+    surface: 's.surface',
+    git_branch: 's.git_branch',
+    first_prompt_search: 's.first_prompt_search',
+    trailing_files: 's.trailing_files',
+    summary: 'r.summary',
+    decisions: 'r.decisions',
+    pending_items: 'r.pending_items',
+    rollup_state: 'r.rollup_state',
+    computed_at: 'r.computed_at',
+    summarizer_status: 'r.summarizer_status',
+    durable_state: 'd.state',
+    open_turn_staged_at: 'ot.staged_at',
+    open_turn_failed_at: 'ot.failed_at',
+    open_turn_receipt_coverage: 'ot.receipt_coverage',
+} as const;
+
+export type SessionCapsuleMetadata = Record<keyof typeof CAPSULE_TEXT_FIELDS, string | null> & {
+    id: number;
+    project_id: number;
+    segment_index: number;
+    metadata_bytes: number;
+    turn_count: number;
+    watermark: number | null;
+    newer_turn_count: number;
+    durable_filter_version: number | null;
+    durable_uncovered: number;
+};
+
+// This projection deliberately never selects transcript paths, durable bodies or
+// standing instructions. Guard the sum of every variable field in SQL before
+// handing strings to JavaScript; a per-column bound multiplies with field count.
+const CAPSULE_TEXT_BYTES = Object.values(CAPSULE_TEXT_FIELDS)
+    .map((expression) => `COALESCE(length(CAST(${expression} AS BLOB)), 0)`)
+    .join(' + ');
+const CAPSULE_BOUNDED_FIELDS = Object.entries(CAPSULE_TEXT_FIELDS)
+    .map(
+        ([name, expression]) =>
+            `CASE WHEN (${CAPSULE_TEXT_BYTES}) <= ${SESSION_CAPSULE_METADATA_MAX_BYTES} THEN ${expression} END AS ${name}`,
+    )
+    .join(', ');
+
+export function readSessionCapsuleByNaturalKey(
+    db: Database.Database,
+    key: { tool: ToolName; nativeId: string; segmentIndex: number },
+): SessionCapsuleMetadata | undefined {
+    return db
+        .prepare(`SELECT s.id, s.project_id, s.segment_index,
+        (${CAPSULE_TEXT_BYTES}) AS metadata_bytes, ${CAPSULE_BOUNDED_FIELDS},
+        (SELECT COUNT(*) FROM memories m WHERE m.session_id = s.id) AS turn_count,
+        r.rolled_up_through_turn_index AS watermark,
+        (SELECT COUNT(*) FROM memories m WHERE m.session_id = s.id
+            AND m.turn_index > r.rolled_up_through_turn_index) AS newer_turn_count,
+        d.filter_version AS durable_filter_version,
+        EXISTS (SELECT 1 FROM memories m LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+            WHERE m.session_id = s.id AND (ft.memory_id IS NULL OR ft.filter_version <> ?)) AS durable_uncovered
+        FROM sessions s JOIN projects p ON p.id = s.project_id
+        LEFT JOIN session_rollups r ON r.session_id = s.id
+        LEFT JOIN durable_capture_status d ON d.session_id = s.id
+        LEFT JOIN open_turns ot ON ot.session_id = s.id AND ot.staged_at IS NOT NULL AND ot.validated_epoch = ot.validation_epoch
+        WHERE s.tool = ? AND s.native_id = ? AND s.segment_index = ?
+        AND ${SERVED_SESSION_KIND_ELIGIBILITY}
+        AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)
+        AND NOT EXISTS (SELECT 1 FROM incognito_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)`)
+        .get(DURABLE_CAPTURE_FILTER_VERSION, key.tool, key.nativeId, key.segmentIndex) as SessionCapsuleMetadata | undefined;
 }
 
 type RawServedSession = Omit<ServedSession, 'trailing_files'> & { trailing_files: string };

@@ -3,6 +3,8 @@ import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { afterEach, describe, expect, it } from 'vitest';
+import { SESSION_CAPSULE_MAX_CONTEXT_CHARS } from '../../src/config/constants.js';
+import { CAPSULE_OPENING_LABEL } from '../../src/serving/session-capsule.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { withTempDir } from '../helpers/tmp.js';
 
@@ -118,5 +120,11 @@ describe('elepha MCP stdio transport', () => {
         expect(text(response)).toContain('Fixed drift in the ES and DE locale files to match the English source.');
         expect(text(response)).toContain('/Users/test/demo-project/extension/src/storage/system-prompts/en.js');
         expect(claudeCodeModelVisibleText(response)).toContain('Check the locale files against English and fix any drift');
+
+        const capsule = await client.callTool({ name: 'get_session', arguments: { id: publicSessionId(), view: 'capsule' } });
+        expect(capsule).not.toHaveProperty('structuredContent');
+        expect(claudeCodeModelVisibleText(capsule)).toContain(CAPSULE_OPENING_LABEL);
+        expect(text(capsule)).not.toContain('Check the locale files against English and fix any drift');
+        expect(text(capsule).length).toBeLessThanOrEqual(SESSION_CAPSULE_MAX_CONTEXT_CHARS);
     });
 });

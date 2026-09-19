@@ -6,7 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { PACKAGE_VERSION } from '../config/constants.js';
-import { SERVER_INSTRUCTIONS } from '../serving/instructions.js';
+import { GUIDED_CONTINUITY_INSTRUCTIONS, SERVER_INSTRUCTIONS } from '../serving/instructions.js';
 import type { DatabaseEncryptionRuntime } from '../storage/database-encryption.js';
 import { defaultDbPath, openManagedDatabase } from '../storage/db.js';
 import { ElephaMcpService, type McpToolHandlers, mcpToolDefinitions } from './tools.js';
@@ -69,7 +69,10 @@ function schemaRefusal(readiness: SchemaReadiness): McpToolResult {
 }
 
 export function createMcpServer(service: McpToolHandlers): McpServer {
-    const server = new McpServer({ name: 'elepha', version: PACKAGE_VERSION }, { instructions: SERVER_INSTRUCTIONS });
+    const server = new McpServer(
+        { name: 'elepha', version: PACKAGE_VERSION },
+        { instructions: `${SERVER_INSTRUCTIONS} ${GUIDED_CONTINUITY_INSTRUCTIONS}` },
+    );
     registerTools(server, mcpToolDefinitions(service));
     return server;
 }
@@ -82,7 +85,10 @@ export function createMcpServerForDatabase(db: Database.Database): McpServer {
         return createMcpServer(new ElephaMcpService(db, mcpResponseShaper));
     }
 
-    const server = new McpServer({ name: 'elepha', version: PACKAGE_VERSION }, { instructions: SERVER_INSTRUCTIONS });
+    const server = new McpServer(
+        { name: 'elepha', version: PACKAGE_VERSION },
+        { instructions: `${SERVER_INSTRUCTIONS} ${GUIDED_CONTINUITY_INSTRUCTIONS}` },
+    );
     registerTools(
         server,
         mcpToolDefinitions({
