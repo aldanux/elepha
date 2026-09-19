@@ -253,6 +253,18 @@ export const SESSION_EVIDENCE_MAX_QUERY_CHARS = 4_000;
 export const SESSION_EVIDENCE_EXCERPT_CHARS = 800;
 // A directed first-interaction read stops once found, or at this byte ceiling.
 export const SESSION_EVIDENCE_SOURCE_MAX_BYTES = 4 * 1024 * 1024;
+// Capsules use stored metadata only. The row ceiling applies before hydration;
+// the smaller response ceiling includes provenance, framing and omission notices.
+export const SESSION_CAPSULE_METADATA_MAX_BYTES = 65_536;
+// Authorization must not bypass the capsule's pre-hydration bound through project metadata.
+export const PROJECT_AUTHORIZATION_ROW_MAX_BYTES = 65_536;
+export const SESSION_CAPSULE_MAX_CONTEXT_CHARS = 8_000;
+export const SESSION_CAPSULE_SUMMARY_CHARS = 2_000;
+export const SESSION_CAPSULE_DECISIONS_CHARS = 2_000;
+export const SESSION_CAPSULE_PENDING_CHARS = 2_000;
+export const SESSION_CAPSULE_FILES_CHARS = 1_000;
+export const SESSION_CAPSULE_MAX_DECISIONS = 3;
+export const SESSION_CAPSULE_MAX_FILES = 5;
 export const EMBEDDING_LOCAL_MAX_TOKENS = 512;
 export const EMBEDDING_CHUNK_CHARACTERS = 1000;
 export const EMBEDDING_API_TIMEOUT_MS = 30_000;

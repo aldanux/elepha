@@ -42,6 +42,7 @@ import {
     readProjectSessionAggregates,
     readProjectSessions,
     readSessionById,
+    readSessionCapsuleByNaturalKey,
     SERVED_SESSION_KIND_ELIGIBILITY,
     type ServedSession,
     safeStringArray,
@@ -540,6 +541,13 @@ export class SessionReader {
         return this.withReadGeneration(
             () => undefined,
             () => readSessionById(this.db, id),
+        );
+    }
+
+    capsuleByNaturalKey(key: Parameters<typeof readSessionCapsuleByNaturalKey>[1]) {
+        return this.withReadGeneration(
+            () => undefined,
+            () => readSessionCapsuleByNaturalKey(this.db, key),
         );
     }
 

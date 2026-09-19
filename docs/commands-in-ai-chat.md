@@ -44,6 +44,34 @@ not typed as an `elepha:` command. `elepha install` connects those MCP tools aut
 for detected Claude Code, Codex, and OpenCode installations. The `elepha:` commands on this
 page work in all three.
 
+## Guided continuity over MCP
+
+For a continuity request, clients first find candidates with `list_sessions` or
+`recall`, then inspect `get_session({ id, view: "capsule" })`. A capsule reads stored
+metadata only: historical summary, newest recorded decisions, historical pending
+items, recently recorded files, and coverage notices. It does not open transcripts
+or load the episode's conversation. It excludes standing instructions and fits
+within 8,000 characters, including framing and omission notices.
+
+The capsule reports when its rollup does not cover newer stored turns. Without a
+summary it may show the indexed opening document, which can already be truncated
+and does not establish an outcome. Durable coverage is metadata, not a guarantee
+that content can currently be read. Historical pending items are not a current agenda.
+
+After deciding what the current task needs, the client can request either:
+
+- `get_session({ id, query: "the decision to investigate" })`: selected evidence,
+  limited to 4,000 characters. Selection prefers stored rollup material, then the
+  indexed first interaction, then lexical excerpts; it is not arbitrary turn
+  targeting, and a miss is inconclusive.
+- `get_session({ id, last_n: 2 })`: a small newest-turn tail, bounded by the existing
+  80,000-character body limit, with older-turn omissions reported.
+
+Clients must not automatically retry with a whole episode when evidence is missing.
+`view: "capsule"` cannot be combined with `query` or `last_n`; that returns
+`invalid_selection`. Omitted `view` and `view: "content"` preserve existing retrieval.
+Explicit `elepha:resume:<n>` and all other in-chat commands are unchanged.
+
 ## Maintenance
 
 Full guide: [docs/maintenance.md](maintenance.md).

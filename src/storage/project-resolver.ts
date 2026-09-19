@@ -5,6 +5,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { PROJECT_AUTHORIZATION_ROW_MAX_BYTES } from '../config/constants.js';
 import { isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import { gitRevParseShowToplevel } from '../security/subprocess-allowlist.js';
 import type { ConsentStore } from './consent-store.js';
@@ -39,8 +40,17 @@ export interface ProjectResolverOptions {
 
 type ProjectConsent = Pick<ConsentStore, 'isConsented' | 'consentState'>;
 
+type ProjectGroupingRow = Pick<ProjectRow, 'id' | 'path' | 'git_root' | 'git_remote' | 'git_root_commit'> &
+    Partial<Pick<ProjectRow, 'display_name'>>;
+
+const AUTHORIZATION_FIELDS = ['path', 'git_root', 'git_remote', 'git_root_commit'] as const;
+const AUTHORIZATION_BYTES = AUTHORIZATION_FIELDS.map((field) => `COALESCE(length(CAST(${field} AS BLOB)), 0)`).join(' + ');
+const AUTHORIZATION_PROJECTION = AUTHORIZATION_FIELDS.map(
+    (field) => `CASE WHEN (${AUTHORIZATION_BYTES}) <= ${PROJECT_AUTHORIZATION_ROW_MAX_BYTES} THEN ${field} END AS ${field}`,
+).join(', ');
+
 interface ResolvedProjectRow {
-    row: ProjectRow;
+    row: ProjectGroupingRow;
     resolvedGitRoot: string | null;
 }
 
@@ -260,8 +270,26 @@ export class ProjectResolver {
         return this.listStored().filter((project) => this.isConsented(project, consent));
     }
 
+    // Fresh authorization only: no display fields, session material, Git probes,
+    // or cached consent. A hidden identity could normalize into the target group,
+    // so an oversized row makes membership indeterminate and must fail closed.
+    isStoredProjectConsented(projectId: number, consent: ProjectConsent): boolean {
+        const rows: ProjectGroupingRow[] = [];
+        for (const value of this.db.prepare(`SELECT id, ${AUTHORIZATION_PROJECTION} FROM projects ORDER BY id`).iterate()) {
+            const row = value as Omit<ProjectGroupingRow, 'path'> & { path: string | null };
+            if (row.path === null) {
+                return false;
+            }
+            rows.push({ ...row, path: row.path });
+        }
+        const storedRoots = new Map(rows.map((row) => [normalizeForCompare(row.path), row.git_root]));
+        const projects = this.buildProjectSets(rows, new Map(), (projectPath) => storedRoots.get(normalizeForCompare(projectPath)) ?? null);
+        const target = projects.find((project) => project.projectIds.includes(projectId));
+        return target !== undefined && this.isConsented(target, consent);
+    }
+
     private buildProjectSets(
-        rows: ProjectRow[],
+        rows: ProjectGroupingRow[],
         roots: Map<string, string | null>,
         resolveRoot: (projectPath: string) => string | null = (projectPath) => {
             const key = normalizeForCompare(projectPath);

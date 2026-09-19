@@ -12,7 +12,10 @@ import {
     ELEPHA_MCP_UNMATCHED_RESULT_IDS_MAX,
     SESSION_CHAR_BUDGET,
 } from '../../src/config/constants.js';
+import { ElephaMcpService } from '../../src/mcp/tools.js';
+import { publicSessionId } from '../../src/serving/session-id.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
 
 const cwd = '/Users/test/demo-project';
 
@@ -148,6 +151,27 @@ describe.each([
     ['Claude Code', () => new ClaudeCodeAdapter(), 'session.jsonl', claudeTurn],
     ['Codex', () => new CodexAdapter(), 'rollout-session.jsonl', codexTurn],
 ] as const)('canonical Elepha MCP self-ingestion in $0', (_name, adapter, fileName, lines) => {
+    it('excludes a real metadata capsule and its immediate synthesis while retaining the canonical receipt', async () => {
+        const f = createTestDb('capsule-rule4-');
+        const project = seedProject(f);
+        mkdirSync(project.path, { recursive: true });
+        seedConsentRoot(f, { path: project.path });
+        const session = seedSession(f, { project, title: 'Historical capsule title' });
+        const result = await new ElephaMcpService(f.db).getSession({ id: publicSessionId(session), view: 'capsule' });
+        const body = result.content[0].text;
+        expect(body).toContain('Historical capsule title');
+        const name = _name === 'Claude Code' ? 'mcp__elepha__get_session' : 'mcp__elepha';
+        const turns = await collect(adapter().parseTurns(fixture(fileName, lines(name, body)), undefined, { closeTrailingOnIdle: true }));
+        expect(turns).toHaveLength(1);
+        expect(turns[0]).toMatchObject({
+            droppedReason: 'elepha-mcp',
+            userMessage: '',
+            assistantText: '',
+            toolCalls: [],
+            elephaMcpResultReceipts: [{ callId: 'call-1', body }],
+        });
+    });
+
     it('drops the whole invoking turn, including immediate synthesis, and retains only verified receipt evidence', async () => {
         const turns = await collect(adapter().parseTurns(fixture(fileName, lines()), undefined, { closeTrailingOnIdle: true }));
 
