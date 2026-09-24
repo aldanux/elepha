@@ -266,6 +266,10 @@ export async function runUserPromptSubmit(
         return { reason: 'invalid_payload' };
     }
     const command = parseUserPromptCommand(payload.prompt);
+    // A pasted multiline command result is conversation data, not an invalid command.
+    if (!command && payload.prompt.trim().startsWith('elepha:') && /[\r\n]/.test(payload.prompt.trim())) {
+        return { reason: 'not_command' };
+    }
     const automatic = !command && !payload.prompt.trim().startsWith('elepha:');
     if (automatic) {
         // Off means no database open, provider construction, or vector scan.

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -9,6 +9,7 @@ import {
     STANDING_RULES_MAX_TOTAL_CHARS,
 } from '../../src/config/constants.js';
 import { getSetting } from '../../src/config/settings.js';
+import { runSessionStart } from '../../src/hooks/session-start.js';
 import { parseUserPromptCommand, runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
 import * as subprocess from '../../src/security/subprocess-allowlist.js';
@@ -21,6 +22,7 @@ import {
     type StandingRulesCommand,
     standingRulesCommandBody,
 } from '../../src/serving/standing-rules.js';
+import { ConsentStore } from '../../src/storage/consent-store.js';
 import { type openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import {
@@ -149,6 +151,87 @@ describe('elepha:rules in-chat grammar', () => {
 });
 
 describe('elepha:rules management', () => {
+    it('lists and adds rules when an approved same-identity worktree no longer exists', async () => {
+        const f = createTestDb('elepha-rules-retired-worktree-');
+        const projectPath = path.join(f.directory, 'live-worktree');
+        const retiredPath = path.join(f.directory, 'retired-worktree');
+        mkdirSync(projectPath);
+        const live = seedProject(f, { path: projectPath });
+        const retired = seedProject(f, { path: retiredPath });
+        f.db.prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?)').run('https://example.test/shared', live.id, retired.id);
+        seedConsentRoot(f, { path: f.directory });
+        expect(existsSync(retiredPath)).toBe(false);
+        f.close();
+
+        const scope = { dbPath: f.dbPath, projectPath };
+        expect(await submit(scope, 'elepha:rules')).toContain(STANDING_RULES_EMPTY);
+        expect(await submit(scope, 'elepha:rules:add Preserve the live checkout rule.')).toContain('Preserve the live checkout rule.');
+        expect(await submit(scope, 'elepha:rules')).toContain('Preserve the live checkout rule.');
+        expect(storedRules(scope).map((rule) => rule.text)).toEqual(['Preserve the live checkout rule.']);
+
+        const db = openUnmanagedDb(f.dbPath);
+        new ConsentStore(db).revoke(retiredPath);
+        db.close();
+        expect(await submit(scope, 'elepha:rules')).toContain(STANDING_RULES_UNCONSENTED);
+        expect(await submit(scope, 'elepha:rules:add Must not cross denial.')).toContain(STANDING_RULES_UNCONSENTED);
+        expect(storedRules(scope).map((rule) => rule.text)).toEqual(['Preserve the live checkout rule.']);
+    });
+
+    it.each(['retired-worktree', '../retired-worktree'])(
+        'refuses a missing same-identity member beneath a symlink into a denied root: %s',
+        async (suffix) => {
+            const f = createTestDb('elepha-rules-denied-symlink-parent-');
+            const projectPath = path.join(f.directory, 'live-worktree');
+            const deniedRoot = path.join(f.directory, 'denied-root');
+            const alias = path.join(f.directory, 'alias');
+            const retiredPath = `${alias}/${suffix}`;
+            mkdirSync(projectPath);
+            const symlinkTarget = path.join(deniedRoot, 'subdir');
+            mkdirSync(symlinkTarget, { recursive: true });
+            symlinkSync(symlinkTarget, alias);
+            const live = seedProject(f, { path: projectPath });
+            const retired = seedProject(f, { path: retiredPath });
+            f.db.prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?)').run('https://example.test/shared', live.id, retired.id);
+            seedConsentRoot(f, { path: f.directory });
+            seedConsentRoot(f, { path: deniedRoot, state: 'denied' });
+            expect(
+                f.store.standingRules.add(
+                    { projectIds: [live.id, retired.id], ownerProjectId: live.id, stillConsented: () => true },
+                    'Private live rule.',
+                    ISO,
+                ).status,
+            ).toBe('added');
+            expect(existsSync(retiredPath)).toBe(false);
+            f.close();
+
+            const scope = { dbPath: f.dbPath, projectPath };
+            const listed = await submit(scope, 'elepha:rules');
+            expect(listed).toContain(STANDING_RULES_UNCONSENTED);
+            expect(listed).not.toContain('Private live rule.');
+            expect(await submit(scope, 'elepha:rules:add Must not cross denial.')).toContain(STANDING_RULES_UNCONSENTED);
+            expect(storedRules(scope).map((rule) => rule.text)).toEqual(['Private live rule.']);
+
+            const delivery = await runSessionStart(
+                JSON.stringify({
+                    session_id: 'rules-chat',
+                    cwd: projectPath,
+                    hook_event_name: 'SessionStart',
+                    source: 'startup',
+                    model: 'test',
+                    permission_mode: 'default',
+                }),
+                'codex',
+                {
+                    dbPath: f.dbPath,
+                    now: () => NOW,
+                    daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
+                    readUpdateAvailable: () => undefined,
+                },
+            );
+            expect(delivery).toEqual({ reason: 'no_notice' });
+        },
+    );
+
     it('adds the first rule in a granted directory before any session creates a project row', async () => {
         const fixture = createTestDb('elepha-rules-first-use-db-');
         const projectPath = withGrantableTestDir('elepha-rules-first-use-project-');
