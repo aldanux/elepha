@@ -1,5 +1,16 @@
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import {
+    copyFileSync,
+    existsSync,
+    mkdirSync,
+    mkdtempSync,
+    readdirSync,
+    readFileSync,
+    realpathSync,
+    rmSync,
+    symlinkSync,
+    writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -10,14 +21,23 @@ import {
     reportImportError,
     runImportOperation,
 } from '../../src/cli/commands/import.js';
+import * as paths from '../../src/config/paths.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
-import { detectShellSyntax, stripShellSyntax } from '../../src/security/sanitize.js';
+import { detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../../src/security/sanitize.js';
+import * as subprocessAllowlist from '../../src/security/subprocess-allowlist.js';
 import { writeBackup } from '../../src/storage/backup.js';
 import { rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import type { ProjectRow } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { readProjectSessions } from '../../src/storage/session-read-model.js';
+import {
+    applyStandingRuleImport,
+    assertStandingRuleImportAuthorized,
+    planStandingRuleImport,
+} from '../../src/storage/standing-rules-import.js';
+import { StandingRulesStore } from '../../src/storage/standing-rules-store.js';
+import { newUlid } from '../../src/storage/ulid.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession, type TestDatabase } from '../helpers/db.js';
 import { testScratchRoot } from '../helpers/tmp.js';
 
@@ -76,6 +96,473 @@ function runTtyImportCli(dbPath: string, input: string, ...args: string[]) {
 function notRunning() {
     return { state: 'NOT RUNNING', healthy: false };
 }
+
+function seedStandingRule(fixture: TestDatabase, project: ProjectRow, text: string, ulid = newUlid()): string {
+    fixture.db
+        .prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)')
+        .run(ulid, project.id, text, '2026-09-20T00:00:00.000Z');
+    return ulid;
+}
+
+describe('standing rule project import', () => {
+    it.each(['pending-peer', 'missing-peer', 'denied-peer', 'revoked-after-preview', 'revoked-after-write'] as const)(
+        'binds every rootless symlink member canonically: %s',
+        async (scenario) => {
+            const source = createTestDb('elepha-import-rules-symlink-');
+            const active = createTestDb('elepha-import-rules-active-');
+            const physical = canonicalDirectory(path.join(source.directory, 'checkout'));
+            const peerPhysical = canonicalDirectory(path.join(active.directory, 'peer-target'));
+            if (scenario !== 'missing-peer') symlinkSync(peerPhysical, path.join(physical, 'peer'));
+            const alias = path.join(active.directory, 'alias');
+            symlinkSync(physical, alias);
+            const local = seedProject(active, { path: alias });
+            const peer = seedProject(active, { path: path.join(alias, 'peer') });
+            expect(local.path).toBe(alias);
+            expect(local.git_root).toBeNull();
+            const project = seedProject(source, { path: physical });
+            const ulid = seedStandingRule(source, project, 'Keep the physical project authority.');
+            const candidate = fullBackup(source, active);
+            if (scenario === 'denied-peer') active.store.consent.revoke(peerPhysical);
+            let verifiedBinding = false;
+            const operation = runImportOperation(candidate, false, {
+                dbPath: active.dbPath,
+                daemonHealth: notRunning,
+                confirm: async (plan) => {
+                    if (scenario !== 'denied-peer' && scenario !== 'missing-peer') {
+                        expect(plan.rules.targets[0]?.memberPaths).toEqual(
+                            expect.arrayContaining([
+                                { original: alias, canonical: physical },
+                                { original: peer.path, canonical: peerPhysical },
+                            ]),
+                        );
+                        verifiedBinding = true;
+                    }
+                    if (scenario === 'revoked-after-preview') active.store.consent.revoke(peerPhysical);
+                    return true;
+                },
+                beforeVerify: (db) => {
+                    if (scenario === 'revoked-after-write') {
+                        expect(db.prepare('SELECT ulid FROM standing_rules').all()).toEqual([{ ulid }]);
+                        db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)').run(
+                            newUlid(),
+                            peerPhysical,
+                            'denied',
+                            '2026-09-20T00:00:00.000Z',
+                            'cli',
+                        );
+                    }
+                },
+            });
+            if (scenario.startsWith('revoked')) {
+                await expect(operation).rejects.toThrow(/changed (after preview|during session import)/);
+                expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+            } else {
+                const result = await operation;
+                expect(result.rules).toEqual({
+                    added: scenario === 'pending-peer' ? 1 : 0,
+                    unchanged: 0,
+                    unmapped: scenario === 'missing-peer' ? 1 : 0,
+                    unconsented: scenario === 'denied-peer' ? 1 : 0,
+                });
+                if (scenario === 'pending-peer')
+                    expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [ulid])).toMatchObject({ project_id: local.id });
+            }
+            if (scenario !== 'denied-peer' && scenario !== 'missing-peer') expect(verifiedBinding).toBe(true);
+            expect(tableCount(active.dbPath, 'projects')).toBe(2);
+        },
+    );
+
+    it('authorizes and applies a canonical rule target without filesystem resolution inside the transaction', () => {
+        const source = createTestDb('elepha-import-rules-no-fs-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'checkout')) });
+        seedStandingRule(source, project, 'Avoid filesystem probes under the writer lock.');
+        active.store.consent.grant(source.directory);
+        const plan = planStandingRuleImport(active.db, source.db);
+        assertStandingRuleImportAuthorized(active.db, plan, true);
+        const resolvePath = vi.spyOn(paths, 'canonicalizeExisting').mockImplementation(() => {
+            throw new Error('Unexpected filesystem resolution');
+        });
+        try {
+            active.db
+                .transaction(() => {
+                    assertStandingRuleImportAuthorized(active.db, plan, false);
+                    const verify = applyStandingRuleImport(active.db, plan);
+                    verify();
+                })
+                .immediate();
+            expect(resolvePath).not.toHaveBeenCalled();
+            expect(active.db.prepare('SELECT * FROM standing_rules').all()).toHaveLength(1);
+        } finally {
+            resolvePath.mockRestore();
+        }
+    });
+
+    it('creates a consented rule-only target, preserves authority and is an exact repeated-import no-op', async () => {
+        const source = createTestDb('elepha-import-rules-source-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'checkout')) });
+        const raw = 'Never execute $(download) or `untrusted`.';
+        const ulid = seedStandingRule(source, project, raw);
+        const candidate = fullBackup(source, active);
+        const runtime = { dbPath: active.dbPath, daemonHealth: notRunning };
+        const first = await runImportOperation(candidate, false, runtime);
+        expect(first.rules).toEqual({ added: 1, unchanged: 0, unmapped: 0, unconsented: 0 });
+        expect(first.added).toBe(0);
+        const stored = row(active.dbPath, 'standing_rules', 'ulid = ?', [ulid]);
+        expect(stored).toMatchObject({ text: escapeShellSyntax(raw), created_at: '2026-09-20T00:00:00.000Z' });
+        const second = await runImportOperation(candidate, true, runtime);
+        expect(second.rules).toEqual({ added: 0, unchanged: 1, unmapped: 0, unconsented: 0 });
+        expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [ulid])).toEqual(stored);
+        expect(tableCount(active.dbPath, 'projects')).toBe(1);
+    });
+
+    it('imports a standing rule and session into a new real Git checkout', async () => {
+        const source = createTestDb('elepha-import-rules-git-source-');
+        const active = createTestDb('elepha-import-rules-git-active-');
+        const checkout = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const initialized = spawnSync('git', ['init', '--quiet', checkout], { encoding: 'utf8' });
+        expect(initialized.status, initialized.stderr).toBe(0);
+        const project = seedProject(source, { path: checkout });
+        const ruleId = seedStandingRule(source, project, 'Keep this instruction across machines.');
+        addSession(source, project, 'standing-rule-git-session', 'backup');
+
+        const result = await runImportOperation(fullBackup(source, active), false, {
+            dbPath: active.dbPath,
+            daemonHealth: notRunning,
+        });
+
+        expect(result.rules.added).toBe(1);
+        expect(result.added).toBe(1);
+        const importedRule = row(active.dbPath, 'standing_rules', 'ulid = ?', [ruleId]);
+        const importedSession = row(active.dbPath, 'sessions', 'native_id = ?', ['standing-rule-git-session']);
+        expect(importedRule).toBeDefined();
+        expect(importedSession).toBeDefined();
+        expect(importedRule?.project_id).toBe(importedSession?.project_id);
+        expect(tableCount(active.dbPath, 'sessions')).toBe(1);
+        const imported = row(active.dbPath, 'projects', 'path = ?', [checkout]);
+        expect(imported?.git_root).toBe(checkout);
+    });
+
+    it('imports a rule and session into a real Git checkout with an existing rootless owner', async () => {
+        const source = createTestDb('elepha-import-rules-git-existing-source-');
+        const active = createTestDb('elepha-import-rules-git-existing-active-');
+        const checkout = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const initialized = spawnSync('git', ['init', '--quiet', checkout], { encoding: 'utf8' });
+        expect(initialized.status, initialized.stderr).toBe(0);
+        const local = seedProject(active, { path: checkout });
+        expect(local.git_root).toBeNull();
+        const exported = seedProject(source, { path: checkout });
+        const ruleId = seedStandingRule(source, exported, 'Keep the existing local owner.');
+        addSession(source, exported, 'standing-rule-git-existing-session', 'backup');
+
+        const result = await runImportOperation(fullBackup(source, active), false, {
+            dbPath: active.dbPath,
+            daemonHealth: notRunning,
+        });
+
+        expect(result.rules.added).toBe(1);
+        expect(result.added).toBe(1);
+        expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [ruleId])?.project_id).toBe(local.id);
+        expect(row(active.dbPath, 'sessions', 'native_id = ?', ['standing-rule-git-existing-session'])?.project_id).toBe(local.id);
+        expect(tableCount(active.dbPath, 'projects')).toBe(1);
+    });
+
+    it('keeps a new rule target inside an approved Git subdirectory', async () => {
+        const source = createTestDb('elepha-import-rules-git-child-');
+        const active = createTestDb('elepha-import-rules-git-active-');
+        const checkout = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const initialized = spawnSync('git', ['init', '--quiet', checkout], { encoding: 'utf8' });
+        expect(initialized.status, initialized.stderr).toBe(0);
+        const child = canonicalDirectory(path.join(checkout, 'child'));
+        const project = seedProject(source, { path: child });
+        const ruleId = seedStandingRule(source, project, 'Keep this instruction in the approved child.');
+        addSession(source, project, 'standing-rule-git-child-session', 'backup');
+        const candidate = path.join(source.directory, 'backup.db');
+        plaintextExport(source.db, candidate);
+        active.store.consent.grant(child);
+
+        const remoteProbe = vi.spyOn(subprocessAllowlist, 'gitRemoteGetUrlOrigin').mockReturnValue(null);
+        const commitProbe = vi.spyOn(subprocessAllowlist, 'gitRootCommit').mockReturnValue(null);
+        let result: Awaited<ReturnType<typeof runImportOperation>>;
+        try {
+            result = await runImportOperation(candidate, false, { dbPath: active.dbPath, daemonHealth: notRunning });
+            expect(remoteProbe).not.toHaveBeenCalledWith(checkout);
+            expect(commitProbe).not.toHaveBeenCalledWith(checkout);
+        } finally {
+            remoteProbe.mockRestore();
+            commitProbe.mockRestore();
+        }
+
+        expect(result.rules.added).toBe(1);
+        expect(result.added).toBe(1);
+        const owner = row(active.dbPath, 'projects', 'path = ?', [child]);
+        expect(owner?.git_root).toBeNull();
+        expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [ruleId])?.project_id).toBe(owner?.id);
+        expect(row(active.dbPath, 'sessions', 'native_id = ?', ['standing-rule-git-child-session'])?.project_id).toBe(owner?.id);
+        expect(tableCount(active.dbPath, 'projects')).toBe(1);
+    });
+
+    it('does not use a transcript cwd as a Git probe when its backup project path is not consented', async () => {
+        const source = createTestDb('elepha-import-git-provenance-source-');
+        const active = createTestDb('elepha-import-git-provenance-active-');
+        const checkout = canonicalDirectory(path.join(active.directory, 'approved-checkout'));
+        const initialized = spawnSync('git', ['init', '--quiet', checkout], { encoding: 'utf8' });
+        expect(initialized.status, initialized.stderr).toBe(0);
+        const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'unapproved-project')) });
+        addSession(source, project, 'git-provenance-session', 'backup', checkout);
+        const candidate = path.join(source.directory, 'backup.db');
+        plaintextExport(source.db, candidate);
+        active.store.consent.grant(checkout);
+
+        const rootProbe = vi.spyOn(subprocessAllowlist, 'gitRevParseShowToplevel').mockReturnValue(checkout);
+        try {
+            const result = await runImportOperation(candidate, false, { dbPath: active.dbPath, daemonHealth: notRunning });
+            expect(result.added).toBe(1);
+            expect(rootProbe).not.toHaveBeenCalledWith(checkout);
+        } finally {
+            rootProbe.mockRestore();
+        }
+        expect(row(active.dbPath, 'projects', 'path = ?', [checkout])?.git_root).toBeNull();
+    });
+
+    it('refuses an existing session owner whose stored Git root lacks consent', async () => {
+        const source = createTestDb('elepha-import-git-owner-source-');
+        const active = createTestDb('elepha-import-git-owner-active-');
+        const checkout = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const child = canonicalDirectory(path.join(checkout, 'child'));
+        const project = seedProject(source, { path: child });
+        addSession(source, project, 'unconsented-parent-owner-session', 'backup');
+        const local = seedProject(active, { path: child });
+        active.db.prepare('UPDATE projects SET git_root = ? WHERE id = ?').run(checkout, local.id);
+        active.store.consent.grant(child);
+        const candidate = path.join(source.directory, 'backup.db');
+        plaintextExport(source.db, candidate);
+
+        await expect(runImportOperation(candidate, false, { dbPath: active.dbPath, daemonHealth: notRunning })).rejects.toThrow(
+            /Git root authorization/,
+        );
+        expect(row(active.dbPath, 'sessions', 'native_id = ?', ['unconsented-parent-owner-session'])).toBeUndefined();
+    });
+
+    it('accepts a real legacy portable candidate without standing_rules', async () => {
+        const source = createTestDb('elepha-import-rules-legacy-');
+        const active = createTestDb('elepha-import-rules-active-');
+        source.db.exec('DROP TABLE standing_rules');
+        const result = await runImportOperation(fullBackup(source, active), false, { dbPath: active.dbPath, daemonHealth: notRunning });
+        expect(result.rules).toEqual({ added: 0, unchanged: 0, unmapped: 0, unconsented: 0 });
+    });
+
+    it('merges fragmented local membership and ignores forged exported Git authority', async () => {
+        const source = createTestDb('elepha-import-rules-fragments-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const root = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const nested = canonicalDirectory(path.join(root, 'nested'));
+        const local = setProjectIdentity(active, seedProject(active, { path: root }), 'local-remote', 'local-commit');
+        const member = addFragment(active, local, nested);
+        const other = setProjectIdentity(
+            active,
+            seedProject(active, { path: canonicalDirectory(path.join(active.directory, 'unrelated')) }),
+            'forged-remote',
+            'forged-commit',
+        );
+        const exported = setProjectIdentity(source, seedProject(source, { path: root }), 'forged-remote', 'forged-commit');
+        const fragment = addFragment(source, exported, nested);
+        seedStandingRule(active, member, 'Existing local rule.');
+        seedStandingRule(source, exported, 'Incoming root rule.');
+        seedStandingRule(source, fragment, 'Incoming fragment rule.');
+        const result = await runImportOperation(fullBackup(source, active), false, { dbPath: active.dbPath, daemonHealth: notRunning });
+        expect(result.rules.added).toBe(2);
+        expect(active.store.standingRules.list([local.id, member.id])).toHaveLength(3);
+        expect(active.store.standingRules.list([other.id])).toEqual([]);
+    });
+
+    it.each(['missing', 'unconsented', 'ambiguous'] as const)(
+        'reports an explicit %s rule target without creating projects',
+        async (kind) => {
+            const source = createTestDb('elepha-import-rules-skipped-');
+            const active = createTestDb('elepha-import-rules-active-');
+            const root = path.join(source.directory, 'checkout');
+            const sourcePath = kind === 'missing' ? root : canonicalDirectory(root);
+            const project = setProjectIdentity(source, seedProject(source, { path: sourcePath }), 'exported-remote', 'exported-commit');
+            seedStandingRule(source, project, 'Retain this rule.');
+            if (kind === 'ambiguous') {
+                const secondPath = canonicalDirectory(path.join(source.directory, 'other'));
+                addFragment(source, project, secondPath);
+                setProjectIdentity(active, seedProject(active, { path: sourcePath }), 'local-one', 'commit-one');
+                setProjectIdentity(active, seedProject(active, { path: secondPath }), 'local-two', 'commit-two');
+            }
+            const candidate = fullBackup(source, active);
+            if (kind === 'unconsented') active.store.consent.revoke(source.directory);
+            const before = tableCount(active.dbPath, 'projects');
+            const result = await runImportOperation(candidate, false, { dbPath: active.dbPath, daemonHealth: notRunning });
+            expect(result.rules).toEqual({
+                added: 0,
+                unchanged: 0,
+                unmapped: kind === 'unconsented' ? 0 : 1,
+                unconsented: kind === 'unconsented' ? 1 : 0,
+            });
+            expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+            expect(tableCount(active.dbPath, 'projects')).toBe(before);
+        },
+    );
+
+    it.each(['consent', 'membership', 'capacity'] as const)('refuses fresh %s changes after preview', async (change) => {
+        const source = createTestDb('elepha-import-rules-stale-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const root = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const project = seedProject(source, { path: root });
+        const local = seedProject(active, { path: root });
+        const incoming = seedStandingRule(source, project, 'Incoming rule.');
+        const candidate = fullBackup(source, active);
+        await expect(
+            runImportOperation(candidate, false, {
+                dbPath: active.dbPath,
+                daemonHealth: notRunning,
+                confirm: async () => {
+                    if (change === 'consent') active.store.consent.revoke(source.directory);
+                    if (change === 'membership') addFragment(active, local, canonicalDirectory(path.join(root, 'nested')));
+                    if (change === 'capacity') seedStandingRule(active, local, 'A new local rule after preview.');
+                    return true;
+                },
+            }),
+        ).rejects.toThrow('changed after preview');
+        expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [incoming])).toBeUndefined();
+    });
+
+    it.each(['ulid-text', 'ulid-target', 'duplicate-text'] as const)('aborts %s collisions even with overwrite', async (kind) => {
+        const source = createTestDb('elepha-import-rules-collision-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const root = canonicalDirectory(path.join(source.directory, 'checkout'));
+        const project = seedProject(source, { path: root });
+        const local = seedProject(active, { path: root });
+        const owner =
+            kind === 'ulid-target' ? seedProject(active, { path: canonicalDirectory(path.join(active.directory, 'other')) }) : local;
+        const existing = seedStandingRule(active, owner, 'Existing rule.');
+        const incoming = seedStandingRule(
+            source,
+            project,
+            kind === 'ulid-text' ? 'Conflicting rule.' : 'Existing rule.',
+            kind === 'duplicate-text' ? newUlid() : existing,
+        );
+        await expect(
+            runImportOperation(fullBackup(source, active), true, { dbPath: active.dbPath, daemonHealth: notRunning }),
+        ).rejects.toThrow(kind === 'duplicate-text' ? 'duplicate text' : 'ULID collision');
+        expect(tableCount(active.dbPath, 'standing_rules')).toBe(1);
+        if (kind === 'duplicate-text') expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [incoming])).toBeUndefined();
+    });
+
+    it.each(['astral', 'escaped', 'aggregate', 'duplicate', 'oversized', 'count'] as const)(
+        'rejects invalid candidate %s rules before confirmation',
+        async (kind) => {
+            const source = createTestDb('elepha-import-rules-invalid-');
+            const active = createTestDb('elepha-import-rules-active-');
+            const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'checkout')) });
+            const texts =
+                kind === 'astral'
+                    ? ['😀'.repeat(151)]
+                    : kind === 'escaped'
+                      ? ['`'.repeat(151)]
+                      : kind === 'aggregate'
+                        ? Array.from({ length: 5 }, (_, i) => `${i}${'😀'.repeat(120)}`)
+                        : kind === 'duplicate'
+                          ? ['same', 'same']
+                          : kind === 'count'
+                            ? Array.from({ length: 9 }, (_, i) => `rule ${i}`)
+                            : ['x'.repeat(100_000)];
+            for (const text of texts) seedStandingRule(source, project, text);
+            const confirm = vi.fn(async () => true);
+            await expect(
+                runImportOperation(fullBackup(source, active), false, { dbPath: active.dbPath, daemonHealth: notRunning, confirm }),
+            ).rejects.toThrow(/standing rule/i);
+            expect(confirm).not.toHaveBeenCalled();
+            expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+        },
+    );
+
+    it('rolls back rule and session writes on a rule failure, and cancellation writes neither', async () => {
+        const source = createTestDb('elepha-import-rules-atomic-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'checkout')) });
+        seedStandingRule(source, project, 'Keep the rule atomic.');
+        addSession(source, project, 'standing-rule-atomic-session', 'backup');
+        const candidate = fullBackup(source, active);
+        const runtime = { dbPath: active.dbPath, daemonHealth: notRunning };
+        await expect(
+            runImportOperation(candidate, false, {
+                ...runtime,
+                beforeVerify: (db) => {
+                    expect(db.prepare('SELECT * FROM standing_rules').all()).toHaveLength(1);
+                    expect(db.prepare('SELECT * FROM sessions').all()).toHaveLength(1);
+                    const local = db.prepare('SELECT id FROM projects').get() as { id: number };
+                    const store = new StandingRulesStore(db);
+                    const saved = store.list([local.id])[0];
+                    if (saved === undefined) throw new Error('Missing imported rule.');
+                    store.importRules({ projectIds: [local.id], ownerProjectId: local.id, stillConsented: () => true }, [
+                        { ...saved, text: 'Conflicting rule authority.' },
+                    ]);
+                },
+            }),
+        ).rejects.toThrow('ULID collision');
+        expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+        expect(tableCount(active.dbPath, 'sessions')).toBe(0);
+        const cancelled = await runImportOperation(candidate, false, { ...runtime, confirm: async () => false });
+        expect(cancelled.cancelled).toBe(true);
+        expect(cancelled.rules.added).toBe(0);
+        expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+        expect(tableCount(active.dbPath, 'sessions')).toBe(0);
+        const successful = await runImportOperation(candidate, false, runtime);
+        expect(successful.added).toBe(1);
+        expect(successful.rules.added).toBe(1);
+        expect(tableCount(active.dbPath, 'sessions')).toBe(1);
+        expect(tableCount(active.dbPath, 'standing_rules')).toBe(1);
+    });
+
+    it('rechecks rule consent inside the transaction after the snapshot boundary', async () => {
+        const source = createTestDb('elepha-import-rules-consent-race-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'checkout')) });
+        seedStandingRule(source, project, 'Approved at preview only.');
+        const candidate = fullBackup(source, active);
+        await expect(
+            runImportOperation(candidate, false, {
+                dbPath: active.dbPath,
+                daemonHealth: notRunning,
+                writeBackup: (db, dbPath) => {
+                    const snapshot = writeBackup(db, dbPath);
+                    active.store.consent.revoke(source.directory);
+                    return snapshot;
+                },
+            }),
+        ).rejects.toThrow('changed after preview');
+        expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+        expect(tableCount(active.dbPath, 'projects')).toBe(0);
+    });
+
+    it('rolls back imported rules and sessions when consent changes inside beforeVerify', async () => {
+        const source = createTestDb('elepha-import-rules-consent-verify-');
+        const active = createTestDb('elepha-import-rules-active-');
+        const project = seedProject(source, { path: canonicalDirectory(path.join(source.directory, 'checkout')) });
+        seedStandingRule(source, project, 'Authority requires fresh consent.');
+        addSession(source, project, 'standing-rule-consent-verify-session', 'backup');
+        const candidate = fullBackup(source, active);
+        await expect(
+            runImportOperation(candidate, false, {
+                dbPath: active.dbPath,
+                daemonHealth: notRunning,
+                beforeVerify: (db) => {
+                    expect(db.prepare('SELECT * FROM standing_rules').all()).toHaveLength(1);
+                    expect(db.prepare('SELECT * FROM sessions').all()).toHaveLength(1);
+                    expect(db.prepare("UPDATE consent_roots SET state = 'denied' WHERE path = ?").run(source.directory).changes).toBe(1);
+                },
+            }),
+        ).rejects.toThrow('consent changed during session import');
+        expect(tableCount(active.dbPath, 'standing_rules')).toBe(0);
+        expect(tableCount(active.dbPath, 'sessions')).toBe(0);
+        expect(tableCount(active.dbPath, 'projects')).toBe(0);
+        expect(active.store.consent.consentState(source.directory)).toBe('approved');
+    });
+});
 
 function canonicalDirectory(directory: string): string {
     mkdirSync(directory, { recursive: true });

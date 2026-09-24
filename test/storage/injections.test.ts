@@ -7,11 +7,33 @@ import {
     INJECTION_QUOTE_BACK_TURN_MAX_BYTES,
 } from '../../src/config/constants.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import { InjectionStore } from '../../src/storage/injection-store.js';
+import { InjectionStore, injectionBodyHash } from '../../src/storage/injection-store.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 
 describe('Rule 4 injections storage', () => {
+    it('attributes exact rule revisions independently while preserving legacy normalized identity and replay', () => {
+        const db = openUnmanagedDb(':memory:');
+        const store = new MemoryStore(db);
+        const input = {
+            tool: 'codex' as const,
+            nativeSessionId: 'rules',
+            injectedAt: '2026-09-20T00:00:00.000Z',
+            injectionId: 'legacy',
+            body: 'Use Foo.',
+        };
+        expect(store.recordInjection(input)).toBe(true);
+        for (const body of ['Use Foo.', 'Use foo.', 'Use foo!']) {
+            expect(store.recordInjection({ ...input, body, injectionId: body, attribution: 'exact' })).toBe(true);
+            expect(store.recordInjection({ ...input, body, injectionId: 'replay', attribution: 'exact' })).toBe(true);
+        }
+        expect(store.injectionsForSession('codex', 'rules', input.injectedAt).map(({ body, body_hash }) => ({ body, body_hash }))).toEqual([
+            { body: input.body, body_hash: injectionBodyHash(input.body) },
+            ...['Use Foo.', 'Use foo.', 'Use foo!'].map((body) => ({ body, body_hash: injectionBodyHash(body, 'exact') })),
+        ]);
+        expect(store.recordInjection({ ...input, body: 'use foo!' })).toBe(false);
+        db.close();
+    });
     it('creates hook injections and MCP receipts with their lookup indexes in a fresh schema', () => {
         const db = openUnmanagedDb(':memory:');
 

@@ -1,5 +1,6 @@
 // Security Rule 2: only fixed git, service-manager, Elepha npm calls, and
-// bounded read-only macOS process inspection for legacy MCP retirement are
+// bounded read-only macOS process inspection for legacy MCP retirement, and
+// fixed OpenCode command/rules clients with JSON-only stdin are
 // permitted. This test is the allowlist half of "both required" - the
 // Biome GritQL plugin (.biome-plugins/no-raw-subprocess.grit) is the other
 // half, structurally banning child_process calls anywhere else in src/. This
@@ -9,6 +10,12 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import {
+    OPENCODE_HOOK_ARGS,
+    OPENCODE_RULES_HOOK_ARGS,
+    renderOpencodeHookClient,
+    renderOpencodeRulesClient,
+} from '../../src/security/subprocess-allowlist.js';
 
 const SRC_ROOT = path.resolve(__dirname, '../../src');
 const ALLOWLIST_MODULE = path.resolve(SRC_ROOT, 'security/subprocess-allowlist.ts');
@@ -27,6 +34,18 @@ function listTsFiles(dir: string): string[] {
 }
 
 describe('subprocess allowlist', () => {
+    it('renders only the two fixed OpenCode hook commands with bounded shell-free stdin clients', () => {
+        expect(OPENCODE_HOOK_ARGS).toEqual(['hook', 'user-prompt-submit', '--tool', 'opencode']);
+        expect(OPENCODE_RULES_HOOK_ARGS).toEqual(['hook', 'standing-rules', '--tool', 'opencode']);
+        for (const source of [renderOpencodeHookClient('/installed/elepha'), renderOpencodeRulesClient('/installed/elepha')]) {
+            expect(source).toContain('shell: false');
+            expect(source).toContain('JSON.stringify(payload)');
+            expect(source).toContain('timeout:');
+            expect(source).toContain('maxBuffer:');
+            expect(source).not.toMatch(/cwd\s*:/);
+        }
+        expect(() => renderOpencodeRulesClient('relative')).toThrow('absolute path');
+    });
     it('is the only file under src/ that imports node:child_process', () => {
         const offenders = listTsFiles(SRC_ROOT)
             .filter((f) => f !== ALLOWLIST_MODULE)

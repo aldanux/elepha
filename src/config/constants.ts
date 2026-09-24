@@ -72,6 +72,16 @@ export const RECENT_SESSION_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 export const MCP_LIST_SESSIONS_DEFAULT_LIMIT = 20;
 export const ELEPHA_LIST_DEFAULT_LIMIT = 5;
 export const ELEPHA_LIST_MAX_LIMIT = 100;
+// Standing rules are a hard write-time contract, not a ranked budget. A rule
+// set that fits in one screen and one small prompt block is the whole product
+// promise, so exceeding either bound fails the write instead of evicting,
+// truncating, or ranking anything the user explicitly entered.
+export const STANDING_RULES_MAX_ACTIVE = 8;
+export const STANDING_RULES_MAX_TOTAL_CHARS = 1_200;
+export const STANDING_RULE_MAX_CHARS = 300;
+// Bound an imported scalar before SQLite transfers it into JavaScript.
+// Four bytes per allowed character accommodates every valid UTF-8 rule.
+export const STANDING_RULE_IMPORT_MAX_BYTES = STANDING_RULE_MAX_CHARS * 4;
 export const REMEMBER_SESSION_RECENCY_CAP = { global: 5_000, here: 5_000 } as const;
 export const REMEMBER_SCAN_BUDGET_MS = 3_000;
 export const REMEMBER_MAX_HITS = 5;

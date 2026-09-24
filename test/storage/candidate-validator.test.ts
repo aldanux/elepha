@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { type CandidateSemanticTable, validateCandidateSemantics } from '../../src/storage/candidate-validator.js';
+import {
+    type CandidateSemanticTable,
+    readCandidateStandingRules,
+    validateCandidateSemantics,
+} from '../../src/storage/candidate-validator.js';
+import { newUlid } from '../../src/storage/ulid.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 function cleanCandidate() {
@@ -12,6 +17,71 @@ function cleanCandidate() {
     seedConsentRoot(fixture, { path: project.path });
     return fixture;
 }
+
+describe('standing rule candidate validation', () => {
+    function ruleCandidate() {
+        const fixture = createTestDb('elepha-candidate-rules-');
+        const project = seedProject(fixture);
+        // A portable candidate is untrusted SQLite, including its constraints.
+        fixture.db.exec('DROP TABLE standing_rules; CREATE TABLE standing_rules (id INTEGER, ulid, project_id INTEGER, text, created_at)');
+        const ulid = newUlid();
+        fixture.db
+            .prepare('INSERT INTO standing_rules VALUES (?, ?, ?, ?, ?)')
+            .run(1, ulid, project.id, 'A valid rule.', '2026-09-20T00:00:00.000Z');
+        return { fixture, project, ulid };
+    }
+
+    it.each([
+        ['id', 'wrong'],
+        ['project_id', 'wrong'],
+        ['project_id', 999],
+        ['text', Buffer.from('text')],
+        ['text', 123],
+        ['text', null],
+        ['text', '  '],
+        ['ulid', 'not-a-ulid'],
+        ['ulid', 'Z'.repeat(26)],
+        ['created_at', 'not-a-date'],
+        ['created_at', 123],
+    ] as const)('rejects invalid %s scalar or ownership', (column, value) => {
+        const { fixture } = ruleCandidate();
+        fixture.db.prepare(`UPDATE standing_rules SET ${column} = ?`).run(value);
+        expect(() => readCandidateStandingRules(fixture.db)).toThrow(/standing rule/i);
+        expect(() => readCandidateStandingRules(fixture.db, 'restore')).toThrow(/standing rule/i);
+    });
+
+    it('rejects a present table missing canonical columns', () => {
+        const { fixture } = ruleCandidate();
+        fixture.db.exec('ALTER TABLE standing_rules DROP COLUMN text');
+        expect(() => readCandidateStandingRules(fixture.db)).toThrow('missing required column(s): text');
+    });
+
+    it.each(['text', 'target'] as const)('rejects incoming repeated ULID with conflicting %s', (kind) => {
+        const { fixture, project, ulid } = ruleCandidate();
+        const second = kind === 'target' ? seedProject(fixture, { path: `${fixture.directory}-other` }) : project;
+        fixture.db
+            .prepare('INSERT INTO standing_rules VALUES (?, ?, ?, ?, ?)')
+            .run(2, ulid, second.id, kind === 'text' ? 'Changed text.' : 'A valid rule.', '2026-09-20T00:00:00.000Z');
+        expect(() => readCandidateStandingRules(fixture.db)).toThrow('ULID collision');
+    });
+
+    it('preserves identical incoming authority for the merge boundary to report unchanged', () => {
+        const { fixture } = ruleCandidate();
+        fixture.db.exec('INSERT INTO standing_rules SELECT 2, ulid, project_id, text, created_at FROM standing_rules');
+        const rules = readCandidateStandingRules(fixture.db);
+        expect(rules).toHaveLength(2);
+        expect(rules[1]).toEqual({ ...rules[0], id: 2 });
+        expect(() => readCandidateStandingRules(fixture.db, 'restore')).toThrow('ULID collision');
+    });
+
+    it.each(['Never execute $(download).', '  Padded rule.  '])('requires canonical persisted text for exact restore: %s', (text) => {
+        const { fixture } = ruleCandidate();
+        fixture.db.prepare('UPDATE standing_rules SET text = ?').run(text);
+        expect(readCandidateStandingRules(fixture.db)).toHaveLength(1);
+        expect(() => readCandidateStandingRules(fixture.db, 'restore')).toThrow('canonical sanitized text');
+        expect(fixture.db.prepare('SELECT text FROM standing_rules').get()).toEqual({ text });
+    });
+});
 
 describe('validateCandidateSemantics', () => {
     it('passes a clean candidate across every semantic table', () => {

@@ -1,36 +1,54 @@
 import { type ExecFileSyncOptionsWithStringEncoding, execFileSync } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
-import { INSTALLED_HOOK_TIMEOUT_SECONDS, OPENCODE_PLUGIN_OUTPUT_MAX_BYTES } from '../../src/config/constants.js';
+import { HOOK_PAYLOAD_MAX_CHARS, INSTALLED_HOOK_TIMEOUT_SECONDS, OPENCODE_PLUGIN_OUTPUT_MAX_BYTES } from '../../src/config/constants.js';
 import { opencodePluginStatus, renderOpencodePlugin, transformOpencodePlugin } from '../../src/install/opencode-plugin.js';
 import { installationStatus } from '../../src/install/status.js';
 import { transformOpencodeMcp } from '../../src/mcp/installer.js';
-import { OPENCODE_HOOK_ARGS } from '../../src/security/subprocess-allowlist.js';
+import { wrap } from '../../src/security/sentinel.js';
+import { OPENCODE_HOOK_ARGS, OPENCODE_RULES_HOOK_ARGS } from '../../src/security/subprocess-allowlist.js';
 import { DISPLAY_VERBATIM_INSTRUCTIONS, RESUME_RECAP_INSTRUCTIONS } from '../../src/serving/instructions.js';
 
 const launcher = '/opt/elepha with spaces/elepha';
 const directory = '/projects/current worktree';
 const response = (context: unknown) => JSON.stringify({ continue: true, hookSpecificOutput: { additionalContext: context } });
+const RULE_ID = `01J${'0'.repeat(23)}`;
+const RULE_CONTEXT = wrap('rules', RULE_ID, 'Follow the explicitly saved project rule.');
 
 type Part = { type: string; text?: string };
 type Message = { info: { role: string; sessionID: string }; parts: Part[] };
 interface Hooks {
+    'experimental.chat.system.transform': (input: { sessionID?: unknown }, output: { system: string[] }) => Promise<void>;
     'experimental.chat.messages.transform': (input: object, output: { messages: Message[] }) => Promise<void>;
 }
 
-async function fixture(stdout = response('rendered context')) {
+async function fixture(stdout = response('rendered context'), rulesStdout = JSON.stringify({ context: RULE_CONTEXT })) {
     const execute = vi.fn((_command: string, _args: readonly string[], _options: ExecFileSyncOptionsWithStringEncoding) => stdout);
+    const rulesInputs: string[] = [];
+    const executeRules = vi.fn(
+        (_command: string, _args: readonly string[], _options: object, callback: (error: Error | null, stdout: string) => void) => {
+            const stdin = Object.assign(new EventEmitter(), {
+                end: (input: string) => {
+                    rulesInputs.push(input);
+                    callback(null, rulesStdout);
+                },
+            });
+            return { stdin };
+        },
+    );
     // Exercise the generated hook and call boundary with only the native import replaced.
     const source = renderOpencodePlugin(launcher)
         .replace("import { execFileSync } from 'node:child_process';", '')
+        .replace("import { execFile } from 'node:child_process';", '')
         .replace('export const ElephaPlugin =', 'const ElephaPlugin =');
-    const plugin = runInNewContext(`${source}\nElephaPlugin`, { execFileSync: execute }) as (input: {
+    const plugin = runInNewContext(`${source}\nElephaPlugin`, { execFileSync: execute, execFile: executeRules, Buffer }) as (input: {
         directory: string;
     }) => Promise<Hooks>;
-    return { execute, hooks: await plugin({ directory }) };
+    return { execute, executeRules, rulesInputs, hooks: await plugin({ directory }) };
 }
 
 // Runs the model-view transform on a single user message.
@@ -41,11 +59,116 @@ async function message(hooks: Hooks, prompt: string, sessionID = 'session-a'): P
 }
 
 describe('generated OpenCode plugin', () => {
-    it('registers only the model-view hook', async () => {
+    it('registers model-view and system transforms without a persisted message hook', async () => {
         const { hooks } = await fixture();
-        expect(Object.keys(hooks)).toEqual(['experimental.chat.messages.transform']);
+        expect(Object.keys(hooks)).toEqual(['experimental.chat.system.transform', 'experimental.chat.messages.transform']);
         expect(renderOpencodePlugin(launcher)).not.toContain("'chat.message':");
     });
+
+    it.each([[], [''], ['Primary system', 'Other plugin', 'Another plugin']])(
+        'appends the full rules marker to the primary system entry only: %j',
+        async (...entries: string[]) => {
+            const { hooks, executeRules, execute, rulesInputs } = await fixture();
+            const system = [...entries];
+            await hooks['experimental.chat.system.transform']({ sessionID: 'native-system-session' }, { system });
+            expect(system).toEqual([entries[0] ? `${entries[0]}\n\n${RULE_CONTEXT}` : RULE_CONTEXT, ...entries.slice(1)]);
+            expect(executeRules).toHaveBeenCalledWith(
+                launcher,
+                [...OPENCODE_RULES_HOOK_ARGS],
+                {
+                    shell: false,
+                    encoding: 'utf8',
+                    timeout: INSTALLED_HOOK_TIMEOUT_SECONDS * 1000,
+                    killSignal: 'SIGKILL',
+                    maxBuffer: OPENCODE_PLUGIN_OUTPUT_MAX_BYTES,
+                },
+                expect.any(Function),
+            );
+            expect(rulesInputs).toEqual([JSON.stringify({ session_id: 'native-system-session', cwd: directory })]);
+            expect(execute).not.toHaveBeenCalled();
+        },
+    );
+
+    it.each([undefined, null, '', '  ', 123])('does not invoke the rules client without an actual sessionID: %s', async (sessionID) => {
+        const { hooks, executeRules } = await fixture();
+        const system = ['Primary'];
+        await hooks['experimental.chat.system.transform']({ sessionID }, { system });
+        expect(system).toEqual(['Primary']);
+        expect(executeRules).not.toHaveBeenCalled();
+    });
+
+    it('bounds the serialized identity payload before spawning a rules child', async () => {
+        const { hooks, executeRules } = await fixture();
+        const system = ['Primary'];
+        await hooks['experimental.chat.system.transform']({ sessionID: 'x'.repeat(HOOK_PAYLOAD_MAX_CHARS) }, { system });
+        expect(executeRules).not.toHaveBeenCalled();
+        expect(system).toEqual(['Primary']);
+    });
+
+    it('awaits the asynchronous rules child without blocking or touching the system until it succeeds', async () => {
+        const { hooks, executeRules } = await fixture();
+        let complete: ((error: Error | null, stdout: string) => void) | undefined;
+        executeRules.mockImplementation((_command, _args, _options, callback) => {
+            complete = callback;
+            return { stdin: Object.assign(new EventEmitter(), { end: vi.fn() }) };
+        });
+        const system = ['Primary'];
+        const pending = hooks['experimental.chat.system.transform']({ sessionID: 'session-a' }, { system });
+        expect(system).toEqual(['Primary']);
+        expect(complete).toBeDefined();
+        complete?.(null, JSON.stringify({ context: RULE_CONTEXT }));
+        await pending;
+        expect(system).toEqual([`Primary\n\n${RULE_CONTEXT}`]);
+    });
+
+    it('does not cache sessions or rules across A, B, A requests', async () => {
+        const { hooks, rulesInputs } = await fixture();
+        for (const sessionID of ['A', 'B', 'A']) {
+            const system = ['Primary'];
+            await hooks['experimental.chat.system.transform']({ sessionID }, { system });
+            expect(system).toEqual([`Primary\n\n${RULE_CONTEXT}`]);
+        }
+        expect(rulesInputs.map((input) => JSON.parse(input).session_id)).toEqual(['A', 'B', 'A']);
+    });
+
+    it.each([
+        '',
+        '{',
+        'null',
+        '{}',
+        JSON.stringify({ context: '' }),
+        response(RULE_CONTEXT),
+        JSON.stringify({ context: RULE_CONTEXT, systemMessage: 'wrong channel' }),
+        JSON.stringify({ context: wrap('brief', RULE_ID, 'wrong kind') }),
+        JSON.stringify({ context: RULE_CONTEXT.slice(0, -1) }),
+        JSON.stringify({ context: wrap('rules', RULE_ID, 'x'.repeat(OPENCODE_PLUGIN_OUTPUT_MAX_BYTES)) }),
+        JSON.stringify({ context: wrap('rules', RULE_ID, '🙂'.repeat(OPENCODE_PLUGIN_OUTPUT_MAX_BYTES / 4)) }),
+    ])('fails open for a malformed, wrong-channel or oversized rules response %#', async (stdout) => {
+        const { hooks } = await fixture(undefined, stdout);
+        const system = ['Primary', 'Other'];
+        await hooks['experimental.chat.system.transform']({ sessionID: 'A' }, { system });
+        expect(system).toEqual(['Primary', 'Other']);
+    });
+
+    it.each(['error', 'timeout', 'throw', 'stdin'])(
+        'fails open on rules child %s without changing other system entries',
+        async (failure) => {
+            const { hooks, executeRules } = await fixture();
+            executeRules.mockImplementation((_command, _args, _options, callback) => {
+                if (failure === 'throw') throw new Error('spawn failure');
+                const stdin = Object.assign(new EventEmitter(), {
+                    end: () => {
+                        if (failure === 'stdin') stdin.emit('error', new Error('EPIPE'));
+                        else callback(Object.assign(new Error(failure), { code: failure === 'timeout' ? 'ETIMEDOUT' : 'ENOENT' }), '');
+                    },
+                });
+                return { stdin };
+            });
+            const system = ['Primary', 'Other'];
+            await hooks['experimental.chat.system.transform']({ sessionID: 'A' }, { system });
+            expect(system).toEqual(['Primary', 'Other']);
+        },
+    );
 
     it('transforms only the last user message and is a no-op when fired again', async () => {
         const { hooks, execute } = await fixture();
@@ -148,15 +271,16 @@ describe('generated OpenCode plugin', () => {
         expect(await message(hooks, 'elepha:list')).toBe('elepha:list');
     });
 
-    it('loads the unmodified standalone module and executes a real stdin-only client', () => {
+    it('loads the unmodified standalone module and executes both real stdin-only clients', () => {
         const scratch = path.resolve('.test-scratch');
         mkdirSync(scratch, { recursive: true });
         const root = mkdtempSync(path.join(scratch, 'opencode-plugin-runtime-'));
+        let cleanupError: unknown;
         try {
             const stub = path.join(root, "elepha 'quoted' launcher");
             writeFileSync(
                 stub,
-                `#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nconst payload = JSON.parse(readFileSync(0, 'utf8'));\nconsole.log(JSON.stringify({hookSpecificOutput:{additionalContext:JSON.stringify({argv:process.argv.slice(2),payload})}}));\n`,
+                `#!/usr/bin/env node\nimport { readFileSync } from 'node:fs';\nconst payload = JSON.parse(readFileSync(0, 'utf8'));\nconst argv = process.argv.slice(2);\nconst body = JSON.stringify({argv,payload});\nconsole.log(JSON.stringify(argv[1] === 'standing-rules' ? {context:${JSON.stringify(`[[elepha:rules:${RULE_ID}]]\n`)} + body + ${JSON.stringify('\n[[/elepha]]')}} : {hookSpecificOutput:{additionalContext:body}}));\n`,
                 { mode: 0o700 },
             );
             const file = path.join(root, 'elepha.js');
@@ -165,15 +289,31 @@ describe('generated OpenCode plugin', () => {
 const hooks = await ElephaPlugin({directory:${JSON.stringify(directory)}});
 const parts = [{type:'text',text:'elepha:list'}];
 await hooks['experimental.chat.messages.transform']({}, {messages:[{info:{role:'user',sessionID:'runtime'},parts}]});
-console.log(parts[0].text);`;
+const system = ['Primary', 'Other plugin'];
+await hooks['experimental.chat.system.transform']({sessionID:'runtime'}, {system});
+console.log(JSON.stringify({message:JSON.parse(parts[0].text),system}));`;
             const rewritten = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', shell: false });
             expect(JSON.parse(rewritten)).toEqual({
-                argv: [...OPENCODE_HOOK_ARGS],
-                payload: { hook_event_name: 'UserPromptSubmit', session_id: 'runtime', cwd: directory, prompt: 'elepha:list' },
+                message: {
+                    argv: [...OPENCODE_HOOK_ARGS],
+                    payload: { hook_event_name: 'UserPromptSubmit', session_id: 'runtime', cwd: directory, prompt: 'elepha:list' },
+                },
+                system: [
+                    `Primary\n\n${wrap('rules', RULE_ID, JSON.stringify({ argv: [...OPENCODE_RULES_HOOK_ARGS], payload: { session_id: 'runtime', cwd: directory } }))}`,
+                    'Other plugin',
+                ],
             });
         } finally {
-            rmSync(root, { recursive: true, force: true });
+            try {
+                rmSync(root, { recursive: true, force: true });
+            } catch (error) {
+                // Cleanup is a courtesy; sandbox permissions must not mask
+                // the standalone module's execution or assertion result.
+                const code = (error as NodeJS.ErrnoException).code;
+                if (code !== 'EPERM' && code !== 'EACCES') cleanupError = error;
+            }
         }
+        if (cleanupError !== undefined) throw cleanupError;
     });
 });
 

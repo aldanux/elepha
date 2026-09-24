@@ -112,6 +112,8 @@ describe('sessions table migration', () => {
         expect(shownListCols).toEqual(['tool', 'native_session_id', 'session_ids']);
         const incognitoCols = (db.pragma('table_info(incognito_transcripts)') as Array<{ name: string }>).map((c) => c.name);
         expect(incognitoCols).toEqual(['tool', 'native_id', 'tombstoned_at']);
+        const standingRuleCols = (db.pragma('table_info(standing_rules)') as Array<{ name: string; notnull: number }>).map((c) => c.name);
+        expect(standingRuleCols).toEqual(['id', 'ulid', 'project_id', 'text', 'created_at']);
         const firstPromptSkipCols = (db.pragma('table_info(first_prompt_search_backfill_skips)') as Array<{ name: string }>).map(
             (c) => c.name,
         );
@@ -603,6 +605,44 @@ describe('migration idempotency and reversibility', () => {
         expect(reopened.prepare('SELECT tool, native_id FROM incognito_transcripts').all()).toEqual([
             { tool: 'codex', native_id: 'off-session' },
         ]);
+        reopened.close();
+    });
+
+    it('adds standing rules to a legacy database, preserves stored rules, and is a no-op when reopened', () => {
+        const dir = withTempDir('elepha-standing-rules-table-');
+        const dbPath = path.join(dir, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          INSERT INTO projects (path, display_name, first_seen_at, last_seen_at)
+          VALUES ('/legacy', 'legacy', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+          DROP INDEX idx_standing_rules_project;
+          DROP TABLE standing_rules;
+        `);
+        prior.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect((migrated.pragma('table_info(standing_rules)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+            'id',
+            'ulid',
+            'project_id',
+            'text',
+            'created_at',
+        ]);
+        expect(
+            migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_standing_rules_project'").get(),
+        ).toEqual({ name: 'idx_standing_rules_project' });
+        migrated
+            .prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)')
+            .run('01J00000000000000000000000', 1, 'Legacy standing rule.', '2026-01-01T00:00:00.000Z');
+        // The project row that owns a rule cannot be removed by a cascade.
+        expect(() => migrated.prepare('DELETE FROM projects WHERE id = 1').run()).toThrow(/FOREIGN KEY/);
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT ulid, project_id, text FROM standing_rules').all()).toEqual([
+            { ulid: '01J00000000000000000000000', project_id: 1, text: 'Legacy standing rule.' },
+        ]);
+        expect(reopened.pragma('foreign_key_check')).toEqual([]);
         reopened.close();
     });
 

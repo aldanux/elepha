@@ -1,22 +1,43 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { CLOSE, OPEN } from '../security/sentinel.js';
-import { renderOpencodeHookClient } from '../security/subprocess-allowlist.js';
+import { renderOpencodeHookClient, renderOpencodeRulesClient } from '../security/subprocess-allowlist.js';
 import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 
 // OpenCode loads plugins listed in opencode.json's `plugin` array (the installer
 // registers this file there). PluginInput.directory is the working directory.
 // Keep this standalone so OpenCode needs no elepha package imports.
 //
-// Transform only the model's message view: chat.message persists edits into the
+// Transform only model-facing views: chat.message persists edits into the
 // displayed user bubble and would duplicate the assistant's rendered response.
 // Title generation may also consume this view; the empty hook input does not
 // identify generation kind, so titles can reflect the payload on command sessions.
 export function renderOpencodePlugin(launcher: string): string {
     return `${OPENCODE_PLUGIN_MARKER}
 ${renderOpencodeHookClient(launcher)}
+${renderOpencodeRulesClient(launcher)}
 const briefOpen = ${JSON.stringify(`${OPEN}brief:`)};
 const briefClose = ${JSON.stringify(CLOSE)};
 export const ElephaPlugin = async ({ directory }) => ({
+    // OpenCode also uses this transform for auxiliary title/compaction calls.
+    // There is no request-kind discriminator, so the same authorized rules apply.
+    'experimental.chat.system.transform': async (input, output) => {
+        try {
+            if (typeof input?.sessionID !== 'string' || !input.sessionID.trim()) return;
+            if (!Array.isArray(output?.system) || (output.system.length && typeof output.system[0] !== 'string')) return;
+            const stdout = await runRulesHook({ session_id: input.sessionID, cwd: directory });
+            if (!stdout) return;
+            const result = JSON.parse(stdout);
+            if (!result || typeof result !== 'object' || Array.isArray(result) || Object.keys(result).length !== 1) return;
+            const context = result.context;
+            if (typeof context !== 'string' || !/^\\[\\[elepha:rules:[0-9A-HJKMNP-TV-Z]{26}]]\\n[\\s\\S]+\\n\\[\\[\\/elepha]]$/.test(context)) return;
+            // Preserve the full sentinel and the primary system entry. Extra
+            // entries belong to other plugins and must retain their positions.
+            if (output.system.length === 0) output.system.push(context);
+            else output.system[0] = output.system[0] ? output.system[0] + '\\n\\n' + context : context;
+        } catch {
+            // Fail open without logging private rules or project identity.
+        }
+    },
     'experimental.chat.messages.transform': async (_input, output) => {
         try {
             const messages = (output && output.messages) || [];

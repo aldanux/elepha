@@ -7,6 +7,8 @@ import type Database from 'better-sqlite3-multiple-ciphers';
 import type { CodexAdapter } from '../adapters/codex.js';
 import { isReadableProviderSource } from '../config/paths.js';
 import { errorMessage } from '../util/error.js';
+import type { ProjectRow } from './project-store.js';
+import { type StandingRuleRow, StandingRulesStore } from './standing-rules-store.js';
 
 export interface ExternalImportPurgeSession {
     id: number;
@@ -42,6 +44,8 @@ export interface ExternalImportPurgePlan {
     memoryRowsAffected: number;
     rollupsAffected: number;
     emptiedProjects: ExternalImportPurgeProject[];
+    projectState: ProjectRow[];
+    standingRules: StandingRuleRow[];
     issues: ExternalImportPurgeIssue[];
     before: StoreCounts;
     resulting: StoreCounts;
@@ -110,6 +114,7 @@ function emptiedProjects(db: Database.Database, sessionIds: number[], projectIds
                        SELECT 1 FROM memories m
                        WHERE m.project_id = p.id AND m.session_id NOT IN (${sessionMarks})
                    )
+                   AND NOT EXISTS (SELECT 1 FROM standing_rules r WHERE r.project_id = p.id)
                  ORDER BY p.id`,
         )
         .all(...projectIds, ...sessionIds, ...sessionIds) as ExternalImportPurgeProject[];
@@ -179,6 +184,13 @@ export async function planExternalAgentImportPurge(
         memoryRowsAffected,
         rollupsAffected,
         emptiedProjects: emptiedProjectsAfterPurge,
+        projectState:
+            projectIds.length === 0
+                ? []
+                : (db
+                      .prepare(`SELECT * FROM projects WHERE id IN (${placeholders(projectIds)}) ORDER BY id`)
+                      .all(...projectIds) as ProjectRow[]),
+        standingRules: new StandingRulesStore(db).list(projectIds),
         issues,
         before,
         resulting: {
@@ -192,6 +204,18 @@ export async function planExternalAgentImportPurge(
 
 function assertPlanStillMatches(db: Database.Database, plan: ExternalImportPurgePlan): void {
     const sessionIds = plan.sessions.map((session) => session.id);
+    const projectIds = [...new Set(plan.sessions.map((session) => session.projectId))];
+    const projects =
+        projectIds.length === 0
+            ? []
+            : db.prepare(`SELECT * FROM projects WHERE id IN (${placeholders(projectIds)}) ORDER BY id`).all(...projectIds);
+    if (
+        JSON.stringify(projects) !== JSON.stringify(plan.projectState) ||
+        JSON.stringify(new StandingRulesStore(db).list(projectIds)) !== JSON.stringify(plan.standingRules) ||
+        JSON.stringify(emptiedProjects(db, sessionIds, projectIds)) !== JSON.stringify(plan.emptiedProjects)
+    ) {
+        throw new Error('project ownership or standing rules changed after preview');
+    }
     const exactSession = db.prepare(
         `SELECT s.id, s.tool, s.native_id, s.segment_index, s.project_id,
                 p.path AS project_path, s.source_path

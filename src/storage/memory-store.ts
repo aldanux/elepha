@@ -3,7 +3,7 @@
 
 import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
+import { DURABLE_CAPTURE_MAX_BYTES, STANDING_RULES_MAX_ACTIVE, STANDING_RULES_MAX_TOTAL_CHARS } from '../config/constants.js';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import type { OpenTailObservation, ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
@@ -17,11 +17,13 @@ import {
     type RecordInjectionInput,
 } from './injection-store.js';
 import { type OpenTurnRow, type OpenTurnSourceSnapshot, OpenTurnStore } from './open-turn-store.js';
+import { ProjectResolver } from './project-resolver.js';
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
 import { sourceTurnDigest } from './source-turn-digest.js';
 import { SqliteSourceWatermarkStore } from './sqlite-source-watermark-store.js';
+import { type StandingRuleRow, StandingRulesStore } from './standing-rules-store.js';
 import { minMedianMax, type ProjectCount, type Stats, type StatusCount, type ToolCount, type ToolZeroPaths } from './stats.js';
 import { type MemoryRow, TurnStore } from './turn-store.js';
 
@@ -57,6 +59,8 @@ export interface IngestedTurnWritePreparation {
 
 // What to purge: at most one project scope, optionally narrowed by time.
 export interface PurgeScope {
+    // Only explicit whole-project deletion includes durable rules. Time filters override this intention.
+    deleteStandingRules?: boolean;
     // Purge every session belonging to project rows matching this path or display name.
     projectPath?: string;
     // Purge every session belonging to these already-resolved project rows.
@@ -93,7 +97,8 @@ export interface PurgeSessionPreview {
 export interface PurgePlan {
     scope: PurgeScope;
     sessions: PurgeSessionPreview[];
-    // Project rows that will have zero sessions left and are therefore removed too.
+    standingRules: Array<StandingRuleRow & { projectPath: string }>;
+    // Project rows that will have neither sessions nor retained rules left.
     emptiedProjects: ProjectRow[];
 }
 
@@ -107,6 +112,7 @@ export class MemoryStore {
     private readonly openTurns: OpenTurnStore;
     private readonly sqliteSourceWatermarks: SqliteSourceWatermarkStore;
     readonly shownSessionLists: ShownSessionListStore;
+    readonly standingRules: StandingRulesStore;
 
     constructor(db: Database, options: MemoryStoreOptions = {}) {
         this.db = db;
@@ -118,6 +124,7 @@ export class MemoryStore {
         this.openTurns = new OpenTurnStore(db);
         this.sqliteSourceWatermarks = new SqliteSourceWatermarkStore(db);
         this.shownSessionLists = new ShownSessionListStore(db);
+        this.standingRules = new StandingRulesStore(db);
     }
 
     get database(): Database {
@@ -717,12 +724,47 @@ export class MemoryStore {
     rekeyProjectsByIdentity(resolveGitRoot: (path: string) => string | null): ProjectMergePlan[] {
         const plans = this.planRekeyProjectsByIdentity(resolveGitRoot);
         const apply = this.db.transaction(() => {
+            // A merge can join formerly independent rule budgets. Include existing
+            // logical membership, then validate all resulting groups before writing.
+            const groups = new ProjectResolver(this.db).listStored().map((project) => new Set(project.projectIds));
+            for (const plan of plans) {
+                const ids = new Set([plan.canonical.id, ...plan.merged.map((project) => project.id)]);
+                for (let index = groups.length - 1; index >= 0; index--) {
+                    const group = groups[index];
+                    if (group !== undefined && [...group].some((id) => ids.has(id))) {
+                        for (const id of group) {
+                            ids.add(id);
+                        }
+                        groups.splice(index, 1);
+                    }
+                }
+                groups.push(ids);
+            }
+            const affected = new Set(plans.flatMap((plan) => [plan.canonical.id, ...plan.merged.map((project) => project.id)]));
+            for (const group of groups.filter((ids) => [...ids].some((id) => affected.has(id)))) {
+                const rules = this.standingRules.list([...group]);
+                const texts = rules.map((rule) => rule.text);
+                const reason =
+                    new Set(texts).size !== texts.length
+                        ? 'duplicate standing rule text'
+                        : rules.length > STANDING_RULES_MAX_ACTIVE
+                          ? 'standing rule count limit'
+                          : texts.reduce((sum, text) => sum + text.length, 0) > STANDING_RULES_MAX_TOTAL_CHARS
+                            ? 'standing rule character limit'
+                            : undefined;
+                if (reason !== undefined) {
+                    throw new Error(
+                        `Rekey refused: ${reason} for project ids ${[...group].join(', ')}; rule ULIDs: ${rules.map((rule) => rule.ulid).join(', ')}.`,
+                    );
+                }
+            }
             for (const plan of plans) {
                 for (const victim of plan.merged) {
                     this.db.prepare('UPDATE memories SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE sessions SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE session_rollups SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE open_turns SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
+                    this.db.prepare('UPDATE standing_rules SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('DELETE FROM projects WHERE id = ?').run(victim.id);
                 }
                 if (plan.gitRoot !== null) {
@@ -757,23 +799,27 @@ export class MemoryStore {
     // Computes what a purge would delete, without deleting anything. The
     // actual session list, not just a count: aggregates hide misclassification.
     planPurge(scope: PurgeScope): PurgePlan {
+        const projects = this.listProjects();
+        let selectedProjectIds: number[] = [];
         let sessionRows: SessionRow[];
         if (scope.projectRoot !== undefined) {
             const root = canonicalizeExisting(scope.projectRoot);
-            const projectIds = this.listProjects()
-                .filter((p) => isWithin(root, canonicalizeExisting(p.path)))
-                .map((p) => p.id);
+            const projectIds = projects.filter((p) => isWithin(root, canonicalizeExisting(p.path))).map((p) => p.id);
             sessionRows = this.sessionsForProjectIds(projectIds);
+            selectedProjectIds = projectIds;
         } else if (scope.projectPath !== undefined) {
             const projectIds = this.findProjectsForPurge(scope.projectPath).map((p) => p.id);
             sessionRows = this.sessionsForProjectIds(projectIds);
+            selectedProjectIds = projectIds;
         } else if (scope.projectIds !== undefined) {
             sessionRows = this.sessionsForProjectIds(scope.projectIds);
+            selectedProjectIds = scope.projectIds;
         } else if (scope.all || scope.newerThan !== undefined || scope.olderThan !== undefined) {
             sessionRows = this.db
                 .prepare('SELECT * FROM sessions')
                 .all()
                 .map((row) => hydrateSessionRow(row as Record<string, unknown>));
+            selectedProjectIds = projects.map((project) => project.id);
         } else {
             sessionRows = [];
         }
@@ -785,7 +831,14 @@ export class MemoryStore {
         if (olderThan !== undefined) {
             sessionRows = sessionRows.filter((session) => session.last_ingested_at <= olderThan);
         }
-        const projectById = new Map(this.listProjects().map((p) => [p.id, p]));
+        const projectById = new Map(projects.map((p) => [p.id, p]));
+        const standingRules =
+            scope.deleteStandingRules === true && newerThan === undefined && olderThan === undefined
+                ? this.standingRules.list(selectedProjectIds).map((rule) => ({
+                      ...rule,
+                      projectPath: projectById.get(rule.project_id)?.path ?? '(unknown project)',
+                  }))
+                : [];
         const countTurns = this.db.prepare('SELECT COUNT(*) as c FROM memories WHERE session_id = ?');
         const filteredRows = this.db.prepare(
             `SELECT ft.memory_id,
@@ -824,27 +877,33 @@ export class MemoryStore {
                 filteredMemoryIds: filtered.map((row) => row.memory_id),
             };
         });
-        // A project is "emptied" if every one of its sessions is in this
-        // purge - compare against its true total, not just what we selected.
+        // Compare both kinds of retained ownership, including rule-only projects.
         const purgedByProject = new Map<number, number>();
         for (const s of sessions) {
             purgedByProject.set(s.projectId, (purgedByProject.get(s.projectId) ?? 0) + 1);
+        }
+        for (const rule of standingRules) {
+            if (!purgedByProject.has(rule.project_id)) {
+                purgedByProject.set(rule.project_id, 0);
+            }
         }
         const totalSessionsByProject = this.db.prepare('SELECT COUNT(*) as c FROM sessions WHERE project_id = ?');
         const emptiedProjects: ProjectRow[] = [];
         for (const [projectId, purgedCount] of purgedByProject) {
             const total = (totalSessionsByProject.get(projectId) as { c: number }).c;
-            if (purgedCount === total) {
+            const retainedRules =
+                this.standingRules.list([projectId]).length - standingRules.filter((rule) => rule.project_id === projectId).length;
+            if (purgedCount === total && retainedRules === 0) {
                 const project = projectById.get(projectId);
                 if (project) {
                     emptiedProjects.push(project);
                 }
             }
         }
-        return { scope, sessions, emptiedProjects };
+        return { scope, sessions, standingRules, emptiedProjects };
     }
 
-    // Applies exactly the still-present sessions in a previewed purge plan, in one transaction.
+    // Applies exactly the still-present sessions and unchanged rules in a previewed plan, in one transaction.
     applyPurgePlan(plan: PurgePlan, purgedAt = new Date().toISOString()): PurgePlan {
         const sessionIdentity = this.db.prepare('SELECT tool, native_id FROM sessions WHERE id = ?');
         const tombstone = this.db.prepare('INSERT OR IGNORE INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)');
@@ -858,10 +917,38 @@ export class MemoryStore {
         const deleteMemories = this.db.prepare('DELETE FROM memories WHERE session_id = ?');
         const deleteSession = this.db.prepare('DELETE FROM sessions WHERE id = ?');
         const countProjectSessions = this.db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE project_id = ?');
+        const countProjectRules = this.db.prepare('SELECT COUNT(*) AS count FROM standing_rules WHERE project_id = ?');
+        const ruleIdentity = this.db.prepare('SELECT id, ulid, project_id, text, created_at FROM standing_rules WHERE id = ?');
+        const deleteRule = this.db.prepare(
+            'DELETE FROM standing_rules WHERE id = ? AND ulid = ? AND project_id = ? AND text = ? AND created_at = ?',
+        );
         const deleteProject = this.db.prepare('DELETE FROM projects WHERE id = ?');
         const appliedSessions: PurgeSessionPreview[] = [];
         const emptiedProjects: ProjectRow[] = [];
         const apply = this.db.transaction(() => {
+            for (const planned of plan.standingRules) {
+                const current = ruleIdentity.get(planned.id) as StandingRuleRow | undefined;
+                const project = this.getProjectById(planned.project_id);
+                if (
+                    current === undefined ||
+                    current.ulid !== planned.ulid ||
+                    current.project_id !== planned.project_id ||
+                    current.text !== planned.text ||
+                    current.created_at !== planned.created_at ||
+                    project?.path !== planned.projectPath
+                ) {
+                    throw new Error(`Purge plan standing rule ${planned.ulid} (id ${planned.id}) no longer matches the previewed rule.`);
+                }
+            }
+            for (const planned of plan.emptiedProjects) {
+                const current = this.getProjectById(planned.id);
+                if (
+                    current !== undefined &&
+                    Object.keys(planned).some((key) => current[key as keyof ProjectRow] !== planned[key as keyof ProjectRow])
+                ) {
+                    throw new Error(`Purge plan project id ${planned.id} no longer matches the previewed project.`);
+                }
+            }
             for (const s of plan.sessions) {
                 const identity = sessionIdentity.get(s.id) as { tool: ToolName; native_id: string } | undefined;
                 if (!identity) {
@@ -880,9 +967,15 @@ export class MemoryStore {
                 deleteSession.run(s.id);
                 appliedSessions.push(s);
             }
+            for (const rule of plan.standingRules) {
+                if (deleteRule.run(rule.id, rule.ulid, rule.project_id, rule.text, rule.created_at).changes !== 1) {
+                    throw new Error(`Purge plan standing rule ${rule.ulid} could not be deleted as previewed.`);
+                }
+            }
             for (const p of plan.emptiedProjects) {
                 const remaining = countProjectSessions.get(p.id) as { count: number };
-                if (remaining.count === 0 && deleteProject.run(p.id).changes > 0) {
+                const retainedRules = countProjectRules.get(p.id) as { count: number };
+                if (remaining.count === 0 && retainedRules.count === 0 && deleteProject.run(p.id).changes > 0) {
                     emptiedProjects.push(p);
                 }
             }

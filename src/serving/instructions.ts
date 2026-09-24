@@ -25,6 +25,14 @@ export const REMEMBER_QUERY_REQUIRED = 'Recall query must contain at least one n
 export const REMEMBER_HERE_UNCONSENTED =
     'This directory is not a consented project. Run elepha:query <terms> to search all consented memory, or elepha consent grant <path> to start capturing here.';
 export const INFO_HELP = 'elepha:info — Show elepha status: sessions here/total, capture state, last session.';
+// Named without backticks for the same reason as REMEMBER_HERE_UNCONSENTED: the
+// write-time sanitizer escapes shell syntax and the user would read the escapes.
+export const STANDING_RULES_HELP = [
+    'elepha:rules — List this project standing rules with their ids.',
+    'elepha:rules:add <text> — Store a new standing rule for this project.',
+    'elepha:rules:remove <id> — Remove one standing rule by its full id.',
+    'elepha:rules:replace <id> <text> — Replace the text of one standing rule.',
+];
 export const HELP = [
     'In-chat commands:',
     'elepha:query <query> — Search all consented projects.',
@@ -32,6 +40,7 @@ export const HELP = [
     "elepha:last — Serve the most recent session's turns.",
     'elepha:list[:<n>][:codex|:claude|:opencode] — List 1–100 recent sessions, optionally filtered by tool.',
     'elepha:resume:<n> — Load the nth session to continue it; the model presents a recap.',
+    ...STANDING_RULES_HELP,
     INFO_HELP,
     'elepha:update — Show the terminal command for updating elepha.',
     'elepha:help — Show this in-chat command list.',

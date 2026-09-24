@@ -44,10 +44,12 @@ subprocesses live in `src/security/subprocess-allowlist.ts`: a fixed set of read
 fixed lifecycle verbs, the resolved npm backend with fixed package-management argv
 for self-update and the isolated Memory-Plus runtime install (enforced by
 `test/security/npm-allowlist.test.ts`), and fixed read-only macOS `/bin/ps` and `/usr/sbin/lsof` probes for
-installer-owned legacy MCP retirement, and the generated OpenCode hook client invoking
-only the installed elepha launcher with `hook user-prompt-submit --tool opencode` and a
-JSON payload on stdin. This client is rendered by the allowlist module; its fixed argv,
-`shell: false`, and stdin boundary are enforced by
+installer-owned legacy MCP retirement, and the generated OpenCode hook clients invoking
+only the installed elepha launcher with fixed `hook user-prompt-submit --tool opencode`
+or `hook standing-rules --tool opencode` argv and JSON payloads on stdin. The command
+client stays synchronous; the rules client is asynchronous with bounded timeout and
+output. Both clients are rendered by the allowlist module; their fixed argv,
+`shell: false`, and stdin boundaries are enforced by
 `test/install/opencode-plugin.test.ts`. Those probes accept only a configured database
 path or a validated OS process ID; Linux uses `/proc` without subprocesses. Every
 subprocess uses an argv array with `shell: false`. **No

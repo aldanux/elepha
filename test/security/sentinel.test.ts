@@ -9,11 +9,12 @@ describe('Rule 4 sentinel', () => {
         expect(containsSentinel('elepha is mentioned in normal prose.')).toBe(false);
     });
 
-    it('wraps a body with line-isolated markers containing the generated ID', () => {
+    it.each(['brief', 'notify', 'rules'] as const)('wraps a %s body with line-isolated markers containing the generated ID', (kind) => {
         const id = buildInjectionId();
-        const wrapped = wrap('brief', id, 'Remember this decision.');
+        const wrapped = wrap(kind, id, 'Remember this decision.');
 
         expect(id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
-        expect(wrapped.split('\n')).toEqual([`${OPEN}brief:${id}]]`, 'Remember this decision.', CLOSE]);
+        expect(wrapped.split('\n')).toEqual([`${OPEN}${kind}:${id}]]`, 'Remember this decision.', CLOSE]);
+        expect(containsSentinel(wrapped)).toBe(true);
     });
 });

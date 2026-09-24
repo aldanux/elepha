@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, symlinkSync } from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PROJECT_AUTHORIZATION_ROW_MAX_BYTES } from '../../src/config/constants.js';
+import * as paths from '../../src/config/paths.js';
 import { normalizeForCompare } from '../../src/config/paths.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
@@ -20,6 +22,49 @@ describe('ProjectResolver', () => {
         db = openUnmanagedDb(':memory:');
         root = withGrantableTestDir('elepha-project-resolver-');
         roots = new Map();
+    });
+
+    it('rebuilds bounded authorization membership without caching or Git and rejects oversized identities', () => {
+        const first = addProject(path.join(root, 'first'), { remote: 'shared' });
+        const second = addProject(path.join(root, 'second'), { remote: 'shared' });
+        const git = vi.fn(() => {
+            throw new Error('Git is forbidden');
+        });
+        const resolver = new ProjectResolver(db, { resolveGitRoot: git });
+        expect(resolver.storedProjectForAuthorization(first)?.projectIds).toEqual([first, second]);
+        db.prepare("UPDATE projects SET git_remote = 'different' WHERE id = ?").run(second);
+        expect(resolver.storedProjectForAuthorization(first)?.projectIds).toEqual([first]);
+        db.prepare('UPDATE projects SET git_remote = ? WHERE id = ?').run('x'.repeat(PROJECT_AUTHORIZATION_ROW_MAX_BYTES + 1), first);
+        expect(resolver.storedProjectForAuthorization(first)).toBeUndefined();
+        expect(git).not.toHaveBeenCalled();
+    });
+
+    it('checks fresh stored consent inside a transaction without resolving filesystem paths', () => {
+        const projectPath = path.join(root, 'stored');
+        const memberPath = path.join(root, 'peer');
+        const projectId = addProject(projectPath, { remote: 'https://example.test/repo' });
+        addProject(memberPath, { remote: 'https://example.test/repo' });
+        const consent = new ConsentStore(db);
+        consent.grant(root);
+        const resolver = new ProjectResolver(db);
+        const canonicalPaths = new Map(
+            [projectPath, memberPath].map((projectPath) => [projectPath, paths.canonicalizeExisting(projectPath)]),
+        );
+        const resolvePath = vi.spyOn(paths, 'canonicalizeExisting').mockImplementation(() => {
+            throw new Error('Unexpected filesystem resolution');
+        });
+        try {
+            db.transaction(() => {
+                expect(resolver.isStoredProjectConsented(projectId, consent, canonicalPaths)).toBe(true);
+                db.prepare(
+                    "INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES ('01J00000000000000000000001', ?, 'denied', '2026-09-20T00:00:00.000Z', 'cli')",
+                ).run(memberPath);
+                expect(resolver.isStoredProjectConsented(projectId, consent, canonicalPaths)).toBe(false);
+            })();
+            expect(resolvePath).not.toHaveBeenCalled();
+        } finally {
+            resolvePath.mockRestore();
+        }
     });
 
     function addProject(

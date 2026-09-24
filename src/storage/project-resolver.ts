@@ -270,22 +270,45 @@ export class ProjectResolver {
         return this.listStored().filter((project) => this.isConsented(project, consent));
     }
 
-    // Fresh authorization only: no display fields, session material, Git probes,
-    // or cached consent. A hidden identity could normalize into the target group,
-    // so an oversized row makes membership indeterminate and must fail closed.
-    isStoredProjectConsented(projectId: number, consent: ProjectConsent): boolean {
+    // Fresh stored membership, without display fields, session material or Git.
+    // Transactional callers must supply physical path bindings resolved before
+    // the transaction; missing bindings fail closed instead of probing the FS.
+    // Other callers retain normal path-aware consent, since stored paths may
+    // still spell a symlink. Oversized identity rows also fail closed.
+    isStoredProjectConsented(
+        projectId: number,
+        consent: Pick<ConsentStore, 'consentState' | 'consentStateForCanonicalPath'>,
+        canonicalPaths?: ReadonlyMap<string, string>,
+    ): boolean {
+        const target = this.storedProjectForAuthorization(projectId);
+        if (
+            target === undefined ||
+            (canonicalPaths !== undefined && target.paths.some((projectPath) => !canonicalPaths.has(projectPath)))
+        ) {
+            return false;
+        }
+        const states = target.paths.map((projectPath) =>
+            canonicalPaths === undefined
+                ? consent.consentState(projectPath)
+                : consent.consentStateForCanonicalPath(canonicalPaths.get(projectPath) ?? ''),
+        );
+        return states.includes('approved') && !states.includes('denied');
+    }
+
+    // Rebuild the current logical membership using bounded identity fields
+    // only. No memoized consent, filesystem resolution or Git is used here.
+    storedProjectForAuthorization(projectId: number): ProjectSet | undefined {
         const rows: ProjectGroupingRow[] = [];
         for (const value of this.db.prepare(`SELECT id, ${AUTHORIZATION_PROJECTION} FROM projects ORDER BY id`).iterate()) {
             const row = value as Omit<ProjectGroupingRow, 'path'> & { path: string | null };
             if (row.path === null) {
-                return false;
+                return undefined;
             }
             rows.push({ ...row, path: row.path });
         }
         const storedRoots = new Map(rows.map((row) => [normalizeForCompare(row.path), row.git_root]));
         const projects = this.buildProjectSets(rows, new Map(), (projectPath) => storedRoots.get(normalizeForCompare(projectPath)) ?? null);
-        const target = projects.find((project) => project.projectIds.includes(projectId));
-        return target !== undefined && this.isConsented(target, consent);
+        return projects.find((project) => project.projectIds.includes(projectId));
     }
 
     private buildProjectSets(

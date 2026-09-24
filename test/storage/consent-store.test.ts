@@ -3,6 +3,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { individualCandidates } from '../../src/cli/init-wizard.js';
+import * as paths from '../../src/config/paths.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { CONSENT_GRANDFATHERED_AT_KEY, canonicalizeConsentRoots, grandfatherConsentRoots } from '../../src/storage/consent-store.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -127,6 +128,38 @@ describe('consent roots', () => {
             } catch {
                 // Cleanup is a courtesy; sandbox permissions must not fail the assertion.
             }
+        }
+    });
+
+    it('checks already-canonical paths without filesystem resolution and preserves fresh closest-root precedence', () => {
+        const db = openUnmanagedDb(':memory:');
+        const consent = new MemoryStore(db).consent;
+        const root = realpathSync(consentFixture('elepha-consent-canonical-'));
+        const child = path.join(root, 'child');
+        const nested = path.join(child, 'nested');
+        const insert = db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)');
+        insert.run('01J00000000000000000000001', root, 'approved', '2026-08-01T00:00:00.000Z', 'cli');
+        insert.run('01J00000000000000000000002', child, 'denied', '2026-08-02T00:00:00.000Z', 'cli');
+        insert.run('01J00000000000000000000003', nested, 'pending', '2026-08-03T00:00:00.000Z', 'discovery');
+        const resolvePath = vi.spyOn(paths, 'canonicalizeExisting').mockImplementation(() => {
+            throw new Error('Unexpected filesystem resolution');
+        });
+        try {
+            expect(consent.consentStateForCanonicalPath(path.join(root, 'sibling'))).toBe('approved');
+            expect(consent.consentStateForCanonicalPath(nested)).toBe('denied');
+            expect(consent.consentStateForCanonicalPath(`${root}-outside`)).toBe('pending');
+            // Equal-depth normalized paths retain the existing explicit-source,
+            // then decision-time precedence instead of depending on row order.
+            insert.run('01J00000000000000000000004', `${child}/`, 'approved', '2026-08-04T00:00:00.000Z', 'cli');
+            expect(consent.consentStateForCanonicalPath(nested)).toBe('approved');
+            db.prepare("UPDATE consent_roots SET state = 'denied', decided_at = '2026-08-05T00:00:00.000Z' WHERE path = ?").run(child);
+            expect(consent.consentStateForCanonicalPath(nested)).toBe('denied');
+            insert.run('01J00000000000000000000005', `${child}//`, 'approved', '2026-08-06T00:00:00.000Z', 'discovery');
+            expect(consent.consentStateForCanonicalPath(nested)).toBe('denied');
+            expect(resolvePath).not.toHaveBeenCalled();
+        } finally {
+            resolvePath.mockRestore();
+            db.close();
         }
     });
 

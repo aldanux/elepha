@@ -1,5 +1,6 @@
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { buildInjectionId, type InjectionKind, wrap } from '../security/sentinel.js';
+import type { InjectionAttribution } from '../storage/injection-store.js';
 import type { MemoryStore } from '../storage/memory-store.js';
 import type { HookTool } from './common.js';
 
@@ -10,6 +11,7 @@ export interface HookOutputInput {
     body: string;
     kind: InjectionKind;
     injectedAt: string;
+    attribution?: InjectionAttribution;
     writeInjection?: (store: MemoryStore, input: Parameters<MemoryStore['recordInjection']>[0]) => boolean;
 }
 
@@ -25,6 +27,7 @@ export function recordHookOutput(input: HookOutputInput): string | undefined {
         injectedAt: input.injectedAt,
         injectionId,
         body,
+        attribution: input.attribution,
     });
     return recorded ? output : undefined;
 }

@@ -34,10 +34,10 @@ function sessionStartPayload(source: 'startup' | 'clear' | 'resume' | 'compact' 
     });
 }
 
-function hookText(result: Awaited<ReturnType<typeof runSessionStart>>, tool: 'claude-code' | 'codex'): string | undefined {
+function hookText(result: Awaited<ReturnType<typeof runSessionStart>>): string | undefined {
     if (!('output' in result)) return undefined;
-    const hookOutput = result.output.hookSpecificOutput as Record<string, unknown>;
-    const value = tool === 'claude-code' ? result.output.systemMessage : hookOutput.additionalContext;
+    expect(result.output.hookSpecificOutput).not.toHaveProperty('additionalContext');
+    const value = result.output.systemMessage;
     return typeof value === 'string' ? value : undefined;
 }
 
@@ -65,21 +65,24 @@ describe('SessionStart operational notices', () => {
             expect(parsePayload(JSON.stringify({ ...fixtures.codex, source }), 'codex')).toMatchObject({ source });
         }
         expect(parsePayload('{}', 'claude-code')).toBeUndefined();
-        expect(envelope('claude-code', 'body', 'additionalContext')).toEqual({
+        expect(parsePayload(JSON.stringify({ ...fixtures['claude-code'], source: 'fork' }), 'claude-code')).toMatchObject({
+            source: 'fork',
+        });
+        expect(parsePayload(JSON.stringify({ ...fixtures.codex, source: 'fork' }), 'codex')).toBeUndefined();
+        expect(envelope('claude-code', { additionalContext: 'body' })).toEqual({
             hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'body' },
         });
-        expect(envelope('codex', 'body', 'additionalContext')).toEqual({
+        expect(envelope('codex', { additionalContext: 'body' })).toEqual({
             continue: true,
             hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'body' },
             stopReason: null,
             suppressOutput: false,
-            systemMessage: null,
         });
-        expect(envelope('claude-code', 'body', 'systemMessage')).toEqual({
+        expect(envelope('claude-code', { systemMessage: 'body' })).toEqual({
             hookSpecificOutput: { hookEventName: 'SessionStart' },
             systemMessage: 'body',
         });
-        expect(envelope('codex', 'body', 'systemMessage')).toEqual({
+        expect(envelope('codex', { systemMessage: 'body' })).toEqual({
             continue: true,
             hookSpecificOutput: { hookEventName: 'SessionStart' },
             stopReason: null,
@@ -105,18 +108,22 @@ describe('SessionStart operational notices', () => {
         expect(parsePayload(JSON.stringify({ ...valid, permission_mode: 'unsafe' }), 'codex')).toBeUndefined();
     });
 
-    it('injects nothing on every source when no operational notice applies', async () => {
-        const openDatabase = vi.fn(() => {
-            throw new Error('a no-op SessionStart must not open the database');
-        });
+    it('opens the database to discover rules even when no operational notice applies', async () => {
+        const openDatabase = vi.fn(async (dbPath: string) => openUnmanagedDb(dbPath));
 
         for (const source of ['startup', 'clear', 'resume', 'compact'] as const) {
-            await expect(runSessionStart(sessionStartPayload(source), 'codex', { ...NO_NOTICE, openDatabase })).resolves.toEqual({
+            await expect(
+                runSessionStart(sessionStartPayload(source), 'codex', {
+                    ...NO_NOTICE,
+                    dbPath: emptyDbPath(),
+                    openDatabase: openDatabase as unknown as SessionStartDependencies['openDatabase'],
+                }),
+            ).resolves.toEqual({
                 reason: 'no_notice',
             });
         }
 
-        expect(openDatabase).not.toHaveBeenCalled();
+        expect(openDatabase).toHaveBeenCalledTimes(4);
     });
 
     it('emits only the daemon-health warning on every source and never an auto-brief or status line', async () => {
@@ -128,7 +135,7 @@ describe('SessionStart operational notices', () => {
                 readUpdateAvailable: () => undefined,
                 writeInjection: () => true,
             });
-            const output = hookText(result, 'codex');
+            const output = hookText(result);
             expect(output).toBeDefined();
             expect(innerBody(output ?? '')).toBe(HEALTH_WARNING);
             expect(output).not.toContain(`${OPEN}brief:`);
@@ -137,7 +144,7 @@ describe('SessionStart operational notices', () => {
         }
     });
 
-    it('emits only the update notice through the tool-specific notify channel and records its exact body', async () => {
+    it('emits only the update notice through systemMessage and records its exact body for both tools', async () => {
         for (const tool of ['claude-code', 'codex'] as const) {
             const dbPath = emptyDbPath();
             const result = await runSessionStart(sessionStartPayload('startup', `native-${tool}`), tool, {
@@ -146,7 +153,7 @@ describe('SessionStart operational notices', () => {
                 daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
                 readUpdateAvailable: () => ({ version: '99.0.0', checkedAt: '2026-09-08T00:00:00.000Z' }),
             });
-            const output = hookText(result, tool);
+            const output = hookText(result);
             expect(output).toBeDefined();
             expect(innerBody(output ?? '')).toBe(UPDATE_NOTICE);
 
@@ -167,7 +174,7 @@ describe('SessionStart operational notices', () => {
             readUpdateAvailable: () => ({ version: '99.0.0', checkedAt: '2026-09-08T00:00:00.000Z' }),
             writeInjection: () => true,
         });
-        const output = hookText(result, 'codex');
+        const output = hookText(result);
         expect(output).toBeDefined();
         expect(innerBody(output ?? '')).toBe(
             `${UPDATE_NOTICE}\n⚠ elepha: capture is paused — daemon not running. → Run (Terminal): elepha doctor`,
@@ -178,6 +185,7 @@ describe('SessionStart operational notices', () => {
     it('fails open to no_notice when notice probes throw or name the running version', async () => {
         await expect(
             runSessionStart(sessionStartPayload(), 'codex', {
+                dbPath: emptyDbPath(),
                 daemonHealth: () => {
                     throw new Error('heartbeat unreadable');
                 },
@@ -188,6 +196,7 @@ describe('SessionStart operational notices', () => {
         ).resolves.toEqual({ reason: 'no_notice' });
         await expect(
             runSessionStart(sessionStartPayload(), 'codex', {
+                dbPath: emptyDbPath(),
                 daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
                 readUpdateAvailable: () => ({ version: PACKAGE_VERSION, checkedAt: '2026-09-08T00:00:00.000Z' }),
             }),

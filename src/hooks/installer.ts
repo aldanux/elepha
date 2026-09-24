@@ -93,7 +93,7 @@ export function transformClaudeHook(text: string, bin: string, uninstall = false
             .filter((group) => group !== undefined);
         if (!uninstall) {
             nextGroups.push({
-                ...(event.matcher === undefined ? {} : { matcher: event.matcher }),
+                ...(event.matcher === undefined ? {} : { matcher: event === SESSION_START ? `${event.matcher}|fork` : event.matcher }),
                 hooks: [
                     { type: 'command', command: hookCommand(bin, 'claude-code', event.cliName), timeout: INSTALLED_HOOK_TIMEOUT_SECONDS },
                 ],

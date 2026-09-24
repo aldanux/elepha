@@ -44,6 +44,7 @@ function purgeState(store: MemoryStore): Record<string, unknown[]> {
         incognitoTombstones: store.database.prepare('SELECT * FROM incognito_transcripts ORDER BY tool, native_id').all(),
         mcpReceipts: store.database.prepare('SELECT * FROM mcp_receipts ORDER BY source_generation, call_id').all(),
         sourceGenerations: store.database.prepare('SELECT * FROM source_generations ORDER BY tool, native_id').all(),
+        standingRules: store.database.prepare('SELECT * FROM standing_rules ORDER BY id').all(),
     };
 }
 
@@ -76,6 +77,102 @@ describe('purge', () => {
         const db = openUnmanagedDb(':memory:');
         store = new MemoryStore(db);
         rollups = new RollupStore(db);
+    });
+
+    function seedRule(projectId: number, ulid = 'rule-one', text = 'Keep project rules'): void {
+        store.database
+            .prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)')
+            .run(ulid, projectId, text, '2026-09-20T00:00:00.000Z');
+    }
+
+    it('previews exact rule-only ownership and deletes only the selected project rules', () => {
+        const project = store.upsertProject('/Users/test/rule-only');
+        const other = store.upsertProject('/Users/test/retained-rules');
+        seedRule(project.id);
+        seedRule(other.id, 'other-rule');
+        const plan = store.planPurge({ projectIds: [project.id], deleteStandingRules: true });
+        expect(plan.sessions).toEqual([]);
+        expect(plan.standingRules).toEqual([{ ...store.standingRules.list([project.id])[0], projectPath: project.path }]);
+        expect(plan.emptiedProjects).toEqual([project]);
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        try {
+            printPurgePlan(plan);
+            const rule = plan.standingRules[0]!;
+            expect(log).toHaveBeenCalledWith(`Standing rules: 1 rule(s).`);
+            expect(log).toHaveBeenCalledWith(
+                `  ${rule.ulid} (id ${rule.id}, project ${rule.project_id}, ${JSON.stringify(rule.projectPath)}, created ${rule.created_at}): ${JSON.stringify(rule.text)}`,
+            );
+            expect(log).not.toHaveBeenCalledWith('Nothing matches this scope. Nothing to purge.');
+        } finally {
+            log.mockRestore();
+        }
+        store.applyPurgePlan(plan);
+        expect(store.standingRules.list([project.id])).toEqual([]);
+        expect(store.getProjectById(project.id)).toBeUndefined();
+        expect(store.standingRules.list([other.id])).toHaveLength(1);
+        expect(store.database.pragma('foreign_key_check')).toEqual([]);
+    });
+
+    it.each([
+        { all: true },
+        { all: true, deleteStandingRules: true, newerThan: '2000-01-01' },
+        { all: true, deleteStandingRules: true, olderThan: '9999-01-01' },
+    ])('retains standing rules and their project during session-only purge %j', (scope) => {
+        const project = store.upsertProject('/Users/test/session-only-rules');
+        store.upsertSession('codex', 'rule-session', project.id, '/tmp/rule-session.jsonl');
+        seedRule(project.id);
+        const plan = store.planPurge(scope);
+        expect(plan.sessions).toHaveLength(1);
+        expect(plan.standingRules).toEqual([]);
+        expect(plan.emptiedProjects).toEqual([]);
+        store.applyPurgePlan(plan);
+        expect(store.standingRules.list([project.id])).toHaveLength(1);
+        expect(store.getProjectById(project.id)).toEqual(project);
+    });
+
+    it('retains rules added after a whole-project preview and keeps their project', () => {
+        const project = store.upsertProject('/Users/test/new-rule');
+        store.upsertSession('codex', 'new-rule-session', project.id, '/tmp/new-rule.jsonl');
+        seedRule(project.id);
+        const plan = store.planPurge({ all: true, deleteStandingRules: true });
+        seedRule(project.id, 'later-rule', 'Added after preview');
+        const applied = store.applyPurgePlan(plan);
+        expect(applied.sessions).toHaveLength(1);
+        expect(applied.standingRules.map((rule) => rule.ulid)).toEqual(['rule-one']);
+        expect(applied.emptiedProjects).toEqual([]);
+        expect(store.standingRules.list([project.id]).map((rule) => rule.ulid)).toEqual(['later-rule']);
+        expect(store.getProjectById(project.id)).toBeDefined();
+    });
+
+    it.each(['text', 'ulid', 'created_at', 'project_id', 'removed'] as const)(
+        'aborts the complete purge when previewed rule %s changes',
+        (field) => {
+            const project = store.upsertProject('/Users/test/changed-rule');
+            const other = store.upsertProject('/Users/test/other-owner');
+            const session = store.upsertSession('codex', 'changed-rule-session', project.id, '/tmp/changed-rule.jsonl');
+            store.recordTurn(makeTurn({ tool: 'codex', sessionId: session.native_id, projectPath: project.path }), session.id, project.id, {
+                decisions: [],
+                pending_items: [],
+                status: 'ok',
+            });
+            seedRule(project.id);
+            const plan = store.planPurge({ projectIds: [project.id], deleteStandingRules: true });
+            if (field === 'removed') store.database.prepare('DELETE FROM standing_rules').run();
+            else store.database.prepare(`UPDATE standing_rules SET ${field} = ?`).run(field === 'project_id' ? other.id : 'changed');
+            const before = purgeState(store);
+            expect(() => store.applyPurgePlan(plan)).toThrow('no longer matches the previewed rule');
+            expect(purgeState(store)).toEqual(before);
+        },
+    );
+
+    it('rejects a substituted project identity before removing its previewed rows', () => {
+        const project = store.upsertProject('/Users/test/changed-project');
+        seedRule(project.id);
+        const plan = store.planPurge({ all: true, deleteStandingRules: true });
+        store.database.prepare('UPDATE projects SET first_seen_at = ? WHERE id = ?').run('replacement', project.id);
+        const before = purgeState(store);
+        expect(() => store.applyPurgePlan(plan)).toThrow('no longer matches the previewed project');
+        expect(purgeState(store)).toEqual(before);
     });
 
     it('purge by project deletes sessions, turns, and rollups, and removes the now-empty project row - other projects untouched', () => {
@@ -340,7 +437,7 @@ describe('purge', () => {
 
                 await expect(runPurgeOperation(fileStore, scope, { applyRequested: true, confirm })).resolves.toBe(true);
 
-                expect(planPurge).toHaveReturnedWith({ scope, sessions: [], emptiedProjects: [] });
+                expect(planPurge).toHaveReturnedWith({ scope, sessions: [], standingRules: [], emptiedProjects: [] });
                 expect(confirm).not.toHaveBeenCalled();
                 expect(purge).not.toHaveBeenCalled();
                 expect(applyPurgePlan).not.toHaveBeenCalled();

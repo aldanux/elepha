@@ -244,6 +244,22 @@ CREATE TABLE IF NOT EXISTS consent_roots (
 );
 CREATE INDEX IF NOT EXISTS idx_consent_roots_state ON consent_roots(state);
 
+-- Standing project rules. Like consent roots and paranoid authority, and
+-- unlike the rebuildable session material that makes up most of this cache,
+-- these rows are durable user authority: a rule exists only because the user
+-- typed it through an exact elepha:rules command, and no rebuild can
+-- reconstruct it. The foreign key deliberately declares no ON DELETE action,
+-- so a project row that still carries rules cannot be removed by a cascade
+-- that was written for rebuildable session data.
+CREATE TABLE IF NOT EXISTS standing_rules (
+  id         INTEGER PRIMARY KEY,
+  ulid       TEXT NOT NULL UNIQUE,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_standing_rules_project ON standing_rules(project_id, id);
+
 ${PARANOID_AUTHORITY_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -258,7 +274,7 @@ CREATE TABLE IF NOT EXISTS injections (
   native_session_id TEXT NOT NULL,
   injected_at       TEXT NOT NULL,
   injection_id      TEXT NOT NULL,   -- ULID embedded in the sentinel
-  body_hash         TEXT NOT NULL,   -- sha256 of the normalized body
+  body_hash         TEXT NOT NULL,   -- normalized sha256, or exact:<sha256 of body>
   body              TEXT NOT NULL,   -- needed for near-verbatim comparison
   UNIQUE (tool, native_session_id, body_hash)
 );
