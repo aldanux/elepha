@@ -6,9 +6,8 @@ import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { PRIVATE_FILE_MODE, SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
-import { normalizeForNearVerbatim } from '../../security/self-ingestion.js';
 import { writeBackup } from '../../storage/backup.js';
-import { validateCandidateSemantics } from '../../storage/candidate-validator.js';
+import { readCandidateStandingRules, validateCandidateSemantics } from '../../storage/candidate-validator.js';
 import {
     type DatabaseEncryptionRuntime,
     databaseKey,
@@ -46,8 +45,9 @@ import {
     inspectPrivateEmptyDatabaseDescriptor,
     writeEncryptedDatabaseImport,
 } from '../../storage/encrypted-database-export.js';
-import type { InjectionRow, McpReceiptRow } from '../../storage/injection-store.js';
+import { type InjectionRow, injectionBodyHash, type McpReceiptRow } from '../../storage/injection-store.js';
 import { type ParanoidControlState, readParanoidControlState } from '../../storage/paranoid-gate.js';
+import type { StandingRuleRow } from '../../storage/standing-rules-store.js';
 import { isToolName } from '../../types/index.js';
 import { errorMessage } from '../../util/error.js';
 import { atomicCopyPrivateFile } from '../../util/fs.js';
@@ -63,6 +63,11 @@ export const REQUIRED_RESTORE_TABLES = [
     'injections',
     'purged_transcripts',
 ] as const;
+export const RESTORE_COUNT_TABLES = [...REQUIRED_RESTORE_TABLES, 'standing_rules'] as const;
+export const RESTORE_STANDING_RULES_CHANGED_ERROR =
+    'Restore preview is stale because active standing rules changed. Run restore again to review the current state.';
+export const RESTORE_STANDING_RULES_STAGE_ERROR = 'Restore staging changed the validated standing rules. Nothing was installed.';
+export const RESTORE_STANDING_RULES_VERIFICATION_ERROR = 'Restored standing rules do not match the validated backup.';
 export const RESTORE_TOMBSTONES_CHANGED_ERROR =
     'Restore preview is stale because active transcript tombstones changed. Run restore again to review the current state.';
 export const RESTORE_CONSENT_CHANGED_ERROR =
@@ -83,7 +88,8 @@ export const RESTORE_CONTROL_TRIGGER_ERROR = 'Backup is unsafe because it contai
 export const RESTORE_CONSENT_TRIGGER_ERROR = 'Backup is unsafe because it contains a consent-root trigger.';
 
 type RequiredRestoreTable = (typeof REQUIRED_RESTORE_TABLES)[number];
-type RestoreCounts = Record<RequiredRestoreTable, number>;
+type RestoreCountTable = (typeof RESTORE_COUNT_TABLES)[number];
+type RestoreCounts = Record<RestoreCountTable, number>;
 type TableColumn = {
     name: string;
     type: string;
@@ -171,15 +177,18 @@ class RestoreApplyError extends Error {
     }
 }
 
-function quoteTable(table: RequiredRestoreTable): string {
+function quoteTable(table: RestoreCountTable): string {
     return `"${table}"`;
 }
 
 function candidateCounts(db: Database.Database): RestoreCounts {
+    const hasRules = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'standing_rules'").get() !== undefined;
     return Object.fromEntries(
-        REQUIRED_RESTORE_TABLES.map((table) => [
+        RESTORE_COUNT_TABLES.map((table) => [
             table,
-            Number((db.prepare(`SELECT COUNT(*) AS count FROM ${quoteTable(table)}`).get() as { count: number }).count),
+            table === 'standing_rules' && !hasRules
+                ? 0
+                : Number((db.prepare(`SELECT COUNT(*) AS count FROM ${quoteTable(table)}`).get() as { count: number }).count),
         ]),
     ) as RestoreCounts;
 }
@@ -432,6 +441,7 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
         if (semanticViolations.length > 0) {
             throw new Error(`Backup is semantically invalid: ${semanticViolations.join('; ')}`);
         }
+        readCandidateStandingRules(staged, 'restore');
         normalizeAndVerifyDurableCapture(staged);
     } finally {
         canonical?.close();
@@ -439,7 +449,7 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
     }
 }
 
-function verifyDatabase(db: Database.Database, expectedCounts: RestoreCounts): string[] {
+function verifyDatabase(db: Database.Database, expectedCounts: RestoreCounts, expectedRulesFingerprint?: string): string[] {
     const missing = missingRequiredTables(db);
     const errors = missing.length > 0 ? [`missing required table(s): ${missing.join(', ')}`] : [];
     if (missing.length > 0) {
@@ -454,9 +464,15 @@ function verifyDatabase(db: Database.Database, expectedCounts: RestoreCounts): s
         errors.push(`foreign_key_check found ${foreignKeyCount} violation(s)`);
     }
     const actualCounts = candidateCounts(db);
-    for (const table of REQUIRED_RESTORE_TABLES) {
+    for (const table of RESTORE_COUNT_TABLES) {
         if (actualCounts[table] !== expectedCounts[table]) {
             errors.push(`${table} row count is ${actualCounts[table]}, expected ${expectedCounts[table]}`);
+        }
+    }
+    if (expectedRulesFingerprint !== undefined) {
+        const hasRules = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'standing_rules'").get() !== undefined;
+        if (!hasRules || standingRulesPlan(db).fingerprint !== expectedRulesFingerprint) {
+            errors.push(RESTORE_STANDING_RULES_VERIFICATION_ERROR);
         }
     }
     return errors;
@@ -477,6 +493,7 @@ function validateCandidate(candidate: Database.Database, candidatePath: string):
             if (missing.length > 0) {
                 validationError = `Backup is incomplete (missing required table(s): ${missing.join(', ')}). Project exports cannot be restored; use the future elepha import command instead.`;
             } else {
+                readCandidateStandingRules(candidate, 'restore');
                 counts = candidateCounts(candidate);
                 const errors = verifyDatabase(candidate, counts);
                 if (errors.length > 0) {
@@ -522,13 +539,20 @@ async function sha256File(filePath: string): Promise<string> {
     return hash.digest('hex');
 }
 
-function printPreview(dbPath: string, candidatePath: string, counts: RestoreCounts, tombstones: TranscriptTombstones): void {
+function printPreview(
+    dbPath: string,
+    candidatePath: string,
+    counts: RestoreCounts,
+    tombstones: TranscriptTombstones,
+    activeRules: number,
+): void {
     console.log(`Restore preview: ${candidatePath}`);
     console.log(`Active database: ${dbPath}`);
     console.log('Candidate rows (the active database will become):');
-    for (const table of REQUIRED_RESTORE_TABLES) {
+    for (const table of RESTORE_COUNT_TABLES) {
         console.log(`  ${table}: ${counts[table]}`);
     }
+    console.log(`Standing rules replacement: ${activeRules} active -> ${counts.standing_rules} candidate.`);
     console.log(
         `Carried tombstones: purged_transcripts: ${tombstones.purged_transcripts.length}, incognito_transcripts: ${tombstones.incognito_transcripts.length}`,
     );
@@ -631,6 +655,58 @@ function logicalPlan<T>(rows: T[]): LogicalPlan<T> {
     return { rows: normalized, fingerprint: createHash('sha256').update(JSON.stringify(normalized)).digest('hex') };
 }
 
+function standingRulesPlan(db: Database.Database, validate = false): LogicalPlan<StandingRuleRow> {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'standing_rules'").get();
+    if (validate) {
+        if (exists === undefined) {
+            throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
+        }
+        return logicalPlan(
+            readCandidateStandingRules(db, 'restore').map(({ id, ulid, project_id, text, created_at }) => ({
+                id,
+                ulid,
+                project_id,
+                text,
+                created_at,
+            })),
+        );
+    }
+    return logicalPlan(
+        exists === undefined
+            ? []
+            : (db.prepare('SELECT id, ulid, project_id, text, created_at FROM standing_rules ORDER BY id').all() as StandingRuleRow[]),
+    );
+}
+
+async function activeStandingRules(
+    dbPath: string,
+    encryption?: DatabaseEncryptionRuntime,
+    lifecycle?: ExclusiveDatabaseLifecycleLease,
+): Promise<LogicalPlan<StandingRuleRow>> {
+    if (!existsSync(dbPath)) {
+        return logicalPlan([]);
+    }
+    const db = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
+    try {
+        return standingRulesPlan(db);
+    } finally {
+        db.close();
+    }
+}
+
+function stagedStandingRules(stagedPath: string, key?: Buffer): LogicalPlan<StandingRuleRow> {
+    // The stage is our private copy. A writable handle closes its empty WAL
+    // bookkeeping; a read-only WAL reader can leave sidecars that correctly
+    // invalidate the sealed-stage hash check even though no row changed.
+    const db =
+        key === undefined ? new Database(stagedPath, { fileMustExist: true }) : openKeyedDatabase(stagedPath, key, { fileMustExist: true });
+    try {
+        return standingRulesPlan(db, true);
+    } finally {
+        db.close();
+    }
+}
+
 function terminalEvictions(db: Database.Database): LogicalPlan<TranscriptIdentity> {
     return logicalPlan(
         db
@@ -691,8 +767,10 @@ async function activeRestoreControls(
             evictions: terminalEvictionAnchors(db),
         }))();
         for (const row of injections) {
-            const hash = createHash('sha256').update(normalizeForNearVerbatim(row.body)).digest('hex');
-            if (!isToolName(row.tool) || row.body_hash !== hash) {
+            if (
+                !isToolName(row.tool) ||
+                (row.body_hash !== injectionBodyHash(row.body) && row.body_hash !== injectionBodyHash(row.body, 'exact'))
+            ) {
                 throw new Error('Active injection provenance is invalid.');
             }
         }
@@ -811,6 +889,7 @@ function overlayControlState(
     tombstones: TranscriptTombstones,
     key?: Buffer,
     controls?: RestoreControls,
+    expectedRulesFingerprint?: string,
 ) {
     const restored = key === undefined ? openUnmanagedDb(stagedPath) : openKeyedDatabase(stagedPath, key);
     try {
@@ -957,6 +1036,9 @@ function overlayControlState(
             }
         })();
         normalizeAndVerifyDurableCapture(restored);
+        if (expectedRulesFingerprint !== undefined && standingRulesPlan(restored, true).fingerprint !== expectedRulesFingerprint) {
+            throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
+        }
         const checkpoint = restored.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
         if (checkpoint[0]?.busy !== 0) {
             throw new Error('Could not checkpoint restored control state.');
@@ -1004,12 +1086,13 @@ function removeAndVerifyDatabaseCompanions(dbPath: string, lifecycle: ExclusiveD
 async function verifyRestoredDatabase(
     dbPath: string,
     expectedCounts: RestoreCounts,
+    expectedRulesFingerprint: string,
     lifecycle: ExclusiveDatabaseLifecycleLease,
     encryption?: DatabaseEncryptionRuntime,
 ): Promise<void> {
     const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
     try {
-        const errors = verifyDatabase(restored, expectedCounts);
+        const errors = verifyDatabase(restored, expectedCounts, expectedRulesFingerprint);
         if (errors.length > 0) {
             throw new Error(errors.join('; '));
         }
@@ -1094,6 +1177,10 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             }
             counts = inspectCandidate(stagedPath, candidatePath, candidateKey);
         }
+        const candidateRules = stagedStandingRules(stagedPath, retainedEncryption?.key ?? candidateKey);
+        if (candidateRules.rows.length !== counts.standing_rules) {
+            throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
+        }
         const expectedStageHash = await validatedStageHash(stagedPath);
         const health = (runtime.daemonHealth ?? currentDaemonHealth)();
         if (health.healthy) {
@@ -1105,7 +1192,8 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         const tombstonePlan = await activeTranscriptTombstones(dbPath, runtime.encryption);
         const currentConsentPlan = await activeConsent(dbPath, runtime.encryption);
         const controlPlan = await activeRestoreControls(dbPath, runtime.encryption, retainedEncryption !== undefined);
-        printPreview(dbPath, candidatePath, counts, tombstonePlan.tombstones);
+        const activeRules = await activeStandingRules(dbPath, runtime.encryption);
+        printPreview(dbPath, candidatePath, counts, tombstonePlan.tombstones, activeRules.rows.length);
         if (runtime.confirm && !(await runtime.confirm())) {
             return { cancelled: true };
         }
@@ -1137,6 +1225,9 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             }
             const confirmedControls = await activeRestoreControls(dbPath, runtime.encryption, retainedEncryption !== undefined, lifecycle);
             assertRestoreControls(confirmedControls, controlPlan);
+            if ((await activeStandingRules(dbPath, runtime.encryption, lifecycle)).fingerprint !== activeRules.fingerprint) {
+                throw new Error(RESTORE_STANDING_RULES_CHANGED_ERROR);
+            }
             if ((await validatedStageHash(stagedPath)) !== expectedStageHash) {
                 throw new Error(RESTORE_STAGE_CHANGED_ERROR);
             }
@@ -1146,6 +1237,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 currentTombstonePlan.tombstones,
                 retainedEncryption?.key ?? candidateKey,
                 confirmedControls,
+                candidateRules.fingerprint,
             );
             removeDatabaseCompanions([stagedPath]);
             if (retainedEncryption !== undefined) {
@@ -1165,6 +1257,18 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 removeDatabaseCompanions([snapshotPath]);
             }
             const snapshotHash = await sha256File(snapshotPath);
+            try {
+                if (stagedStandingRules(stagedPath, retainedEncryption?.key ?? candidateKey).fingerprint !== candidateRules.fingerprint) {
+                    throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
+                }
+            } catch (error) {
+                // Unreadable whole-file corruption retains the existing install
+                // hash failure and atomic rollback contract. This additional
+                // guard classifies only readable standing-rule mutations.
+                if ((error as { code?: string }).code !== 'SQLITE_NOTADB') {
+                    throw error;
+                }
+            }
             lifecycle.beginReplacement();
             try {
                 lifecycle.assertReplacementReady();
@@ -1172,7 +1276,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 const installedHash = await sha256File(dbPath);
                 assertInstalledRestoreHash(installedHash, installStageHash);
                 removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
-                await verifyRestoredDatabase(dbPath, overlay.counts, lifecycle, runtime.encryption);
+                await verifyRestoredDatabase(dbPath, overlay.counts, candidateRules.fingerprint, lifecycle, runtime.encryption);
                 if (retainedEncryption !== undefined) {
                     await assertActiveEncryption(retainedEncryption, dbPath, lifecycle, runtime.encryption);
                 } else {

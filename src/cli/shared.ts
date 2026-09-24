@@ -174,7 +174,7 @@ export async function withCapturePaused(
 }
 
 export function printPurgePlan(plan: PurgePlan): void {
-    if (plan.sessions.length === 0) {
+    if (plan.sessions.length === 0 && plan.standingRules.length === 0) {
         console.log('Nothing matches this scope. Nothing to purge.');
         return;
     }
@@ -182,10 +182,20 @@ export function printPurgePlan(plan: PurgePlan): void {
     const totalFilteredTurns = plan.sessions.reduce((sum, s) => sum + s.filteredTurnCount, 0);
     const totalFilteredBytes = plan.sessions.reduce((sum, s) => sum + s.filteredBytes, 0);
     const emptiedProjectPaths = new Set(plan.emptiedProjects.map((project) => project.path));
-    const projectPaths = [...new Set(plan.sessions.map((session) => session.projectPath))].sort((a, b) => a.localeCompare(b));
+    const projectPaths = [
+        ...new Set([...plan.sessions.map((session) => session.projectPath), ...plan.standingRules.map((rule) => rule.projectPath)]),
+    ].sort((a, b) => a.localeCompare(b));
 
     console.log(`In total: ${plan.sessions.length} session(s), ${totalTurns} turn(s).`);
     console.log(`Stored conversation copy: ${totalFilteredTurns} filtered turn(s), ${totalFilteredBytes} byte(s).`);
+    if (plan.standingRules.length > 0) {
+        console.log(`Standing rules: ${plan.standingRules.length} rule(s).`);
+        for (const rule of plan.standingRules) {
+            console.log(
+                `  ${rule.ulid} (id ${rule.id}, project ${rule.project_id}, ${JSON.stringify(rule.projectPath)}, created ${rule.created_at}): ${JSON.stringify(rule.text)}`,
+            );
+        }
+    }
     console.log('\nelepha memory in these projects:');
     for (const projectPath of projectPaths) {
         console.log(

@@ -1,24 +1,33 @@
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
-import { canonicalizeExisting, isWithinProviderStore, normalizeForCompare } from '../../config/paths.js';
+import { canonicalizeExisting, isWithin, isWithinProviderStore, normalizeForCompare } from '../../config/paths.js';
 import { readSessionMetadata } from '../../discovery/session-projects.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
 import { stripShellSyntax } from '../../security/sanitize.js';
+import { gitRemoteGetUrlOrigin, gitRevParseShowToplevel, gitRootCommit } from '../../security/subprocess-allowlist.js';
 import { writeBackup } from '../../storage/backup.js';
-import { validateCandidateSemantics } from '../../storage/candidate-validator.js';
+import { readCandidateStandingRules, validateCandidateSemantics } from '../../storage/candidate-validator.js';
+import { ConsentStore } from '../../storage/consent-store.js';
 import { defaultDbPath, hasPlaintextDatabaseHeader, openManagedDatabase } from '../../storage/db.js';
 import { firstPromptSearch } from '../../storage/first-prompt-search.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver } from '../../storage/project-resolver.js';
-import type { ProjectRow } from '../../storage/project-store.js';
+import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from '../../storage/project-store.js';
 import {
     sanitizeRollupDecisionsField,
     sanitizeRollupDisplayField,
     sanitizeRollupPendingItemsField,
 } from '../../storage/sanitize-backfill.js';
+import {
+    applyStandingRuleImport,
+    assertStandingRuleImportAuthorized,
+    planStandingRuleImport,
+    type RuleImportCounts,
+    type RuleImportPlan,
+} from '../../storage/standing-rules-import.js';
 import { hydrateTurnDecisions, sanitizeTurnDecision } from '../../storage/turn-store.js';
 import type { ToolName } from '../../types/index.js';
 import { errorMessage } from '../../util/error.js';
@@ -75,6 +84,7 @@ interface SessionPlan {
 }
 
 export interface ImportPlan {
+    rules: RuleImportPlan;
     projects: ProjectTarget[];
     sessions: SessionPlan[];
     counts: {
@@ -97,6 +107,7 @@ export interface ImportRuntime {
 }
 
 export interface ImportResult {
+    rules: RuleImportCounts;
     cancelled: boolean;
     snapshotPath?: string;
     added: number;
@@ -208,6 +219,7 @@ function validateCandidate(db: Database.Database): void {
     if (semanticViolations.length > 0) {
         throw new Error(`Backup is semantically invalid: ${semanticViolations.join('; ')}`);
     }
+    readCandidateStandingRules(db);
 
     const integrity = db.pragma('integrity_check') as Array<{ integrity_check: string }>;
     if (integrity.length !== 1 || integrity[0]?.integrity_check !== 'ok') {
@@ -407,6 +419,7 @@ async function buildPlan(active: Database.Database, candidate: Database.Database
     return {
         projects,
         sessions,
+        rules: planStandingRuleImport(active, candidate),
         counts: {
             new: sessions.filter((session) => session.disposition === 'new').length,
             existing: sessions.filter((session) => session.disposition === 'existing').length,
@@ -441,6 +454,18 @@ function printPreview(candidatePath: string, overwrite: boolean, plan: ImportPla
     }
     if (plan.counts.outsideStore > 0) {
         console.error(`${plan.counts.outsideStore} skipped (transcript outside provider store)`);
+    }
+    const rules = plan.rules.counts;
+    if (Object.values(rules).some((count) => count > 0)) {
+        console.log(
+            `Standing rules: ${rules.added} new, ${rules.unchanged} unchanged, ${rules.unmapped} skipped (unmapped), ${rules.unconsented} skipped (unconsented).`,
+        );
+        for (const target of plan.rules.targets) {
+            console.log(`Standing rule target: ${target.path} (${target.rules.length} rules).`);
+        }
+        if (rules.added > 0) {
+            console.log('Confirming this import also adds the previewed standing rules; --overwrite never replaces existing rules.');
+        }
     }
 }
 
@@ -510,8 +535,14 @@ function updateSession(db: Database.Database, row: ImportSessionRow, localSessio
     );
 }
 
-function applyProjects(db: Database.Database, plan: ImportPlan, overwrite: boolean): Map<number, number> {
-    const sessionStore = new MemoryStore(db);
+function applyProjects(
+    db: Database.Database,
+    plan: ImportPlan,
+    overwrite: boolean,
+    projectIdentities: ReadonlyMap<string, ResolvedProjectIdentity>,
+): Map<number, number> {
+    const projectStore = new ProjectStore(db);
+    const consent = new ConsentStore(db);
     const localByCanonicalCwd = new Map<string, number>();
     const sessionProjectIds = new Map<number, number>();
     for (const session of plan.sessions) {
@@ -522,7 +553,20 @@ function applyProjects(db: Database.Database, plan: ImportPlan, overwrite: boole
         if (canonicalCwd === undefined) {
             throw new Error(`Importable backup session ${session.row.id} has no canonical cwd.`);
         }
-        const projectId = localByCanonicalCwd.get(canonicalCwd) ?? sessionStore.upsertProject(canonicalCwd).id;
+        const projectIdentity = projectIdentities.get(canonicalCwd);
+        if (projectIdentity === undefined) {
+            throw new Error(`Importable backup session ${session.row.id} has no resolved project identity.`);
+        }
+        const cachedProjectId = localByCanonicalCwd.get(canonicalCwd);
+        if (cachedProjectId !== undefined) {
+            sessionProjectIds.set(session.row.id, cachedProjectId);
+            continue;
+        }
+        const project = projectStore.upsertProject(canonicalCwd, projectIdentity);
+        if (project.git_root !== null && consent.consentStateForCanonicalPath(project.git_root) !== 'approved') {
+            throw new Error(`Import Git root authorization changed after preview: ${project.git_root}.`);
+        }
+        const projectId = project.id;
         localByCanonicalCwd.set(canonicalCwd, projectId);
         sessionProjectIds.set(session.row.id, projectId);
     }
@@ -574,8 +618,14 @@ function assertPlanStillAuthorized(db: Database.Database, plan: ImportPlan): voi
     }
 }
 
-function applyMerge(db: Database.Database, candidate: Database.Database, plan: ImportPlan, overwrite: boolean): void {
-    const sessionProjectIds = applyProjects(db, plan, overwrite);
+function applyMerge(
+    db: Database.Database,
+    candidate: Database.Database,
+    plan: ImportPlan,
+    overwrite: boolean,
+    projectIdentities: ReadonlyMap<string, ResolvedProjectIdentity>,
+): void {
+    const sessionProjectIds = applyProjects(db, plan, overwrite, projectIdentities);
     const sessionIds = new Map<number, number>();
     const importedSessionIds = new Set<number>();
 
@@ -649,6 +699,60 @@ function applyMerge(db: Database.Database, candidate: Database.Database, plan: I
     }
 }
 
+function resolveAuthorizedImportIdentity(db: Database.Database, canonicalCwd: string, consent: ConsentStore): ResolvedProjectIdentity {
+    const rootless: ResolvedProjectIdentity = { gitRoot: null, gitRemote: null, gitRootCommit: null };
+    if (consent.consentState(canonicalCwd) !== 'approved') {
+        // The transactional authorization check reports the affected session.
+        return rootless;
+    }
+    // Git runs only from a physical, consent-checked local project path. A
+    // repository discovered above that path needs its own consent before any
+    // remote or commit probe or project-set binding may use it.
+    const discovered = gitRevParseShowToplevel(canonicalCwd);
+    if (discovered === null) {
+        return rootless;
+    }
+    let gitRoot: string;
+    try {
+        gitRoot = realpathSync(discovered);
+    } catch {
+        return rootless;
+    }
+    if (!isWithin(gitRoot, canonicalCwd) || consent.consentState(gitRoot) !== 'approved') {
+        return rootless;
+    }
+    const existing = db.prepare('SELECT git_remote, git_root_commit FROM projects WHERE git_root = ? ORDER BY id LIMIT 1').get(gitRoot) as
+        | { git_remote: string | null; git_root_commit: string | null }
+        | undefined;
+    return {
+        gitRoot,
+        gitRemote: existing ? existing.git_remote : gitRemoteGetUrlOrigin(gitRoot),
+        gitRootCommit: existing ? existing.git_root_commit : gitRootCommit(gitRoot),
+    };
+}
+
+function consentedBackupProjectPath(
+    candidate: Database.Database,
+    backupProjectId: number,
+    canonicalSessionCwd: string,
+    consent: ConsentStore,
+): string | undefined {
+    const project = candidate.prepare('SELECT path FROM projects WHERE id = ?').get(backupProjectId) as { path: unknown } | undefined;
+    if (typeof project?.path !== 'string' || consent.consentState(project.path) !== 'approved') {
+        return undefined;
+    }
+    try {
+        const physical = realpathSync(project.path);
+        return statSync(physical).isDirectory() &&
+            isWithin(physical, canonicalSessionCwd) &&
+            consent.consentStateForCanonicalPath(physical) === 'approved'
+            ? physical
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 async function applyImport(
     dbPath: string,
     candidate: Database.Database,
@@ -663,11 +767,46 @@ async function applyImport(
         active.pragma('journal_mode = WAL');
         active.pragma('foreign_keys = ON');
         active.pragma('wal_checkpoint(TRUNCATE)');
+        assertStandingRuleImportAuthorized(active, plan.rules, true);
+        const consent = new ConsentStore(active);
+        const projectIdentities = new Map<string, ResolvedProjectIdentity>();
+        for (const session of plan.sessions) {
+            if (session.disposition !== 'new' && !(overwrite && session.disposition === 'existing')) {
+                continue;
+            }
+            if (session.canonicalCwd === undefined) {
+                throw new Error(`Importable backup session ${session.row.id} has no canonical cwd.`);
+            }
+            if (!projectIdentities.has(session.canonicalCwd)) {
+                // Transcript cwd decides session eligibility. Only a separately
+                // checked backup project record can supply a Git probe cwd.
+                const projectPath = consentedBackupProjectPath(candidate, session.row.project_id, session.canonicalCwd, consent);
+                projectIdentities.set(
+                    session.canonicalCwd,
+                    projectPath === undefined
+                        ? { gitRoot: null, gitRemote: null, gitRootCommit: null }
+                        : resolveAuthorizedImportIdentity(active, projectPath, consent),
+                );
+            }
+        }
+        for (const target of plan.rules.targets) {
+            if (!projectIdentities.has(target.path)) {
+                projectIdentities.set(target.path, resolveAuthorizedImportIdentity(active, target.path, consent));
+            }
+        }
         snapshotPath = snapshotWriter(active, dbPath);
         const merge = active.transaction(() => {
             assertPlanStillAuthorized(active, plan);
-            applyMerge(active, candidate, plan, overwrite);
+            assertStandingRuleImportAuthorized(active, plan.rules, false);
+            for (const projectIdentity of projectIdentities.values()) {
+                if (projectIdentity.gitRoot !== null && consent.consentStateForCanonicalPath(projectIdentity.gitRoot) !== 'approved') {
+                    throw new Error('Import Git root authorization changed after preview.');
+                }
+            }
+            const verifyRuleTargets = applyStandingRuleImport(active, plan.rules, projectIdentities);
+            applyMerge(active, candidate, plan, overwrite, projectIdentities);
             beforeVerify?.(active);
+            verifyRuleTargets();
             const foreignKeys = active.pragma('foreign_key_check') as unknown[];
             if (foreignKeys.length > 0) {
                 throw new Error(`foreign_key_check found ${foreignKeys.length} violation(s)`);
@@ -704,6 +843,7 @@ export async function runImportOperation(candidatePath: string, overwrite: boole
         if (runtime.confirm && !(await runtime.confirm(plan))) {
             return {
                 cancelled: true,
+                rules: { ...plan.rules.counts, added: 0, unchanged: 0 },
                 added: 0,
                 overwritten: 0,
                 skipped:
@@ -729,7 +869,13 @@ export async function runImportOperation(candidatePath: string, overwrite: boole
         console.log(
             `Imported: ${plan.counts.new} added, ${overwritten} overwritten, ${skipped} skipped. ${plan.counts.unconsented} skipped (unconsented). Snapshot: ${snapshotPath}`,
         );
-        return { cancelled: false, snapshotPath, added: plan.counts.new, overwritten, skipped };
+        const rules = plan.rules.counts;
+        if (Object.values(rules).some((count) => count > 0)) {
+            console.log(
+                `Standing rules imported: ${rules.added} added, ${rules.unchanged} unchanged, ${rules.unmapped} skipped (unmapped), ${rules.unconsented} skipped (unconsented).`,
+            );
+        }
+        return { cancelled: false, snapshotPath, added: plan.counts.new, overwritten, skipped, rules };
     } finally {
         candidate.close();
     }

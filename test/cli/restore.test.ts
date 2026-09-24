@@ -31,6 +31,9 @@ import {
     RESTORE_MCP_RECEIPTS_CHANGED_ERROR,
     RESTORE_PARANOID_CHANGED_ERROR,
     RESTORE_STAGE_CHANGED_ERROR,
+    RESTORE_STANDING_RULES_CHANGED_ERROR,
+    RESTORE_STANDING_RULES_STAGE_ERROR,
+    RESTORE_STANDING_RULES_VERIFICATION_ERROR,
     RESTORE_TOMBSTONES_CHANGED_ERROR,
     runRestoreOperation,
 } from '../../src/cli/commands/restore.js';
@@ -43,7 +46,7 @@ import { DEFAULT_MEMORY_CONFIG } from '../../src/config/memory-config.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { recordHookOutput } from '../../src/hooks/output.js';
 import { filterTurn } from '../../src/rendering/filtered-turn.js';
-import { detectShellSyntax } from '../../src/security/sanitize.js';
+import { detectShellSyntax, escapeShellSyntax } from '../../src/security/sanitize.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-recall.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { writeBackup } from '../../src/storage/backup.js';
@@ -65,6 +68,7 @@ import {
     inspectPrivateEmptyDatabaseDescriptor,
     writeEncryptedDatabaseImport,
 } from '../../src/storage/encrypted-database-export.js';
+import { injectionBodyHash } from '../../src/storage/injection-store.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import {
     enableParanoidMode,
@@ -78,6 +82,8 @@ import { ProjectResolver, type ProjectSet } from '../../src/storage/project-reso
 import { applyManualSplit, planManualSplit } from '../../src/storage/resegmentation.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import { sourceTurnDigest } from '../../src/storage/source-turn-digest.js';
+import type { StandingRuleRow } from '../../src/storage/standing-rules-store.js';
+import { newUlid } from '../../src/storage/ulid.js';
 import type { ParsedTurn, SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
@@ -366,6 +372,22 @@ function populate(dbPath: string, suffix: string): void {
     db.close();
 }
 
+function seedRestoreRule(db: Database.Database, text: string, ulid = newUlid()): StandingRuleRow {
+    const project = db.prepare('SELECT id FROM projects ORDER BY id LIMIT 1').get() as { id: number };
+    return db
+        .prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?) RETURNING *')
+        .get(ulid, project.id, text, '2026-09-20T00:00:00.000Z') as StandingRuleRow;
+}
+
+function restoredRules(dbPath: string, key?: Buffer): StandingRuleRow[] {
+    const db = key === undefined ? new Database(dbPath, { readonly: true }) : openKeyedDatabase(dbPath, key, { readonly: true });
+    try {
+        return db.prepare('SELECT id, ulid, project_id, text, created_at FROM standing_rules ORDER BY id').all() as StandingRuleRow[];
+    } finally {
+        db.close();
+    }
+}
+
 function fullBackup(sourcePath: string, destination: string): void {
     const db = openUnmanagedDb(sourcePath);
     try {
@@ -436,6 +458,342 @@ function replaceWithLegacySessionsTable(db: Database.Database): void {
 }
 
 describe('elepha restore', () => {
+    it('preserves mixed legacy and exact hook attribution unchanged through full restore', async () => {
+        const active = createTestDb('elepha-exact-attribution-active-');
+        const candidate = createTestDb('elepha-exact-attribution-candidate-');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        const input = {
+            tool: 'codex' as const,
+            nativeSessionId: 'rules-chat',
+            injectedAt: '2026-09-20T00:00:00.000Z',
+            injectionId: 'legacy',
+            body: 'Use Foo.',
+        };
+        expect(active.store.recordInjection(input)).toBe(true);
+        for (const body of ['Use Foo.', 'Use foo!', 'Use foo.'])
+            expect(active.store.recordInjection({ ...input, body, injectionId: body, attribution: 'exact' })).toBe(true);
+        // Restore overlays provenance with new internal row ids; the durable
+        // identity, timestamps, bodies and both hash formats must stay exact.
+        const projection = 'SELECT tool, native_session_id, injected_at, injection_id, body_hash, body FROM injections ORDER BY body_hash';
+        const expected = active.db.prepare(projection).all();
+        const backup = path.join(candidate.directory, 'full.db');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        await runRestoreOperation(backup, { dbPath: active.dbPath, daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }) });
+        const restored = openUnmanagedDb(active.dbPath);
+        try {
+            expect(restored.prepare(projection).all()).toEqual(expected);
+        } finally {
+            restored.close();
+        }
+    });
+
+    it.each(['exact:', `exact:${'a'.repeat(64)}`, 'exact:normalized', 'normalized-digest'])(
+        'rejects malformed or incorrect exact attribution before confirmation: %s',
+        async (invalid) => {
+            const active = createTestDb('elepha-invalid-attribution-active-');
+            const candidate = createTestDb('elepha-invalid-attribution-candidate-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const body = 'Use Foo.';
+            active.store.recordInjection({
+                tool: 'codex',
+                nativeSessionId: 'rules-chat',
+                injectedAt: '2026-09-20T00:00:00.000Z',
+                injectionId: 'rule',
+                body,
+                attribution: 'exact',
+            });
+            active.db
+                .prepare("UPDATE injections SET body_hash = ? WHERE native_session_id = 'rules-chat'")
+                .run(invalid === 'normalized-digest' ? `exact:${injectionBodyHash(body)}` : invalid);
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const confirm = vi.fn(async () => true);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    confirm,
+                }),
+            ).rejects.toThrow('Active injection provenance is invalid.');
+            expect(confirm).not.toHaveBeenCalled();
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        },
+    );
+
+    describe('standing rules', () => {
+        it('rolls back the exact previous rules when post-install fingerprint verification fails', async () => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-verify-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const prior = seedRestoreRule(active.db, 'Original active rule.');
+            const incoming = seedRestoreRule(candidate.db, 'Candidate rule for verification.');
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const originalPrepare = Database.prototype.prepare;
+            let fingerprintChecked = false;
+            const prepare = vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (this: Database.Database, sql: string) {
+                const statement = originalPrepare.call(this, sql) as Database.Statement;
+                if (
+                    this.name === active.dbPath &&
+                    sql === 'SELECT id, ulid, project_id, text, created_at FROM standing_rules ORDER BY id'
+                ) {
+                    const stored = statement.all() as StandingRuleRow[];
+                    if (stored[0]?.ulid === incoming.ulid) {
+                        fingerprintChecked = true;
+                        vi.spyOn(statement, 'all').mockReturnValue(
+                            stored.map((rule) => ({ ...rule, text: 'Changed without changing the count.' })),
+                        );
+                    }
+                }
+                return statement;
+            });
+            try {
+                await expect(
+                    runRestoreOperation(backup, { dbPath: active.dbPath, daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }) }),
+                ).rejects.toThrow(RESTORE_STANDING_RULES_VERIFICATION_ERROR);
+            } finally {
+                prepare.mockRestore();
+            }
+            expect(fingerprintChecked).toBe(true);
+            expect(restoredRules(active.dbPath)).toEqual([prior]);
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+
+        it('rejects unsafe encrypted candidate rules before confirmation', async () => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-encrypted-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            seedRestoreRule(candidate.db, 'Never run $(untrusted).');
+            active.close();
+            candidate.close();
+            const encryption = encryptionRuntime();
+            await encryptDatabase(active.dbPath, encryption);
+            await encryptDatabase(candidate.dbPath, encryption);
+            const backup = path.join(candidate.directory, 'encrypted.db');
+            const source = openKeyedDatabase(candidate.dbPath, FIXED_KEY);
+            try {
+                exportAll(source, backup, FIXED_KEY);
+            } finally {
+                source.close();
+            }
+            const confirm = vi.fn(async () => true);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    encryption,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    confirm,
+                }),
+            ).rejects.toThrow('canonical sanitized text');
+            expect(confirm).not.toHaveBeenCalled();
+            expect(restoredRules(active.dbPath, FIXED_KEY)).toEqual([]);
+        });
+
+        it.each(['plaintext', 'encrypted'] as const)('preserves exact %s candidate rows and replaces active rules', async (mode) => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-candidate-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const prior = seedRestoreRule(active.db, 'Active rule to replace.');
+            const expected = [seedRestoreRule(candidate.db, escapeShellSyntax('Never run $(untrusted) or `shell`.'))];
+            active.close();
+            candidate.close();
+            const encryption = mode === 'encrypted' ? encryptionRuntime() : undefined;
+            const backup = path.join(candidate.directory, 'full.db');
+            if (encryption !== undefined) {
+                await encryptDatabase(active.dbPath, encryption);
+                await encryptDatabase(candidate.dbPath, encryption);
+                const source = openKeyedDatabase(candidate.dbPath, FIXED_KEY);
+                try {
+                    exportAll(source, backup, FIXED_KEY);
+                } finally {
+                    source.close();
+                }
+            } else fullBackup(candidate.dbPath, backup);
+            const result = await runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                encryption,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            });
+            expect(restoredRules(active.dbPath, encryption === undefined ? undefined : FIXED_KEY)).toEqual(expected);
+            expect(result.snapshotPath).toBeDefined();
+            expect(restoredRules(result.snapshotPath ?? '', encryption === undefined ? undefined : FIXED_KEY)).toEqual([prior]);
+        });
+
+        it('previews active replacement by a real legacy full backup with zero candidate rules', async () => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-legacy-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'legacy');
+            seedRestoreRule(active.db, 'Will be replaced by an empty rule set.');
+            candidate.db.exec('DROP TABLE standing_rules');
+            candidate.db.pragma('wal_checkpoint(TRUNCATE)');
+            const backup = path.join(candidate.directory, 'legacy.db');
+            candidate.close();
+            active.close();
+            copyFileSync(candidate.dbPath, backup);
+            const output: string[] = [];
+            const log = vi.spyOn(console, 'log').mockImplementation((message) => output.push(String(message)));
+            try {
+                await runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                });
+            } finally {
+                log.mockRestore();
+            }
+            expect(output).toContain('  standing_rules: 0');
+            expect(output).toContain('Standing rules replacement: 1 active -> 0 candidate.');
+            expect(restoredRules(active.dbPath)).toEqual([]);
+        });
+
+        it.each(['add', 'replace', 'remove'] as const)('rejects active rule %s after confirmation preview', async (mutation) => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-candidate-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            seedRestoreRule(active.db, 'Original rule.');
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const snapshot = vi.fn(writeBackup);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    writeBackup: snapshot,
+                    confirm: async () => {
+                        const db = new Database(active.dbPath);
+                        try {
+                            if (mutation === 'add') seedRestoreRule(db, 'Added after preview.');
+                            else if (mutation === 'replace') db.exec("UPDATE standing_rules SET text = 'Replaced after preview.'");
+                            else db.exec('DELETE FROM standing_rules');
+                        } finally {
+                            db.close();
+                        }
+                        return true;
+                    },
+                }),
+            ).rejects.toThrow(RESTORE_STANDING_RULES_CHANGED_ERROR);
+            expect(snapshot).not.toHaveBeenCalled();
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+
+        it.each([
+            'unsafe',
+            'noncanonical',
+            'orphan',
+            'duplicate-id',
+            'duplicate-ulid',
+            'duplicate-text',
+            'scalar',
+            'count',
+            'chars',
+            'astral',
+        ] as const)('rejects %s candidate rules before confirmation', async (invalid) => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-invalid-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const rule = seedRestoreRule(candidate.db, 'Valid rule.');
+            candidate.db.exec(
+                'ALTER TABLE standing_rules RENAME TO original_rules; CREATE TABLE standing_rules (id INTEGER, ulid, project_id INTEGER, text, created_at); INSERT INTO standing_rules SELECT * FROM original_rules; DROP TABLE original_rules',
+            );
+            if (invalid === 'unsafe') candidate.db.exec("UPDATE standing_rules SET text = 'Never run $(download).'");
+            if (invalid === 'noncanonical') candidate.db.exec("UPDATE standing_rules SET text = '  Padded rule.  '");
+            if (invalid === 'orphan') candidate.db.exec('UPDATE standing_rules SET project_id = 99999');
+            if (invalid === 'scalar') candidate.db.prepare('UPDATE standing_rules SET text = ?').run(Buffer.alloc(100_000, 65));
+            if (invalid === 'astral') candidate.db.prepare('UPDATE standing_rules SET text = ?').run('😀'.repeat(151));
+            if (invalid.startsWith('duplicate'))
+                candidate.db
+                    .prepare('INSERT INTO standing_rules VALUES (?, ?, ?, ?, ?)')
+                    .run(
+                        invalid === 'duplicate-id' ? rule.id : rule.id + 1,
+                        invalid === 'duplicate-ulid' ? rule.ulid : newUlid(),
+                        rule.project_id,
+                        invalid === 'duplicate-id' ? 'Another rule.' : rule.text,
+                        rule.created_at,
+                    );
+            if (invalid === 'count' || invalid === 'chars') {
+                candidate.db.exec('DELETE FROM standing_rules');
+                for (let i = 0; i < (invalid === 'count' ? 9 : 5); i++)
+                    candidate.db
+                        .prepare('INSERT INTO standing_rules VALUES (?, ?, ?, ?, ?)')
+                        .run(
+                            i + 1,
+                            newUlid(),
+                            rule.project_id,
+                            invalid === 'count' ? `Rule ${i}.` : `${i}${'😀'.repeat(120)}`,
+                            rule.created_at,
+                        );
+            }
+            const backup = path.join(candidate.directory, 'invalid.db');
+            candidate.db.pragma('wal_checkpoint(TRUNCATE)');
+            candidate.close();
+            active.close();
+            copyFileSync(candidate.dbPath, backup);
+            const confirm = vi.fn(async () => true);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    confirm,
+                }),
+            ).rejects.toThrow(/standing rule/i);
+            expect(confirm).not.toHaveBeenCalled();
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+
+        it.each(['mutate', 'lose'] as const)('rejects readable staging rule %s before installation', async (mutation) => {
+            const active = createTestDb('elepha-restore-rules-active-');
+            const candidate = createTestDb('elepha-restore-rules-stage-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const prior = seedRestoreRule(active.db, 'Retain active rule.');
+            seedRestoreRule(candidate.db, 'Candidate rule.');
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const restoreTemp = isolateRestoreTemp();
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    writeBackup: (db, dbPath) => {
+                        const snapshot = writeBackup(db, dbPath);
+                        const directory = stagedRestoreDirectories(restoreTemp)[0];
+                        if (directory === undefined) throw new Error('Missing stage.');
+                        const staged = new Database(path.join(restoreTemp, directory, 'candidate.db'));
+                        try {
+                            staged.exec(
+                                mutation === 'lose'
+                                    ? 'DELETE FROM standing_rules'
+                                    : "UPDATE standing_rules SET text = 'Changed staged rule.'",
+                            );
+                            staged.pragma('wal_checkpoint(TRUNCATE)');
+                        } finally {
+                            staged.close();
+                        }
+                        return snapshot;
+                    },
+                }),
+            ).rejects.toThrow(RESTORE_STANDING_RULES_STAGE_ERROR);
+            expect(restoredRules(active.dbPath)).toEqual([prior]);
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+    });
     it.each([
         { encrypted: false, label: 'plaintext' },
         { encrypted: true, label: 'same-key encrypted' },
@@ -3090,6 +3448,8 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         const backup = path.join(candidate.directory, 'full.db');
         populate(active.dbPath, 'before');
         populate(candidate.dbPath, 'after');
+        const previousRules = [seedRestoreRule(active.db, 'Preserve this rule across generic rollback.')];
+        seedRestoreRule(candidate.db, 'Candidate rule for generic rollback.');
         fullBackup(candidate.dbPath, backup);
         active.close();
         candidate.close();
@@ -3120,6 +3480,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(snapshotPath).toBeDefined();
         expect(existsSync(snapshotPath!)).toBe(true);
         expect(readFileSync(active.dbPath)).toEqual(before);
+        expect(restoredRules(active.dbPath)).toEqual(previousRules);
         expect(hasLifecycleIntent(active.dbPath)).toBe(false);
         expect(stagedRestoreDirectories(restoreTemp)).toEqual([]);
     });
@@ -3410,6 +3771,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             );
         replaceWithLegacySessionsTable(candidate.db);
         candidate.db.exec(`
+            DROP TABLE standing_rules;
             DROP TABLE filtered_turns_fts;
             DROP TABLE filtered_turns;
             DROP TABLE durable_capture_status;
@@ -3446,6 +3808,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             );
             expect(() => assertCanonicalDurableCaptureSchema(restored, canonical)).not.toThrow();
             expect(restored.prepare('SELECT id, total_bytes FROM durable_capture_usage').all()).toEqual([{ id: 1, total_bytes: 0 }]);
+            expect(restored.prepare('SELECT * FROM standing_rules').all()).toEqual([]);
         } finally {
             canonical.close();
             restored.close();

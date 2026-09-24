@@ -68,6 +68,15 @@ function seedExportFixture() {
     seedRollup(fixture, { project: primary, session: primarySession });
     seedRollup(fixture, { project: fragment, session: fragmentSession });
     seedRollup(fixture, { project: other, session: otherSession });
+    for (const member of [primary, fragment, other]) {
+        expect(
+            store.standingRules.add(
+                { projectIds: [member.id], ownerProjectId: member.id, stillConsented: () => true },
+                `Rule for project row ${member.id}.`,
+                '2026-09-20T00:00:00.000Z',
+            ).status,
+        ).toBe('added');
+    }
     const resolution = new ProjectResolver(fixture.db).resolve('elepha');
     if (!('project' in resolution) || resolution.project === null) throw new Error('fragmented project did not resolve');
     fixture.db.pragma('wal_checkpoint(TRUNCATE)');
@@ -115,8 +124,8 @@ function portableSchemaRows(db: Database.Database): Array<Record<string, unknown
         .prepare(
             `SELECT type, name, tbl_name, sql
              FROM sqlite_master
-             WHERE (type = 'table' AND name IN ('projects', 'sessions', 'memories', 'session_rollups'))
-                OR (type IN ('index', 'trigger') AND tbl_name IN ('projects', 'sessions', 'memories', 'session_rollups'))
+             WHERE (type = 'table' AND name IN ('projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'))
+                OR (type IN ('index', 'trigger') AND tbl_name IN ('projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'))
              ORDER BY type, name`,
         )
         .all() as Array<Record<string, unknown>>;
@@ -281,6 +290,36 @@ function fakePrompts(selections: string[], destination: string): { prompts: Back
 }
 
 describe('elepha backup exports', () => {
+    it('exports a rule-only logical project without unrelated rules or sessions', () => {
+        const fixture = createTestDb('elepha-backup-rule-only-');
+        const project = seedProject(fixture);
+        const other = seedProject(fixture, { path: path.join(fixture.directory, 'other') });
+        for (const member of [project, other]) {
+            expect(
+                fixture.store.standingRules.add(
+                    { projectIds: [member.id], ownerProjectId: member.id, stillConsented: () => true },
+                    `Keep rule ${member.id}.`,
+                    '2026-09-20T00:00:00.000Z',
+                ).status,
+            ).toBe('added');
+        }
+        const selected = new ProjectResolver(fixture.db).listStored().find((set) => set.projectIds.includes(project.id));
+        if (selected === undefined) throw new Error('Missing rule-only project.');
+        fixture.db.pragma('wal_checkpoint(TRUNCATE)');
+        fixture.db.pragma('journal_mode = DELETE');
+        rekeyDatabaseConnection(fixture.db, FIXED_KEY);
+        const output = path.join(fixture.directory, 'rule-only.db');
+        exportProject(fixture.db, selected, output, FIXED_KEY);
+        const exported = openKeyedDatabase(output, FIXED_KEY, { readonly: true });
+        try {
+            expect(exported.prepare('SELECT * FROM sessions').all()).toEqual([]);
+            expect(exported.prepare('SELECT * FROM standing_rules').all()).toEqual(fixture.store.standingRules.list([project.id]));
+            expect(exported.prepare('SELECT id FROM projects').all()).toEqual([{ id: project.id }]);
+        } finally {
+            exported.close();
+        }
+    });
+
     it('configures the production attached target while its first encrypted page is still unwritten', () => {
         const { fixture } = seedExportFixture();
         const output = path.join(fixture.directory, 'keyed-from-first-write.db');
@@ -312,6 +351,9 @@ describe('elepha backup exports', () => {
         const keyed = openKeyedDatabase(output, FIXED_KEY, { readonly: true, fileMustExist: true });
         try {
             expect(keyed.prepare('SELECT COUNT(*) AS count FROM sessions').get()).toEqual({ count: 3 });
+            expect(keyed.prepare('SELECT * FROM standing_rules ORDER BY id').all()).toEqual(
+                fixture.db.prepare('SELECT * FROM standing_rules ORDER BY id').all(),
+            );
         } finally {
             keyed.close();
         }
@@ -524,6 +566,7 @@ describe('elepha backup exports', () => {
                 { name: 'projects' },
                 { name: 'session_rollups' },
                 { name: 'sessions' },
+                { name: 'standing_rules' },
             ]);
             expect(exported.prepare('SELECT id FROM projects ORDER BY id').all()).toEqual(project.projectIds.map((id) => ({ id })));
             expect(exported.prepare('SELECT DISTINCT project_id FROM sessions ORDER BY project_id').all()).toEqual(
@@ -536,6 +579,23 @@ describe('elepha backup exports', () => {
                 project.projectIds.map((project_id) => ({ project_id })),
             );
             expect(exported.prepare('SELECT COUNT(*) AS count FROM projects WHERE id = ?').get(other.id)).toEqual({ count: 0 });
+            expect(exported.prepare('SELECT * FROM standing_rules ORDER BY id').all()).toEqual(
+                fixture.db
+                    .prepare(
+                        `SELECT * FROM standing_rules WHERE project_id IN (${project.projectIds.map(() => '?').join(',')}) ORDER BY id`,
+                    )
+                    .all(...project.projectIds),
+            );
+            expect(exported.prepare('SELECT COUNT(*) AS count FROM standing_rules').get()).toEqual({ count: 2 });
+            expect(
+                exported
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'standing_rules' AND sql IS NOT NULL")
+                    .all(),
+            ).toEqual(
+                fixture.db
+                    .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'standing_rules' AND sql IS NOT NULL")
+                    .all(),
+            );
             expect(portableSchemaRows(exported)).toEqual(sourceSchema);
             expect(
                 exported

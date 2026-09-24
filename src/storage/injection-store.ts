@@ -32,12 +32,22 @@ export interface McpReceiptRow {
     body: string;
 }
 
+export type InjectionAttribution = 'normalized' | 'exact';
+
+export function injectionBodyHash(body: string, attribution: InjectionAttribution = 'normalized'): string {
+    const digest = createHash('sha256')
+        .update(attribution === 'exact' ? body : normalizeForNearVerbatim(body))
+        .digest('hex');
+    return attribution === 'exact' ? `exact:${digest}` : digest;
+}
+
 export interface RecordInjectionInput {
     tool: ToolName;
     nativeSessionId: string;
     injectedAt: string;
     injectionId: string;
     body: string;
+    attribution?: InjectionAttribution;
 }
 
 export type InjectionQuoteBackResult = 'match' | 'no-match' | 'incomplete';
@@ -137,8 +147,10 @@ export class InjectionStore {
 
     // Stores a future hook injection's exact body once; normalized-hash
     // uniqueness preserves the original hook contract and timestamp gating.
+    // Explicit user rules use namespaced exact identity so case/punctuation
+    // edits remain separately attributable without changing legacy bodies.
     recordInjection(input: RecordInjectionInput): boolean {
-        const bodyHash = createHash('sha256').update(normalizeForNearVerbatim(input.body)).digest('hex');
+        const bodyHash = injectionBodyHash(input.body, input.attribution);
         const result = this.stmts.insertInjection.run({
             tool: input.tool,
             native_session_id: input.nativeSessionId,

@@ -1,6 +1,6 @@
 import { newUlid } from '../storage/ulid.js';
 
-export type InjectionKind = 'brief' | 'notify';
+export type InjectionKind = 'brief' | 'notify' | 'rules';
 
 export const OPEN = '[[elepha:';
 export const CLOSE = '[[/elepha]]';

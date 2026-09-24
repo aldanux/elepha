@@ -1,4 +1,5 @@
-// Fail-open SessionStart hook. This module emits operational notices only.
+// Fail-open SessionStart hook. User-saved rules and operational notices use
+// separate channels and separately attributable, atomically recorded bodies.
 
 import { existsSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
@@ -7,8 +8,14 @@ import { updateAvailablePath } from '../config/paths.js';
 import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
+import { prepareStandingRulesDelivery, STANDING_RULES_INVALID } from '../serving/standing-rules.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
+import {
+    type AuthenticatedReadGeneration,
+    memoryReadAuthorityMatchesGenerationInTransaction,
+    withMemoryReadGeneration,
+} from '../storage/paranoid-gate.js';
 import { type HookTool, parsePayload, readStdin, type SessionStartPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
 import { recordHookOutput } from './output.js';
@@ -22,6 +29,9 @@ export interface SessionStartDependencies {
     // Local daemon marker only. The hook never performs the registry check.
     readUpdateAvailable?: (markerPath: string) => UpdateAvailable | undefined;
     writeInjection?: (store: MemoryStore, input: Parameters<MemoryStore['recordInjection']>[0]) => boolean;
+    // Synchronous checkpoint after physical resolution, before the DB-only
+    // authorization and recording transaction. Used to exercise stale plans.
+    beforeDelivery?: (db: Database.Database) => void;
 }
 
 export type HookResult = { output: Record<string, unknown> } | { reason: string };
@@ -43,26 +53,20 @@ export function handleWatchdogTimeout(
     exit(0);
 }
 
-function envelope(tool: HookTool, body: string, channel: 'additionalContext' | 'systemMessage'): Record<string, unknown> {
-    const hookSpecificOutput =
-        channel === 'additionalContext' ? { hookEventName: 'SessionStart', additionalContext: body } : { hookEventName: 'SessionStart' };
+function envelope(tool: HookTool, channels: { additionalContext?: string; systemMessage?: string }): Record<string, unknown> {
+    const hookSpecificOutput = {
+        hookEventName: 'SessionStart',
+        ...(channels.additionalContext === undefined ? {} : { additionalContext: channels.additionalContext }),
+    };
     return tool === 'claude-code'
-        ? channel === 'systemMessage'
-            ? { hookSpecificOutput, systemMessage: body }
-            : { hookSpecificOutput }
+        ? { hookSpecificOutput, ...(channels.systemMessage === undefined ? {} : { systemMessage: channels.systemMessage }) }
         : {
               continue: true,
               hookSpecificOutput,
               stopReason: null,
               suppressOutput: false,
-              systemMessage: channel === 'systemMessage' ? body : null,
+              ...(channels.systemMessage === undefined ? {} : { systemMessage: channels.systemMessage }),
           };
-}
-
-function notifyChannel(tool: HookTool): 'additionalContext' | 'systemMessage' {
-    // Claude Code renders systemMessage at startup. Codex renders only
-    // additionalContext there; its developer-channel record is not ingested.
-    return tool === 'claude-code' ? 'systemMessage' : 'additionalContext';
 }
 
 export function withDaemonHealthWarning(body: string, now: number, healthCheck: typeof classifyDaemonHealth): string {
@@ -104,16 +108,13 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
     const now = clock();
     let body = withDaemonHealthWarning('', now, dependencies.daemonHealth ?? classifyDaemonHealth);
     body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
-    if (!body) {
-        return { reason: 'no_notice' };
-    }
     let db: Database.Database;
     try {
         const dbPath = dependencies.dbPath ?? defaultDbPath();
         if (!existsSync(dbPath)) {
             return { reason: 'database_unavailable' };
         }
-        // Hooks must see additive schema migrations before recording a notice.
+        // Hooks must see additive schema migrations before reading rules or recording output.
         // `openDb` is idempotent and refuses no existing data.
         db = await (dependencies.openDatabase ?? openDb)(dbPath);
     } catch {
@@ -121,25 +122,64 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
     }
     try {
         const store = new MemoryStore(db);
-        const emit = (notice: string): HookResult => {
-            const output = recordHookOutput({
-                store,
-                tool,
-                nativeSessionId: payload.session_id,
-                injectedAt: new Date(now).toISOString(),
-                body: notice,
-                kind: 'notify',
-                writeInjection: dependencies.writeInjection,
-            });
+        const generation = withMemoryReadGeneration<AuthenticatedReadGeneration | undefined>(
+            db,
+            () => undefined,
+            (token) => token,
+        );
+        const readRules = generation === undefined ? () => undefined : prepareStandingRulesDelivery(db, store, payload.cwd);
+        dependencies.beforeDelivery?.(db);
+        const recordFailed = new Error('injection_record_failed');
+        const record = (text: string, kind: 'rules' | 'notify'): string => {
+            let output: string | undefined;
+            try {
+                output = recordHookOutput({
+                    store,
+                    tool,
+                    nativeSessionId: payload.session_id,
+                    injectedAt: new Date(now).toISOString(),
+                    body: text,
+                    kind,
+                    attribution: kind === 'rules' ? 'exact' : 'normalized',
+                    writeInjection: dependencies.writeInjection,
+                });
+            } catch {
+                throw recordFailed;
+            }
             if (output === undefined) {
+                throw recordFailed;
+            }
+            return output;
+        };
+        let result: HookResult;
+        let invalidRules = false;
+        try {
+            result = db
+                .transaction((): HookResult => {
+                    const readable = generation !== undefined && memoryReadAuthorityMatchesGenerationInTransaction(db, generation);
+                    const delivery = readable ? readRules() : undefined;
+                    invalidRules = delivery !== undefined && 'reason' in delivery;
+                    const rules = delivery !== undefined && 'body' in delivery ? delivery.body : undefined;
+                    if (rules === undefined && !body) {
+                        return { reason: invalidRules ? STANDING_RULES_INVALID : 'no_notice' };
+                    }
+                    const additionalContext = rules === undefined ? undefined : record(rules, 'rules');
+                    const systemMessage = body ? record(body, 'notify') : undefined;
+                    return { output: envelope(tool, { additionalContext, systemMessage }) };
+                })
+                .immediate();
+        } catch (error) {
+            if (error === recordFailed) {
                 log(sessionLogLine(tool, payload, 'failed reason=injection_record_failed'));
                 return { reason: 'injection_record_failed' };
             }
-            return { output: envelope(tool, output, notifyChannel(tool)) };
-        };
-        const result = emit(body);
+            throw error;
+        }
+        if (invalidRules) {
+            log(sessionLogLine(tool, payload, `skipped reason=${STANDING_RULES_INVALID}`));
+        }
         if ('output' in result) {
-            log(sessionLogLine(tool, payload, 'emitted notice'));
+            log(sessionLogLine(tool, payload, 'emitted output'));
         }
         return result;
     } catch (error) {

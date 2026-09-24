@@ -17,6 +17,15 @@ import {
 const bin = '/opt/npm/bin/elepha';
 
 describe('global hook transforms', () => {
+    it('matches Claude fork only while preserving the Codex four-source matcher and context limit', () => {
+        const claude = JSON.parse(transformClaudeHook('{}', bin));
+        const codex = parse(transformCodexHook('', bin)) as {
+            hooks: { SessionStart: Array<{ matcher: string; hooks: Array<{ additionalContextLimit: number }> }> };
+        };
+        expect(claude.hooks.SessionStart[0].matcher.split('|')).toEqual(['startup', 'clear', 'resume', 'compact', 'fork']);
+        expect(codex.hooks.SessionStart[0].matcher.split('|')).toEqual(['startup', 'clear', 'resume', 'compact']);
+        expect(codex.hooks.SessionStart[0].hooks[0].additionalContextLimit).toBe(0);
+    });
     it('installs exactly one Claude handler and preserves its sibling handler', () => {
         const input = JSON.stringify({
             hooks: {

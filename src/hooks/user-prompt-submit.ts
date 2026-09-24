@@ -35,6 +35,12 @@ import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js
 import { currentRecallHits, renderSemanticUnion, semanticRecall, semanticRecallNotices } from '../serving/semantic-recall.js';
 import { selectSessionEvidence } from '../serving/session-evidence.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
+import {
+    isStandingRulesCommand,
+    parseStandingRulesCommand,
+    type StandingRulesCommand,
+    standingRulesCommandBody,
+} from '../serving/standing-rules.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
@@ -54,6 +60,7 @@ export type UserPromptCommand =
     | { kind: 'list'; count: number; tool?: ToolName }
     | { kind: 'resume'; index: number }
     | { kind: 'query'; query: string; scope: 'global' | 'here' }
+    | StandingRulesCommand
     | { kind: 'action'; command: 'self-update' };
 
 export interface UserPromptSubmitDependencies {
@@ -69,7 +76,7 @@ export interface UserPromptSubmitDependencies {
 }
 
 export type UserPromptSubmitResult = { output: Record<string, unknown> } | { reason: string };
-type ProjectCommand = Exclude<UserPromptCommand, { kind: 'query' }>;
+type ProjectCommand = Exclude<UserPromptCommand, { kind: 'query' } | StandingRulesCommand>;
 interface CommandBodyResult {
     body: string;
     shownSessionIds?: number[];
@@ -126,6 +133,10 @@ export function parseUserPromptCommand(prompt: string): UserPromptCommand | unde
     }
     if (command === 'elepha:last') {
         return { kind: 'last' };
+    }
+    const rules = parseStandingRulesCommand(command);
+    if (rules) {
+        return rules;
     }
     const queryHere = /^elepha:query:here(?:\s+([\s\S]*))?$/.exec(command);
     if (queryHere) {
@@ -297,11 +308,18 @@ export async function runUserPromptSubmit(
             }
             return { output: envelope(output) };
         };
+        let completedRuleCommand = false;
         const locked = (): UserPromptSubmitResult => {
             if (automatic) {
                 return { reason: 'not_command' };
             }
-            const result = emit(LOCKED_MEMORY_MESSAGE);
+            // The outer read gate can change after a rule mutation and its
+            // receipt commit. Never expose that stale private result, but tell
+            // the user to inspect the saved state before repeating the command.
+            const message = completedRuleCommand
+                ? 'The standing-rule command finished before memory locked. Run elepha unlock, then elepha:rules to inspect the result before retrying.'
+                : LOCKED_MEMORY_MESSAGE;
+            const result = emit(message);
             if ('output' in result) {
                 log(promptLogLine(tool, payload, 'served locked'));
             }
@@ -506,6 +524,34 @@ export async function runUserPromptSubmit(
                             storeShownSessionIds = true;
                         }
                     }
+                }
+            } else if (isStandingRulesCommand(command)) {
+                // Handled synchronously: the project set, the consent check and
+                // the write must not be separated by an awaited boundary.
+                const receiptFailure = new Error('Standing rule receipt failed.');
+                let receipt: UserPromptSubmitResult | undefined;
+                try {
+                    commandOutput = standingRulesCommandBody(db, store, command, payload.cwd, new Date(clock()).toISOString(), (body) => {
+                        try {
+                            receipt = emit(body);
+                        } catch {
+                            log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
+                            throw receiptFailure;
+                        }
+                        if (!('output' in receipt)) {
+                            throw receiptFailure;
+                        }
+                    });
+                } catch (error) {
+                    if (error === receiptFailure) {
+                        return { reason: 'injection_record_failed' };
+                    }
+                    throw error;
+                }
+                if (receipt !== undefined) {
+                    completedRuleCommand = true;
+                    log(promptLogLine(tool, payload, command.kind));
+                    return receipt;
                 }
             } else {
                 const project = consentedProject(db, payload.cwd);

@@ -44,7 +44,7 @@ export function registerPurge(program: Command): void {
     program
         .command('purge')
         .description(
-            'Delete sessions, turns, and rollups (and any project row left with zero sessions) — the privacy instrument behind consent revocation. Dry-run by default.',
+            'Delete selected sessions, turns, and rollups; whole-project scopes also delete standing rules. Remove project rows with no remaining memory. Dry-run by default.',
         )
         .option('--project <pathOrName>', 'purge everything for project rows matching this path or display name')
         .option('--here', 'purge everything for the project in the current working directory')
@@ -127,7 +127,7 @@ export function registerPurge(program: Command): void {
                     if (!process.stdout.isTTY || opts.skipConfirmation) {
                         return true;
                     }
-                    if (await confirmPurgeDeletion(plan.sessions.length)) {
+                    if (await confirmPurgeDeletion(plan.sessions.length, plan.standingRules.length)) {
                         return true;
                     }
                     console.log('Cancelled — nothing was deleted.');
@@ -151,7 +151,7 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
         operationLabel: 'purge',
         plan: () => options.plan ?? store.planPurge(scope),
         describe: printPurgePlan,
-        isEmpty: (plan) => plan.sessions.length === 0,
+        isEmpty: (plan) => plan.sessions.length === 0 && plan.standingRules.length === 0,
         messages: {
             dryRun:
                 "\nThis is a preview — nothing was deleted. This clears elepha's memory only — your original AI coding session history on disk is untouched. " +
@@ -165,13 +165,21 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
         backupLog: reportPurgeBackup,
         apply: (plan) => {
             appliedPlan = store.applyPurgePlan(plan);
-            const affectedProjects = new Set(appliedPlan.sessions.map((session) => session.projectId)).size;
+            const affectedProjects = new Set([
+                ...appliedPlan.sessions.map((session) => session.projectId),
+                ...appliedPlan.standingRules.map((rule) => rule.project_id),
+            ]).size;
             console.log(`Deleted ${appliedPlan.sessions.length} session(s) across ${affectedProjects} project(s) from elepha's memory.`);
+            if (appliedPlan.standingRules.length > 0) {
+                console.log(`Deleted ${appliedPlan.standingRules.length} standing rule(s).`);
+            }
         },
         verify: () => {
             const findSession = store.database.prepare('SELECT 1 FROM sessions WHERE id = ?');
             const appliedSessions = appliedPlan?.sessions ?? [];
             const remainingSessions = appliedSessions.filter((session) => findSession.get(session.id) !== undefined);
+            const findRule = store.database.prepare('SELECT 1 FROM standing_rules WHERE id = ? OR ulid = ?');
+            const remainingRules = (appliedPlan?.standingRules ?? []).filter((rule) => findRule.get(rule.id, rule.ulid) !== undefined);
             const withFilteredRows = store.database.prepare(
                 `SELECT COUNT(*) AS count
                  FROM filtered_turns
@@ -202,6 +210,11 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
                     throw new Error('Purge FTS verification was not initialized.');
                 }
                 remainingFtsTerms += (withFtsTerms.get(ids) as { count: number }).count;
+            }
+            if (remainingRules.length > 0) {
+                verificationFailed = true;
+                console.error(`\nVERIFICATION FAILED: ${remainingRules.length} standing rule(s) from the applied purge still remain.`);
+                process.exitCode = 1;
             }
             if (remainingSessions.length > 0 || remainingFilteredRows > 0 || remainingFtsTerms > 0) {
                 verificationFailed = true;
@@ -305,8 +318,8 @@ function printExternalImportPurgePlan(plan: ExternalImportPurgePlan): void {
     );
 }
 
-async function confirmPurgeDeletion(sessionCount: number): Promise<boolean> {
+async function confirmPurgeDeletion(sessionCount: number, ruleCount = 0): Promise<boolean> {
     return confirmYesNo(
-        `Delete elepha's memory for these ${sessionCount} session(s)? Your Claude Code / Codex history on disk is untouched. This cannot be undone (a backup is saved). [y/N] `,
+        `Delete elepha's memory for these ${sessionCount} session(s)${ruleCount > 0 ? ` and ${ruleCount} standing rule(s)` : ''}? Your Claude Code / Codex history on disk is untouched. This cannot be undone (a backup is saved). [y/N] `,
     );
 }

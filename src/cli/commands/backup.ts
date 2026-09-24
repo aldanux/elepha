@@ -40,7 +40,7 @@ import { errorMessage } from '../../util/error.js';
 import { ensureCreatedDirsPrivate, listRegularFiles } from '../../util/fs.js';
 import { runBackupWizard } from '../backup-wizard.js';
 
-const EXPORTED_TABLES = ['projects', 'sessions', 'memories', 'session_rollups'] as const;
+const EXPORTED_TABLES = ['projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'] as const;
 
 interface BackupCommandOptions {
     all: boolean;
@@ -203,7 +203,7 @@ export function exportAll(db: Database.Database, destination: string, encryption
     return destination;
 }
 
-// Exports exactly one resolved ProjectSet and the four portable tables that reference it.
+// Exports exactly one resolved ProjectSet and its portable memory and rule tables.
 export function exportProject(
     source: Database.Database,
     project: ProjectSet,
@@ -988,6 +988,9 @@ function copyProjectRows(source: Database.Database, targetSchema: string, projec
     const target = (table: (typeof EXPORTED_TABLES)[number]) => `"${targetSchema.replaceAll('"', '""')}"."${table}"`;
     source.prepare(`INSERT INTO ${target('projects')} SELECT * FROM main.projects WHERE id IN (${ids})`).run(...projectIds);
     source.prepare(`INSERT INTO ${target('sessions')} SELECT * FROM main.sessions WHERE project_id IN (${ids})`).run(...projectIds);
+    source
+        .prepare(`INSERT INTO ${target('standing_rules')} SELECT * FROM main.standing_rules WHERE project_id IN (${ids})`)
+        .run(...projectIds);
     source
         .prepare(
             `INSERT INTO ${target('memories')}

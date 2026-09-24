@@ -3,7 +3,7 @@
 // (.biome-plugins/no-raw-subprocess.grit) bans exec/execSync/spawn/spawnSync
 // calls and the shell option everywhere else, and
 // test/security/subprocess-allowlist.test.ts asserts this file's actual call
-// sites match the fixed OpenCode hook, git, service, npm, and macOS inspection wrappers here.
+// sites match the fixed OpenCode hooks, git, service, npm, and macOS inspection wrappers here.
 //
 // Git uses fixed subcommands and a canonicalized, consent-checked project
 // cwd. Service and npm wrappers use fixed lifecycle/package-management verbs
@@ -17,6 +17,7 @@ import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import {
+    HOOK_PAYLOAD_MAX_CHARS,
     INSTALLED_HOOK_TIMEOUT_SECONDS,
     LEGACY_MCP_INSPECTION_MAX_BYTES,
     LEGACY_MCP_INSPECTION_TIMEOUT_MS,
@@ -31,6 +32,7 @@ import type { LauncherBackend } from '../install/launcher.js';
 import { ensurePrivateDir } from '../util/fs.js';
 
 export const OPENCODE_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'opencode'] as const;
+export const OPENCODE_RULES_HOOK_ARGS = ['hook', 'standing-rules', '--tool', 'opencode'] as const;
 
 // This client runs inside OpenCode. Only the trusted installed launcher is
 // baked into its code; project directory, session ID, and prompt stay on stdin.
@@ -49,6 +51,39 @@ function runHook(payload) {
         timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
         killSignal: 'SIGKILL',
         maxBuffer: ${OPENCODE_PLUGIN_OUTPUT_MAX_BYTES},
+    });
+}
+`;
+}
+
+// The system transform must not block OpenCode's event loop. Its executable
+// and argv are installer-owned constants; session/project identity is JSON
+// on stdin only. execFile bounds both output streams and kills on timeout.
+export function renderOpencodeRulesClient(launcher: string): string {
+    if (!path.isAbsolute(launcher)) {
+        throw new Error('OpenCode plugin launcher must be an absolute path');
+    }
+    return `import { execFile } from 'node:child_process';
+const rulesLauncher = ${JSON.stringify(launcher)};
+function runRulesHook(payload) {
+    return new Promise((resolve) => {
+        try {
+            const input = JSON.stringify(payload);
+            if (input.length > ${HOOK_PAYLOAD_MAX_CHARS}) { resolve(''); return; }
+            const child = execFile(rulesLauncher, ${JSON.stringify(OPENCODE_RULES_HOOK_ARGS)}, {
+                shell: false,
+                encoding: 'utf8',
+                timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
+                killSignal: 'SIGKILL',
+                maxBuffer: ${OPENCODE_PLUGIN_OUTPUT_MAX_BYTES},
+            }, (error, stdout) => {
+                resolve(error || typeof stdout !== 'string' || Buffer.byteLength(stdout, 'utf8') > ${OPENCODE_PLUGIN_OUTPUT_MAX_BYTES} ? '' : stdout);
+            });
+            child.stdin.on('error', () => resolve(''));
+            child.stdin.end(input);
+        } catch {
+            resolve('');
+        }
     });
 }
 `;

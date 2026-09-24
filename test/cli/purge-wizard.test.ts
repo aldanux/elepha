@@ -49,6 +49,44 @@ function fakePrompts(
 }
 
 describe('revoked purge scope', () => {
+    it('retains durable rules after revoke and after a revoked-session purge', () => {
+        const directory = withGrantableTestDir('purge-revoked-rules-');
+        const db = openUnmanagedDb(':memory:');
+        const store = new MemoryStore(db);
+        const project = store.upsertProject(path.join(directory, 'project'));
+        store.consent.grant(directory);
+        store.upsertSession('codex', 'revoked-rules', project.id, '/tmp/revoked-rules.jsonl');
+        db.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)').run(
+            'revoked-rule',
+            project.id,
+            'Keep after revoke',
+            '2026-09-20',
+        );
+        store.consent.revoke(directory);
+        expect(store.standingRules.list([project.id])).toHaveLength(1);
+        const scope = buildPurgeScope(store, { revoked: true });
+        expect(scope.deleteStandingRules).toBe(false);
+        const applied = store.purge(scope);
+        expect(applied.sessions).toHaveLength(1);
+        expect(applied.standingRules).toEqual([]);
+        expect(store.standingRules.list([project.id])).toHaveLength(1);
+        expect(store.getProjectById(project.id)).toBeDefined();
+        db.close();
+    });
+
+    it.each([
+        [{ project: '/selected' }, true],
+        [{ orphan: true }, true],
+        [{ all: true }, true],
+        [{ revoked: true }, false],
+        [{ project: '/selected', olderThan: '2026-01-01' }, false],
+        [{ orphan: true, newerThan: '2026-01-01' }, false],
+        [{ all: true, olderThan: '2026-01-01' }, false],
+    ] as const)('carries the whole-project rule intention for %j', (options, expected) => {
+        const db = openUnmanagedDb(':memory:');
+        expect(buildPurgeScope(new MemoryStore(db), options).deleteStandingRules).toBe(expected);
+        db.close();
+    });
     it.each([
         { parentState: 'approved', childState: 'denied', expectedSelected: true },
         { parentState: 'denied', childState: 'approved', expectedSelected: false },
@@ -91,6 +129,44 @@ describe('revoked purge scope', () => {
 });
 
 describe('elepha purge wizard', () => {
+    it('confirms exact rule-only deletion through the interactive project branch', async () => {
+        const directory = withGrantableTestDir('purge-wizard-rule-only-');
+        const db = openUnmanagedDb(':memory:');
+        const store = new MemoryStore(db);
+        const project = store.upsertProject(directory);
+        db.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)').run(
+            'wizard-rule',
+            project.id,
+            'A durable rule',
+            '2026-09-20',
+        );
+        const { prompts, events } = fakePrompts(['project', directory], true);
+        await expect(
+            runPurgeWizard({
+                input: ttyStream(),
+                output: ttyStream(),
+                store,
+                prompts,
+                runPurge: async (scope, plan, confirm) => {
+                    expect(scope.deleteStandingRules).toBe(true);
+                    expect(plan.sessions).toEqual([]);
+                    expect(plan.standingRules.map((rule) => rule.ulid)).toEqual(['wizard-rule']);
+                    expect(await confirm(plan)).toBe(true);
+                    store.applyPurgePlan(plan);
+                    return true;
+                },
+                runExternalAgentImports: async () => false,
+            }),
+        ).resolves.toBe(0);
+        expect(prompts.confirm).toHaveBeenCalledWith({
+            message:
+                "Delete elepha's memory for these 0 session(s) and 1 standing rule(s)? Your Claude Code / Codex history on disk is untouched. A backup is saved first.",
+            initialValue: false,
+        });
+        expect(events).toContain('outro:Purge complete.');
+        expect(store.getProjectById(project.id)).toBeUndefined();
+        db.close();
+    });
     it('does not print a success outro when the destructive operation refuses to run', async () => {
         const { prompts, events } = fakePrompts(['all'], true);
         const plan = { sessions: [{ id: 1 }] };
@@ -208,7 +284,10 @@ describe('elepha purge wizard', () => {
             expect(store.findSession('codex', selectedSession.native_id)).toBeUndefined();
             expect(store.findSession('codex', fragmentSession.native_id)).toBeUndefined();
             expect(store.findSession('codex', retainedSession.native_id)).toBeDefined();
-            expect(runPurge.mock.calls[0]?.[0]).toEqual({ projectIds: [selectedProject.id, fragmentProjectId] });
+            expect(runPurge.mock.calls[0]?.[0]).toEqual({
+                projectIds: [selectedProject.id, fragmentProjectId],
+                deleteStandingRules: true,
+            });
             expect(store.planPurge({ projectPath: selectedPath }).sessions).toEqual([]);
         } finally {
             if (previousDbPath === undefined) {

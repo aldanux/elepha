@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { runPurgeOperation } from '../../src/cli/commands/purge.js';
 import { PURGE_HERE_UNCONSENTED } from '../../src/cli/purge-wizard.js';
 import { consentedProject } from '../../src/hooks/common.js';
+import { listManagedBackups } from '../../src/storage/backup.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
@@ -82,6 +83,38 @@ function databaseRows(dbPath: string): Record<string, unknown[]> {
 }
 
 describe('elepha purge orphan project scope', () => {
+    it('previews, confirms, backs up and deletes a rule-only project through the CLI', () => {
+        const directory = withGrantableTestDir('purge-rule-only-cli-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const db = openUnmanagedDb(dbPath);
+        const store = new MemoryStore(db);
+        const project = store.upsertProject(path.join(directory, 'rules-project'));
+        db.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)').run(
+            'cli-rule',
+            project.id,
+            'Only durable rule',
+            '2026-09-20',
+        );
+        db.close();
+        const preview = runPurgeCli(dbPath, '--project', project.path);
+        expect(preview.status).toBe(0);
+        expect(preview.stdout).toContain('Standing rules: 1 rule(s).');
+        expect(preview.stdout).toContain(
+            `cli-rule (id 1, project ${project.id}, ${JSON.stringify(project.path)}, created 2026-09-20): "Only durable rule"`,
+        );
+        expect(databaseRows(dbPath).standing_rules).toHaveLength(1);
+        const applied = runTtyPurgeCli(dbPath, 'y\n', '--project', project.path, '--apply');
+        expect(applied.status).toBe(0);
+        expect(applied.stdout).toContain('0 session(s) and 1 standing rule(s)?');
+        const [snapshot] = listManagedBackups(dbPath);
+        expect(snapshot).toBeDefined();
+        expect(databaseRows(snapshot!).standing_rules).toEqual([
+            { id: 1, ulid: 'cli-rule', project_id: project.id, text: 'Only durable rule', created_at: '2026-09-20' },
+        ]);
+        expect(applied.stdout).toContain('Deleted 1 standing rule(s).');
+        expect(databaseRows(dbPath).standing_rules).toEqual([]);
+        expect(databaseRows(dbPath).projects).toEqual([]);
+    });
     it('applies only surviving previewed ids when matching sessions appear during confirmation', async () => {
         const directory = withTempDir('elepha-purge-');
         const dbPath = path.join(directory, 'elepha.db');

@@ -11,7 +11,7 @@ import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js
 import type { SessionAdapterTool } from '../types/index.js';
 
 export type HookTool = SessionAdapterTool | 'opencode';
-export type HookSource = 'startup' | 'clear' | 'resume' | 'compact';
+export type HookSource = 'startup' | 'clear' | 'resume' | 'compact' | 'fork';
 
 interface CommonHookPayload {
     session_id: string;
@@ -84,7 +84,10 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
         transcript_path: payload.transcript_path as string | null | undefined,
     };
     if (payload.hook_event_name === 'SessionStart') {
-        if (!['startup', 'clear', 'resume', 'compact'].includes(payload.source as string)) {
+        if (
+            !['startup', 'clear', 'resume', 'compact'].includes(payload.source as string) &&
+            !(tool === 'claude-code' && payload.source === 'fork')
+        ) {
             return undefined;
         }
         return { ...common, hook_event_name: 'SessionStart', source: payload.source as HookSource };

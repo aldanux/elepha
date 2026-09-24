@@ -150,6 +150,47 @@ describe('external-agent import purge', () => {
 
     afterEach(() => vi.unstubAllEnvs());
 
+    it('retains a project whose imported sessions are gone but standing rules remain', async () => {
+        const project = store.upsertProject('/Users/test/imported-rules');
+        store.upsertSession('codex', 'rule-owned-import', project.id, importedSource);
+        db.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)').run(
+            'external-rule',
+            project.id,
+            'Preserve this project',
+            '2026-09-20',
+        );
+        const adapter = new CodexAdapter(() => {});
+        const plan = await planExternalAgentImportPurge(db, adapter);
+        expect(plan.emptiedProjects).not.toContainEqual({ id: project.id, path: project.path });
+        expect(plan.resulting.projects).toBe(2);
+        applyExternalAgentImportPurge(db, plan);
+        expect(store.getProjectById(project.id)).toBeDefined();
+        expect(store.standingRules.list([project.id])).toHaveLength(1);
+        expect((await verifyExternalAgentImportPurge(db, adapter, plan)).ok).toBe(true);
+    });
+
+    it('aborts atomically when a rule is added after preview to a project planned for deletion', async () => {
+        const project = store.upsertProject('/Users/test/imported-new-rule');
+        store.upsertSession('codex', 'new-rule-owned-import', project.id, importedSource);
+        const plan = await planExternalAgentImportPurge(db, new CodexAdapter(() => {}));
+        expect(plan.emptiedProjects).toContainEqual({ id: project.id, path: project.path });
+        db.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)').run(
+            'new-external-rule',
+            project.id,
+            'Added after preview',
+            '2026-09-20',
+        );
+        const state = () =>
+            Object.fromEntries(
+                ['projects', 'sessions', 'memories', 'session_rollups', 'standing_rules', 'mcp_receipts', 'source_generations'].map(
+                    (table) => [table, db.prepare(`SELECT * FROM ${table}`).all()],
+                ),
+            );
+        const before = state();
+        expect(() => applyExternalAgentImportPurge(db, plan)).toThrow('project ownership or standing rules changed after preview');
+        expect(state()).toEqual(before);
+    });
+
     it('previews exact source-backed rows and resulting counts without writing', async () => {
         const plan = await planExternalAgentImportPurge(db, new CodexAdapter(() => {}));
 

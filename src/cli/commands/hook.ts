@@ -1,10 +1,20 @@
 import type { Command } from 'commander';
 import { isHookTool } from '../../hooks/common.js';
 import { runSessionStartCli } from '../../hooks/session-start.js';
+import { runStandingRulesHookCli } from '../../hooks/standing-rules.js';
 import { runUserPromptSubmitCli } from '../../hooks/user-prompt-submit.js';
 
 export function registerHook(program: Command): void {
     const hook = program.command('hook', { hidden: true }).description('Install and execute bounded elepha hooks');
+    hook.command('standing-rules')
+        .requiredOption('--tool <tool>', 'opencode')
+        .action(async (opts: { tool: string }) => {
+            if (opts.tool !== 'opencode') {
+                process.exitCode = 0;
+                return;
+            }
+            await runStandingRulesHookCli();
+        });
     hook.command('session-start')
         .requiredOption('--tool <tool>', 'claude-code, codex, or opencode')
         .action(async (opts: { tool: string }) => {

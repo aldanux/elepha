@@ -192,6 +192,103 @@ describe('MemoryStore', () => {
         // the others' history.
         const fakeResolver = (map: Record<string, string | null>) => (p: string) => map[p] ?? null;
 
+        it('preserves every rule identity and creation order when merging project owners', () => {
+            const root = store.upsertProject('/rules-repo');
+            const child = store.upsertProject('/rules-repo/child');
+            const insert = store.database.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)');
+            insert.run('first-rule', child.id, 'First rule', '2026-09-20T01:00:00.000Z');
+            insert.run('second-rule', root.id, 'Second rule', '2026-09-20T00:00:00.000Z');
+            const before = store.standingRules.list([root.id, child.id]);
+            store.rekeyProjectsByIdentity(fakeResolver({ '/rules-repo': '/rules-repo', '/rules-repo/child': '/rules-repo' }));
+            expect(store.standingRules.list([root.id])).toEqual(before.map((rule) => ({ ...rule, project_id: root.id })));
+            expect(store.getProjectById(child.id)).toBeUndefined();
+            expect(store.database.pragma('foreign_key_check')).toEqual([]);
+        });
+
+        it('rekeys an exactly full rule budget with escaped shell references byte-for-byte', () => {
+            const root = store.upsertProject('/escaped-rules');
+            const child = store.upsertProject('/escaped-rules/child');
+            const texts = [
+                'Never execute \\`commands\\` or $\\(commands).'.padEnd(300, 'x'),
+                'Second rule.'.padEnd(300, 'y'),
+                'Third rule.'.padEnd(300, 'z'),
+                'Fourth rule.'.padEnd(300, 'w'),
+            ];
+            const insert = store.database.prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)');
+            texts.forEach((text, index) => {
+                insert.run(`escaped-${index}`, index % 2 === 0 ? child.id : root.id, text, '2026-09-20T00:00:00.000Z');
+            });
+            const before = store.standingRules.list([root.id, child.id]);
+            expect(before.reduce((total, rule) => total + rule.text.length, 0)).toBe(1200);
+            expect(() =>
+                store.rekeyProjectsByIdentity(
+                    fakeResolver({ '/escaped-rules': '/escaped-rules', '/escaped-rules/child': '/escaped-rules' }),
+                ),
+            ).not.toThrow();
+            expect(store.standingRules.list([root.id])).toEqual(before.map((rule) => ({ ...rule, project_id: root.id })));
+        });
+
+        it.each(['duplicate', 'count', 'characters'] as const)(
+            'rejects a %s rule conflict before mutating any planned project group',
+            (conflict) => {
+                const root = store.upsertProject('/earlier');
+                const child = store.upsertProject('/earlier/child');
+                const later = store.upsertProject('/later');
+                const laterChild = store.upsertProject('/later/child');
+                const now = '2026-09-20T00:00:00.000Z';
+                const session = store.upsertSession('codex', 'rekey-owner', child.id, '/tmp/rekey-owner.jsonl');
+                store.recordTurn(makeTurn({ tool: 'codex', sessionId: session.native_id, projectPath: child.path }), session.id, child.id, {
+                    decisions: [{ what: 'preserve', why: null }],
+                    pending_items: [],
+                    status: 'ok',
+                });
+                store.database
+                    .prepare(`INSERT INTO session_rollups
+                (session_id, project_id, tool, title, summary, decisions, pending_items, files_touched, turn_count, started_at, ended_at, kind, parent_session_id, summarizer_status, rollup_state, rolled_up_through_turn_index, computed_at, rollup_version)
+                VALUES (?, ?, 'codex', 'preserve', '', '[]', '[]', '[]', 0, ?, ?, 'primary', NULL, 'ok', 'final', -1, ?, 1)`)
+                    .run(session.id, child.id, now, now, now);
+                store.database
+                    .prepare(`INSERT INTO open_turns
+                (tool, native_session_id, session_id, project_id, source_generation, turn_index, candidate_cursor, source_path, source_dev, source_ino, source_size, source_mtime_ms, source_revision, source_digest, failed_at, observed_at, receipt_coverage)
+                VALUES ('codex', 'rekey-owner', ?, ?, 0, 1, 'next', '/tmp/rekey-owner.jsonl', '1', '2', 1, 1, 'revision', 'digest', ?, ?, 'complete')`)
+                    .run(session.id, child.id, now, now);
+                const insert = store.database.prepare(
+                    'INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)',
+                );
+                insert.run('earlier-rule', child.id, 'Preserve earlier rule', now);
+                const texts =
+                    conflict === 'duplicate'
+                        ? ['same', 'same']
+                        : conflict === 'count'
+                          ? Array.from({ length: 9 }, (_, i) => `rule ${i}`)
+                          : Array.from({ length: 5 }, (_, i) => `${i}${'😀'.repeat(125)}`);
+                texts.forEach((text, index) => {
+                    insert.run(`conflict-${index}`, index % 2 === 0 ? later.id : laterChild.id, text, now);
+                });
+                const state = () =>
+                    Object.fromEntries(
+                        ['projects', 'sessions', 'memories', 'session_rollups', 'open_turns', 'standing_rules'].map((table) => [
+                            table,
+                            store.database.prepare(`SELECT * FROM ${table}`).all(),
+                        ]),
+                    );
+                const before = state();
+                expect(() =>
+                    store.rekeyProjectsByIdentity(
+                        fakeResolver({
+                            '/earlier': '/earlier',
+                            '/earlier/child': '/earlier',
+                            '/later': '/later',
+                            '/later/child': '/later',
+                        }),
+                    ),
+                ).toThrow(/Rekey refused:.*standing rule.*project ids.*conflict-0/);
+                expect(state()).toEqual(before);
+                expect(store.getProjectById(root.id)).toBeDefined();
+                expect(store.database.pragma('foreign_key_check')).toEqual([]);
+            },
+        );
+
         it('merges subdirectory rows onto the row whose path IS the git root', () => {
             const root = store.upsertProject('/repo');
             const sub = store.upsertProject('/repo/resources/js');

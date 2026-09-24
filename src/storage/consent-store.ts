@@ -173,8 +173,17 @@ export class ConsentStore {
         return this.explicitConsentDecision(projectPath)?.state ?? 'pending';
     }
 
+    // DB-only authorization for physical paths resolved before a transaction.
+    // Stored project paths alone are not proof: they may still name a symlink.
+    consentStateForCanonicalPath(canonicalProjectPath: string): ConsentState {
+        return this.explicitConsentDecisionForCanonicalPath(canonicalProjectPath)?.state ?? 'pending';
+    }
+
     private explicitConsentDecision(projectPath: string): ConsentRoot | undefined {
-        const canonicalProjectPath = canonicalPath(projectPath);
+        return this.explicitConsentDecisionForCanonicalPath(canonicalPath(projectPath));
+    }
+
+    private explicitConsentDecisionForCanonicalPath(canonicalProjectPath: string): ConsentRoot | undefined {
         return this.list()
             .filter((root) => root.state !== 'pending' && isWithin(root.path, canonicalProjectPath))
             .reduce<ConsentRoot | undefined>((closest, candidate) => {
