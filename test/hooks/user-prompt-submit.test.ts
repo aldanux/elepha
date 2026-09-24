@@ -1,6 +1,6 @@
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ELEPHA_LIST_DEFAULT_LIMIT, RESUME_CHAR_BUDGET, RESUME_TOKEN_BUDGET } from '../../src/config/constants.js';
 import { claudeProjectsRoot, codexSessionsRoot, hookLogPath } from '../../src/config/paths.js';
 import { parseUserPromptCommand, runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
@@ -182,6 +182,28 @@ function expectNonceBoundResumeContext(context: string): void {
 }
 
 describe('D40 UserPromptSubmit command hook', () => {
+    it.each(['codex', 'claude-code'] as const)(
+        'ignores pasted multiline elepha output in %s without opening memory or injecting',
+        async (tool) => {
+            const openDatabase = vi.fn(() => {
+                throw new Error('pasted output must not open memory');
+            });
+            const writeInjection = vi.fn(() => true);
+            const prompt =
+                'elepha:rules\n\n• No standing rules for this project yet.\n  Add one with elepha:rules:add <text>.\n\nIn-chat commands:\nelepha:help — Show this in-chat command list.';
+
+            const result = await runUserPromptSubmit(payload(process.cwd(), prompt), tool, {
+                dbPath: SOURCE,
+                openDatabase,
+                writeInjection,
+            });
+
+            expect(result).toEqual({ reason: 'not_command' });
+            expect(openDatabase).not.toHaveBeenCalled();
+            expect(writeInjection).not.toHaveBeenCalled();
+        },
+    );
+
     it('accepts every exact lowercase command form after trimming and distinguishes help from rejected input', async () => {
         expect(ELEPHA_LIST_DEFAULT_LIMIT).toBe(5);
         expect(RESUME_TOKEN_BUDGET).toBe(400_000);
@@ -194,6 +216,10 @@ describe('D40 UserPromptSubmit command hook', () => {
         expect(HELP.split('\n')).toContain(INFO_HELP);
         expect(HELP.split('\n')).toContain('elepha:resume:<n> — Load the nth session to continue it; the model presents a recap.');
         expect(parseUserPromptCommand('  elepha:help  ')).toEqual({ kind: 'help' });
+        expect(parseUserPromptCommand('elepha:rules:add First line\nSecond line')).toEqual({
+            kind: 'rules-add',
+            text: 'First line\nSecond line',
+        });
         expect(parseUserPromptCommand('  elepha:info  ')).toEqual({ kind: 'info' });
         expect(parseUserPromptCommand('  elepha:last  ')).toEqual({ kind: 'last' });
         expect(parseUserPromptCommand('elepha:list')).toEqual({ kind: 'list', count: ELEPHA_LIST_DEFAULT_LIMIT });
