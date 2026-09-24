@@ -108,6 +108,22 @@ describe('SessionStart standing rules', () => {
         }
     });
 
+    it('delivers rules with an approved same-identity worktree missing from disk', async () => {
+        const f = fixture(['Preserve the live checkout rule.']);
+        const retiredPath = path.join(f.directory, 'retired-worktree');
+        const db = openUnmanagedDb(f.dbPath);
+        const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        const retired = store.upsertProject(retiredPath);
+        db.prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?)').run('https://example.test/shared', f.project.id, retired.id);
+        new ConsentStore(db).grant(f.directory);
+        expect(fs.existsSync(retiredPath)).toBe(false);
+        db.close();
+
+        const result = channels(await runSessionStart(payload(f.cwd), 'codex', { ...QUIET, dbPath: f.dbPath }));
+        expect(unwrapped(result.rules ?? '', 'rules')).toBe(`${STANDING_RULES_AUTHORITY}\n- Preserve the live checkout rule.`);
+        expect(records(f.dbPath).map(({ body }) => body)).toEqual([`${STANDING_RULES_AUTHORITY}\n- Preserve the live checkout rule.`]);
+    });
+
     it('does not choose among ambiguous consented logical projects', async () => {
         const f = createTestDb('elepha-ambiguous-session-rules-');
         seedConsentRoot(f, { path: f.directory });
