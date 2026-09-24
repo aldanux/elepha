@@ -542,10 +542,7 @@ describe('elepha restore', () => {
             let fingerprintChecked = false;
             const prepare = vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (this: Database.Database, sql: string) {
                 const statement = originalPrepare.call(this, sql) as Database.Statement;
-                if (
-                    this.name === active.dbPath &&
-                    sql === 'SELECT id, ulid, project_id, text, created_at FROM standing_rules ORDER BY id'
-                ) {
+                if (sql === 'SELECT id, ulid, project_id, text, created_at FROM standing_rules ORDER BY id') {
                     const stored = statement.all() as StandingRuleRow[];
                     if (stored[0]?.ulid === incoming.ulid) {
                         fingerprintChecked = true;
