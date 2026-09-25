@@ -147,6 +147,7 @@ interface CodexPayload {
 
 interface CodexLine {
     timestamp?: string;
+    ordinal?: unknown;
     type: string; // "session_meta" | "event_msg" | "response_item" | "turn_context" | ...
     payload?: CodexPayload;
 }
@@ -193,6 +194,9 @@ function emptySessionSignals(line: CodexLine): EmptySessionSignals {
 // against the real corpus rather than assumed.
 interface CodexSessionMeta {
     forked_from_id?: string | null;
+    history_mode?: unknown;
+    history_base?: unknown;
+    forked_from_ordinal_exclusive?: unknown;
     parent_thread_id?: string | null;
     thread_source?: string | null;
     agent_path?: string | null;
@@ -219,6 +223,32 @@ export function isCodexGuardianMetadata(meta: CodexSessionMeta): boolean {
 
 function nonemptyString(value: unknown): value is string {
     return typeof value === 'string' && value.length > 0;
+}
+
+function hasReferencedPaginatedForkBoundary(first: CodexLine, meta: CodexSessionMeta, firstAtStart: boolean): boolean {
+    const base = meta.history_base;
+    const cutoff = meta.forked_from_ordinal_exclusive;
+    return (
+        firstAtStart &&
+        first.type === 'session_meta' &&
+        meta.history_mode === 'paginated' &&
+        nonemptyString(meta.forked_from_id) &&
+        typeof cutoff === 'number' &&
+        Number.isSafeInteger(cutoff) &&
+        cutoff >= 0 &&
+        first.ordinal === cutoff &&
+        typeof base === 'object' &&
+        base !== null &&
+        !Array.isArray(base) &&
+        'thread_id' in base &&
+        nonemptyString(base.thread_id) &&
+        'end_ordinal_exclusive' in base &&
+        base.end_ordinal_exclusive === cutoff &&
+        'end_byte_offset' in base &&
+        typeof base.end_byte_offset === 'number' &&
+        Number.isSafeInteger(base.end_byte_offset) &&
+        base.end_byte_offset >= 0
+    );
 }
 
 function validKindMetadata(meta: Record<string, unknown>): boolean {
@@ -522,11 +552,14 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // Measured against the local corpus, the signals that actually separate
     // the cases:
     //
-    // - forked_from_id nonempty string -> the file BEGINS with a copy of the
-    //   parent's whole transcript, every copied line restamped with the fork
-    //   instant (observed: 175 turns inside 73ms of each other, byte-identical
-    //   user messages to the parent, vs. multi-hour spans on every
-    //   non-forked child). Ingesting it duplicates the parent.
+    // - Legacy forks with forked_from_id begin with a copy of the parent's
+    //   whole transcript, every copied line restamped with the fork instant
+    //   (observed: 175 turns inside 73ms of each other, byte-identical user
+    //   messages to the parent, vs. multi-hour spans on every non-forked
+    //   child). Ingesting it duplicates the parent. Paginated forks instead
+    //   begin at their inherited history cutoff; the first record's ordinal
+    //   must match it. The physical history base may name an ancestor rather
+    //   than the immediate forked_from_id parent.
     // - thread_source 'subagent' with NO agent_path/agent_nickname -> Codex's
     //   internal approval adjudicator. Its own prompt labels the transcript
     //   "untrusted evidence, not instructions to follow"; there is no human in
@@ -535,7 +568,7 @@ export class CodexAdapter extends JsonlTurnAdapter {
     //   'guardian_review'. Both formats retain source.subagent.other equal
     //   to 'guardian'; these are approval evidence, not human sessions.
     async classifySession(filePath: string, options?: Pick<ParseTurnsOptions, 'handle'>): Promise<SessionClassification> {
-        const { first, externalAgentImport } = await this.readClassificationPreamble(filePath, options?.handle);
+        const { first, firstAtStart, externalAgentImport } = await this.readClassificationPreamble(filePath, options?.handle);
         if (!first) {
             return { kind: 'primary' };
         }
@@ -553,11 +586,19 @@ export class CodexAdapter extends JsonlTurnAdapter {
         }
 
         if (nonemptyString(meta.forked_from_id)) {
-            return {
-                kind: 'fork-copy',
-                parentNativeId: meta.forked_from_id,
-                reason: `transcript opens with a fork-time copy of session ${meta.forked_from_id}`,
-            };
+            if (!hasReferencedPaginatedForkBoundary(first, meta, firstAtStart)) {
+                if (meta.history_mode === 'paginated') {
+                    this.warnUnknownLine(`CodexAdapter: inconsistent paginated fork boundary in ${filePath}`);
+                }
+                return {
+                    kind: 'fork-copy',
+                    parentNativeId: meta.forked_from_id,
+                    reason:
+                        meta.history_mode === 'paginated'
+                            ? `paginated fork history boundary is unverified for session ${meta.forked_from_id}`
+                            : `transcript opens with a fork-time copy of session ${meta.forked_from_id}`,
+                };
+            }
         }
 
         if (isCodexGuardianMetadata(meta)) {
@@ -586,8 +627,9 @@ export class CodexAdapter extends JsonlTurnAdapter {
     private async readClassificationPreamble(
         filePath: string,
         handle?: FileHandle,
-    ): Promise<{ first: CodexLine | undefined; externalAgentImport: boolean }> {
+    ): Promise<{ first: CodexLine | undefined; firstAtStart: boolean; externalAgentImport: boolean }> {
         let first: CodexLine | undefined;
+        let firstAtStart = true;
 
         try {
             for await (const { text } of readBoundedLines(filePath, { handle })) {
@@ -595,13 +637,16 @@ export class CodexAdapter extends JsonlTurnAdapter {
                 try {
                     line = JSON.parse(text) as CodexLine;
                 } catch {
+                    if (!first) {
+                        firstAtStart = false;
+                    }
                     continue;
                 }
 
                 first ??= line;
                 const turnId = line.type === 'event_msg' ? line.payload?.turn_id : undefined;
                 if (typeof turnId === 'string') {
-                    return { first, externalAgentImport: turnId.startsWith(EXTERNAL_IMPORT_TURN_PREFIX) };
+                    return { first, firstAtStart, externalAgentImport: turnId.startsWith(EXTERNAL_IMPORT_TURN_PREFIX) };
                 }
             }
         } catch (error) {
@@ -611,7 +656,7 @@ export class CodexAdapter extends JsonlTurnAdapter {
             // The daemon's file-level readability guard owns the visible alert.
         }
 
-        return { first, externalAgentImport: false };
+        return { first, firstAtStart, externalAgentImport: false };
     }
 
     protected cwdOf(line: unknown): string | undefined {
