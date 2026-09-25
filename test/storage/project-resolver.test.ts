@@ -290,6 +290,123 @@ describe('ProjectResolver', () => {
         expect(resolver().list()).toHaveLength(2);
     });
 
+    it('serves only independently approved members of a Git group and vetoes an explicitly denied member', async () => {
+        const pendingPath = path.join(root, 'a-pending');
+        const approvedPath = path.join(root, 'z-approved');
+        const remote = 'git@example.test:grouped/consent.git';
+        const pendingId = addProject(pendingPath, { remote, displayName: 'Private pending checkout' });
+        const approvedId = addProject(approvedPath, { remote, displayName: 'Approved checkout' });
+        const git = vi.fn(() => null);
+        const consent = new ConsentStore(db);
+        consent.grant(approvedPath);
+        const resolver = new ProjectResolver(db, { resolveGitRoot: git });
+
+        const expected = expect.objectContaining({
+            displayName: 'Approved checkout',
+            paths: [approvedPath],
+            projectIds: [approvedId],
+        });
+        expect(resolver.listConsented(consent)).toEqual([expected]);
+        expect(resolver.listConsentedStored(consent)).toEqual([expected]);
+        expect(resolver.resolveConsented(remote, consent)).toEqual({ project: expected });
+        expect(resolver.resolveConsented('Private pending checkout', consent)).toEqual({ project: null });
+        expect(resolver.isStoredProjectConsented(approvedId, consent)).toBe(true);
+        expect(resolver.isStoredProjectConsented(pendingId, consent)).toBe(false);
+        expect(git).not.toHaveBeenCalledWith(pendingPath);
+
+        const reader = new SessionReader(db);
+        const approvedSessions = reader.recentConsentedSessions(resolver.listConsentedStored(consent));
+        expect(approvedSessions.map((session) => session.project_id)).toEqual([approvedId]);
+        const query = tokenizeRecallQuery('stored identity needle');
+        expect(query).toBeDefined();
+        if (!query) return;
+        const recalled = await lexicalRecall(
+            reader,
+            resolver.listConsentedStored(consent),
+            query,
+            'global',
+            undefined,
+            undefined,
+            'strict',
+        );
+        expect(recalled.sessionIds).toEqual(approvedSessions.map((session) => session.id));
+
+        consent.revoke(pendingPath);
+        expect(resolver.listConsented(consent)).toEqual([]);
+        expect(resolver.listConsentedStored(consent)).toEqual([]);
+        expect(resolver.resolveConsented(remote, consent)).toEqual({ project: null });
+        expect(resolver.resolveConsented(approvedPath, consent)).toEqual({ project: null });
+        expect(resolver.isStoredProjectConsented(approvedId, consent)).toBe(false);
+    });
+
+    it('keeps a missing historical checkout readable when that exact path has its own grant', () => {
+        const missingPath = path.join(root, 'old-missing-checkout');
+        const livePath = path.join(root, 'current-checkout');
+        const remote = 'git@example.test:grouped/history.git';
+        const oldId = addProject(missingPath, { remote, createDirectory: false });
+        const currentId = addProject(livePath, { remote });
+        const consent = new ConsentStore(db);
+        consent.grant(missingPath);
+        consent.grant(livePath);
+        const git = vi.fn(() => null);
+        const resolver = new ProjectResolver(db, { resolveGitRoot: git });
+
+        expect(existsSync(missingPath)).toBe(false);
+        expect(resolver.listConsentedStored(consent)[0]?.projectIds).toEqual([currentId, oldId]);
+        expect(resolver.isStoredProjectConsented(oldId, consent)).toBe(true);
+        expect(resolver.resolveConsented(remote, consent)).toEqual(
+            expect.objectContaining({ project: expect.objectContaining({ projectIds: [currentId, oldId] }) }),
+        );
+        expect(git).not.toHaveBeenCalledWith(missingPath);
+    });
+
+    it('does not probe unrelated approved checkouts when resolving one remote group', () => {
+        const selectedPath = path.join(root, 'selected');
+        const unrelatedPath = path.join(root, 'unrelated');
+        addProject(selectedPath, { remote: 'git@example.test:selected.git' });
+        addProject(unrelatedPath, { remote: 'git@example.test:unrelated.git' });
+        const consent = new ConsentStore(db);
+        consent.grant(selectedPath);
+        consent.grant(unrelatedPath);
+        const git = vi.fn(() => null);
+
+        const result = new ProjectResolver(db, { resolveGitRoot: git }).resolveConsented('git@example.test:selected.git', consent);
+        expect(result).toEqual(expect.objectContaining({ project: expect.objectContaining({ paths: [selectedPath] }) }));
+        expect(git).toHaveBeenCalledWith(selectedPath);
+        expect(git).not.toHaveBeenCalledWith(unrelatedPath);
+    });
+
+    it.each(['root-commit', 'rootless'] as const)(
+        'does not probe unrelated approved checkouts for an exact %s path and retains a denied-member veto',
+        (identity) => {
+            const selectedPath = path.join(root, 'selected');
+            const unrelatedPath = path.join(root, 'unrelated');
+            const peerPath = identity === 'root-commit' ? path.join(root, 'old-peer') : path.join(selectedPath, 'nested');
+            const rootCommit = identity === 'root-commit' ? '3333333333333333333333333333333333333333' : null;
+            addProject(selectedPath, { rootCommit });
+            addProject(peerPath, { rootCommit });
+            addProject(unrelatedPath);
+            const consent = new ConsentStore(db);
+            consent.grant(selectedPath);
+            consent.grant(unrelatedPath);
+            const git = vi.fn(() => null);
+
+            const approved = new ProjectResolver(db, { resolveGitRoot: git }).resolveConsented(selectedPath, consent);
+            expect(approved).toEqual(
+                expect.objectContaining({
+                    project: expect.objectContaining({ paths: identity === 'rootless' ? [selectedPath, peerPath] : [selectedPath] }),
+                }),
+            );
+            expect(git).not.toHaveBeenCalledWith(unrelatedPath);
+
+            consent.revoke(peerPath);
+            git.mockClear();
+            expect(new ProjectResolver(db, { resolveGitRoot: git }).resolveConsented(selectedPath, consent)).toEqual({ project: null });
+            expect(git).not.toHaveBeenCalledWith(unrelatedPath);
+            expect(git).not.toHaveBeenCalledWith(peerPath);
+        },
+    );
+
     it('keeps a moved set consented for an approved path unless any member path is denied', () => {
         const oldPath = path.join(root, 'old-checkout');
         const newPath = path.join(root, 'new-checkout');
@@ -303,7 +420,7 @@ describe('ProjectResolver', () => {
 
         const approved = resolver().resolveConsented(remote, consent);
         expect(approved).toEqual(expect.objectContaining({ project: expect.anything() }));
-        expect(new Set((approved as { project: { paths: string[] } }).project.paths)).toEqual(new Set([oldPath, newPath]));
+        expect((approved as { project: { paths: string[] } }).project.paths).toEqual([oldPath]);
 
         consent.revoke(newPath);
         expect(resolver().resolveConsented(remote, consent)).toEqual({ project: null });

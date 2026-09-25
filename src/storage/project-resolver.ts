@@ -118,8 +118,8 @@ function prefixGroups(rows: ResolvedProjectRow[]): ProjectSetBuild[] {
 
 export class ProjectResolver {
     private readonly resolveGitRoot: (projectPath: string) => string | null;
-    private listMemo: { consent: ProjectConsent; projects: ProjectSet[] } | undefined;
-    private listStoredMemo: ProjectSet[] | undefined;
+    private listMemo: { consent: ProjectConsent; groups: ProjectSetBuild[]; projects: ProjectSet[] } | undefined;
+    private listStoredMemo: { groups: ProjectSetBuild[]; projects: ProjectSet[] } | undefined;
 
     constructor(
         private readonly db: Pick<Database, 'prepare'>,
@@ -139,7 +139,7 @@ export class ProjectResolver {
         const rows = this.db.prepare('SELECT * FROM projects ORDER BY id').all() as ProjectRow[];
         const roots = new Map<string, string | null>();
         const storedRoots = new Map(rows.map((row) => [normalizeForCompare(row.path), row.git_root]));
-        const projects = this.buildProjectSets(rows, roots, (projectPath) => {
+        const groups = this.groupProjectRows(rows, roots, (projectPath) => {
             const key = normalizeForCompare(projectPath);
             const cached = roots.get(key);
             if (cached !== undefined || roots.has(key)) {
@@ -152,7 +152,8 @@ export class ProjectResolver {
             roots.set(key, resolved);
             return resolved;
         });
-        this.listMemo = { consent, projects };
+        const projects = this.projectSets(groups);
+        this.listMemo = { consent, groups, projects };
         return projects;
     }
 
@@ -162,19 +163,17 @@ export class ProjectResolver {
     // use list(consent).
     listStored(): ProjectSet[] {
         if (this.listStoredMemo !== undefined) {
-            return this.listStoredMemo;
+            return this.listStoredMemo.projects;
         }
         const rows = this.db.prepare('SELECT * FROM projects ORDER BY id').all() as ProjectRow[];
         const storedRoots = new Map(rows.map((row) => [normalizeForCompare(row.path), row.git_root]));
-        this.listStoredMemo = this.buildProjectSets(
-            rows,
-            new Map(),
-            (projectPath) => storedRoots.get(normalizeForCompare(projectPath)) ?? null,
-        );
-        return this.listStoredMemo;
+        const groups = this.groupProjectRows(rows, new Map(), (projectPath) => storedRoots.get(normalizeForCompare(projectPath)) ?? null);
+        const projects = this.projectSets(groups);
+        this.listStoredMemo = { groups, projects };
+        return projects;
     }
 
-    resolve(query: string): ProjectResolution {
+    resolve(query: string, consent?: ProjectConsent): ProjectResolution {
         const rows = this.db.prepare('SELECT * FROM projects ORDER BY id').all() as ProjectRow[];
         const roots = new Map<string, string | null>();
         // Git resolves a symlinked stored path to its physical toplevel, so the
@@ -204,7 +203,10 @@ export class ProjectResolver {
                 return cached ?? null;
             }
             // Missing paths deliberately stay rootless so only recorded paths group them.
-            const resolved = existsSync(projectPath) ? this.resolveGitRoot(projectPath) : null;
+            const resolved =
+                existsSync(projectPath) && (consent === undefined || consent.consentState(projectPath) === 'approved')
+                    ? this.resolveGitRoot(projectPath)
+                    : null;
             roots.set(key, resolved);
             return resolved;
         };
@@ -231,43 +233,68 @@ export class ProjectResolver {
         );
         const directIds = new Set(directlyMatched.map((row) => row.id));
         const candidates = rows.filter((row) => directIds.has(row.id) || anchors.some((anchor) => related(row.path, anchor)));
-        const sets = this.buildProjectSets(candidates, roots, resolveRoot);
+        const groups = this.groupProjectRows(candidates, roots, resolveRoot);
+        const sets = consent === undefined ? this.projectSets(groups) : this.consentedProjectSets(groups, consent);
 
         return this.match(query, sets);
     }
 
-    // Restricts resolution to sets with an approved member path and no denied member path.
+    // Restricts resolution to approved members, with a denied member vetoing its group.
     resolveConsented(query: string, consent: Pick<ConsentStore, 'isConsented' | 'consentState'>): ProjectResolution {
         // An existing unconsented caller path must never become a Git subprocess cwd.
         // Consented paths and loose names may proceed to consent-checked or stored candidate paths.
         if (existsSync(query) && consent.consentState(query) !== 'approved') {
             return { project: null };
         }
-        const resolved = this.resolve(query);
+        const resolved = this.resolve(query, consent);
         if ('project' in resolved) {
-            return resolved.project !== null && this.isConsented(resolved.project, consent) ? resolved : { project: null };
+            if (resolved.project === null) {
+                return resolved;
+            }
+            // Stable captured identity gives the full denied-member veto
+            // without Git-probing unrelated approved projects on each hook.
+            const storedGroup = this.listStored().find((set) => resolved.project?.projectIds.some((id) => set.projectIds.includes(id)));
+            const firstId = resolved.project.projectIds[0];
+            const needsCommit =
+                resolved.project.gitRemote === null && resolved.project.gitRoot !== null && storedGroup?.key === resolved.project.key;
+            const firstCommit =
+                !needsCommit || firstId === undefined
+                    ? null
+                    : (
+                          this.db.prepare('SELECT git_root_commit FROM projects WHERE id = ?').get(firstId) as
+                              | { git_root_commit: string | null }
+                              | undefined
+                      )?.git_root_commit;
+            const stableStoredGroup =
+                storedGroup !== undefined &&
+                ((resolved.project.gitRemote !== null && storedGroup.gitRemote === resolved.project.gitRemote) ||
+                    (storedGroup.key === resolved.project.key &&
+                        (resolved.project.gitRoot === null || (firstCommit !== null && firstCommit === resolved.project.key))));
+            if (stableStoredGroup) {
+                const stored = this.listConsentedStored(consent).find((set) =>
+                    resolved.project?.projectIds.some((id) => set.projectIds.includes(id)),
+                );
+                return { project: stored === undefined ? null : { ...stored, gitRoot: resolved.project.gitRoot ?? stored.gitRoot } };
+            }
+            // Live-root groups can change after a checkout moves; reconcile
+            // those against complete live membership before serving.
+            const projects = this.listConsented(consent);
+            const project = projects.find((set) => resolved.project?.projectIds.some((id) => set.projectIds.includes(id)));
+            return { project: project ?? null };
         }
         const projects = this.listConsented(consent);
-        const candidates = resolved.candidates.filter((candidate) => projects.some((project) => project.paths[0] === candidate.path));
-        if (candidates.length === 0) {
-            return { project: null };
-        }
-        if (candidates.length === 1) {
-            const [candidate] = candidates;
-            const project = projects.find((set) => set.paths[0] === candidate?.path);
-            if (project !== undefined) {
-                return { project };
-            }
-        }
-        return { ambiguous: true, candidates };
+        const matches = projects.filter((set) => resolved.candidates.some((candidate) => set.paths.includes(candidate.path)));
+        return matches.length === 0 ? { project: null } : this.singleOrAmbiguous(matches);
     }
 
     listConsented(consent: ProjectConsent): ProjectSet[] {
-        return this.list(consent).filter((project) => this.isConsented(project, consent));
+        this.list(consent);
+        return this.consentedProjectSets(this.listMemo?.groups ?? [], consent);
     }
 
     listConsentedStored(consent: ProjectConsent): ProjectSet[] {
-        return this.listStored().filter((project) => this.isConsented(project, consent));
+        this.listStored();
+        return this.consentedProjectSets(this.listStoredMemo?.groups ?? [], consent);
     }
 
     // Fresh stored membership, without display fields, session material or Git.
@@ -292,7 +319,8 @@ export class ProjectResolver {
                 ? consent.consentState(projectPath)
                 : consent.consentStateForCanonicalPath(canonicalPaths.get(projectPath) ?? ''),
         );
-        return states.includes('approved') && !states.includes('denied');
+        const targetIndex = target.projectIds.indexOf(projectId);
+        return targetIndex >= 0 && states[targetIndex] === 'approved' && !states.includes('denied');
     }
 
     // Rebuild the current logical membership using bounded identity fields
@@ -307,11 +335,13 @@ export class ProjectResolver {
             rows.push({ ...row, path: row.path });
         }
         const storedRoots = new Map(rows.map((row) => [normalizeForCompare(row.path), row.git_root]));
-        const projects = this.buildProjectSets(rows, new Map(), (projectPath) => storedRoots.get(normalizeForCompare(projectPath)) ?? null);
+        const projects = this.projectSets(
+            this.groupProjectRows(rows, new Map(), (projectPath) => storedRoots.get(normalizeForCompare(projectPath)) ?? null),
+        );
         return projects.find((project) => project.projectIds.includes(projectId));
     }
 
-    private buildProjectSets(
+    private groupProjectRows(
         rows: ProjectGroupingRow[],
         roots: Map<string, string | null>,
         resolveRoot: (projectPath: string) => string | null = (projectPath) => {
@@ -324,7 +354,7 @@ export class ProjectResolver {
             roots.set(key, resolved);
             return resolved;
         },
-    ): ProjectSet[] {
+    ): ProjectSetBuild[] {
         const resolved = rows.map((row) => ({ row, resolvedGitRoot: resolveRoot(row.path) }));
         const byIdentity = new Map<string, ProjectSetBuild>();
         const rootless: ResolvedProjectRow[] = [];
@@ -344,9 +374,31 @@ export class ProjectResolver {
             }
         }
 
-        return [...byIdentity.values(), ...prefixGroups(rootless)]
+        return [...byIdentity.values(), ...prefixGroups(rootless)];
+    }
+
+    private projectSets(groups: ProjectSetBuild[]): ProjectSet[] {
+        return groups
             .map((group) => this.toProjectSet(group))
             .sort((a, b) => normalizeForCompare(a.paths[0] ?? '').localeCompare(normalizeForCompare(b.paths[0] ?? '')));
+    }
+
+    private consentedProjectSets(groups: ProjectSetBuild[], consent: ProjectConsent): ProjectSet[] {
+        return this.projectSets(
+            groups.flatMap((group) => {
+                const states = group.members.map((member) => consent.consentState(member.row.path));
+                if (states.includes('denied')) {
+                    return [];
+                }
+                const approved = group.members.filter((_, index) => states[index] === 'approved');
+                if (approved.length === 0) {
+                    return [];
+                }
+                return [
+                    { members: approved, gitRoot: approved.find((member) => member.resolvedGitRoot !== null)?.resolvedGitRoot ?? null },
+                ];
+            }),
+        );
     }
 
     private match(query: string, sets: ProjectSet[]): ProjectResolution {
@@ -381,13 +433,6 @@ export class ProjectResolver {
 
     private pathsRelated(a: string, b: string): boolean {
         return samePath(a, b) || isWithin(a, b) || isWithin(b, a);
-    }
-
-    private isConsented(project: ProjectSet, consent: ProjectConsent): boolean {
-        return (
-            project.paths.some((projectPath) => consent.isConsented(projectPath)) &&
-            project.paths.every((projectPath) => consent.consentState(projectPath) !== 'denied')
-        );
     }
 
     private toProjectSet(group: ProjectSetBuild): ProjectSet {

@@ -11,6 +11,7 @@ import { createMcpServer, createMcpServerForDatabase, mcpResponseShaper, openMcp
 import { ElephaMcpService, mcpToolDefinitions } from '../../src/mcp/tools.js';
 import { omissionMarker } from '../../src/rendering/raw-turn-renderer.js';
 import { dataBlockClose, dataBlockOpen } from '../../src/serving/instructions.js';
+import { publicSessionId } from '../../src/serving/session-id.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
@@ -126,6 +127,39 @@ describe('elepha MCP server surface', () => {
             expect.objectContaining({ title: 'Claude session', tool: 'claude-code' }),
         ]);
         expect(claudeOnly.structuredContent?.sessions).toEqual([expect.objectContaining({ title: 'Claude session', tool: 'claude-code' })]);
+    });
+
+    it('does not serve a pending Git-group member through project, session, or capsule reads', async () => {
+        const fixture = createTestDb('elepha-mcp-pending-git-member-');
+        const pendingPath = path.join(fixture.directory, 'a-pending');
+        const approvedPath = path.join(fixture.directory, 'z-approved');
+        const pending = seedProject(fixture, { path: pendingPath });
+        const approved = seedProject(fixture, { path: approvedPath });
+        const remote = 'git@example.test:grouped/private.git';
+        fixture.db.prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?)').run(remote, pending.id, approved.id);
+        fixture.db.prepare('UPDATE projects SET display_name = ? WHERE id = ?').run('Private pending checkout', pending.id);
+        fixture.db.prepare('UPDATE projects SET display_name = ? WHERE id = ?').run('Approved checkout', approved.id);
+        seedConsentRoot(fixture, { path: approvedPath });
+        const privateSession = seedSession(fixture, { project: pending, nativeId: 'private-session', title: 'Private session' });
+        const publicSession = seedSession(fixture, { project: approved, nativeId: 'approved-session', title: 'Approved session' });
+        const service = new ElephaMcpService(fixture.db);
+
+        const listedProjects = service.listProjects();
+        const listedSessions = service.listSessions({ project: remote, include_all: true });
+        expect(listedProjects.structuredContent?.projects).toEqual([
+            expect.objectContaining({ name: 'Approved checkout', paths: [approvedPath] }),
+        ]);
+        expect(JSON.stringify(listedProjects.structuredContent)).not.toContain(pendingPath);
+        expect(JSON.stringify(listedProjects.structuredContent)).not.toContain('Private pending checkout');
+        expect(listedSessions.structuredContent?.sessions).toEqual([expect.objectContaining({ id: publicSessionId(publicSession) })]);
+        expect(JSON.stringify(listedSessions.structuredContent)).not.toContain('Private session');
+        expect((await service.getSession({ id: publicSessionId(privateSession) })).structuredContent).toMatchObject({
+            reason: 'unknown_session',
+        });
+        expect((await service.getSession({ id: publicSessionId(privateSession), view: 'capsule' })).structuredContent).toEqual({
+            empty: true,
+            reason: 'unknown_session',
+        });
     });
 
     it('rejects a pagination cursor issued for another consented project', () => {

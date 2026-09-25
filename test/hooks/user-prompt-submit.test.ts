@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ELEPHA_LIST_DEFAULT_LIMIT, RESUME_CHAR_BUDGET, RESUME_TOKEN_BUDGET } from '../../src/config/constants.js';
@@ -366,6 +366,41 @@ describe('D40 UserPromptSubmit command hook', () => {
         expect(injectedBody(result)).toBe(
             `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture: OFF · sessions: 0 here / 1 total · type elepha:list to recall · run 'elepha consent grant ${canonicalPendingCwd}' to capture here`,
         );
+    });
+
+    it('reports capture off when an approved Codex worktree loses valid metadata', async () => {
+        const fixture = createTestDb('elepha-info-invalid-worktree-');
+        const codexHome = path.join(fixture.directory, '.codex');
+        const cwd = path.join(codexHome, 'worktrees', 'e251', 'elepha');
+        const gitDir = path.join(fixture.directory, 'repository.git', 'worktrees', 'elepha');
+        mkdirSync(cwd, { recursive: true });
+        mkdirSync(gitDir, { recursive: true });
+        writeFileSync(path.join(cwd, '.git'), `gitdir: ${gitDir}\n`);
+        writeFileSync(path.join(gitDir, 'gitdir'), `${path.join(cwd, '.git')}\n`);
+        writeFileSync(path.join(gitDir, 'commondir'), '../..\n');
+        const previousCodexHome = process.env.CODEX_HOME;
+        process.env.CODEX_HOME = codexHome;
+        try {
+            const project = seedProject(fixture, { path: cwd });
+            seedConsentRoot(fixture, { path: cwd });
+            const session = seedSession(fixture, { project, nativeId: 'historical-worktree', title: 'Historical worktree' });
+            seedMemory(fixture, { project, session });
+            fixture.close();
+            writeFileSync(path.join(gitDir, 'gitdir'), '/wrong/worktree/.git\n');
+
+            const result = await runUserPromptSubmit(payload(cwd, 'elepha:info'), 'codex', {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+                daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
+                readUpdateAvailable: () => undefined,
+            });
+            expect(injectedBody(result)).toBe(
+                `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 elepha · capture: OFF · sessions: 0 here / 1 total · type elepha:list to recall`,
+            );
+        } finally {
+            if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+            else process.env.CODEX_HOME = previousCodexHome;
+        }
     });
 
     it('carries daemon-health and update notices on elepha:info', async () => {

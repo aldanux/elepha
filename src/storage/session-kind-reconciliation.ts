@@ -6,7 +6,6 @@ import {
     SESSION_KIND_RECONCILIATION_BUDGET_MS,
     SESSION_KIND_REVISION,
 } from '../config/constants.js';
-import { isRefusedProjectRoot } from '../config/paths.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
 import { stripShellSyntax } from '../security/sanitize.js';
 import { errorMessage } from '../util/error.js';
@@ -152,7 +151,7 @@ export async function reconcileSessionKinds(
             const generations = new Map(rows.map((row) => [row.native_id, sourceGeneration(store, 'codex', row.native_id)]));
             const authorized = (row: Candidate): boolean =>
                 !isMemoryLocked(db) &&
-                !isRefusedProjectRoot(row.project_path) &&
+                !store.consent.isRefusedForCapture(row.project_path) &&
                 store.consent.isConsented(row.project_path) &&
                 !store.isTranscriptPurged('codex', row.native_id) &&
                 !store.isTranscriptIncognito('codex', row.native_id) &&
@@ -190,7 +189,9 @@ export async function reconcileSessionKinds(
                     continue;
                 }
                 const headerAuthorized = (cwd: string, nativeId: string): boolean =>
-                    !isRefusedProjectRoot(cwd) && store.consent.isConsented(cwd) && eligible().some((row) => row.native_id === nativeId);
+                    !store.consent.isRefusedForCapture(cwd) &&
+                    store.consent.isConsented(cwd) &&
+                    eligible().some((row) => row.native_id === nativeId);
                 const preamble = await readCodexKindPreamble(opened.resolvedPath, opened.handle, headerAuthorized);
                 if (preamble.malformed) {
                     summary.malformed++;

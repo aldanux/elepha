@@ -168,6 +168,8 @@ describe('metadata-only session capsule', () => {
             mkdirSync(peer.path, { recursive: true });
             if (identity !== 'prefix') {
                 f.db.prepare(`UPDATE projects SET ${identity} = ? WHERE id IN (?, ?)`).run('captured-identity', f.project.id, peer.id);
+                // Shared Git identity alone does not authorize the peer row.
+                seedConsentRoot(f, { path: peer.path });
             }
             f.db.prepare('UPDATE sessions SET project_id = ? WHERE id = ?').run(peer.id, f.session.id);
             const resolver = new ProjectResolver(f.db);

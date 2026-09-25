@@ -21,6 +21,20 @@ function consentFixture(prefix: string): string {
     return fixture;
 }
 
+function codexWorktreeFixture(): { root: string; codexHome: string; gitDir: string } {
+    const fixture = consentFixture('elepha-consent-codex-worktree-');
+    const codexHome = path.join(fixture, '.codex');
+    const root = path.join(codexHome, 'worktrees', 'e251', 'elepha');
+    const gitDir = path.join(fixture, 'repository.git', 'worktrees', 'elepha');
+    mkdirSync(root, { recursive: true });
+    mkdirSync(gitDir, { recursive: true });
+    writeFileSync(path.join(root, '.git'), `gitdir: ${gitDir}\n`);
+    writeFileSync(path.join(gitDir, 'gitdir'), `${path.join(root, '.git')}\n`);
+    writeFileSync(path.join(gitDir, 'commondir'), '../..\n');
+    vi.stubEnv('CODEX_HOME', codexHome);
+    return { root, codexHome, gitDir };
+}
+
 function insertHistoricalProject(db: ReturnType<typeof openUnmanagedDb>, projectPath: string, suffix: string): void {
     const project = db
         .prepare(
@@ -129,6 +143,84 @@ describe('consent roots', () => {
                 // Cleanup is a courtesy; sandbox permissions must not fail the assertion.
             }
         }
+    });
+
+    it('admits only an explicit, live Codex worktree grant for capture', () => {
+        const { root, codexHome, gitDir } = codexWorktreeFixture();
+        const db = openUnmanagedDb(':memory:');
+        const consent = new MemoryStore(db).consent;
+        const nested = path.join(root, 'src');
+        mkdirSync(nested);
+
+        expect(paths.isRefusedProjectRoot(root)).toBe(true);
+        expect(consent.isRefusedForCapture(root)).toBe(true);
+        consent.grant(root);
+        expect(consent.isRefusedForCapture(root)).toBe(false);
+        expect(consent.captureOffNudge(root)).toBeUndefined();
+        expect(consent.isRefusedForCapture(nested)).toBe(false);
+        expect(consent.isRefusedForCapture(path.dirname(root))).toBe(true);
+        expect(consent.isRefusedForCapture(path.join(codexHome, 'sessions'))).toBe(true);
+        expect(() => consent.grant(path.join(codexHome, 'sessions'))).toThrow(/refused project root/);
+        expect(() => consent.grant(path.dirname(root))).toThrow(/refused project root/);
+
+        writeFileSync(path.join(gitDir, 'gitdir'), '/other/worktree/.git\n');
+        expect(consent.isConsented(root)).toBe(true);
+        expect(consent.isRefusedForCapture(root)).toBe(true);
+        expect(consent.captureOffNudge(root)).toBe('refused');
+        consent.revoke(root);
+        expect(consent.isRefusedForCapture(root)).toBe(true);
+        db.close();
+    });
+
+    it('rejects a worktree alias and malformed linked-worktree metadata', () => {
+        const { root, codexHome, gitDir } = codexWorktreeFixture();
+        const db = openUnmanagedDb(':memory:');
+        const consent = new MemoryStore(db).consent;
+        const alias = path.join(codexHome, 'worktrees', 'e251', 'alias');
+        symlinkSync(root, alias);
+        expect(() => consent.grant(alias)).toThrow(/refused project root/);
+
+        writeFileSync(path.join(root, '.git'), 'gitdir: /other/repository/.git/worktrees/elepha\n');
+        expect(() => consent.grant(root)).toThrow(/refused project root/);
+        writeFileSync(path.join(root, '.git'), `gitdir: ${gitDir}\n`);
+        writeFileSync(path.join(gitDir, 'commondir'), '../../../outside\n');
+        expect(() => consent.grant(root)).toThrow(/refused project root/);
+        writeFileSync(path.join(gitDir, 'commondir'), '../..\n');
+        const pointerCopy = path.join(path.dirname(codexHome), 'pointer');
+        writeFileSync(pointerCopy, `gitdir: ${gitDir}\n`);
+        unlinkSync(path.join(root, '.git'));
+        symlinkSync(pointerCopy, path.join(root, '.git'));
+        expect(() => consent.grant(root)).toThrow(/refused project root/);
+        expect(consent.list()).toEqual([]);
+        db.close();
+    });
+
+    it('keeps a worktree grant usable when CODEX_HOME itself is a symlink', () => {
+        const { root, codexHome } = codexWorktreeFixture();
+        const aliasHome = path.join(path.dirname(codexHome), 'codex-home-link');
+        symlinkSync(codexHome, aliasHome);
+        vi.stubEnv('CODEX_HOME', aliasHome);
+        const aliasRoot = path.join(aliasHome, 'worktrees', 'e251', 'elepha');
+        const externalAlias = path.join(path.dirname(codexHome), 'worktree-link');
+        symlinkSync(root, externalAlias);
+        const db = openUnmanagedDb(':memory:');
+        const consent = new MemoryStore(db).consent;
+
+        expect(consent.grant(aliasRoot).path).toBe(root);
+        expect(consent.isRefusedForCapture(aliasRoot)).toBe(false);
+        expect(consent.isRefusedForCapture(root)).toBe(false);
+        expect(consent.isRefusedForCapture(externalAlias)).toBe(true);
+        db.close();
+    });
+
+    it('does not grandfather a valid Codex worktree into consent', () => {
+        const { root } = codexWorktreeFixture();
+        const db = openUnmanagedDb(':memory:');
+        insertHistoricalProject(db, root, 'codex-worktree');
+        db.prepare('DELETE FROM meta WHERE key = ?').run(CONSENT_GRANDFATHERED_AT_KEY);
+
+        expect(grandfatherConsentRoots(db)).toEqual([expect.objectContaining({ path: root, state: 'denied' })]);
+        db.close();
     });
 
     it('checks already-canonical paths without filesystem resolution and preserves fresh closest-root precedence', () => {

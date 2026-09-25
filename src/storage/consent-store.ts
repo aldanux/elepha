@@ -2,8 +2,17 @@
 // from project rows: a project row is historical capture, while consent is a
 // user decision that can cover a whole ProjectSet and later be withdrawn.
 
+import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { canonicalizeExisting, isRefusedProjectRoot, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
+import {
+    canonicalizeExisting,
+    codexHome,
+    isRefusedProjectRoot,
+    isValidCodexWorktreeRoot,
+    isWithin,
+    normalizeForCompare,
+    samePath,
+} from '../config/paths.js';
 import { ProjectResolver } from './project-resolver.js';
 import { newUlid } from './ulid.js';
 
@@ -158,6 +167,33 @@ export class ConsentStore {
         return this.consentState(projectPath) === 'approved';
     }
 
+    // Provider state stays refused unless this exact worktree has a live CLI grant.
+    isRefusedForCapture(projectPath: string): boolean {
+        if (!isRefusedProjectRoot(projectPath)) {
+            return false;
+        }
+        const canonical = canonicalizeExisting(projectPath);
+        const grant = this.explicitConsentDecisionForCanonicalPath(canonical);
+        if (
+            grant?.state !== 'approved' ||
+            grant.source !== 'cli' ||
+            !isWithin(grant.path, canonical) ||
+            !isValidCodexWorktreeRoot(grant.path)
+        ) {
+            return true;
+        }
+        const lexical = path.resolve(projectPath);
+        if (isWithin(grant.path, lexical)) {
+            return false;
+        }
+        const physicalHome = canonicalizeExisting(codexHome());
+        if (!isWithin(physicalHome, grant.path)) {
+            return true;
+        }
+        const aliasRoot = path.join(codexHome(), path.relative(physicalHome, grant.path));
+        return !isWithin(aliasRoot, lexical);
+    }
+
     isRevoked(projectPath: string): boolean {
         return this.consentState(projectPath) === 'denied';
     }
@@ -229,7 +265,7 @@ export class ConsentStore {
     captureOffNudge(projectPath: string): ConsentRoot | 'refused' | undefined {
         const decision = this.explicitConsentDecision(projectPath);
         if (decision?.state === 'approved') {
-            return undefined;
+            return this.isRefusedForCapture(projectPath) ? 'refused' : undefined;
         }
         if (decision) {
             return decision;
@@ -239,7 +275,7 @@ export class ConsentStore {
 
     grant(projectPath: string): ConsentRoot {
         const canonical = canonicalPath(projectPath);
-        if (isRefusedProjectRoot(projectPath) || isRefusedProjectRoot(canonical)) {
+        if ((isRefusedProjectRoot(projectPath) || isRefusedProjectRoot(canonical)) && !isValidCodexWorktreeRoot(projectPath)) {
             throw new Error(`${canonical} is a refused project root and cannot be granted.`);
         }
         return this.setState(projectPath, 'approved', 'cli');
