@@ -63,9 +63,101 @@ describe('CodexAdapter.classifySession', () => {
         expect(result.parentNativeId).toBe('parent-123');
     });
 
+    it('keeps a paginated fork whose physical transcript starts at the inherited history cutoff', async () => {
+        const file = writeRollout([
+            {
+                ...meta({
+                    forked_from_id: 'parent-123',
+                    history_mode: 'paginated',
+                    history_base: { thread_id: 'parent-123', end_ordinal_exclusive: 48, end_byte_offset: 302241 },
+                    forked_from_ordinal_exclusive: 48,
+                }),
+                ordinal: 48,
+            },
+            { type: 'event_msg', ordinal: 49, payload: { type: 'user_message', message: 'Only child work' } },
+            {
+                type: 'response_item',
+                ordinal: 50,
+                payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Captured.' }] },
+            },
+        ]);
+        const adapter = new CodexAdapter();
+
+        expect(await adapter.classifySession(file)).toEqual({ kind: 'primary' });
+        expect((await collect(adapter.parseTurns(file, undefined, { closeTrailingOnIdle: true }))).map((turn) => turn.userMessage)).toEqual(
+            ['Only child work'],
+        );
+    });
+
+    it('keeps a nested paginated fork whose physical history base names an ancestor', async () => {
+        const file = writeRollout([
+            {
+                ...meta({
+                    forked_from_id: 'immediate-parent',
+                    history_mode: 'paginated',
+                    history_base: { thread_id: 'ancestor', end_ordinal_exclusive: 48, end_byte_offset: 302241 },
+                    forked_from_ordinal_exclusive: 48,
+                }),
+                ordinal: 48,
+            },
+        ]);
+        expect(await new CodexAdapter().classifySession(file)).toEqual({ kind: 'primary' });
+    });
+
+    it.each([
+        [{ history_mode: 'legacy' }, 48],
+        [{ history_base: { thread_id: '', end_ordinal_exclusive: 48, end_byte_offset: 302241 } }, 48],
+        [{ forked_from_ordinal_exclusive: 47 }, 48],
+        [{ history_base: { thread_id: 'parent-123', end_ordinal_exclusive: 47, end_byte_offset: 302241 } }, 48],
+        [{ history_base: { thread_id: 'parent-123', end_ordinal_exclusive: 48, end_byte_offset: -1 } }, 48],
+        [{}, 0],
+        [{}, undefined],
+    ])('continues to exclude a fork with an inconsistent paginated boundary: %j, ordinal %s', async (override, ordinal) => {
+        const file = writeRollout([
+            {
+                ...meta({
+                    forked_from_id: 'parent-123',
+                    history_mode: 'paginated',
+                    history_base: { thread_id: 'parent-123', end_ordinal_exclusive: 48, end_byte_offset: 302241 },
+                    forked_from_ordinal_exclusive: 48,
+                    ...override,
+                }),
+                ordinal,
+            },
+        ]);
+        expect((await new CodexAdapter(() => {}).classifySession(file)).kind).toBe('fork-copy');
+    });
+
+    it('keeps paginated subagents typed and guardian sessions excluded', async () => {
+        const paginated = {
+            forked_from_id: 'parent-123',
+            history_mode: 'paginated',
+            history_base: { thread_id: 'parent-123', end_ordinal_exclusive: 48, end_byte_offset: 302241 },
+            forked_from_ordinal_exclusive: 48,
+        };
+        const subagent = writeRollout([
+            {
+                ...meta({
+                    ...paginated,
+                    parent_thread_id: 'parent-123',
+                    thread_source: 'subagent',
+                    agent_path: '/root/review',
+                    agent_nickname: 'Locke',
+                }),
+                ordinal: 48,
+            },
+        ]);
+        const guardian = writeRollout([
+            { ...meta({ ...paginated, thread_source: 'guardian_review', source: { subagent: { other: 'guardian' } } }), ordinal: 48 },
+        ]);
+        expect(await new CodexAdapter().classifySession(subagent)).toEqual({ kind: 'subagent', parentNativeId: 'parent-123' });
+        expect((await new CodexAdapter().classifySession(guardian)).kind).toBe('adjudicator');
+    });
+
     // parent_thread_id is present on EVERY child session, copied or not. Using
     // it as a fork signal misclassified 26 real sessions (turns spanning hours
-    // to days) as duplicates - only forked_from_id means a copied transcript.
+    // to days) as duplicates. forked_from_id identifies a fork, whose history
+    // is copied in legacy mode and referenced in valid paginated mode.
     it('does not treat parent_thread_id alone as a fork-copy', async () => {
         const file = writeRollout([meta({ parent_thread_id: 'parent-456', thread_source: 'subagent', agent_nickname: 'Locke' })]);
         const result = await new CodexAdapter().classifySession(file);
