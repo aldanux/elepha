@@ -169,6 +169,22 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(1);
     });
 
+    it('fails doctor when the managed launcher is intact but the nvm default lacks elepha', async () => {
+        const result = await runDoctor(
+            runtime({
+                inspectLauncher: () => ({
+                    healthy: false,
+                    detail: 'nvm default v24.21.0 is missing elepha',
+                }),
+            }),
+        );
+
+        expect(result.lines.some((line) => /✗ Launcher: nvm default v24\.21\.0/.test(line))).toBe(true);
+        expect(result.lines).toContain('Summary: action required.');
+        expect(result.nextSteps).toContain(terminalHandoff('install'));
+        expect(result.exitCode).toBe(1);
+    });
+
     it('hands off missing hooks and consent without installing or modifying consent', async () => {
         const result = await runDoctor(
             runtime({
