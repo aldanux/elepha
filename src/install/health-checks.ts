@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
+import path from 'node:path';
 import { PRIVATE_DIR_MODE } from '../config/constants.js';
 import {
     claudeMcpPath,
@@ -14,7 +15,7 @@ import { HEARTBEAT_STALE_MS, type Heartbeat, isPidAlive, readHeartbeat } from '.
 import { errorMessage } from '../util/error.js';
 import { readJson } from '../util/fs.js';
 import { resolveInstalledElephaBin } from './binary.js';
-import { launcherHash } from './launcher.js';
+import { launcherHash, resolveDefaultNvm } from './launcher.js';
 import { LAUNCHER_MARKER } from './markers.js';
 import { readOpencodePlugin } from './opencode-plugin.js';
 import { detectPresentTools, type PresentTools, type ToolConfigPaths } from './present-tools.js';
@@ -110,6 +111,7 @@ export function managedLauncherHealth(service: ServiceBackend = serviceBackend()
     try {
         const manifest = readJson<{
             version?: unknown;
+            backend?: { kind?: unknown; root?: unknown };
             launcherHash: string;
             launcherMode: number;
         }>(service.manifestPath);
@@ -129,6 +131,24 @@ export function managedLauncherHealth(service: ServiceBackend = serviceBackend()
         }
         if ((statSync(service.launcherPath).mode & 0o777) !== manifest.launcherMode || launcherHash(launcher) !== manifest.launcherHash) {
             return { healthy: false, detail: `${service.launcherPath} does not match its managed launcher manifest` };
+        }
+        if (manifest.backend?.kind === 'nvm') {
+            if (typeof manifest.backend.root !== 'string') {
+                return { healthy: false, detail: `${service.manifestPath} has no valid nvm root` };
+            }
+            const version = resolveDefaultNvm(manifest.backend.root);
+            if (!version) {
+                return { healthy: false, detail: 'nvm default does not resolve to an installed Node version' };
+            }
+            const bin = path.join(manifest.backend.root, 'versions', 'node', version, 'bin', 'elepha');
+            try {
+                resolveInstalledElephaBin({ pathValue: path.dirname(bin), argvEntrypoint: bin });
+            } catch {
+                return {
+                    healthy: false,
+                    detail: `nvm default ${version} has no valid elepha npm installation; switch to that default, install elepha globally, then run elepha install`,
+                };
+            }
         }
         return { healthy: true, detail: 'managed launcher is valid' };
     } catch (error) {

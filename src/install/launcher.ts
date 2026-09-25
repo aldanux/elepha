@@ -71,7 +71,7 @@ function readNodeVersion(packageRoot: string): string {
     return match[1];
 }
 
-function resolveDefaultNvm(root: string): string | undefined {
+export function resolveDefaultNvm(root: string): string | undefined {
     const aliasDir = path.join(root, 'alias');
     const defaultPath = path.join(aliasDir, 'default');
     if (!readable(defaultPath)) {

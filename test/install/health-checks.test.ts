@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { MINIMUM_NODE_VERSION } from '../../src/config/constants.js';
@@ -78,5 +78,40 @@ describe('shared installation health checks', () => {
             healthy: false,
             detail: `${paths.launcher} is not an elepha managed launcher`,
         });
+    });
+
+    it('reports when an nvm default upgrade leaves the managed launcher without elepha', () => {
+        const home = withTempDir('elepha-nvm-launcher-health-');
+        const root = path.join(home, '.nvm');
+        const paths = defaultLaunchdServicePaths(home);
+        const service = new LaunchdBackend(paths, { run: () => ({ stdout: '', stderr: '', status: 0 }) }, 501);
+        const backend = { kind: 'nvm', command: path.join(root, 'nvm-exec'), root } as const;
+        const oldVersion = 'v24.19.0';
+        const newVersion = 'v24.21.0';
+        const oldBin = path.join(root, 'versions', 'node', oldVersion, 'bin');
+        const newBin = path.join(root, 'versions', 'node', newVersion, 'bin');
+        mkdirSync(path.join(root, 'alias'), { recursive: true });
+        mkdirSync(oldBin, { recursive: true });
+        mkdirSync(newBin, { recursive: true });
+        writeFileSync(path.join(root, 'alias', 'default'), '24\n');
+        const installPackage = (bin: string): void => {
+            const packageRoot = path.join(path.dirname(bin), 'lib', 'node_modules', 'elepha');
+            mkdirSync(path.join(packageRoot, 'bin'), { recursive: true });
+            writeFileSync(path.join(packageRoot, 'package.json'), JSON.stringify({ name: 'elepha', bin: { elepha: './bin/elepha.js' } }));
+            const packageBin = path.join(packageRoot, 'bin', 'elepha.js');
+            writeFileSync(packageBin, '#!/usr/bin/env node\n');
+            chmodSync(packageBin, 0o755);
+            symlinkSync(packageBin, path.join(bin, 'elepha'));
+        };
+        installPackage(oldBin);
+        service.install(renderLauncher(backend, MINIMUM_NODE_VERSION), backend);
+
+        const drift = managedLauncherHealth(service);
+        expect(drift.healthy).toBe(false);
+        expect(drift.detail).toContain(newVersion);
+        expect(drift.detail).toContain('elepha');
+
+        installPackage(newBin);
+        expect(managedLauncherHealth(service)).toEqual({ healthy: true, detail: 'managed launcher is valid' });
     });
 });
