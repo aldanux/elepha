@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
-import { canonicalizeExisting, isRefusedProjectRoot } from '../../config/paths.js';
+import { canonicalizeExisting, isRefusedProjectRoot, isValidCodexWorktreeRoot } from '../../config/paths.js';
 import { IngestionDaemon } from '../../daemon/index.js';
 import { reconcileCaptureService, serviceBackend } from '../../install/service-backend.js';
 import { type ConsentRoot, ConsentStore } from '../../storage/consent-store.js';
@@ -46,12 +46,12 @@ function resolveConsentPath(rootPath: string | undefined, options: ConsentPathOp
     return path.resolve(rootPath ?? process.cwd());
 }
 
-function consentPruneReason(rootPath: string): ConsentPruneReason | undefined {
+function consentPruneReason(rootPath: string, store: ConsentStore): ConsentPruneReason | undefined {
     if (!existsSync(rootPath)) {
         return 'missing';
     }
     try {
-        return isRefusedProjectRoot(canonicalizeExisting(rootPath)) ? 'refused' : undefined;
+        return store.isRefusedForCapture(canonicalizeExisting(rootPath)) ? 'refused' : undefined;
     } catch {
         return 'missing';
     }
@@ -59,7 +59,7 @@ function consentPruneReason(rootPath: string): ConsentPruneReason | undefined {
 
 function planConsentPrune(store: ConsentStore): ConsentPruneCandidate[] {
     return store.list().flatMap((root) => {
-        const reason = consentPruneReason(root.path);
+        const reason = consentPruneReason(root.path, store);
         return reason === undefined ? [] : [{ root, reason }];
     });
 }
@@ -157,7 +157,7 @@ export function registerConsent(program: Command): void {
                         let removed = 0;
                         for (const candidate of candidates) {
                             const current = findRoot.get(candidate.root.ulid) as Pick<ConsentRoot, 'path' | 'state'> | undefined;
-                            const currentReason = current === undefined ? undefined : consentPruneReason(current.path);
+                            const currentReason = current === undefined ? undefined : consentPruneReason(current.path, store);
                             if (
                                 current === undefined ||
                                 current.path !== candidate.root.path ||
@@ -215,7 +215,7 @@ export function registerConsent(program: Command): void {
             if (root === undefined) {
                 return;
             }
-            if (isRefusedProjectRoot(root)) {
+            if (isRefusedProjectRoot(root) && !isValidCodexWorktreeRoot(root)) {
                 console.error(`${root} is a refused project root and cannot be granted.`);
                 process.exitCode = 1;
                 return;

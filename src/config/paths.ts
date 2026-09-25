@@ -9,11 +9,13 @@
 // samePath/normalizeForCompare; store the original casing. Volume-level
 // case-sensitivity detection is deliberately out of scope.
 
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { O_NOFOLLOW, O_RDONLY } from 'node:constants';
+import { closeSync, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { ToolName } from '../types/index.js';
 import {
+    CODEX_WORKTREE_METADATA_MAX_BYTES,
     DEFAULT_ELEPHA_SERVICE_LABEL,
     PARANOID_STATE_FILE_NAME,
     REFUSED_ABSOLUTE_PROJECT_ROOTS,
@@ -451,6 +453,137 @@ export function isRefusedProjectRoot(projectPath: string): boolean {
             roots.toolConfig.some((root) => isWithin(root, candidate)) ||
             isRefusedWslWindowsRoot(candidate),
     );
+}
+
+function readBoundedWorktreeMetadata(filePath: string): string | undefined {
+    let fd: number;
+    try {
+        fd = openSync(filePath, O_RDONLY | O_NOFOLLOW);
+    } catch {
+        return undefined;
+    }
+    try {
+        const opened = fstatSync(fd);
+        if (!opened.isFile() || opened.size > CODEX_WORKTREE_METADATA_MAX_BYTES) {
+            return undefined;
+        }
+        const bytes = Buffer.alloc(CODEX_WORKTREE_METADATA_MAX_BYTES + 1);
+        let length = 0;
+        while (length < bytes.length) {
+            const count = readSync(fd, bytes, length, bytes.length - length, length);
+            if (count === 0) {
+                break;
+            }
+            length += count;
+        }
+        if (length === 0 || length > CODEX_WORKTREE_METADATA_MAX_BYTES) {
+            return undefined;
+        }
+        const current = statSync(filePath);
+        if (opened.dev !== current.dev || opened.ino !== current.ino || !samePath(realpathSync(filePath), filePath)) {
+            return undefined;
+        }
+        return bytes.subarray(0, length).toString('utf8');
+    } catch {
+        return undefined;
+    } finally {
+        closeSync(fd);
+    }
+}
+
+function oneMetadataLine(value: string, prefix = ''): string | undefined {
+    const match = value.match(/^([^\r\n\0]+)\r?\n?$/);
+    if (!match?.[1].startsWith(prefix)) {
+        return undefined;
+    }
+    return match[1].slice(prefix.length).trim() || undefined;
+}
+
+// This admits one explicitly granted checkout, never the containing Codex state tree.
+// The metadata check uses filesystem APIs because a candidate path may come from a transcript.
+export function isValidCodexWorktreeRoot(projectPath: string): boolean {
+    if (!path.isAbsolute(projectPath)) {
+        return false;
+    }
+    const lexicalHome = codexHome();
+    const lexicalRoot = path.resolve(projectPath);
+    try {
+        const physicalHome = realpathSync(lexicalHome);
+        const matchingHome = [lexicalHome, physicalHome].find((home) => {
+            const segments = path.relative(home, lexicalRoot).split(path.sep);
+            return segments.length === 3 && segments[0] === 'worktrees' && !!segments[1] && !!segments[2] && !segments.includes('..');
+        });
+        if (!matchingHome) {
+            return false;
+        }
+        const parts = path.relative(matchingHome, lexicalRoot).split(path.sep);
+        const physicalRoot = realpathSync(lexicalRoot);
+        const expectedRoot = path.join(physicalHome, ...parts);
+        const rootStat = statSync(physicalRoot);
+        if (!samePath(physicalRoot, expectedRoot) || !rootStat.isDirectory()) {
+            return false;
+        }
+        if (
+            [path.join(matchingHome, 'worktrees'), path.join(matchingHome, 'worktrees', parts[1]), lexicalRoot].some((candidate) =>
+                lstatSync(candidate).isSymbolicLink(),
+            )
+        ) {
+            return false;
+        }
+        const refused = refusedRootSet({
+            home: homedir(),
+            xdgConfigHome: process.env.XDG_CONFIG_HOME,
+            claudeConfigRoot: claudeConfigDir(),
+            codexConfigRoot: lexicalHome,
+        });
+        if (
+            [lexicalRoot, physicalRoot].some(
+                (candidate) =>
+                    refused.exact.some((root) => samePath(root, candidate)) ||
+                    refused.temporary.some((root) => isWithin(root, candidate)) ||
+                    withCanonicalForms([claudeConfigDir()]).some((root) => isWithin(root, candidate)),
+            )
+        ) {
+            return false;
+        }
+        const dotGit = path.join(physicalRoot, '.git');
+        const pointer = oneMetadataLine(readBoundedWorktreeMetadata(dotGit) ?? '', 'gitdir: ');
+        if (!pointer) {
+            return false;
+        }
+        const lexicalGitDir = path.resolve(physicalRoot, pointer);
+        const gitDir = realpathSync(lexicalGitDir);
+        const providerRoots = withCanonicalForms([claudeConfigDir(), lexicalHome]);
+        if (
+            !samePath(lexicalGitDir, gitDir) ||
+            path.basename(path.dirname(gitDir)) !== 'worktrees' ||
+            providerRoots.some((root) => isWithin(root, gitDir))
+        ) {
+            return false;
+        }
+        const common = oneMetadataLine(readBoundedWorktreeMetadata(path.join(gitDir, 'commondir')) ?? '');
+        const reciprocal = oneMetadataLine(readBoundedWorktreeMetadata(path.join(gitDir, 'gitdir')) ?? '');
+        if (!common || !reciprocal) {
+            return false;
+        }
+        const lexicalCommonDir = path.resolve(gitDir, common);
+        const commonDir = realpathSync(lexicalCommonDir);
+        const lexicalReciprocal = path.resolve(gitDir, reciprocal);
+        if (
+            !samePath(lexicalCommonDir, commonDir) ||
+            !samePath(commonDir, path.dirname(path.dirname(gitDir))) ||
+            !statSync(commonDir).isDirectory() ||
+            providerRoots.some((root) => isWithin(root, commonDir)) ||
+            !samePath(lexicalReciprocal, dotGit) ||
+            !samePath(realpathSync(lexicalReciprocal), dotGit)
+        ) {
+            return false;
+        }
+        const currentRoot = statSync(lexicalRoot);
+        return currentRoot.dev === rootStat.dev && currentRoot.ino === rootStat.ino && samePath(realpathSync(lexicalRoot), physicalRoot);
+    } catch {
+        return false;
+    }
 }
 
 // De-duplicates paths that differ only by case, keeping the first spelling

@@ -105,7 +105,7 @@ function seedStandingRule(fixture: TestDatabase, project: ProjectRow, text: stri
 }
 
 describe('standing rule project import', () => {
-    it.each(['pending-peer', 'missing-peer', 'denied-peer', 'revoked-after-preview', 'revoked-after-write'] as const)(
+    it.each(['pending-peer', 'approved-peer', 'missing-peer', 'denied-peer', 'revoked-after-preview', 'revoked-after-write'] as const)(
         'binds every rootless symlink member canonically: %s',
         async (scenario) => {
             const source = createTestDb('elepha-import-rules-symlink-');
@@ -122,13 +122,15 @@ describe('standing rule project import', () => {
             const project = seedProject(source, { path: physical });
             const ulid = seedStandingRule(source, project, 'Keep the physical project authority.');
             const candidate = fullBackup(source, active);
+            const approvedPeer = scenario === 'approved-peer' || scenario.startsWith('revoked');
+            if (approvedPeer) active.store.consent.grant(peerPhysical);
             if (scenario === 'denied-peer') active.store.consent.revoke(peerPhysical);
             let verifiedBinding = false;
             const operation = runImportOperation(candidate, false, {
                 dbPath: active.dbPath,
                 daemonHealth: notRunning,
                 confirm: async (plan) => {
-                    if (scenario !== 'denied-peer' && scenario !== 'missing-peer') {
+                    if (approvedPeer) {
                         expect(plan.rules.targets[0]?.memberPaths).toEqual(
                             expect.arrayContaining([
                                 { original: alias, canonical: physical },
@@ -137,19 +139,14 @@ describe('standing rule project import', () => {
                         );
                         verifiedBinding = true;
                     }
+                    if (scenario === 'pending-peer') expect(plan.rules.targets).toEqual([]);
                     if (scenario === 'revoked-after-preview') active.store.consent.revoke(peerPhysical);
                     return true;
                 },
                 beforeVerify: (db) => {
                     if (scenario === 'revoked-after-write') {
                         expect(db.prepare('SELECT ulid FROM standing_rules').all()).toEqual([{ ulid }]);
-                        db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)').run(
-                            newUlid(),
-                            peerPhysical,
-                            'denied',
-                            '2026-09-20T00:00:00.000Z',
-                            'cli',
-                        );
+                        expect(db.prepare("UPDATE consent_roots SET state = 'denied' WHERE path = ?").run(peerPhysical).changes).toBe(1);
                     }
                 },
             });
@@ -159,15 +156,16 @@ describe('standing rule project import', () => {
             } else {
                 const result = await operation;
                 expect(result.rules).toEqual({
-                    added: scenario === 'pending-peer' ? 1 : 0,
+                    added: scenario === 'approved-peer' ? 1 : 0,
                     unchanged: 0,
                     unmapped: scenario === 'missing-peer' ? 1 : 0,
-                    unconsented: scenario === 'denied-peer' ? 1 : 0,
+                    unconsented: scenario === 'pending-peer' || scenario === 'denied-peer' ? 1 : 0,
                 });
-                if (scenario === 'pending-peer')
+                if (scenario === 'approved-peer')
                     expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [ulid])).toMatchObject({ project_id: local.id });
+                if (scenario === 'pending-peer') expect(row(active.dbPath, 'standing_rules', 'ulid = ?', [ulid])).toBeUndefined();
             }
-            if (scenario !== 'denied-peer' && scenario !== 'missing-peer') expect(verifiedBinding).toBe(true);
+            if (approvedPeer) expect(verifiedBinding).toBe(true);
             expect(tableCount(active.dbPath, 'projects')).toBe(2);
         },
     );

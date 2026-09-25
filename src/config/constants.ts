@@ -206,6 +206,7 @@ export const DECISION_PROVENANCE_OVERLAP_THRESHOLD = 0.5;
 export const FINGERPRINT_WINDOW_BYTES = 4096;
 export const MAX_TRANSCRIPT_RECORD_BYTES = 64 * 1024 * 1024;
 export const MAX_METADATA_SCAN_BYTES = 4 * 1024 * 1024;
+export const CODEX_WORKTREE_METADATA_MAX_BYTES = 4 * 1024;
 export const MAX_METADATA_SCAN_LINES = 2_048;
 // Revision of historical guardian exclusion, not full reclassification.
 // Repair consumes a bounded preamble, never turns.

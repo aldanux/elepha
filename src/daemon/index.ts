@@ -50,7 +50,6 @@ import {
     daemonStderrLogPath,
     daemonStdoutLogPath,
     isReadableProviderSource,
-    isRefusedProjectRoot,
     isWithin,
     opencodeDbPath,
     opencodeStoreRoot,
@@ -1285,7 +1284,7 @@ export class IngestionDaemon {
                             continue;
                         }
                     } else {
-                        if (isRefusedProjectRoot(session.directory)) {
+                        if (this.store.consent.isRefusedForCapture(session.directory)) {
                             this.recordSkippedFile(
                                 canonicalPath,
                                 {
@@ -1536,7 +1535,7 @@ export class IngestionDaemon {
                 }
             }
             if (onlyProjectRoots === undefined) {
-                if (isRefusedProjectRoot(metadata.cwd)) {
+                if (this.store.consent.isRefusedForCapture(metadata.cwd)) {
                     return {
                         ingested: 0,
                         skipped: this.recordSkippedFile(
@@ -1807,7 +1806,7 @@ export class IngestionDaemon {
         if (!this.isCurrentOpenTurnValidation(turn.tool, turn.sessionId, validationEpoch)) {
             return;
         }
-        if (isRefusedProjectRoot(turn.projectPath)) {
+        if (this.store.consent.isRefusedForCapture(turn.projectPath)) {
             return;
         }
         const consentState = this.consentStateForTurn(turn);
@@ -1899,7 +1898,7 @@ export class IngestionDaemon {
         // Enforced here rather than downstream because a project row created
         // from a bad cwd is self-healing in the wrong direction: purge it and
         // the next turn from that directory recreates it.
-        if (isRefusedProjectRoot(turn.projectPath)) {
+        if (this.store.consent.isRefusedForCapture(turn.projectPath)) {
             this.recordSkippedFile(
                 turn.sourcePath,
                 {
@@ -2060,7 +2059,7 @@ export class IngestionDaemon {
         customTitle?: string,
         explicitClassification?: SessionClassification,
     ): Promise<void> {
-        if (isRefusedProjectRoot(turn.projectPath)) {
+        if (this.store.consent.isRefusedForCapture(turn.projectPath)) {
             this.recordSkippedFile(
                 turn.sourcePath,
                 {

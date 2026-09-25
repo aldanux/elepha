@@ -117,6 +117,22 @@ function claudeTranscript(cwd: string, sessionId: string): string {
     })}\n`;
 }
 
+function codexTranscript(cwd: string, sessionId: string): string {
+    return `${JSON.stringify({
+        timestamp: '2026-08-20T00:00:00.000Z',
+        type: 'session_meta',
+        payload: { session_id: sessionId, cwd, originator: 'codex-tui', thread_source: 'user' },
+    })}\n${JSON.stringify({
+        timestamp: '2026-08-20T00:00:01.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Codex request' }] },
+    })}\n${JSON.stringify({
+        timestamp: '2026-08-20T00:00:02.000Z',
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Codex response' }] },
+    })}\n`;
+}
+
 function counts(dbPath: string): { sessions: number; turns: number } {
     const db = openUnmanagedDb(dbPath);
     try {
@@ -130,6 +146,44 @@ function counts(dbPath: string): { sessions: number; turns: number } {
 }
 
 describe('elepha consent grant/revoke', () => {
+    it('grants an explicit linked worktree beneath the Codex worktrees directory', () => {
+        const directory = withGrantableTestDir('elepha-codex-worktree-grant-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const root = path.join(directory, '.codex', 'worktrees', 'e251', 'elepha');
+        const gitDir = path.join(directory, 'repository.git', 'worktrees', 'elepha');
+        mkdirSync(root, { recursive: true });
+        mkdirSync(gitDir, { recursive: true });
+        writeFileSync(path.join(root, '.git'), `gitdir: ${gitDir}\n`);
+        writeFileSync(path.join(gitDir, 'gitdir'), `${path.join(root, '.git')}\n`);
+        writeFileSync(path.join(gitDir, 'commondir'), '../..\n');
+        const sessionId = 'codex-worktree-session';
+        const transcript = path.join(directory, '.codex', 'sessions', '2026', '09', '25', `rollout-${sessionId}.jsonl`);
+        mkdirSync(path.dirname(transcript), { recursive: true });
+        writeFileSync(transcript, codexTranscript(root, sessionId));
+        openUnmanagedDb(dbPath).close();
+
+        try {
+            const result = runConsentCli(dbPath, 'grant', { root });
+            expect(result.status).toBe(0);
+            expect(result.stdout).toContain(`Granted ${realpathSync(root)}; backfilled 1 turn(s)`);
+            const db = openUnmanagedDb(dbPath);
+            expect(new MemoryStore(db).consent.list('approved')).toEqual([
+                expect.objectContaining({ path: realpathSync(root), source: 'cli' }),
+            ]);
+            expect(counts(dbPath)).toEqual({ sessions: 1, turns: 1 });
+            db.close();
+
+            const prune = runConsentCli(dbPath, 'prune');
+            expect(prune.status).toBe(0);
+            expect(prune.stdout).not.toContain(root);
+            const revoke = runConsentCli(dbPath, 'revoke', { root });
+            expect(revoke.status).toBe(0);
+            expect(counts(dbPath)).toEqual({ sessions: 1, turns: 1 });
+        } finally {
+            removeDirectory(directory);
+        }
+    });
+
     it('grants the current directory and backfills its already-written transcript with --here', () => {
         const directory = withTempDir('elepha-consent-grant-here-');
         const projectDirectory = withGrantableTestDir('consent-grant-here-');
