@@ -75,12 +75,14 @@ export function removeMemoryPlusRuntime(plan: MemoryPlusRemovalPlan): void {
     try {
         const stat = lstatSync(renamedPath);
         if (!stat.isDirectory() || stat.isSymbolicLink() || stat.dev !== plan.dev || stat.ino !== plan.ino) {
+            //noinspection ExceptionCaughtLocallyJS
             throw new Error('Memory-Plus runtime identity changed after rename; nothing removed.');
         }
         // Recursive filesystem removal does not follow child symlinks. No npm,
         // lifecycle scripts, model cache, or elepha installation teardown is involved.
         rmSync(renamedPath, { recursive: true });
         if (statIfPresent(renamedPath) || statIfPresent(plan.physicalPath) || statIfPresent(plan.path)) {
+            //noinspection ExceptionCaughtLocallyJS
             throw new Error(`Memory-Plus runtime still exists after removal: ${JSON.stringify(plan.path)}.`);
         }
     } catch (error) {

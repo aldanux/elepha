@@ -58,6 +58,7 @@ async function runInstall(): Promise<void> {
             progress.done();
         } catch (error) {
             progress.fail();
+            //noinspection ExceptionCaughtLocallyJS
             throw error;
         }
         const onPhase = createInstallProgressReporter();

@@ -775,6 +775,7 @@ async function applyImport(
                 continue;
             }
             if (session.canonicalCwd === undefined) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new Error(`Importable backup session ${session.row.id} has no canonical cwd.`);
             }
             if (!projectIdentities.has(session.canonicalCwd)) {

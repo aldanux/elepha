@@ -233,28 +233,4 @@ export class OpenTurnStore {
     delete(tool: ToolName, nativeSessionId: string): boolean {
         return this.db.prepare('DELETE FROM open_turns WHERE tool = ? AND native_session_id = ?').run(tool, nativeSessionId).changes > 0;
     }
-
-    clearDurableProjection(tool: ToolName, nativeSessionId: string, revision: string): boolean {
-        return (
-            this.db
-                .prepare(
-                    `UPDATE open_turns SET
-                       durable_included = NULL,
-                       durable_user_prompt = NULL,
-                       durable_assistant_response = NULL,
-                       durable_assistant_structure = NULL,
-                       durable_tool_calls = NULL,
-                       durable_omitted_tool_call_count = NULL,
-                       durable_dropped_tool_ref_count = NULL,
-                       durable_omitted_before_chars = NULL,
-                       durable_filter_version = NULL
-                     WHERE tool = ? AND native_session_id = ? AND source_revision = ?`,
-                )
-                .run(tool, nativeSessionId, revision).changes === 1
-        );
-    }
-
-    deleteForSession(sessionId: number): void {
-        this.db.prepare('DELETE FROM open_turns WHERE session_id = ?').run(sessionId);
-    }
 }

@@ -272,10 +272,7 @@ function validKindMetadata(meta: Record<string, unknown>): boolean {
     if (!subagent || typeof subagent !== 'object' || Array.isArray(subagent)) {
         return false;
     }
-    if ('other' in subagent && (typeof subagent.other !== 'string' || subagent.other.length === 0)) {
-        return false;
-    }
-    return true;
+    return !('other' in subagent && (typeof subagent.other !== 'string' || subagent.other.length === 0));
 }
 
 // This revision repairs guardian exclusions, not every historical classifier.

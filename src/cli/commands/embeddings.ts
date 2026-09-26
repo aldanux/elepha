@@ -13,6 +13,7 @@ export function registerEmbeddings(program: Command): void {
         .action(async (options: { rebuild?: boolean }) => {
             try {
                 if (!getSetting('memory-plus').value) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw new Error(MEMORY_PLUS_DISABLED);
                 }
                 const db = await openDb();

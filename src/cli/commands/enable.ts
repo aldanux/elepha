@@ -51,6 +51,7 @@ export async function enableMemoryPlus(
     try {
         provider = await (options.createProvider ?? createEmbeddingProvider)(true);
         if (provider === undefined) {
+            //noinspection ExceptionCaughtLocallyJS
             throw new Error('Embedding provider was not available.');
         }
         // Verification uses fixed synthetic text, never session content. The

@@ -250,6 +250,7 @@ describe('Memory-Plus disable and runtime uninstall', () => {
                 // Change only the result of the check after the move; no ancestor swap.
                 vi.spyOn(fs, 'lstatSync').mockImplementationOnce(() => {
                     if (failure === 'stat failure') throw new Error('stat failed');
+                    //noinspection JSUnusedGlobalSymbols (isDirectory & isSymbolicLink)
                     return Object.assign(Object.create(stat), {
                         dev: failure === 'dev' ? stat.dev + 1 : stat.dev,
                         ino: failure === 'ino' ? stat.ino + 1 : stat.ino,

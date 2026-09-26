@@ -112,6 +112,7 @@ describe('automatic daemon embedding refresh', () => {
     it('observes disable during an active worker, retains completed vectors and starts no subsequent passes', async () => {
         const f = fixture();
         setSetting('memory-plus', 'true');
+        //noinspection JSUnusedGlobalSymbols (embed & dispose)
         const provider = {
             configuration: embeddingConfiguration(true)!,
             embed: async () => Array(384).fill(0.25),

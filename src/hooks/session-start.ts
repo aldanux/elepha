@@ -179,6 +179,7 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                 log(sessionLogLine(tool, payload, 'failed reason=injection_record_failed'));
                 return { reason: 'injection_record_failed' };
             }
+            //noinspection ExceptionCaughtLocallyJS
             throw error;
         }
         if (invalidRules) {

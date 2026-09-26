@@ -74,6 +74,7 @@ export async function runNpmPostinstall(packageRoot: string, runtime: NpmPostins
             if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
                 return 0;
             }
+            //noinspection ExceptionCaughtLocallyJS
             throw error;
         }
         if (!database.isFile() || database.uid !== process.getuid?.() || !hasPlaintextDatabaseHeader(databasePath)) {

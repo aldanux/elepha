@@ -18,6 +18,7 @@ export function registerStop(program: Command, runtime: StopCommandRuntime = def
             try {
                 const service = resolveCaptureService(runtime);
                 if (!service) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw new Error('elepha stop is available on macOS and Linux after `elepha install`.');
                 }
                 // Backends clear the heartbeat on stop. Retain its PID so a
@@ -33,6 +34,7 @@ export function registerStop(program: Command, runtime: StopCommandRuntime = def
                     }
                     const remaining = deadline - runtime.now();
                     if (remaining <= 0) {
+                        //noinspection ExceptionCaughtLocallyJS
                         throw new Error(`Capture daemon pid ${livePid} is still running after stop.`);
                     }
                     await runtime.sleep(Math.min(DAEMON_HEALTH_CHECK_POLL_MS, remaining));
