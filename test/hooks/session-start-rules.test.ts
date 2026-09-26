@@ -76,6 +76,59 @@ function records(dbPath: string) {
 }
 
 describe('SessionStart standing rules', () => {
+    for (const tool of ['claude-code', 'codex'] as const) {
+        it(`keeps ${tool} child SessionStart output out of the parent's session`, async () => {
+            const f = fixture(['Parent rule.']);
+            const openDatabase = vi.fn(async (dbPath: string) => openUnmanagedDb(dbPath));
+            const daemonHealth = vi.fn(() => ({ state: 'STUCK' as const, healthy: false }));
+            const readUpdateAvailable = vi.fn(() => ({ version: '99.0.0', checkedAt: ISO }));
+            const writeInjection = vi.fn();
+            const dependencies: SessionStartDependencies = {
+                dbPath: f.dbPath,
+                now: () => NOW,
+                openDatabase: openDatabase as unknown as SessionStartDependencies['openDatabase'],
+                daemonHealth,
+                readUpdateAvailable,
+                writeInjection,
+            };
+            const parent = JSON.parse(payload(f.cwd)) as Record<string, unknown>;
+
+            expect(
+                await runSessionStart(JSON.stringify({ ...parent, agent_id: 'agent-child', agent_type: 'Explore' }), tool, dependencies),
+            ).toEqual({ reason: 'subagent_context' });
+            expect(openDatabase).not.toHaveBeenCalled();
+            expect(daemonHealth).not.toHaveBeenCalled();
+            expect(readUpdateAvailable).not.toHaveBeenCalled();
+            expect(writeInjection).not.toHaveBeenCalled();
+
+            const db = openUnmanagedDb(f.dbPath);
+            expect(db.prepare('SELECT body FROM injections WHERE tool = ? AND native_session_id = ?').all(tool, 'rules-chat')).toEqual([]);
+            db.close();
+
+            const result = channels(
+                await runSessionStart(JSON.stringify({ ...parent, agent_type: 'custom-main-agent' }), tool, {
+                    ...dependencies,
+                    writeInjection: undefined,
+                }),
+            );
+            expect(result.rules).toContain('Parent rule.');
+            expect(result.notice).toContain('capture may be stalled');
+            expect(openDatabase).toHaveBeenCalledTimes(1);
+
+            const recorded = openUnmanagedDb(f.dbPath);
+            const bodies = recorded
+                .prepare('SELECT body FROM injections WHERE tool = ? AND native_session_id = ?')
+                .all(tool, 'rules-chat') as Array<{
+                body: string;
+            }>;
+            expect(bodies).toHaveLength(2);
+            expect(bodies.map(({ body }) => body)).toContain(unwrapped(result.rules ?? '', 'rules'));
+            if (typeof result.notice !== 'string') throw new Error('notice missing');
+            expect(bodies.map(({ body }) => body)).toContain(unwrapped(result.notice ?? '', 'notify'));
+            recorded.close();
+        });
+    }
+
     it.each(['approved', 'denied'] as const)('binds all same-remote checkouts and handles a %s peer', async (peerConsent) => {
         const f = fixture(['First checkout rule.']);
         const peerPath = path.join(f.directory, 'second-checkout');

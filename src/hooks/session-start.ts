@@ -104,6 +104,12 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
     if (!payload) {
         return { reason: 'invalid_payload' };
     }
+    // Child hooks can carry the parent's native session ID, so neither
+    // rules nor notices can be safely attributed to this hook invocation.
+    if (payload.agent_id !== undefined) {
+        log(sessionLogLine(tool, payload, 'discarded reason=subagent_context'));
+        return { reason: 'subagent_context' };
+    }
     const clock = dependencies.now ?? Date.now;
     const now = clock();
     let body = withDaemonHealthWarning('', now, dependencies.daemonHealth ?? classifyDaemonHealth);
