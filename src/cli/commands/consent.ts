@@ -46,12 +46,18 @@ function resolveConsentPath(rootPath: string | undefined, options: ConsentPathOp
     return path.resolve(rootPath ?? process.cwd());
 }
 
-function consentPruneReason(rootPath: string, store: ConsentStore): ConsentPruneReason | undefined {
-    if (!existsSync(rootPath)) {
+function consentPruneReason(root: Pick<ConsentRoot, 'path' | 'state'>, store: ConsentStore): ConsentPruneReason | undefined {
+    if (!existsSync(root.path)) {
         return 'missing';
     }
     try {
-        return store.isRefusedForCapture(canonicalizeExisting(rootPath)) ? 'refused' : undefined;
+        const canonical = canonicalizeExisting(root.path);
+        if (!store.isRefusedForCapture(canonical)) {
+            return undefined;
+        }
+        // A pending valid Codex worktree root is still awaiting the user's
+        // grant decision, so it is live, not stale. A denied one was decided.
+        return root.state === 'pending' && isValidCodexWorktreeRoot(canonical) ? undefined : 'refused';
     } catch {
         return 'missing';
     }
@@ -59,7 +65,7 @@ function consentPruneReason(rootPath: string, store: ConsentStore): ConsentPrune
 
 function planConsentPrune(store: ConsentStore): ConsentPruneCandidate[] {
     return store.list().flatMap((root) => {
-        const reason = consentPruneReason(root.path, store);
+        const reason = consentPruneReason(root, store);
         return reason === undefined ? [] : [{ root, reason }];
     });
 }
@@ -157,7 +163,7 @@ export function registerConsent(program: Command): void {
                         let removed = 0;
                         for (const candidate of candidates) {
                             const current = findRoot.get(candidate.root.ulid) as Pick<ConsentRoot, 'path' | 'state'> | undefined;
-                            const currentReason = current === undefined ? undefined : consentPruneReason(current.path, store);
+                            const currentReason = current === undefined ? undefined : consentPruneReason(current, store);
                             if (
                                 current === undefined ||
                                 current.path !== candidate.root.path ||

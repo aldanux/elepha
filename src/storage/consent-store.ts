@@ -49,6 +49,10 @@ function prefersConsentRow(candidate: ConsentRoot, incumbent: ConsentRoot): bool
     return candidate.ulid > incumbent.ulid;
 }
 
+function isExactCliGrant(decision: ConsentRoot, canonicalRoot: string): boolean {
+    return decision.state === 'approved' && decision.source === 'cli' && samePath(decision.path, canonicalRoot);
+}
+
 function canonicalPath(projectPath: string): string {
     return canonicalizeExisting(projectPath);
 }
@@ -241,7 +245,33 @@ export class ConsentStore {
 
     // Records an unseen root once; a pending decision must be visible, never a quiet drop.
     recordPending(projectPath: string): ConsentRoot {
-        const canonical = canonicalPath(projectPath);
+        return this.recordPendingCanonical(canonicalPath(projectPath));
+    }
+
+    // Claims the one-time consent notice for an already-validated physical Codex
+    // worktree root. DB-only so it can run inside the caller's write transaction:
+    // a rolled-back delivery leaves the notice unclaimed, and the guarded update
+    // stops concurrent SessionStart hooks from claiming it twice. A denied
+    // decision keeps it silent, as does the exact CLI grant that alone turns
+    // capture on. An approved parent or a historical non-CLI approval still
+    // leaves capture refused, so it must not suppress the notice; the claim
+    // only stamps nudged_at and never changes the stored decision.
+    claimWorktreeConsentNotice(physicalWorktreeRoot: string, nudgedAt: string): boolean {
+        const decision = this.explicitConsentDecisionForCanonicalPath(physicalWorktreeRoot);
+        if (decision?.state === 'denied' || (decision !== undefined && isExactCliGrant(decision, physicalWorktreeRoot))) {
+            return false;
+        }
+        const root = this.recordPendingCanonical(physicalWorktreeRoot);
+        const claimed = this.db
+            .prepare(
+                `UPDATE consent_roots SET nudged_at = ? WHERE ulid = ? AND nudged_at IS NULL
+                 AND state <> 'denied' AND NOT (state = 'approved' AND source = 'cli')`,
+            )
+            .run(nudgedAt, root.ulid);
+        return claimed.changes === 1;
+    }
+
+    private recordPendingCanonical(canonical: string): ConsentRoot {
         const current = this.list().find((root) => samePath(root.path, canonical));
         if (current) {
             return current;
