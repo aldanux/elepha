@@ -338,6 +338,57 @@ describe('elepha consent prune', () => {
         }
     }, 15000);
 
+    it('keeps a grantable pending Codex worktree listed while pruning invalid and denied ones', () => {
+        const directory = withGrantableTestDir('elepha-consent-prune-worktree-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const worktree = (name: string, gitDir: string) => {
+            const root = path.join(directory, '.codex', 'worktrees', 'e251', name);
+            mkdirSync(root, { recursive: true });
+            mkdirSync(gitDir, { recursive: true });
+            writeFileSync(path.join(root, '.git'), `gitdir: ${gitDir}\n`);
+            writeFileSync(path.join(gitDir, 'commondir'), '../..\n');
+            return root;
+        };
+        const validGitDir = path.join(directory, 'repository.git', 'worktrees', 'valid');
+        const validRoot = worktree('valid', validGitDir);
+        writeFileSync(path.join(validGitDir, 'gitdir'), `${path.join(validRoot, '.git')}\n`);
+        const brokenGitDir = path.join(directory, 'repository.git', 'worktrees', 'broken');
+        const brokenRoot = worktree('broken', brokenGitDir);
+        writeFileSync(path.join(brokenGitDir, 'gitdir'), '/other/worktree/.git\n');
+        const deniedGitDir = path.join(directory, 'repository.git', 'worktrees', 'denied');
+        const deniedRoot = worktree('denied', deniedGitDir);
+        writeFileSync(path.join(deniedGitDir, 'gitdir'), `${path.join(deniedRoot, '.git')}\n`);
+        const canonicalValidRoot = realpathSync(validRoot);
+        const canonicalBrokenRoot = realpathSync(brokenRoot);
+        const canonicalDeniedRoot = realpathSync(deniedRoot);
+        const db = openUnmanagedDb(dbPath);
+        const store = new MemoryStore(db);
+        store.consent.recordPending(canonicalValidRoot);
+        store.consent.recordPending(canonicalBrokenRoot);
+        store.consent.revoke(canonicalDeniedRoot);
+        db.close();
+
+        try {
+            const preview = runConsentCli(dbPath, 'prune');
+            expect(preview.status).toBe(0);
+            expect(preview.stdout).toContain(`refused\t${canonicalBrokenRoot}`);
+            expect(preview.stdout).toContain(`refused\t${canonicalDeniedRoot}`);
+            expect(preview.stdout).not.toContain(canonicalValidRoot);
+
+            const applied = runConsentCli(dbPath, 'prune', { apply: true, skipConfirmation: true });
+            expect(applied.status).toBe(0);
+            expect(applied.stdout).toContain('Removed 2 consent root(s).');
+
+            const list = runConsentCli(dbPath, 'list');
+            expect(list.status).toBe(0);
+            expect(list.stdout).toContain(`pending\t${canonicalValidRoot}`);
+            expect(list.stdout).not.toContain(canonicalBrokenRoot);
+            expect(list.stdout).not.toContain(canonicalDeniedRoot);
+        } finally {
+            removeDirectory(directory);
+        }
+    }, 15000);
+
     it('previews and removes missing and refused roots without touching live roots or memory', () => {
         const directory = withTempDir('elepha-consent-prune-');
         const dbPath = path.join(directory, 'elepha.db');

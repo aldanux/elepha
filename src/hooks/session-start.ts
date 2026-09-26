@@ -4,10 +4,11 @@
 import { existsSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { HOOK_WATCHDOG_TIMEOUT_MS, PACKAGE_VERSION } from '../config/constants.js';
-import { updateAvailablePath } from '../config/paths.js';
+import { codexWorktreeRootContaining, updateAvailablePath } from '../config/paths.js';
 import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
+import { escapeShellSyntax } from '../security/sanitize.js';
 import { prepareStandingRulesDelivery } from '../serving/standing-rules.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
@@ -97,6 +98,14 @@ export function withUpdateNotice(body: string, readMarker: (markerPath: string) 
     }
 }
 
+// The root is displayed, never embedded in the command: a worktree name is
+// untrusted, so the user runs a fixed command from inside that directory.
+function worktreeConsentNotice(physicalRoot: string): string {
+    const displayRoot = escapeShellSyntax(physicalRoot).replace(/[\n\t]/g, ' ');
+    const command = terminalHandoff('consent grant --here');
+    return `ℹ elepha: Codex worktree not captured (shown once): ${displayRoot}\nTo capture it, from that worktree root: ${command}`;
+}
+
 // Pure orchestration seam used by tests and the thin CLI adapter.
 export async function runSessionStart(rawStdin: string, tool: HookTool, dependencies: SessionStartDependencies = {}): Promise<HookResult> {
     const log = dependencies.log ?? logLine;
@@ -142,6 +151,8 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                       payload.cwd,
                       tool === 'opencode' ? undefined : { tool, nativeSessionId: payload.session_id },
                   );
+        // Filesystem validation stays outside the write transaction; the claim inside it is DB-only.
+        const worktreeRoot = tool === 'opencode' ? undefined : codexWorktreeRootContaining(payload.cwd);
         dependencies.beforeDelivery?.(db);
         const recordFailed = new Error('injection_record_failed');
         const record = (text: string, kind: 'rules' | 'notify'): string => {
@@ -174,11 +185,18 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                     const delivery = readable ? readRules() : undefined;
                     invalidRulesReason = delivery === undefined ? undefined : 'reason' in delivery ? delivery.reason : delivery.chatReason;
                     const rules = delivery !== undefined && 'body' in delivery ? delivery.body : undefined;
-                    if (rules === undefined && !body) {
+                    // A failed record below rolls this claim back, so the one-time notice is not consumed.
+                    const nudgedAt = new Date(now).toISOString();
+                    const worktreeNotice =
+                        worktreeRoot !== undefined && store.consent.claimWorktreeConsentNotice(worktreeRoot, nudgedAt)
+                            ? worktreeConsentNotice(worktreeRoot)
+                            : undefined;
+                    const notices = [body, worktreeNotice].filter((notice) => !!notice).join('\n');
+                    if (rules === undefined && !notices) {
                         return { reason: invalidRulesReason ?? 'no_notice' };
                     }
                     const additionalContext = rules === undefined ? undefined : record(rules, 'rules');
-                    const systemMessage = body ? record(body, 'notify') : undefined;
+                    const systemMessage = notices ? record(notices, 'notify') : undefined;
                     return { output: envelope(tool, { additionalContext, systemMessage }) };
                 })
                 .immediate();

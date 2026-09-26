@@ -586,6 +586,34 @@ export function isValidCodexWorktreeRoot(projectPath: string): boolean {
     }
 }
 
+// Maps a cwd inside a managed Codex worktree to that checkout's physical root.
+// Only spellings under CODEX_HOME qualify, because those are the only aliases an
+// exact worktree grant admits for capture; a symlink escaping the root is refused.
+export function codexWorktreeRootContaining(cwd: string): string | undefined {
+    if (!path.isAbsolute(cwd)) {
+        return undefined;
+    }
+    const lexicalCwd = path.resolve(cwd);
+    try {
+        const lexicalHome = codexHome();
+        for (const home of [lexicalHome, realpathSync(lexicalHome)]) {
+            const segments = path.relative(home, lexicalCwd).split(path.sep);
+            if (segments.length < 3 || segments[0] !== 'worktrees' || segments.includes('..')) {
+                continue;
+            }
+            const candidate = path.join(home, ...segments.slice(0, 3));
+            if (!isValidCodexWorktreeRoot(candidate)) {
+                continue;
+            }
+            const physicalRoot = realpathSync(candidate);
+            return isWithin(physicalRoot, realpathSync(lexicalCwd)) ? physicalRoot : undefined;
+        }
+    } catch {
+        return undefined;
+    }
+    return undefined;
+}
+
 // De-duplicates paths that differ only by case, keeping the first spelling
 // seen. Used for files_touched: on macOS the same file reached via different
 // casing must not appear twice.
