@@ -26,6 +26,50 @@ interface Hooks {
     'experimental.chat.messages.transform': (input: object, output: { messages: Message[] }) => Promise<void>;
 }
 
+type V2Message = { role: string; content: Array<{ type: string; text?: string }> };
+type V2Event = { sessionID: string; messages: V2Message[]; system: Array<{ type: string; text: string }> };
+
+async function v2Fixture(stdout = response('rendered context'), rulesStdout = JSON.stringify({ context: RULE_CONTEXT })) {
+    const execute = vi.fn((_command: string, _args: readonly string[], _options: ExecFileSyncOptionsWithStringEncoding) => stdout);
+    const rulesInputs: string[] = [];
+    const executeRules = vi.fn(
+        (_command: string, _args: readonly string[], _options: object, callback: (error: Error | null, stdout: string) => void) => ({
+            stdin: Object.assign(new EventEmitter(), {
+                end: (input: string) => {
+                    rulesInputs.push(input);
+                    callback(null, rulesStdout);
+                },
+            }),
+        }),
+    );
+    const source = renderOpencodePlugin(launcher)
+        .replace("import { execFileSync } from 'node:child_process';", '')
+        .replace("import { execFile } from 'node:child_process';", '')
+        .replace('export default ', 'const ElephaPlugin = ');
+    const plugin = runInNewContext(`${source}\nElephaPlugin`, { execFileSync: execute, execFile: executeRules, Buffer }) as {
+        id: string;
+        setup: (ctx: {
+            location: { directory: string };
+            session: {
+                get: (input: { sessionID: string }) => Promise<{ location: { directory: string } }>;
+                hook: (name: string, callback: (event: V2Event) => Promise<void>) => Promise<void>;
+            };
+        }) => Promise<void>;
+    };
+    const hooks = new Map<string, (event: V2Event) => Promise<void>>();
+    const get = vi.fn(async (_input: { sessionID: string }) => ({ location: { directory } }));
+    await plugin.setup({
+        location: { directory: '/wrong/plugin/location' },
+        session: {
+            get,
+            hook: async (name, callback) => {
+                hooks.set(name, callback);
+            },
+        },
+    });
+    return { plugin, hooks, get, execute, executeRules, rulesInputs };
+}
+
 async function fixture(stdout = response('rendered context'), rulesStdout = JSON.stringify({ context: RULE_CONTEXT })) {
     const execute = vi.fn((_command: string, _args: readonly string[], _options: ExecFileSyncOptionsWithStringEncoding) => stdout);
     const rulesInputs: string[] = [];
@@ -44,11 +88,11 @@ async function fixture(stdout = response('rendered context'), rulesStdout = JSON
     const source = renderOpencodePlugin(launcher)
         .replace("import { execFileSync } from 'node:child_process';", '')
         .replace("import { execFile } from 'node:child_process';", '')
-        .replace('export const ElephaPlugin =', 'const ElephaPlugin =');
-    const plugin = runInNewContext(`${source}\nElephaPlugin`, { execFileSync: execute, execFile: executeRules, Buffer }) as (input: {
-        directory: string;
-    }) => Promise<Hooks>;
-    return { execute, executeRules, rulesInputs, hooks: await plugin({ directory }) };
+        .replace('export default ', 'const ElephaPlugin = ');
+    const plugin = runInNewContext(`${source}\nElephaPlugin`, { execFileSync: execute, execFile: executeRules, Buffer }) as {
+        server: (input: { directory: string }) => Promise<Hooks>;
+    };
+    return { execute, executeRules, rulesInputs, hooks: await plugin.server({ directory }) };
 }
 
 // Runs the model-view transform on a single user message.
@@ -57,6 +101,103 @@ async function message(hooks: Hooks, prompt: string, sessionID = 'session-a'): P
     await hooks['experimental.chat.messages.transform']({}, { messages: [{ info: { role: 'user', sessionID }, parts }] });
     return parts[0]?.text;
 }
+
+describe('generated OpenCode V2 plugin', () => {
+    it('loads the default definition and registers every model request kind', async () => {
+        const { plugin, hooks } = await v2Fixture();
+        expect(plugin.id).toBe('elepha');
+        expect([...hooks.keys()]).toEqual(['context', 'compaction', 'generate', 'title']);
+    });
+
+    it('rewrites only the outgoing last user message and uses its session directory for both clients', async () => {
+        const { hooks, execute, rulesInputs, get } = await v2Fixture();
+        const original: V2Message = {
+            role: 'user',
+            content: [{ type: 'text', text: 'elepha:list' }, { type: 'file' }, { type: 'text', text: 'recent' }],
+        };
+        const event: V2Event = {
+            sessionID: 'v2-session',
+            messages: [{ role: 'assistant', content: [{ type: 'text', text: 'prior reply' }] }, original],
+            system: [
+                { type: 'text', text: 'Primary' },
+                { type: 'text', text: 'Other plugin' },
+            ],
+        };
+        await hooks.get('context')?.(event);
+        expect(get).toHaveBeenCalledWith({ sessionID: 'v2-session' });
+        expect(rulesInputs).toEqual([JSON.stringify({ session_id: 'v2-session', cwd: directory })]);
+        expect(JSON.parse(execute.mock.calls[0]![2].input as string)).toEqual({
+            hook_event_name: 'UserPromptSubmit',
+            session_id: 'v2-session',
+            cwd: directory,
+            prompt: 'elepha:list\nrecent',
+        });
+        expect(event.system).toEqual([
+            { type: 'text', text: `Primary\n\n${RULE_CONTEXT}` },
+            { type: 'text', text: 'Other plugin' },
+        ]);
+        expect(event.messages[1]?.content).toEqual([{ type: 'text', text: 'rendered context' }, { type: 'file' }]);
+        expect(original.content).toEqual([{ type: 'text', text: 'elepha:list' }, { type: 'file' }, { type: 'text', text: 'recent' }]);
+    });
+
+    it('does not replay a persisted command on a tool-driven continuation', async () => {
+        const { hooks, execute } = await v2Fixture();
+        const original: V2Message = { role: 'user', content: [{ type: 'text', text: 'elepha:list' }] };
+        const event: V2Event = {
+            sessionID: 'v2-session',
+            messages: [original, { role: 'assistant', content: [{ type: 'text', text: 'tool result' }] }],
+            system: [],
+        };
+        await hooks.get('context')?.(event);
+        expect(execute).not.toHaveBeenCalled();
+        expect(event.messages[0]).toBe(original);
+        expect(event.system).toEqual([{ type: 'text', text: RULE_CONTEXT }]);
+    });
+
+    it('applies rules to auxiliary model calls without rewriting their messages', async () => {
+        const { hooks, execute, rulesInputs } = await v2Fixture();
+        for (const kind of ['compaction', 'generate', 'title']) {
+            const event: V2Event = {
+                sessionID: kind,
+                messages: [{ role: 'user', content: [{ type: 'text', text: 'elepha:list' }] }],
+                system: [],
+            };
+            await hooks.get(kind)?.(event);
+            expect(event.system).toEqual([{ type: 'text', text: RULE_CONTEXT }]);
+            expect(event.messages[0]?.content[0]?.text).toBe('elepha:list');
+        }
+        expect(rulesInputs.map((input) => JSON.parse(input).session_id)).toEqual(['compaction', 'generate', 'title']);
+        expect(execute).not.toHaveBeenCalled();
+    });
+
+    it('fails open when session lookup or bounded rules output fails', async () => {
+        const { hooks, get, executeRules } = await v2Fixture(response('rendered context'), '{');
+        const event: V2Event = {
+            sessionID: 'v2-session',
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'ordinary text' }] }],
+            system: [{ type: 'text', text: 'Primary' }],
+        };
+        await hooks.get('context')?.(event);
+        expect(event.system).toEqual([{ type: 'text', text: 'Primary' }]);
+        expect(executeRules).toHaveBeenCalledTimes(1);
+        get.mockRejectedValueOnce(new Error('session gone'));
+        await hooks.get('context')?.(event);
+        expect(executeRules).toHaveBeenCalledTimes(1);
+        expect(event.messages[0]?.content[0]?.text).toBe('ordinary text');
+    });
+
+    it('does not spawn a rules child for an oversized V2 identity payload', async () => {
+        const { hooks, executeRules } = await v2Fixture();
+        const event: V2Event = {
+            sessionID: 'x'.repeat(HOOK_PAYLOAD_MAX_CHARS),
+            messages: [],
+            system: [{ type: 'text', text: 'Primary' }],
+        };
+        await hooks.get('context')?.(event);
+        expect(executeRules).not.toHaveBeenCalled();
+        expect(event.system).toEqual([{ type: 'text', text: 'Primary' }]);
+    });
+});
 
 describe('generated OpenCode plugin', () => {
     it('registers model-view and system transforms without a persisted message hook', async () => {
@@ -285,13 +426,21 @@ describe('generated OpenCode plugin', () => {
             );
             const file = path.join(root, 'elepha.js');
             writeFileSync(file, renderOpencodePlugin(stub));
-            const script = `const { ElephaPlugin } = await import(${JSON.stringify(pathToFileURL(file).href)});
-const hooks = await ElephaPlugin({directory:${JSON.stringify(directory)}});
+            const script = `const { default: ElephaPlugin } = await import(${JSON.stringify(pathToFileURL(file).href)});
+const hooks = await ElephaPlugin.server({directory:${JSON.stringify(directory)}});
+const v2Hooks = {};
+await ElephaPlugin.setup({location:{directory:'/wrong/plugin/location'},session:{
+    get:async ({sessionID})=>({location:{directory:${JSON.stringify(directory)}}}),
+    hook:async (kind,callback)=>{v2Hooks[kind]=callback;},
+}});
+const original = {role:'user',content:[{type:'text',text:'elepha:list'}]};
+const v2Event = {sessionID:'runtime',messages:[original],system:[{type:'text',text:'Primary'},{type:'text',text:'Other plugin'}]};
+await v2Hooks.context(v2Event);
 const parts = [{type:'text',text:'elepha:list'}];
 await hooks['experimental.chat.messages.transform']({}, {messages:[{info:{role:'user',sessionID:'runtime'},parts}]});
 const system = ['Primary', 'Other plugin'];
 await hooks['experimental.chat.system.transform']({sessionID:'runtime'}, {system});
-console.log(JSON.stringify({message:JSON.parse(parts[0].text),system}));`;
+console.log(JSON.stringify({message:JSON.parse(parts[0].text),system,v2:{message:JSON.parse(v2Event.messages[0].content[0].text),system:v2Event.system,original:original.content[0].text,hooks:Object.keys(v2Hooks)}}));`;
             const rewritten = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', shell: false });
             expect(JSON.parse(rewritten)).toEqual({
                 message: {
@@ -302,6 +451,21 @@ console.log(JSON.stringify({message:JSON.parse(parts[0].text),system}));`;
                     `Primary\n\n${wrap('rules', RULE_ID, JSON.stringify({ argv: [...OPENCODE_RULES_HOOK_ARGS], payload: { session_id: 'runtime', cwd: directory } }))}`,
                     'Other plugin',
                 ],
+                v2: {
+                    message: {
+                        argv: [...OPENCODE_HOOK_ARGS],
+                        payload: { hook_event_name: 'UserPromptSubmit', session_id: 'runtime', cwd: directory, prompt: 'elepha:list' },
+                    },
+                    system: [
+                        {
+                            type: 'text',
+                            text: `Primary\n\n${wrap('rules', RULE_ID, JSON.stringify({ argv: [...OPENCODE_RULES_HOOK_ARGS], payload: { session_id: 'runtime', cwd: directory } }))}`,
+                        },
+                        { type: 'text', text: 'Other plugin' },
+                    ],
+                    original: 'elepha:list',
+                    hooks: ['context', 'compaction', 'generate', 'title'],
+                },
             });
         } finally {
             try {

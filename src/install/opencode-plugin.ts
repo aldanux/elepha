@@ -4,7 +4,7 @@ import { renderOpencodeHookClient, renderOpencodeRulesClient } from '../security
 import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 
 // OpenCode loads plugins listed in opencode.json's `plugin` array (the installer
-// registers this file there). PluginInput.directory is the working directory.
+// registers this file there). V1 PluginInput.directory is the working directory.
 // Keep this standalone so OpenCode needs no elepha package imports.
 //
 // Transform only model-facing views: chat.message persists edits into the
@@ -17,7 +17,7 @@ ${renderOpencodeHookClient(launcher)}
 ${renderOpencodeRulesClient(launcher)}
 const briefOpen = ${JSON.stringify(`${OPEN}brief:`)};
 const briefClose = ${JSON.stringify(CLOSE)};
-export const ElephaPlugin = async ({ directory }) => ({
+function v1Hooks(directory) { return {
     // OpenCode also uses this transform for auxiliary title/compaction calls.
     // There is no request-kind discriminator, so the same authorized rules apply.
     'experimental.chat.system.transform': async (input, output) => {
@@ -76,7 +76,103 @@ export const ElephaPlugin = async ({ directory }) => ({
             // Fail open without logging private prompt or context data.
         }
     },
-});
+}; }
+
+function rulesContext(stdout) {
+    if (!stdout) return;
+    const result = JSON.parse(stdout);
+    if (!result || typeof result !== 'object' || Array.isArray(result) || Object.keys(result).length !== 1) return;
+    const context = result.context;
+    if (typeof context !== 'string' || !/^\\[\\[elepha:rules:[0-9A-HJKMNP-TV-Z]{26}]]\\n[\\s\\S]+\\n\\[\\[\\/elepha]]$/.test(context)) return;
+    return context;
+}
+
+function commandBody(stdout) {
+    if (!stdout.trim()) return;
+    const context = JSON.parse(stdout)?.hookSpecificOutput?.additionalContext;
+    if (typeof context !== 'string' || !context) return;
+    const body = context
+        .split('\\n')
+        .filter((line) => !line.startsWith(briefOpen) && line.trim() !== briefClose)
+        .join('\\n').trim();
+    return body || undefined;
+}
+
+export default {
+    id: 'elepha',
+    async server({ directory }) {
+        return v1Hooks(directory);
+    },
+    async setup(ctx) {
+        async function modelRules(event, cwd) {
+            try {
+                if (!Array.isArray(event.system)) return;
+                const context = rulesContext(await runRulesHook({ session_id: event.sessionID, cwd }));
+                if (!context) return;
+                const first = event.system[0];
+                if (!first) event.system.push({ type: 'text', text: context });
+                else if (first.type === 'text' && typeof first.text === 'string') {
+                    event.system[0] = { ...first, text: first.text ? first.text + '\\n\\n' + context : context };
+                } else event.system.push({ type: 'text', text: context });
+            } catch {
+                // Fail open without logging private rules or project identity.
+            }
+        }
+
+        async function sessionDirectory(event) {
+            if (typeof event?.sessionID !== 'string' || !event.sessionID.trim()) return;
+            try {
+                const session = await ctx.session.get({ sessionID: event.sessionID });
+                const cwd = session?.location?.directory;
+                return typeof cwd === 'string' && cwd ? cwd : undefined;
+            } catch {
+                // A removed or unavailable session has no authorized project identity.
+            }
+        }
+
+        await ctx.session.hook('context', async (event) => {
+            const cwd = await sessionDirectory(event);
+            if (!cwd) return;
+            await modelRules(event, cwd);
+            try {
+                if (!Array.isArray(event.messages)) return;
+                const index = event.messages.length - 1;
+                // The previous user prompt remains in persisted history on tool
+                // continuations; only a pending user message may run a command.
+                if (index < 0 || event.messages[index]?.role !== 'user') return;
+                const message = event.messages[index];
+                if (!Array.isArray(message?.content)) return;
+                const textParts = message.content.filter((part) => part?.type === 'text' && typeof part.text === 'string');
+                if (!textParts.length) return;
+                const prompt = textParts.map((part) => part.text).join('\\n');
+                if (!prompt.trim().startsWith('elepha:')) return;
+                const body = commandBody(runHook({
+                    hook_event_name: 'UserPromptSubmit',
+                    session_id: event.sessionID,
+                    cwd,
+                    prompt,
+                }));
+                if (!body) return;
+                const firstText = textParts[0];
+                event.messages[index] = {
+                    ...message,
+                    content: message.content
+                        .filter((part) => part?.type !== 'text' || part === firstText)
+                        .map((part) => part === firstText ? { ...part, text: body } : part),
+                };
+            } catch {
+                // Fail open without logging private prompt or context data.
+            }
+        });
+
+        for (const kind of ['compaction', 'generate', 'title']) {
+            await ctx.session.hook(kind, async (event) => {
+                const cwd = await sessionDirectory(event);
+                if (cwd) await modelRules(event, cwd);
+            });
+        }
+    },
+};
 `;
 }
 
