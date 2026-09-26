@@ -34,12 +34,12 @@ Full guide: [docs/consent.md](consent.md).
 
 Full guide: [docs/capture.md](capture.md).
 
-| Command                   | Description                                                                                                                                                 |
-|---------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha projects [--all]` | List captured or approved projects; `--all` includes missing and temporary paths. More details in [docs/capture.md](capture.md#see-what-has-been-captured). |
-| `elepha pause`            | Stop and disable background capture without changing consent or memory. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service). |
-| `elepha resume`           | Enable and start background capture for approved roots. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).                 |
-| `elepha restart`          | Run the pause operation followed by the resume operation. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).               |
+| Command                   | Description                                                                                                                                                                        |
+|---------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `elepha projects [--all]` | List captured or approved projects; `--all` includes missing and temporary paths. More details in [docs/capture.md](capture.md#see-what-has-been-captured).                        |
+| `elepha pause`            | Stop and disable background capture without changing consent or memory. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).                        |
+| `elepha resume`           | Enable and start background capture for approved roots. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).                                        |
+| `elepha restart`          | Run the pause operation followed by the resume operation. More details in [docs/capture.md](capture.md#pause-and-resume-the-capture-service).                                      |
 | `elepha stop`             | Stop the background daemon and wait for its process to exit, releasing its database connection. Leaves the service enabled state unchanged; use `elepha resume` to start it again. |
 
 ## Configuration
