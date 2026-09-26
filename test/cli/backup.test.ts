@@ -18,7 +18,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it, vi } from 'vitest';
-import { type BackupPrompts, runBackupWizard } from '../../src/cli/backup-wizard.js';
+import { type BackupPrompts, runBackupWizard, sessionRulesExcludedMessage } from '../../src/cli/backup-wizard.js';
 import { defaultBackupPath, exportAll, exportProject, listFullBackups } from '../../src/cli/commands/backup.js';
 import { isSupportedPlatform } from '../../src/install/platform.js';
 import { openKeyedDatabase, rekeyDatabaseConnection } from '../../src/storage/db.js';
@@ -290,6 +290,50 @@ function fakePrompts(selections: string[], destination: string): { prompts: Back
 }
 
 describe('elepha backup exports', () => {
+    it('preserves chat-bound rules in a full backup and excludes them with an exact project-export count', () => {
+        const { fixture, project, other } = seedExportFixture();
+        const selectedOwner = project.projectIds[0];
+        if (selectedOwner === undefined) throw new Error('Missing selected project owner.');
+        for (const [ulid, owner, nativeId] of [
+            ['01J00000000000000000000001', selectedOwner, 'selected-chat'],
+            ['01J00000000000000000000002', selectedOwner, 'another-selected-chat'],
+            ['01J00000000000000000000003', other.id, 'unrelated-chat'],
+        ] as const) {
+            fixture.db
+                .prepare(
+                    `INSERT INTO session_rules
+                     (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                     VALUES (?, 'codex', ?, ?, ?, ?, '2026-09-20T00:00:00.000Z')`,
+                )
+                .run(ulid, nativeId, repositoryRoot, owner, `Rule for ${nativeId}.`);
+        }
+
+        const fullPath = path.join(fixture.directory, 'full-with-chat-rules.db');
+        exportAll(fixture.db, fullPath, FIXED_KEY);
+        const full = openKeyedDatabase(fullPath, FIXED_KEY, { readonly: true });
+        try {
+            expect(full.prepare('SELECT * FROM session_rules ORDER BY id').all()).toEqual(
+                fixture.db.prepare('SELECT * FROM session_rules ORDER BY id').all(),
+            );
+        } finally {
+            full.close();
+        }
+
+        const projectPath = path.join(fixture.directory, 'project-without-chat-rules.db');
+        const excluded: number[] = [];
+        exportProject(fixture.db, project, projectPath, FIXED_KEY, false, (count) => excluded.push(count));
+        const portable = openKeyedDatabase(projectPath, FIXED_KEY, { readonly: true });
+        try {
+            expect(
+                portable.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_rules'").get(),
+            ).toBeUndefined();
+            expect(excluded).toEqual([2]);
+            expect(portable.prepare('SELECT COUNT(*) AS count FROM standing_rules').get()).toEqual({ count: 2 });
+        } finally {
+            portable.close();
+        }
+    });
+
     it('exports a rule-only logical project without unrelated rules or sessions', () => {
         const fixture = createTestDb('elepha-backup-rule-only-');
         const project = seedProject(fixture);
@@ -4092,6 +4136,13 @@ describe('elepha backup exports', () => {
 
     it('selects a consolidated project and writes its export through the fakeable wizard seam', async () => {
         const { fixture, project } = seedExportFixture();
+        fixture.db
+            .prepare(
+                `INSERT INTO session_rules
+                 (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, 'codex', ?, ?, ?, ?, ?)`,
+            )
+            .run('01J00000000000000000000005', 'wizard-chat', repositoryRoot, project.projectIds[0], 'Wizard-only rule.', '2026-09-20');
         const output = path.join(fixture.directory, 'wizard-export.db');
         const { prompts } = fakePrompts(['project', repositoryRoot], output);
         const wizardOutput = ttyStream();
@@ -4106,7 +4157,8 @@ describe('elepha backup exports', () => {
                 backupAll: async () => {
                     throw new Error('all memory was not selected');
                 },
-                backupProject: async (selected, destination) => exportProject(fixture.db, selected, destination, FIXED_KEY),
+                backupProject: async (selected, destination, reportExcluded) =>
+                    exportProject(fixture.db, selected, destination, FIXED_KEY, false, reportExcluded),
             }),
         ).resolves.toBe(0);
 
@@ -4121,6 +4173,7 @@ describe('elepha backup exports', () => {
                 ],
             });
             expect(prompts.select).toHaveBeenNthCalledWith(2, expect.objectContaining({ message: 'Which project should elepha back up?' }));
+            expect(prompts.outro).toHaveBeenCalledWith(expect.stringContaining(sessionRulesExcludedMessage(1)));
         } finally {
             exported.close();
         }

@@ -169,6 +169,45 @@ describe('external-agent import purge', () => {
         expect((await verifyExternalAgentImportPurge(db, adapter, plan)).ok).toBe(true);
     });
 
+    it('retains a project whose imported sessions are gone but chat rules remain', async () => {
+        const project = store.upsertProject('/Users/test/imported-chat-rules');
+        store.upsertSession('codex', 'chat-rule-owned-import', project.id, importedSource);
+        db.prepare(
+            `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+             VALUES ('external-chat-rule', 'codex', 'chat-rule-owned-import', ?, ?, 'Preserve this chat', '2026-09-20')`,
+        ).run(project.path, project.id);
+        const adapter = new CodexAdapter(() => {});
+        const plan = await planExternalAgentImportPurge(db, adapter);
+        expect(plan.sessionRules).toMatchObject([{ ulid: 'external-chat-rule', owner_project_id: project.id }]);
+        expect(plan.emptiedProjects).not.toContainEqual({ id: project.id, path: project.path });
+        applyExternalAgentImportPurge(db, plan);
+        expect(store.getProjectById(project.id)).toBeDefined();
+        expect(db.prepare('SELECT ulid FROM session_rules WHERE owner_project_id = ?').all(project.id)).toEqual([
+            { ulid: 'external-chat-rule' },
+        ]);
+        expect((await verifyExternalAgentImportPurge(db, adapter, plan)).ok).toBe(true);
+    });
+
+    it('aborts atomically when a chat rule is added after preview to an owner planned for deletion', async () => {
+        const project = store.upsertProject('/Users/test/imported-new-chat-rule');
+        store.upsertSession('codex', 'new-chat-rule-import', project.id, importedSource);
+        const plan = await planExternalAgentImportPurge(db, new CodexAdapter(() => {}));
+        expect(plan.emptiedProjects).toContainEqual({ id: project.id, path: project.path });
+        db.prepare(
+            `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+             VALUES ('new-external-chat-rule', 'codex', 'new-chat-rule-import', ?, ?, 'Added after preview', '2026-09-20')`,
+        ).run(project.path, project.id);
+        const state = () =>
+            Object.fromEntries(
+                ['projects', 'sessions', 'memories', 'session_rollups', 'session_rules', 'mcp_receipts', 'source_generations'].map(
+                    (table) => [table, db.prepare(`SELECT * FROM ${table}`).all()],
+                ),
+            );
+        const before = state();
+        expect(() => applyExternalAgentImportPurge(db, plan)).toThrow('project ownership or standing rules changed after preview');
+        expect(state()).toEqual(before);
+    });
+
     it('aborts atomically when a rule is added after preview to a project planned for deletion', async () => {
         const project = store.upsertProject('/Users/test/imported-new-rule');
         store.upsertSession('codex', 'new-rule-owned-import', project.id, importedSource);

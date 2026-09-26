@@ -8,7 +8,7 @@ import { updateAvailablePath } from '../config/paths.js';
 import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
-import { prepareStandingRulesDelivery, STANDING_RULES_INVALID } from '../serving/standing-rules.js';
+import { prepareStandingRulesDelivery } from '../serving/standing-rules.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
 import {
@@ -133,7 +133,15 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
             () => undefined,
             (token) => token,
         );
-        const readRules = generation === undefined ? () => undefined : prepareStandingRulesDelivery(db, store, payload.cwd);
+        const readRules =
+            generation === undefined
+                ? () => undefined
+                : prepareStandingRulesDelivery(
+                      db,
+                      store,
+                      payload.cwd,
+                      tool === 'opencode' ? undefined : { tool, nativeSessionId: payload.session_id },
+                  );
         dependencies.beforeDelivery?.(db);
         const recordFailed = new Error('injection_record_failed');
         const record = (text: string, kind: 'rules' | 'notify'): string => {
@@ -158,16 +166,16 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
             return output;
         };
         let result: HookResult;
-        let invalidRules = false;
+        let invalidRulesReason: string | undefined;
         try {
             result = db
                 .transaction((): HookResult => {
                     const readable = generation !== undefined && memoryReadAuthorityMatchesGenerationInTransaction(db, generation);
                     const delivery = readable ? readRules() : undefined;
-                    invalidRules = delivery !== undefined && 'reason' in delivery;
+                    invalidRulesReason = delivery === undefined ? undefined : 'reason' in delivery ? delivery.reason : delivery.chatReason;
                     const rules = delivery !== undefined && 'body' in delivery ? delivery.body : undefined;
                     if (rules === undefined && !body) {
-                        return { reason: invalidRules ? STANDING_RULES_INVALID : 'no_notice' };
+                        return { reason: invalidRulesReason ?? 'no_notice' };
                     }
                     const additionalContext = rules === undefined ? undefined : record(rules, 'rules');
                     const systemMessage = body ? record(body, 'notify') : undefined;
@@ -182,8 +190,8 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
             //noinspection ExceptionCaughtLocallyJS
             throw error;
         }
-        if (invalidRules) {
-            log(sessionLogLine(tool, payload, `skipped reason=${STANDING_RULES_INVALID}`));
+        if (invalidRulesReason !== undefined) {
+            log(sessionLogLine(tool, payload, `skipped reason=${invalidRulesReason}`));
         }
         if ('output' in result) {
             log(sessionLogLine(tool, payload, 'emitted output'));

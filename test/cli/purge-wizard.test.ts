@@ -140,6 +140,10 @@ describe('elepha purge wizard', () => {
             'A durable rule',
             '2026-09-20',
         );
+        db.prepare(
+            `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+             VALUES ('wizard-chat-rule', 'codex', 'wizard-chat', ?, ?, 'A durable chat rule', '2026-09-20')`,
+        ).run(directory, project.id);
         const { prompts, events } = fakePrompts(['project', directory], true);
         await expect(
             runPurgeWizard({
@@ -151,6 +155,7 @@ describe('elepha purge wizard', () => {
                     expect(scope.deleteStandingRules).toBe(true);
                     expect(plan.sessions).toEqual([]);
                     expect(plan.standingRules.map((rule) => rule.ulid)).toEqual(['wizard-rule']);
+                    expect(plan.sessionRules.map((rule) => rule.ulid)).toEqual(['wizard-chat-rule']);
                     expect(await confirm(plan)).toBe(true);
                     store.applyPurgePlan(plan);
                     return true;
@@ -160,7 +165,7 @@ describe('elepha purge wizard', () => {
         ).resolves.toBe(0);
         expect(prompts.confirm).toHaveBeenCalledWith({
             message:
-                "Delete elepha's memory for these 0 session(s) and 1 standing rule(s)? Your Claude Code / Codex history on disk is untouched. A backup is saved first.",
+                "Delete elepha's memory for these 0 session(s) and 1 standing rule(s) and 1 chat standing rule(s)? Your Claude Code / Codex history on disk is untouched. A backup is saved first.",
             initialValue: false,
         });
         expect(events).toContain('outro:Purge complete.');

@@ -39,7 +39,7 @@ export interface BackupWizardOptions {
     store: MemoryStore;
     defaultOutput(project?: ProjectSet): string;
     backupAll(output: string): Promise<string>;
-    backupProject(project: ProjectSet, output: string): Promise<string>;
+    backupProject(project: ProjectSet, output: string, reportExcludedSessionRules: (count: number) => void): Promise<string>;
     // Test seam; production routes every visual element through @clack/prompts.
     prompts?: BackupPrompts;
 }
@@ -82,6 +82,10 @@ function projectOptions(store: MemoryStore): { options: PromptOption[]; projects
 function cancelled(prompts: BackupPrompts): number {
     prompts.cancel('Operation cancelled. No backup was written.');
     return 0;
+}
+
+export function sessionRulesExcludedMessage(count: number): string {
+    return `Chat standing rules: ${count} excluded from portable backup.`;
 }
 
 async function chooseOutput(prompts: BackupPrompts, defaultOutput: string): Promise<string | undefined> {
@@ -141,7 +145,12 @@ export async function runBackupWizard(options: BackupWizardOptions): Promise<num
     if (destination === undefined) {
         return cancelled(prompts);
     }
-    const written = await options.backupProject(project, destination);
-    prompts.outro(`Backup written to ${written}.`);
+    let excludedSessionRules = 0;
+    const written = await options.backupProject(project, destination, (count) => {
+        excludedSessionRules = count;
+    });
+    prompts.outro(
+        `Backup written to ${written}.${excludedSessionRules > 0 ? `\n${sessionRulesExcludedMessage(excludedSessionRules)}` : ''}`,
+    );
     return 0;
 }

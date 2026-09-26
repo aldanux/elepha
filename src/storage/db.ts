@@ -260,6 +260,22 @@ CREATE TABLE IF NOT EXISTS standing_rules (
 );
 CREATE INDEX IF NOT EXISTS idx_standing_rules_project ON standing_rules(project_id, id);
 
+-- Session rules are durable user authority for one native chat in one physical
+-- checkout. They must survive rebuilds and segment changes, so they reference
+-- the owning project but never a segmented sessions row.
+CREATE TABLE IF NOT EXISTS session_rules (
+  id                INTEGER PRIMARY KEY,
+  ulid              TEXT NOT NULL UNIQUE,
+  tool              TEXT NOT NULL ${SUPPORTED_TOOL_CHECK},
+  native_session_id TEXT NOT NULL,
+  checkout_anchor   TEXT NOT NULL,
+  owner_project_id  INTEGER NOT NULL REFERENCES projects(id),
+  text              TEXT NOT NULL,
+  created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_rules_scope
+ON session_rules(tool, native_session_id, checkout_anchor, owner_project_id, id);
+
 ${PARANOID_AUTHORITY_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS meta (

@@ -190,9 +190,9 @@ export function buildPurgeScope(store: MemoryStore, options: PurgeScopeOptions):
     };
 }
 
-async function confirmPurge(prompts: PurgePrompts, sessionCount: number, ruleCount = 0): Promise<boolean> {
+async function confirmPurge(prompts: PurgePrompts, sessionCount: number, ruleCount = 0, chatRuleCount = 0): Promise<boolean> {
     const confirmed = await prompts.confirm({
-        message: `Delete elepha's memory for these ${sessionCount} session(s)${ruleCount > 0 ? ` and ${ruleCount} standing rule(s)` : ''}? Your Claude Code / Codex history on disk is untouched. A backup is saved first.`,
+        message: `Delete elepha's memory for these ${sessionCount} session(s)${ruleCount > 0 ? ` and ${ruleCount} standing rule(s)` : ''}${chatRuleCount > 0 ? ` and ${chatRuleCount} chat standing rule(s)` : ''}? Your Claude Code / Codex history on disk is untouched. A backup is saved first.`,
         initialValue: false,
     });
     if (prompts.isCancel(confirmed) || confirmed !== true) {
@@ -282,13 +282,22 @@ export async function runPurgeWizard(options: PurgeWizardOptions): Promise<numbe
     preview.stop();
     let cancelled = false;
     const completed = await options.runPurge(scope, plan, async (purgePlan) => {
-        const confirmed = await confirmPurge(prompts, purgePlan.sessions.length, purgePlan.standingRules.length);
+        const confirmed = await confirmPurge(
+            prompts,
+            purgePlan.sessions.length,
+            purgePlan.standingRules.length,
+            purgePlan.sessionRules.length,
+        );
         cancelled ||= !confirmed;
         return confirmed;
     });
     if (!completed) {
         return cancelled ? 0 : 1;
     }
-    prompts.outro(plan.sessions.length === 0 && plan.standingRules.length === 0 ? 'Nothing was deleted.' : 'Purge complete.');
+    prompts.outro(
+        plan.sessions.length === 0 && plan.standingRules.length === 0 && plan.sessionRules.length === 0
+            ? 'Nothing was deleted.'
+            : 'Purge complete.',
+    );
     return 0;
 }

@@ -12,6 +12,7 @@ import {
 import { STANDING_RULES_AUTHORITY, STANDING_RULES_INVALID } from '../../src/serving/standing-rules.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { SessionRulesStore } from '../../src/storage/session-rules-store.js';
 import { createTestDb, seedConsentRoot, seedProject } from '../helpers/db.js';
 
 const ISO = '2026-09-20T00:00:00.000Z';
@@ -54,6 +55,30 @@ function context(result: Awaited<ReturnType<typeof runStandingRulesHook>>): stri
 }
 
 describe('OpenCode standing-rules transport', () => {
+    it('delivers project rules only, even when the same native ID has a stored chat rule', async () => {
+        const f = fixture();
+        f.mutate((store) => {
+            expect(
+                new SessionRulesStore(store.database).add(
+                    {
+                        identity: { tool: 'opencode', nativeSessionId: 'A', checkoutAnchor: f.cwd },
+                        projectIds: f.scope.projectIds,
+                        ownerProjectId: f.scope.ownerProjectId,
+                        stillAuthorized: () => true,
+                    },
+                    'Private chat rule.',
+                    ISO,
+                ).status,
+            ).toBe('added');
+        });
+        expect(context(await f.run('A'))).toBe(`${STANDING_RULES_AUTHORITY}\n- ${f.rule.text}`);
+        f.mutate((store) => {
+            expect(store.injectionsForSession('opencode', 'A', ISO).map(({ body }) => body)).toEqual([
+                `${STANDING_RULES_AUTHORITY}\n- ${f.rule.text}`,
+            ]);
+        });
+    });
+
     it.each([
         '',
         '{}',

@@ -8,6 +8,7 @@ import type { CodexAdapter } from '../adapters/codex.js';
 import { isReadableProviderSource } from '../config/paths.js';
 import { errorMessage } from '../util/error.js';
 import type { ProjectRow } from './project-store.js';
+import type { SessionRuleRow } from './session-rules-store.js';
 import { type StandingRuleRow, StandingRulesStore } from './standing-rules-store.js';
 
 export interface ExternalImportPurgeSession {
@@ -46,6 +47,7 @@ export interface ExternalImportPurgePlan {
     emptiedProjects: ExternalImportPurgeProject[];
     projectState: ProjectRow[];
     standingRules: StandingRuleRow[];
+    sessionRules: SessionRuleRow[];
     issues: ExternalImportPurgeIssue[];
     before: StoreCounts;
     resulting: StoreCounts;
@@ -83,6 +85,18 @@ function placeholders(values: readonly unknown[]): string {
     return values.map(() => '?').join(',');
 }
 
+function sessionRulesForProjects(db: Database.Database, projectIds: readonly number[]): SessionRuleRow[] {
+    if (projectIds.length === 0) {
+        return [];
+    }
+    return db
+        .prepare(
+            `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
+             FROM session_rules WHERE owner_project_id IN (${placeholders(projectIds)}) ORDER BY id`,
+        )
+        .all(...projectIds) as SessionRuleRow[];
+}
+
 function affectedRollupCount(db: Database.Database, sessionIds: number[]): number {
     if (sessionIds.length === 0) {
         return 0;
@@ -115,6 +129,7 @@ function emptiedProjects(db: Database.Database, sessionIds: number[], projectIds
                        WHERE m.project_id = p.id AND m.session_id NOT IN (${sessionMarks})
                    )
                    AND NOT EXISTS (SELECT 1 FROM standing_rules r WHERE r.project_id = p.id)
+                   AND NOT EXISTS (SELECT 1 FROM session_rules r WHERE r.owner_project_id = p.id)
                  ORDER BY p.id`,
         )
         .all(...projectIds, ...sessionIds, ...sessionIds) as ExternalImportPurgeProject[];
@@ -191,6 +206,7 @@ export async function planExternalAgentImportPurge(
                       .prepare(`SELECT * FROM projects WHERE id IN (${placeholders(projectIds)}) ORDER BY id`)
                       .all(...projectIds) as ProjectRow[]),
         standingRules: new StandingRulesStore(db).list(projectIds),
+        sessionRules: sessionRulesForProjects(db, projectIds),
         issues,
         before,
         resulting: {
@@ -212,6 +228,7 @@ function assertPlanStillMatches(db: Database.Database, plan: ExternalImportPurge
     if (
         JSON.stringify(projects) !== JSON.stringify(plan.projectState) ||
         JSON.stringify(new StandingRulesStore(db).list(projectIds)) !== JSON.stringify(plan.standingRules) ||
+        JSON.stringify(sessionRulesForProjects(db, projectIds)) !== JSON.stringify(plan.sessionRules) ||
         JSON.stringify(emptiedProjects(db, sessionIds, projectIds)) !== JSON.stringify(plan.emptiedProjects)
     ) {
         throw new Error('project ownership or standing rules changed after preview');
@@ -324,6 +341,10 @@ export async function verifyExternalAgentImportPurge(
         if (counts[key] !== plan.resulting[key]) {
             errors.push(`${key} count is ${counts[key]}, expected ${plan.resulting[key]}`);
         }
+    }
+    const projectIds = [...new Set(plan.sessions.map((session) => session.projectId))];
+    if (JSON.stringify(sessionRulesForProjects(db, projectIds)) !== JSON.stringify(plan.sessionRules)) {
+        errors.push('retained chat standing rules changed after apply');
     }
     const violations = db.pragma('foreign_key_check') as unknown[];
     if (violations.length > 0) {

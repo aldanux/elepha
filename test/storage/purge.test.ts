@@ -45,6 +45,7 @@ function purgeState(store: MemoryStore): Record<string, unknown[]> {
         mcpReceipts: store.database.prepare('SELECT * FROM mcp_receipts ORDER BY source_generation, call_id').all(),
         sourceGenerations: store.database.prepare('SELECT * FROM source_generations ORDER BY tool, native_id').all(),
         standingRules: store.database.prepare('SELECT * FROM standing_rules ORDER BY id').all(),
+        sessionRules: store.database.prepare('SELECT * FROM session_rules ORDER BY id').all(),
     };
 }
 
@@ -84,6 +85,43 @@ describe('purge', () => {
             .prepare('INSERT INTO standing_rules (ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)')
             .run(ulid, projectId, text, '2026-09-20T00:00:00.000Z');
     }
+
+    function seedChatRule(projectId: number, ulid = 'chat-rule-one', text = 'Keep this chat rule'): void {
+        store.database
+            .prepare(
+                `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, 'codex', 'chat-one', '/Users/test/checkout', ?, ?, '2026-09-20T00:00:00.000Z')`,
+            )
+            .run(ulid, projectId, text);
+    }
+
+    it('previews and deletes exact chat-rule-only ownership while retaining other projects', () => {
+        const project = store.upsertProject('/Users/test/chat-rule-only');
+        const other = store.upsertProject('/Users/test/other-chat-rule');
+        seedChatRule(project.id);
+        seedChatRule(other.id, 'other-chat-rule');
+        const plan = store.planPurge({ projectIds: [project.id], deleteStandingRules: true });
+        expect(plan.sessions).toEqual([]);
+        expect(plan.standingRules).toEqual([]);
+        expect(plan.sessionRules).toMatchObject([{ ulid: 'chat-rule-one', owner_project_id: project.id, projectPath: project.path }]);
+        expect(plan.emptiedProjects).toEqual([project]);
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+        try {
+            printPurgePlan(plan);
+            const rule = plan.sessionRules[0]!;
+            expect(log).toHaveBeenCalledWith(`Chat standing rules: 1 rule(s).`);
+            expect(log).toHaveBeenCalledWith(
+                `  ${rule.ulid} (id ${rule.id}, ${rule.tool}:${rule.native_session_id}, checkout ${JSON.stringify(rule.checkout_anchor)}, ` +
+                    `owner ${rule.owner_project_id}, ${JSON.stringify(rule.projectPath)}, created ${rule.created_at}): ${JSON.stringify(rule.text)}`,
+            );
+        } finally {
+            log.mockRestore();
+        }
+        store.applyPurgePlan(plan);
+        expect(store.database.prepare('SELECT ulid FROM session_rules').all()).toEqual([{ ulid: 'other-chat-rule' }]);
+        expect(store.getProjectById(project.id)).toBeUndefined();
+        expect(store.getProjectById(other.id)).toBeDefined();
+    });
 
     it('previews exact rule-only ownership and deletes only the selected project rules', () => {
         const project = store.upsertProject('/Users/test/rule-only');
@@ -130,6 +168,23 @@ describe('purge', () => {
         expect(store.getProjectById(project.id)).toEqual(project);
     });
 
+    it.each([
+        { all: true },
+        { all: true, deleteStandingRules: true, newerThan: '2000-01-01' },
+        { all: true, deleteStandingRules: true, olderThan: '9999-01-01' },
+    ])('retains chat rules and their owner during narrower or date-bound purge %j', (scope) => {
+        const project = store.upsertProject('/Users/test/retained-chat-rule');
+        store.upsertSession('codex', 'chat-one', project.id, '/tmp/chat-one.jsonl');
+        seedChatRule(project.id);
+        const plan = store.planPurge(scope);
+        expect(plan.sessions).toHaveLength(1);
+        expect(plan.sessionRules).toEqual([]);
+        expect(plan.emptiedProjects).toEqual([]);
+        store.applyPurgePlan(plan);
+        expect(store.database.prepare('SELECT ulid FROM session_rules').all()).toEqual([{ ulid: 'chat-rule-one' }]);
+        expect(store.getProjectById(project.id)).toEqual(project);
+    });
+
     it('retains rules added after a whole-project preview and keeps their project', () => {
         const project = store.upsertProject('/Users/test/new-rule');
         store.upsertSession('codex', 'new-rule-session', project.id, '/tmp/new-rule.jsonl');
@@ -143,6 +198,39 @@ describe('purge', () => {
         expect(store.standingRules.list([project.id]).map((rule) => rule.ulid)).toEqual(['later-rule']);
         expect(store.getProjectById(project.id)).toBeDefined();
     });
+
+    it('retains a chat rule added after a whole-project preview and keeps its owner', () => {
+        const project = store.upsertProject('/Users/test/new-chat-rule');
+        store.upsertSession('codex', 'chat-one', project.id, '/tmp/new-chat-rule.jsonl');
+        seedChatRule(project.id);
+        const plan = store.planPurge({ all: true, deleteStandingRules: true });
+        seedChatRule(project.id, 'later-chat-rule', 'Added after preview');
+        const applied = store.applyPurgePlan(plan);
+        expect(applied.sessions).toHaveLength(1);
+        expect(applied.sessionRules.map((rule) => rule.ulid)).toEqual(['chat-rule-one']);
+        expect(applied.emptiedProjects).toEqual([]);
+        expect(store.database.prepare('SELECT ulid FROM session_rules').all()).toEqual([{ ulid: 'later-chat-rule' }]);
+        expect(store.getProjectById(project.id)).toBeDefined();
+    });
+
+    it.each(['tool', 'native_session_id', 'checkout_anchor', 'owner_project_id', 'text', 'created_at', 'removed'] as const)(
+        'aborts the complete purge when previewed chat rule %s changes',
+        (field) => {
+            const project = store.upsertProject('/Users/test/changed-chat-rule');
+            const other = store.upsertProject('/Users/test/other-chat-owner');
+            store.upsertSession('codex', 'chat-one', project.id, '/tmp/changed-chat-rule.jsonl');
+            seedChatRule(project.id);
+            const plan = store.planPurge({ projectIds: [project.id], deleteStandingRules: true });
+            if (field === 'removed') store.database.prepare('DELETE FROM session_rules').run();
+            else
+                store.database
+                    .prepare(`UPDATE session_rules SET ${field} = ?`)
+                    .run(field === 'owner_project_id' ? other.id : field === 'tool' ? 'claude-code' : 'changed');
+            const before = purgeState(store);
+            expect(() => store.applyPurgePlan(plan)).toThrow('no longer matches the previewed rule');
+            expect(purgeState(store)).toEqual(before);
+        },
+    );
 
     it.each(['text', 'ulid', 'created_at', 'project_id', 'removed'] as const)(
         'aborts the complete purge when previewed rule %s changes',
@@ -437,7 +525,7 @@ describe('purge', () => {
 
                 await expect(runPurgeOperation(fileStore, scope, { applyRequested: true, confirm })).resolves.toBe(true);
 
-                expect(planPurge).toHaveReturnedWith({ scope, sessions: [], standingRules: [], emptiedProjects: [] });
+                expect(planPurge).toHaveReturnedWith({ scope, sessions: [], standingRules: [], sessionRules: [], emptiedProjects: [] });
                 expect(confirm).not.toHaveBeenCalled();
                 expect(purge).not.toHaveBeenCalled();
                 expect(applyPurgePlan).not.toHaveBeenCalled();
