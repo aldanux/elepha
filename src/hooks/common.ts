@@ -16,6 +16,8 @@ export type HookSource = 'startup' | 'clear' | 'resume' | 'compact' | 'fork';
 interface CommonHookPayload {
     session_id: string;
     cwd: string;
+    agent_id?: string;
+    agent_type?: string;
     model?: string;
     permission_mode?: 'default' | 'acceptEdits' | 'plan' | 'dontAsk' | 'bypassPermissions';
     transcript_path?: string | null;
@@ -69,6 +71,11 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
     if (payload.transcript_path !== undefined && payload.transcript_path !== null && typeof payload.transcript_path !== 'string') {
         return undefined;
     }
+    for (const field of ['agent_id', 'agent_type'] as const) {
+        if (Object.hasOwn(payload, field) && (typeof payload[field] !== 'string' || !payload[field].trim())) {
+            return undefined;
+        }
+    }
     if (
         tool === 'codex' &&
         (typeof payload.model !== 'string' ||
@@ -79,6 +86,8 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
     const common: CommonHookPayload = {
         session_id: payload.session_id,
         cwd: payload.cwd,
+        ...(payload.agent_id === undefined ? {} : { agent_id: payload.agent_id as string }),
+        ...(payload.agent_type === undefined ? {} : { agent_type: payload.agent_type as string }),
         model: payload.model as string | undefined,
         permission_mode: payload.permission_mode as CommonHookPayload['permission_mode'],
         transcript_path: payload.transcript_path as string | null | undefined,

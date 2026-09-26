@@ -106,6 +106,20 @@ describe('SessionStart operational notices', () => {
         expect(parsePayload(JSON.stringify({ ...valid, source: 'other' }), 'codex')).toBeUndefined();
         expect(parsePayload(JSON.stringify({ ...valid, model: null }), 'codex')).toBeUndefined();
         expect(parsePayload(JSON.stringify({ ...valid, permission_mode: 'unsafe' }), 'codex')).toBeUndefined();
+        for (const tool of ['claude-code', 'codex'] as const) {
+            expect(parsePayload(JSON.stringify({ ...valid, agent_id: 'agent-child', agent_type: 'Explore' }), tool)).toMatchObject({
+                agent_id: 'agent-child',
+                agent_type: 'Explore',
+            });
+            for (const field of ['agent_id', 'agent_type'] as const) {
+                for (const value of [null, 7, '', ' ']) {
+                    expect(parsePayload(JSON.stringify({ ...valid, [field]: value }), tool)).toBeUndefined();
+                }
+            }
+        }
+        expect(parsePayload(JSON.stringify({ ...valid, agent_type: 'custom-main-agent' }), 'claude-code')).toMatchObject({
+            agent_type: 'custom-main-agent',
+        });
     });
 
     it('opens the database to discover rules even when no operational notice applies', async () => {

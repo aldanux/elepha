@@ -23,7 +23,7 @@ import {
     standingRulesCommandBody,
 } from '../../src/serving/standing-rules.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
-import { type openDb, openUnmanagedDb } from '../../src/storage/db.js';
+import { openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import {
     enableParanoidMode,
@@ -151,6 +151,59 @@ describe('elepha:rules in-chat grammar', () => {
 });
 
 describe('elepha:rules management', () => {
+    it.each(['claude-code', 'codex'] as const)(
+        'does not let a %s subagent sharing its parent session id mutate rules or hook state',
+        async (tool) => {
+            const f = seededDb('elepha-rules-subagent-', ['Keep this rule.']);
+            const original = storedRules(f);
+            const childPayload = (prompt: string) =>
+                JSON.stringify({
+                    ...JSON.parse(payload(f.projectPath, prompt)),
+                    agent_id: 'agent-child',
+                    agent_type: 'Explore',
+                });
+            const openDatabase = vi.fn(openDb);
+            const childDependencies = { dbPath: f.dbPath, now: () => NOW, openDatabase: openDatabase as unknown as typeof openDb };
+            for (const prompt of [
+                'elepha:rules:add Do not save this.',
+                `elepha:rules:remove ${original[0]!.ulid}`,
+                `elepha:rules:replace ${original[0]!.ulid} Do not replace this.`,
+                'elepha:list',
+            ]) {
+                expect(await runUserPromptSubmit(childPayload(prompt), tool, childDependencies)).toEqual({
+                    reason: 'subagent_context',
+                });
+            }
+            for (const agentId of [null, 7, '', ' ']) {
+                const malformed = JSON.stringify({
+                    ...JSON.parse(payload(f.projectPath, 'elepha:rules:add Do not save this.')),
+                    agent_id: agentId,
+                    agent_type: 'Explore',
+                });
+                expect(await runUserPromptSubmit(malformed, tool, childDependencies)).toEqual({
+                    reason: 'invalid_payload',
+                });
+            }
+            expect(openDatabase).not.toHaveBeenCalled();
+            expect(storedRules(f)).toEqual(original);
+            const db = openUnmanagedDb(f.dbPath);
+            try {
+                expect(db.prepare('SELECT COUNT(*) AS count FROM injections').get()).toEqual({ count: 0 });
+                expect(db.prepare('SELECT COUNT(*) AS count FROM shown_session_lists').get()).toEqual({ count: 0 });
+            } finally {
+                db.close();
+            }
+
+            const mainPayload = JSON.stringify({
+                ...JSON.parse(payload(f.projectPath, 'elepha:rules:add Main chat only.')),
+                ...(tool === 'claude-code' ? { agent_type: 'custom-main-agent' } : {}),
+            });
+            const main = await runUserPromptSubmit(mainPayload, tool, { dbPath: f.dbPath, now: () => NOW });
+            expect(injectedBody(main)).toContain('Main chat only.');
+            expect(storedRules(f).map((rule) => rule.text)).toEqual(['Keep this rule.', 'Main chat only.']);
+        },
+    );
+
     it('lists and adds rules when an approved same-identity worktree no longer exists', async () => {
         const f = createTestDb('elepha-rules-retired-worktree-');
         const projectPath = path.join(f.directory, 'live-worktree');
