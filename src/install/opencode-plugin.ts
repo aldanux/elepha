@@ -17,14 +17,40 @@ ${renderOpencodeHookClient(launcher)}
 ${renderOpencodeRulesClient(launcher)}
 const briefOpen = ${JSON.stringify(`${OPEN}brief:`)};
 const briefClose = ${JSON.stringify(CLOSE)};
-function v1Hooks(directory) { return {
+
+// A subagent runs in its own native session whose parentID names the chat
+// that spawned it. Only a host session matching the requested id with no
+// parent is a top-level chat; a failed lookup, another id, or any other
+// parentID value withholds chat authority while project rules still apply.
+function rootSession(session, sessionID) {
+    return typeof sessionID === 'string' && !!sessionID && !!session && typeof session === 'object' &&
+        !Array.isArray(session) && session.id === sessionID &&
+        (session.parentID === undefined || session.parentID === null);
+}
+
+function withSessionRoot(payload, root) {
+    return root ? { ...payload, session_root: true } : payload;
+}
+
+function v1Hooks(directory, client) {
+    async function sessionRoot(sessionID) {
+        try {
+            const result = await client.session.get({ path: { id: sessionID } });
+            return rootSession(result?.data, sessionID);
+        } catch {
+            // Unknown parentage fails closed without logging the session id.
+            return false;
+        }
+    }
+    return {
     // OpenCode also uses this transform for auxiliary title/compaction calls.
     // There is no request-kind discriminator, so the same authorized rules apply.
     'experimental.chat.system.transform': async (input, output) => {
         try {
             if (typeof input?.sessionID !== 'string' || !input.sessionID.trim()) return;
             if (!Array.isArray(output?.system) || (output.system.length && typeof output.system[0] !== 'string')) return;
-            const stdout = await runRulesHook({ session_id: input.sessionID, cwd: directory });
+            const root = await sessionRoot(input.sessionID);
+            const stdout = await runRulesHook(withSessionRoot({ session_id: input.sessionID, cwd: directory }, root));
             if (!stdout) return;
             const result = JSON.parse(stdout);
             if (!result || typeof result !== 'object' || Array.isArray(result) || Object.keys(result).length !== 1) return;
@@ -54,12 +80,13 @@ function v1Hooks(directory) { return {
             if (!textPart) return;
             const prompt = parts.filter((part) => part.type === 'text').map((part) => part.text).join('\\n');
             if (!prompt.trim().startsWith('elepha:')) return;
-            const stdout = runHook({
+            const root = await sessionRoot(message.info.sessionID);
+            const stdout = runHook(withSessionRoot({
                 hook_event_name: 'UserPromptSubmit',
                 session_id: message.info.sessionID,
                 cwd: directory,
                 prompt,
-            });
+            }, root));
             if (!stdout.trim()) return;
             const context = JSON.parse(stdout)?.hookSpecificOutput?.additionalContext;
             if (typeof context !== 'string' || !context) return;
@@ -76,7 +103,8 @@ function v1Hooks(directory) { return {
             // Fail open without logging private prompt or context data.
         }
     },
-}; }
+    };
+}
 
 function rulesContext(stdout) {
     if (!stdout) return;
@@ -100,14 +128,14 @@ function commandBody(stdout) {
 
 export default {
     id: 'elepha',
-    async server({ directory }) {
-        return v1Hooks(directory);
+    async server({ directory, client }) {
+        return v1Hooks(directory, client);
     },
     async setup(ctx) {
-        async function modelRules(event, cwd) {
+        async function modelRules(event, session) {
             try {
                 if (!Array.isArray(event.system)) return;
-                const context = rulesContext(await runRulesHook({ session_id: event.sessionID, cwd }));
+                const context = rulesContext(await runRulesHook(withSessionRoot({ session_id: event.sessionID, cwd: session.cwd }, session.root)));
                 if (!context) return;
                 const first = event.system[0];
                 if (!first) event.system.push({ type: 'text', text: context });
@@ -119,21 +147,22 @@ export default {
             }
         }
 
-        async function sessionDirectory(event) {
+        // One lookup supplies both the project directory and chat parentage.
+        async function sessionContext(event) {
             if (typeof event?.sessionID !== 'string' || !event.sessionID.trim()) return;
             try {
                 const session = await ctx.session.get({ sessionID: event.sessionID });
                 const cwd = session?.location?.directory;
-                return typeof cwd === 'string' && cwd ? cwd : undefined;
+                return typeof cwd === 'string' && cwd ? { cwd, root: rootSession(session, event.sessionID) } : undefined;
             } catch {
                 // A removed or unavailable session has no authorized project identity.
             }
         }
 
         await ctx.session.hook('context', async (event) => {
-            const cwd = await sessionDirectory(event);
-            if (!cwd) return;
-            await modelRules(event, cwd);
+            const session = await sessionContext(event);
+            if (!session) return;
+            await modelRules(event, session);
             try {
                 if (!Array.isArray(event.messages)) return;
                 const index = event.messages.length - 1;
@@ -146,12 +175,12 @@ export default {
                 if (!textParts.length) return;
                 const prompt = textParts.map((part) => part.text).join('\\n');
                 if (!prompt.trim().startsWith('elepha:')) return;
-                const body = commandBody(runHook({
+                const body = commandBody(runHook(withSessionRoot({
                     hook_event_name: 'UserPromptSubmit',
                     session_id: event.sessionID,
-                    cwd,
+                    cwd: session.cwd,
                     prompt,
-                }));
+                }, session.root)));
                 if (!body) return;
                 const firstText = textParts[0];
                 event.messages[index] = {
@@ -167,8 +196,8 @@ export default {
 
         for (const kind of ['compaction', 'generate', 'title']) {
             await ctx.session.hook(kind, async (event) => {
-                const cwd = await sessionDirectory(event);
-                if (cwd) await modelRules(event, cwd);
+                const session = await sessionContext(event);
+                if (session) await modelRules(event, session);
             });
         }
     },

@@ -1,4 +1,5 @@
-// OpenCode's system transform requests only the user's standing project rules.
+// OpenCode's system transform requests the user's standing project rules, plus
+// chat rules when the plugin's host session lookup proved a top-level chat.
 // This is not a SessionStart event and never serves operational notices.
 
 import { existsSync } from 'node:fs';
@@ -19,6 +20,7 @@ import { recordHookOutput } from './output.js';
 interface StandingRulesPayload {
     session_id: string;
     cwd: string;
+    session_root?: true;
 }
 
 export interface StandingRulesHookDependencies {
@@ -42,8 +44,10 @@ export function parseStandingRulesPayload(raw: string): StandingRulesPayload | u
             return undefined;
         }
         const payload = value as Record<string, unknown>;
+        const root = Object.hasOwn(payload, 'session_root');
         if (
-            Object.keys(payload).length !== 2 ||
+            Object.keys(payload).length !== (root ? 3 : 2) ||
+            (root && payload.session_root !== true) ||
             typeof payload.session_id !== 'string' ||
             !payload.session_id.trim() ||
             typeof payload.cwd !== 'string' ||
@@ -51,7 +55,9 @@ export function parseStandingRulesPayload(raw: string): StandingRulesPayload | u
         ) {
             return undefined;
         }
-        return { session_id: payload.session_id, cwd: payload.cwd };
+        return root
+            ? { session_id: payload.session_id, cwd: payload.cwd, session_root: true }
+            : { session_id: payload.session_id, cwd: payload.cwd };
     } catch {
         return undefined;
     }
@@ -88,9 +94,13 @@ export async function runStandingRulesHook(
             () => undefined,
             (token) => token,
         );
-        const readRules = generation === undefined ? () => undefined : prepareStandingRulesDelivery(db, store, payload.cwd);
+        // Without a host-verified top-level chat, a child sharing nothing but
+        // this hook channel must never read chat rules; project rules remain.
+        const chat = payload.session_root === true ? { tool: 'opencode' as const, nativeSessionId: payload.session_id } : undefined;
+        const readRules = generation === undefined ? () => undefined : prepareStandingRulesDelivery(db, store, payload.cwd, chat);
         dependencies.beforeDelivery?.(db);
         const injectedAt = new Date((dependencies.now ?? Date.now)()).toISOString();
+        let chatReason: string | undefined;
         const result = db
             .transaction((): StandingRulesHookResult => {
                 if (generation === undefined || !memoryReadAuthorityMatchesGenerationInTransaction(db, generation)) {
@@ -103,6 +113,7 @@ export async function runStandingRulesHook(
                 if ('reason' in delivery) {
                     return delivery;
                 }
+                chatReason = delivery.chatReason;
                 let context: string | undefined;
                 try {
                     context = recordHookOutput({
@@ -128,6 +139,10 @@ export async function runStandingRulesHook(
         // synchronous log append/stat for every model request without rules.
         if ('reason' in result && result.reason !== 'no_rules') {
             report(result.reason);
+        }
+        // Project rules were served, but withheld chat rules must not be silent.
+        if ('context' in result && chatReason !== undefined) {
+            report(chatReason);
         }
         return result;
     } catch (error) {

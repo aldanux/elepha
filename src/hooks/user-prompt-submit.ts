@@ -562,7 +562,11 @@ export async function runUserPromptSubmit(
                                 throw receiptFailure;
                             }
                         },
-                        { tool, nativeSessionId: payload.session_id, sessionAuthorized: tool !== 'opencode' },
+                        {
+                            tool,
+                            nativeSessionId: payload.session_id,
+                            sessionAuthorized: tool !== 'opencode' || payload.session_root === true,
+                        },
                     );
                 } catch (error) {
                     if (error === receiptFailure) {

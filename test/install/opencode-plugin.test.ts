@@ -51,13 +51,13 @@ async function v2Fixture(stdout = response('rendered context'), rulesStdout = JS
         setup: (ctx: {
             location: { directory: string };
             session: {
-                get: (input: { sessionID: string }) => Promise<{ location: { directory: string } }>;
+                get: (input: { sessionID: string }) => Promise<unknown>;
                 hook: (name: string, callback: (event: V2Event) => Promise<void>) => Promise<void>;
             };
         }) => Promise<void>;
     };
     const hooks = new Map<string, (event: V2Event) => Promise<void>>();
-    const get = vi.fn(async (_input: { sessionID: string }) => ({ location: { directory } }));
+    const get = vi.fn(async (_input: { sessionID: string }): Promise<unknown> => ({ location: { directory } }));
     await plugin.setup({
         location: { directory: '/wrong/plugin/location' },
         session: {
@@ -70,7 +70,9 @@ async function v2Fixture(stdout = response('rendered context'), rulesStdout = JS
     return { plugin, hooks, get, execute, executeRules, rulesInputs };
 }
 
-async function fixture(stdout = response('rendered context'), rulesStdout = JSON.stringify({ context: RULE_CONTEXT })) {
+type V1Client = { session: { get: (input: { path: { id: string } }) => Promise<unknown> } };
+
+async function fixture(stdout = response('rendered context'), rulesStdout = JSON.stringify({ context: RULE_CONTEXT }), client?: V1Client) {
     const execute = vi.fn((_command: string, _args: readonly string[], _options: ExecFileSyncOptionsWithStringEncoding) => stdout);
     const rulesInputs: string[] = [];
     const executeRules = vi.fn(
@@ -90,9 +92,9 @@ async function fixture(stdout = response('rendered context'), rulesStdout = JSON
         .replace("import { execFile } from 'node:child_process';", '')
         .replace('export default ', 'const ElephaPlugin = ');
     const plugin = runInNewContext(`${source}\nElephaPlugin`, { execFileSync: execute, execFile: executeRules, Buffer }) as {
-        server: (input: { directory: string }) => Promise<Hooks>;
+        server: (input: { directory: string; client?: V1Client }) => Promise<Hooks>;
     };
-    return { execute, executeRules, rulesInputs, hooks: await plugin.server({ directory }) };
+    return { execute, executeRules, rulesInputs, hooks: await plugin.server({ directory, client }) };
 }
 
 // Runs the model-view transform on a single user message.
@@ -255,8 +257,9 @@ describe('generated OpenCode plugin', () => {
         });
         const system = ['Primary'];
         const pending = hooks['experimental.chat.system.transform']({ sessionID: 'session-a' }, { system });
+        // The host parentage lookup settles before the rules child starts.
+        await vi.waitFor(() => expect(complete).toBeDefined());
         expect(system).toEqual(['Primary']);
-        expect(complete).toBeDefined();
         complete?.(null, JSON.stringify({ context: RULE_CONTEXT }));
         await pending;
         expect(system).toEqual([`Primary\n\n${RULE_CONTEXT}`]);
@@ -478,6 +481,121 @@ console.log(JSON.stringify({message:JSON.parse(parts[0].text),system,v2:{message
             }
         }
         if (cleanupError !== undefined) throw cleanupError;
+    });
+});
+
+// Host session shapes and whether each proves a top-level chat for 'native'.
+const PARENTAGE: Array<[string, unknown, boolean]> = [
+    ['root without parentID', { id: 'native' }, true],
+    ['root with null parentID', { id: 'native', parentID: null }, true],
+    ['child', { id: 'native', parentID: 'parent-chat' }, false],
+    ['empty parentID', { id: 'native', parentID: '' }, false],
+    ['non-string parentID', { id: 'native', parentID: 7 }, false],
+    ['mismatched identity', { id: 'other-chat' }, false],
+    ['missing identity', { parentID: null }, false],
+    ['array', [], false],
+    ['string', 'native', false],
+    ['absent', undefined, false],
+];
+
+describe('OpenCode chat parentage classification', () => {
+    it.each(PARENTAGE)('V1 %s keeps project rules and grants chat authority only to a root', async (_label, session, root) => {
+        const get = vi.fn(async (_input: { path: { id: string } }) => ({ data: session }));
+        const { hooks, execute, rulesInputs } = await fixture(undefined, undefined, { session: { get } });
+        const system = ['Primary', 'Other plugin'];
+        await hooks['experimental.chat.system.transform']({ sessionID: 'native' }, { system });
+        expect(system).toEqual([`Primary\n\n${RULE_CONTEXT}`, 'Other plugin']);
+        expect(rulesInputs.map((input) => JSON.parse(input))).toEqual([
+            { session_id: 'native', cwd: directory, ...(root ? { session_root: true } : {}) },
+        ]);
+        expect(await message(hooks, 'elepha:rules:session', 'native')).toBe('rendered context');
+        expect(JSON.parse(execute.mock.calls[0]![2].input as string)).toEqual({
+            hook_event_name: 'UserPromptSubmit',
+            session_id: 'native',
+            cwd: directory,
+            prompt: 'elepha:rules:session',
+            ...(root ? { session_root: true } : {}),
+        });
+        expect(get.mock.calls).toEqual([[{ path: { id: 'native' } }], [{ path: { id: 'native' } }]]);
+    });
+
+    it('V1 fails closed for chat authority when the host lookup rejects or returns an error result', async () => {
+        for (const get of [
+            vi.fn(async () => {
+                throw new Error('lookup failed');
+            }),
+            vi.fn(async () => ({ error: { name: 'NotFoundError' } })),
+        ]) {
+            const { hooks, execute, rulesInputs } = await fixture(undefined, undefined, { session: { get } });
+            const system = ['Primary'];
+            await hooks['experimental.chat.system.transform']({ sessionID: 'native' }, { system });
+            expect(system).toEqual([`Primary\n\n${RULE_CONTEXT}`]);
+            expect(rulesInputs).toEqual([JSON.stringify({ session_id: 'native', cwd: directory })]);
+            expect(await message(hooks, 'elepha:rules', 'native')).toBe('rendered context');
+            expect(JSON.parse(execute.mock.calls[0]![2].input as string)).not.toHaveProperty('session_root');
+        }
+    });
+
+    it('V1 does not look up parentage for ordinary prompts', async () => {
+        const get = vi.fn(async () => ({ data: { id: 'native' } }));
+        const { hooks, execute } = await fixture(undefined, undefined, { session: { get } });
+        expect(await message(hooks, 'ordinary text', 'native')).toBe('ordinary text');
+        expect(get).not.toHaveBeenCalled();
+        expect(execute).not.toHaveBeenCalled();
+    });
+
+    it.each(PARENTAGE)('V2 %s reuses the directory lookup and grants chat authority only to a root', async (_label, session, root) => {
+        const { hooks, get, execute, rulesInputs } = await v2Fixture();
+        const withDirectory =
+            session && typeof session === 'object' && !Array.isArray(session) ? { ...session, location: { directory } } : session;
+        get.mockResolvedValue(withDirectory);
+        const original: V2Message = { role: 'user', content: [{ type: 'text', text: 'elepha:rules:session' }] };
+        const event: V2Event = {
+            sessionID: 'native',
+            messages: [original],
+            system: [
+                { type: 'text', text: 'Primary' },
+                { type: 'text', text: 'Other plugin' },
+            ],
+        };
+        await hooks.get('context')?.(event);
+        expect(get).toHaveBeenCalledTimes(1);
+        expect(get).toHaveBeenCalledWith({ sessionID: 'native' });
+        if (withDirectory === session) {
+            // Without a session object there is no native directory to serve.
+            expect(rulesInputs).toEqual([]);
+            expect(execute).not.toHaveBeenCalled();
+            expect(event.messages[0]).toBe(original);
+            return;
+        }
+        expect(rulesInputs.map((input) => JSON.parse(input))).toEqual([
+            { session_id: 'native', cwd: directory, ...(root ? { session_root: true } : {}) },
+        ]);
+        expect(JSON.parse(execute.mock.calls[0]![2].input as string)).toEqual({
+            hook_event_name: 'UserPromptSubmit',
+            session_id: 'native',
+            cwd: directory,
+            prompt: 'elepha:rules:session',
+            ...(root ? { session_root: true } : {}),
+        });
+        expect(event.system).toEqual([
+            { type: 'text', text: `Primary\n\n${RULE_CONTEXT}` },
+            { type: 'text', text: 'Other plugin' },
+        ]);
+        expect(original.content).toEqual([{ type: 'text', text: 'elepha:rules:session' }]);
+    });
+
+    it('V2 auxiliary requests carry the same classification from one lookup each', async () => {
+        const { hooks, get, rulesInputs } = await v2Fixture();
+        get.mockResolvedValue({ id: 'native', parentID: 'parent-chat', location: { directory } });
+        await hooks.get('title')?.({ sessionID: 'native', messages: [], system: [] });
+        get.mockResolvedValue({ id: 'native', location: { directory } });
+        await hooks.get('compaction')?.({ sessionID: 'native', messages: [], system: [] });
+        expect(get).toHaveBeenCalledTimes(2);
+        expect(rulesInputs.map((input) => JSON.parse(input))).toEqual([
+            { session_id: 'native', cwd: directory },
+            { session_id: 'native', cwd: directory, session_root: true },
+        ]);
     });
 });
 

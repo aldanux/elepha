@@ -748,9 +748,9 @@ export function standingRulesCommandBody(
         return standingRulesCommandBody(db, store, projectCommand, cwd, now, recordReceipt);
     }
     if (command.kind === 'rules-scoped' && (chat === undefined || !chat.sessionAuthorized)) {
-        // OpenCode's current hook payload cannot distinguish a top-level chat
-        // from a child sharing the parent's id. Explain the refusal without
-        // reading a chat rule or mutating its durable authority.
+        // An OpenCode payload without a host-verified top-level session may
+        // come from a child or an unknown parentage. Explain the refusal
+        // without reading a chat rule or mutating its durable authority.
         return framed(SESSION_RULES_CONTEXT_UNVERIFIED);
     }
     // Resolved here, with no awaited boundary between this decision and the

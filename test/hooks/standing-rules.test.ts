@@ -10,6 +10,7 @@ import {
 } from '../../src/config/constants.js';
 import { getSetting } from '../../src/config/settings.js';
 import { runSessionStart } from '../../src/hooks/session-start.js';
+import { parseStandingRulesPayload, runStandingRulesHook } from '../../src/hooks/standing-rules.js';
 import { parseUserPromptCommand, runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
 import * as subprocess from '../../src/security/subprocess-allowlist.js';
@@ -163,7 +164,7 @@ describe('elepha:rules in-chat grammar', () => {
         }
         expect(HELP).toContain('elepha:rules — List project standing rules and rules for this chat in this checkout.');
         expect(HELP).toContain(
-            'Chat standing-rule commands are available only in Claude Code and Codex; OpenCode cannot verify chat identity yet.',
+            'Chat standing-rule commands are available in Claude Code, Codex and top-level OpenCode chats; OpenCode subagent sessions cannot use them.',
         );
     });
 
@@ -1131,6 +1132,111 @@ describe('elepha:rules management', () => {
                 }),
             ),
         ).toContain(STANDING_RULES_EMPTY);
+    });
+
+    it('serves and manages chat rules only for a host-verified top-level OpenCode chat', async () => {
+        const fixture = seededDb('elepha-rules-opencode-root-', ['Shared project rule.']);
+        const scope = { dbPath: fixture.dbPath, projectPath: fixture.projectPath };
+        const openCodePayload = (prompt: string, sessionId: string, root: boolean) =>
+            JSON.stringify({
+                session_id: sessionId,
+                cwd: fixture.projectPath,
+                hook_event_name: 'UserPromptSubmit',
+                prompt,
+                ...(root ? { session_root: true } : {}),
+            });
+        const command = async (prompt: string, sessionId = 'root-chat', root = true) =>
+            injectedBody(
+                await runUserPromptSubmit(openCodePayload(prompt, sessionId, root), 'opencode', { dbPath: fixture.dbPath, now: () => NOW }),
+            );
+        const logs: string[] = [];
+        const delivered = async (sessionId: string, root: boolean) => {
+            const result = await runStandingRulesHook(
+                JSON.stringify({ session_id: sessionId, cwd: fixture.projectPath, ...(root ? { session_root: true } : {}) }),
+                { dbPath: fixture.dbPath, now: () => NOW, log: (line) => logs.push(line) },
+            );
+            if (!('context' in result)) throw new Error(`rules were not delivered: ${result.reason}`);
+            return result.context;
+        };
+
+        expect(await command('elepha:rules:session:add Root chat rule.')).toContain('Root chat rule.');
+        const [saved] = storedSessionRules(scope);
+        if (!saved) throw new Error('expected a chat rule');
+        expect(saved).toMatchObject({ tool: 'opencode', native_session_id: 'root-chat', checkout_anchor: fixture.projectPath });
+        const report = await command('elepha:rules');
+        expect(report).toContain('Shared project rule.');
+        expect(report).toContain('Standing rules for this chat in this checkout (active):');
+        expect(report).toContain('Root chat rule.');
+
+        const rootContext = await delivered('root-chat', true);
+        expect(rootContext).toContain('Shared project rule.');
+        expect(rootContext).toContain('Root chat rule.');
+
+        // A child, a sibling and an unverified lookup of the root id all keep
+        // project rules but receive no chat authority.
+        for (const [sessionId, root] of [
+            ['root-chat', false],
+            ['child-chat', false],
+            ['sibling-chat', true],
+        ] as const) {
+            const context = await delivered(sessionId, root);
+            expect(context, sessionId).toContain('Shared project rule.');
+            expect(context, sessionId).not.toContain('Root chat rule.');
+        }
+        for (const prompt of [
+            'elepha:rules:session',
+            'elepha:rules:session:add Must not save.',
+            `elepha:rules:session:remove ${saved.ulid}`,
+            `elepha:rules:session:replace ${saved.ulid} Must not replace.`,
+        ]) {
+            expect(await command(prompt, 'root-chat', false), prompt).toContain(SESSION_RULES_CONTEXT_UNVERIFIED);
+            expect(await command(prompt, 'child-chat', false), prompt).toContain(SESSION_RULES_CONTEXT_UNVERIFIED);
+        }
+        const sibling = await command('elepha:rules', 'sibling-chat');
+        expect(sibling).toContain('Shared project rule.');
+        expect(sibling).not.toContain('Root chat rule.');
+        expect(await command(`elepha:rules:session:remove ${saved.ulid}`, 'sibling-chat')).toContain(
+            'No standing rule with that id belongs to this chat in this checkout.',
+        );
+        expect(storedSessionRules(scope)).toEqual([saved]);
+        // The same native id from another tool is another chat.
+        expect(
+            injectedBody(
+                await runUserPromptSubmit(payload(fixture.projectPath, 'elepha:rules:session', 'root-chat'), 'codex', {
+                    dbPath: fixture.dbPath,
+                    now: () => NOW,
+                }),
+            ),
+        ).not.toContain('Root chat rule.');
+
+        expect(await command(`elepha:rules:session:replace ${saved.ulid} Updated root rule.`)).toContain('Updated root rule.');
+        expect(await command(`elepha:rules:session:remove ${saved.ulid}`)).toContain('Updated root rule.');
+        expect(storedSessionRules(scope)).toEqual([]);
+        expect(logs.join('\n')).not.toMatch(/root-chat|child-chat|sibling-chat|Root chat rule|Shared project rule/);
+    });
+
+    it.each([false, 'true', 1, null])('rejects a malformed OpenCode session_root claim: %j', async (value) => {
+        const fixture = seededDb('elepha-rules-opencode-root-claim-');
+        const openDatabase = vi.fn(openDb);
+        const dependencies = { dbPath: fixture.dbPath, now: () => NOW, openDatabase: openDatabase as unknown as typeof openDb };
+        expect(
+            await runUserPromptSubmit(
+                JSON.stringify({
+                    session_id: 'root-chat',
+                    cwd: fixture.projectPath,
+                    hook_event_name: 'UserPromptSubmit',
+                    prompt: 'elepha:rules:session:add Must not save.',
+                    session_root: value,
+                }),
+                'opencode',
+                dependencies,
+            ),
+        ).toEqual({ reason: 'invalid_payload' });
+        expect(parseStandingRulesPayload(JSON.stringify({ session_id: 'root-chat', cwd: fixture.projectPath, session_root: value }))).toBe(
+            undefined,
+        );
+        expect(openDatabase).not.toHaveBeenCalled();
+        expect(storedSessionRules(fixture)).toEqual([]);
     });
 
     it('rolls back first-owner creation and existing chat mutations when the receipt fails', async () => {
