@@ -53,6 +53,7 @@ async function countSession(
     try {
         for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
             if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new InjectionQuoteBackIncompleteError(`Rendered chars backfill for ${session.native_id}`);
             }
             if (

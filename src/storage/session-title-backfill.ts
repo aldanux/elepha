@@ -55,6 +55,7 @@ async function turnsForSession(db: Database, session: SessionSeed, adapter: Sess
     try {
         for await (const turn of adapter.parseTurns(session.source_path, undefined, { closeTrailingOnIdle: true })) {
             if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new InjectionQuoteBackIncompleteError(`Session title backfill for ${session.native_id}`);
             }
             if (

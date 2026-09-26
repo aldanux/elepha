@@ -71,6 +71,7 @@ async function deriveFirstPrompt(
                     return undefined;
                 }
                 if (turn.droppedReason === 'elepha-mcp' && !injections.rememberElephaMcpReceipts(turn)) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw new InjectionQuoteBackIncompleteError(`First prompt backfill for ${session.native_id}`);
                 }
                 if (

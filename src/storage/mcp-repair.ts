@@ -166,6 +166,7 @@ export async function planMcpRepair(
             WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ? ORDER BY m.id`);
         for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, { handle: opened.handle, closeTrailingOnIdle: true })) {
             if (turn.tool !== tool || turn.sessionId !== nativeId || !sessions.some((s) => s.project_path === turn.projectPath)) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new Error('MCP repair transcript identity does not match the stored session');
             }
             const stored = lookup.all(tool, nativeId, turn.turnIndex) as McpRepairPlan['memories'];
@@ -174,6 +175,7 @@ export async function planMcpRepair(
                     continue;
                 }
                 if (turn.droppedReason !== undefined || sourceLedger.isQuoteBackOrThrow(turn, 'MCP repair')) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw new Error(`MCP repair cannot reconstruct unrelated stored turn ${turn.turnIndex}`);
                 }
                 for (const memory of stored) {
@@ -199,6 +201,7 @@ export async function planMcpRepair(
             }
             turn.validateSource = plan.validateSource;
             if (!sourceLedger.rememberElephaMcpReceipts(turn) || !ledger.rememberElephaMcpReceipts(turn, plan.generation)) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new Error('MCP repair receipt protection incomplete');
             }
             plan.receipts.push(turn);
@@ -211,15 +214,18 @@ export async function planMcpRepair(
             plan.memories.push(...stored);
         }
         if (!ledger.validateCompleteMcpReceiptLedger(tool, nativeId, plan.generation)) {
+            //noinspection ExceptionCaughtLocallyJS
             throw new Error('MCP repair receipt ledger differs from source; source reconciliation required');
         }
         assertAuthorized(store, plan);
         if (fingerprint(db, tool, nativeId) !== plan.fingerprint) {
+            //noinspection ExceptionCaughtLocallyJS
             throw new Error('MCP repair rows changed during preview');
         }
         for (const session of sessions) {
             const count = (db.prepare('SELECT COUNT(*) AS n FROM memories WHERE session_id = ?').get(session.id) as { n: number }).n;
             if (count !== derivedFor(plan, session.id).observed + plan.memories.filter((m) => m.session_id === session.id).length) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new Error('MCP repair source cannot reproduce all stored turn identities');
             }
         }

@@ -71,6 +71,7 @@ export async function generateEmbeddings(
                     } else {
                         provider ??= await (options.createProvider ?? createEmbeddingProvider)(true);
                         if (provider === undefined) {
+                            //noinspection ExceptionCaughtLocallyJS
                             throw new Error(MEMORY_PLUS_DISABLED);
                         }
                         const check = () => {

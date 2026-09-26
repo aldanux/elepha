@@ -138,6 +138,7 @@ export function linuxLegacyMcpProbe(database: DatabaseIdentity, uid: number, pro
                     foundDatabase = true;
                     const flags = /^flags:\s+([0-7]+)$/m.exec(readProcFile(path.join(directory, 'fdinfo', name)))?.[1];
                     if (flags === undefined) {
+                        //noinspection ExceptionCaughtLocallyJS
                         throw new Error('Legacy MCP database descriptor access mode is unrecognized.');
                     }
                     readOnly &&= (Number.parseInt(flags, 8) & 3) === 0;
@@ -357,6 +358,7 @@ export async function retireLegacyMcpReaders(
     try {
         for (const pid of pids) {
             if (Date.now() >= deadline) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new Error('Legacy MCP process inspection exceeded its time limit.');
             }
             const candidate = probe.inspect(pid);
@@ -375,6 +377,7 @@ export async function retireLegacyMcpReaders(
                 continue;
             }
             if (Date.now() >= deadline) {
+                //noinspection ExceptionCaughtLocallyJS
                 throw new Error('Legacy MCP process inspection exceeded its time limit.');
             }
             try {
@@ -382,6 +385,7 @@ export async function retireLegacyMcpReaders(
                 retired.push(candidate);
             } catch (error) {
                 if (!disappeared(error)) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw error;
                 }
             }
@@ -391,6 +395,7 @@ export async function retireLegacyMcpReaders(
             let stillOpen = false;
             for (const candidate of retired) {
                 if (Date.now() >= closeDeadline) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw new Error('A retired elepha MCP did not release the database before the timeout.');
                 }
                 let current: LegacyMcpProcess | undefined;
@@ -400,6 +405,7 @@ export async function retireLegacyMcpReaders(
                     // Linux may deny a final /proc/<pid>/fd lookup while the
                     // signaled process exits. Keep waiting; never infer closure.
                     if (!processDescriptorsClosing(error)) {
+                        //noinspection ExceptionCaughtLocallyJS
                         throw error;
                     }
                     stillOpen = true;

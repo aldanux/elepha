@@ -233,16 +233,6 @@ export class SessionStore {
         this.stmts.updateSessionCursor.run(cursor, now, sessionDbId);
     }
 
-    // Quote-back runs before project/session persistence, so it can only advance an existing session.
-    advanceExistingSessionCursor(tool: ToolName, nativeId: string, cursor: string): boolean {
-        const session = this.findSession(tool, nativeId);
-        if (!session) {
-            return false;
-        }
-        this.advanceSessionCursor(session.id, cursor);
-        return true;
-    }
-
     // Applies the shared sanitized title rules to a persisted session.
     updateSessionTitle(sessionDbId: number, turn: Pick<ParsedTurn, 'aiTitle' | 'userMessage'>): void {
         const row = this.db.prepare('SELECT title, segment_index FROM sessions WHERE id = ?').get(sessionDbId) as

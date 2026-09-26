@@ -88,7 +88,10 @@ process.stdout.write('ready\\n');
             try {
                 await waitForReader(child);
                 const pid = child.pid;
-                if (pid === undefined) throw new Error('Legacy fixture has no PID.');
+                if (pid === undefined) {
+                    //noinspection ExceptionCaughtLocallyJS
+                    throw new Error('Legacy fixture has no PID.');
+                }
                 // A later install runs after npm removed its retired tree;
                 // postinstall runs before that cleanup. Exercise both states.
                 if (mode === 'install retry') unlinkSync(nativePath);

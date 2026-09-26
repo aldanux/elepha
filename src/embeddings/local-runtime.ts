@@ -26,6 +26,7 @@ export function loadLocalRuntime(): TransformersRuntime {
         // falling back to elepha's or an ancestor's node_modules.
         const runtime = createRequire(import.meta.url)(memoryPlusPackagePath()) as TransformersRuntime;
         if (typeof runtime.pipeline !== 'function' || !runtime.env) {
+            //noinspection ExceptionCaughtLocallyJS
             throw new Error('Invalid Transformers runtime');
         }
         return runtime;

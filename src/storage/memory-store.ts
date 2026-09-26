@@ -365,20 +365,12 @@ export class MemoryStore {
         })();
     }
 
-    deleteOpenTurn(tool: ToolName, nativeId: string): boolean {
-        return this.openTurns.delete(tool, nativeId);
-    }
-
     getSqliteSourceWatermark(tool: ToolName, sourcePath: string): number | undefined {
         return this.sqliteSourceWatermarks.get(tool, sourcePath);
     }
 
     setSqliteSourceWatermark(tool: ToolName, sourcePath: string, watermark: number): void {
         this.sqliteSourceWatermarks.set(tool, sourcePath, watermark);
-    }
-
-    advanceExistingSessionCursor(tool: ToolName, nativeId: string, cursor: string): boolean {
-        return this.sessions.advanceExistingSessionCursor(tool, nativeId, cursor);
     }
 
     getLastIngestedAt(): string | undefined {
@@ -445,7 +437,7 @@ export class MemoryStore {
             // inside the final-write transaction before durable accounting so it
             // cannot make the canonical replacement evict an unrelated row.
             this.openTurns.delete(turn.tool, turn.sessionId);
-            const result = {
+            return {
                 project,
                 session,
                 inserted: this.turns.recordTurnInTransaction(
@@ -458,7 +450,6 @@ export class MemoryStore {
                     evictionPlan,
                 ),
             };
-            return result;
         });
         return write();
     }

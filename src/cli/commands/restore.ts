@@ -1259,6 +1259,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             const snapshotHash = await sha256File(snapshotPath);
             try {
                 if (stagedStandingRules(stagedPath, retainedEncryption?.key ?? candidateKey).fingerprint !== candidateRules.fingerprint) {
+                    //noinspection ExceptionCaughtLocallyJS
                     throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
                 }
             } catch (error) {

@@ -22,6 +22,7 @@ function fixture() {
     mkdirSync(cwd);
     const project = seedProject(f, { path: cwd });
     seedConsentRoot(f, { path: cwd });
+    //noinspection JSUnusedGlobalSymbols
     const scope = { projectIds: [project.id], ownerProjectId: project.id, stillConsented: () => true };
     const added = f.store.standingRules.add(scope, 'Use Foo and keep $(syntax) inert.', ISO);
     expect(added.status).toBe('added');

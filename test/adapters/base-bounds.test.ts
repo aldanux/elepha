@@ -96,11 +96,8 @@ describe('bounded transcript value parsing', () => {
         const directory = withTempDir('elepha-evidence-boundary-budget-');
         const filePath = path.join(directory, 'budget.jsonl');
         writeFileSync(filePath, `${JSON.stringify({ type: 'session_meta', payload: { padding: 'x'.repeat(4096) } })}\n`);
-        await expect(async () => {
-            for await (const _ of new CodexAdapter().parseTurns(filePath, undefined, { maxReadBytes: 128 })) {
-                throw new Error('No turn may be emitted from an incomplete boundary scan.');
-            }
-        }).rejects.toBeInstanceOf(TranscriptReadBudgetError);
+        const iterator = new CodexAdapter().parseTurns(filePath, undefined, { maxReadBytes: 128 });
+        await expect(iterator.next()).rejects.toBeInstanceOf(TranscriptReadBudgetError);
     });
 
     it('traverses deeply nested values iteratively and stops at the depth limit', () => {
