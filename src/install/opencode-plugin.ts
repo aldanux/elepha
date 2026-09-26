@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { CLOSE, OPEN } from '../security/sentinel.js';
 import { renderOpencodeHookClient, renderOpencodeRulesClient } from '../security/subprocess-allowlist.js';
+import { DISPLAY_VERBATIM_INSTRUCTIONS } from '../serving/instructions.js';
 import { OPENCODE_PLUGIN_MARKER } from './markers.js';
 
 // OpenCode loads plugins listed in opencode.json's `plugin` array (the installer
@@ -17,6 +18,7 @@ ${renderOpencodeHookClient(launcher)}
 ${renderOpencodeRulesClient(launcher)}
 const briefOpen = ${JSON.stringify(`${OPEN}brief:`)};
 const briefClose = ${JSON.stringify(CLOSE)};
+const displayVerbatim = ${JSON.stringify(DISPLAY_VERBATIM_INSTRUCTIONS)};
 
 // A subagent runs in its own native session whose parentID names the chat
 // that spawned it. Only a host session matching the requested id with no
@@ -126,6 +128,11 @@ function commandBody(stdout) {
     return body || undefined;
 }
 
+// Empties the request's tool record in place so the host sends the mutated view.
+function clearTools(tools) {
+    if (tools && typeof tools === 'object') for (const key of Object.keys(tools)) delete tools[key];
+}
+
 export default {
     id: 'elepha',
     async server({ directory, client }) {
@@ -183,12 +190,19 @@ export default {
                 }, session.root)));
                 if (!body) return;
                 const firstText = textParts[0];
-                event.messages[index] = {
+                const command = {
                     ...message,
                     content: message.content
                         .filter((part) => part?.type !== 'text' || part === firstText)
                         .map((part) => part === firstText ? { ...part, text: body } : part),
                 };
+                if (body.startsWith(displayVerbatim)) {
+                    // A display-only receipt needs neither history nor tools; either
+                    // invites unrelated calls such as elepha.recall instead of the
+                    // receipt. This edits only the outgoing request, not the chat.
+                    clearTools(event.tools);
+                    event.messages.splice(0, event.messages.length, command);
+                } else event.messages[index] = command;
             } catch {
                 // Fail open without logging private prompt or context data.
             }

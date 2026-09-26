@@ -27,7 +27,15 @@ interface Hooks {
 }
 
 type V2Message = { role: string; content: Array<{ type: string; text?: string }> };
-type V2Event = { sessionID: string; messages: V2Message[]; system: Array<{ type: string; text: string }> };
+type V2Tools = Record<string, { description: string; input: object }>;
+type V2Event = { sessionID: string; messages: V2Message[]; system: Array<{ type: string; text: string }>; tools?: V2Tools };
+const v2Tools = (): V2Tools => ({ 'elepha.recall': { description: 'Recall', input: { type: 'object' } } });
+const DISPLAY_CONTEXT = `[[elepha:brief:01ABCDEF]]\n${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 Added chat standing rule.\n[[/elepha]]`;
+const RESUME_CONTEXT = `[[elepha:brief:01ABCDEF]]\n${RESUME_RECAP_INSTRUCTIONS}\n# Session title\n\nSession turns\n[[/elepha]]`;
+const history = (): V2Message[] => [
+    { role: 'user', content: [{ type: 'text', text: 'earlier question' }] },
+    { role: 'assistant', content: [{ type: 'text', text: 'earlier answer' }] },
+];
 
 async function v2Fixture(stdout = response('rendered context'), rulesStdout = JSON.stringify({ context: RULE_CONTEXT })) {
     const execute = vi.fn((_command: string, _args: readonly string[], _options: ExecFileSyncOptionsWithStringEncoding) => stdout);
@@ -154,6 +162,59 @@ describe('generated OpenCode V2 plugin', () => {
         expect(execute).not.toHaveBeenCalled();
         expect(event.messages[0]).toBe(original);
         expect(event.system).toEqual([{ type: 'text', text: RULE_CONTEXT }]);
+    });
+
+    it('sends a display-only command result alone and with no tools', async () => {
+        const { hooks, execute } = await v2Fixture(response(DISPLAY_CONTEXT));
+        const command: V2Message = { role: 'user', content: [{ type: 'text', text: 'elepha:rules:session:add keep it short' }] };
+        const tools = v2Tools();
+        const event: V2Event = { sessionID: 'v2-session', messages: [...history(), command], system: [], tools };
+        await hooks.get('context')?.(event);
+        expect(execute).toHaveBeenCalledTimes(1);
+        expect(event.messages).toEqual([
+            { role: 'user', content: [{ type: 'text', text: `${DISPLAY_VERBATIM_INSTRUCTIONS}\n🐘 Added chat standing rule.` }] },
+        ]);
+        expect(event.tools).toBe(tools);
+        expect(tools).toEqual({});
+        expect(event.system).toEqual([{ type: 'text', text: RULE_CONTEXT }]);
+        expect(command.content).toEqual([{ type: 'text', text: 'elepha:rules:session:add keep it short' }]);
+    });
+
+    it('keeps history and tools for recap commands, ordinary prompts and failed commands', async () => {
+        for (const [stdout, prompt] of [
+            [response(RESUME_CONTEXT), 'elepha:resume:1'],
+            [response(DISPLAY_CONTEXT), 'ordinary question'],
+            ['', 'elepha:list'],
+        ] as const) {
+            const { hooks } = await v2Fixture(stdout);
+            const tools = v2Tools();
+            const event: V2Event = {
+                sessionID: 'v2-session',
+                messages: [...history(), { role: 'user', content: [{ type: 'text', text: prompt }] }],
+                system: [],
+                tools,
+            };
+            await hooks.get('context')?.(event);
+            expect(event.messages.slice(0, 2)).toEqual(history());
+            expect(event.messages).toHaveLength(3);
+            expect(event.tools).toBe(tools);
+            expect(tools).toEqual(v2Tools());
+        }
+    });
+
+    it('does not rerun or isolate a persisted display command on continuation', async () => {
+        const { hooks, execute } = await v2Fixture(response(DISPLAY_CONTEXT));
+        const messages: V2Message[] = [
+            ...history(),
+            { role: 'user', content: [{ type: 'text', text: 'elepha:rules:session:add keep it short' }] },
+            { role: 'assistant', content: [{ type: 'text', text: 'receipt' }] },
+        ];
+        const tools = v2Tools();
+        const event: V2Event = { sessionID: 'v2-session', messages: [...messages], system: [], tools };
+        await hooks.get('context')?.(event);
+        expect(execute).not.toHaveBeenCalled();
+        expect(event.messages).toEqual(messages);
+        expect(tools).toEqual(v2Tools());
     });
 
     it('applies rules to auxiliary model calls without rewriting their messages', async () => {
