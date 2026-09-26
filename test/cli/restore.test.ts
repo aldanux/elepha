@@ -30,6 +30,8 @@ import {
     RESTORE_INJECTIONS_CHANGED_ERROR,
     RESTORE_MCP_RECEIPTS_CHANGED_ERROR,
     RESTORE_PARANOID_CHANGED_ERROR,
+    RESTORE_SESSION_RULES_STAGE_ERROR,
+    RESTORE_SESSION_RULES_VERIFICATION_ERROR,
     RESTORE_STAGE_CHANGED_ERROR,
     RESTORE_STANDING_RULES_CHANGED_ERROR,
     RESTORE_STANDING_RULES_STAGE_ERROR,
@@ -81,6 +83,7 @@ import {
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
 import { applyManualSplit, planManualSplit } from '../../src/storage/resegmentation.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
+import type { SessionRuleRow } from '../../src/storage/session-rules-store.js';
 import { sourceTurnDigest } from '../../src/storage/source-turn-digest.js';
 import type { StandingRuleRow } from '../../src/storage/standing-rules-store.js';
 import { newUlid } from '../../src/storage/ulid.js';
@@ -383,6 +386,29 @@ function restoredRules(dbPath: string, key?: Buffer): StandingRuleRow[] {
     const db = key === undefined ? new Database(dbPath, { readonly: true }) : openKeyedDatabase(dbPath, key, { readonly: true });
     try {
         return db.prepare('SELECT id, ulid, project_id, text, created_at FROM standing_rules ORDER BY id').all() as StandingRuleRow[];
+    } finally {
+        db.close();
+    }
+}
+
+function seedRestoreSessionRule(db: Database.Database, text: string, ulid = newUlid()): SessionRuleRow {
+    const project = db.prepare('SELECT id, path FROM projects ORDER BY id LIMIT 1').get() as { id: number; path: string };
+    return db
+        .prepare(
+            `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+        )
+        .get(ulid, 'codex', 'chat-for-rule', project.path, project.id, text, '2026-09-20T00:00:00.000Z') as SessionRuleRow;
+}
+
+function restoredSessionRules(dbPath: string, key?: Buffer): SessionRuleRow[] {
+    const db = key === undefined ? new Database(dbPath, { readonly: true }) : openKeyedDatabase(dbPath, key, { readonly: true });
+    try {
+        return db
+            .prepare(
+                'SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at FROM session_rules ORDER BY id',
+            )
+            .all() as SessionRuleRow[];
     } finally {
         db.close();
     }
@@ -788,6 +814,239 @@ describe('elepha restore', () => {
                 }),
             ).rejects.toThrow(RESTORE_STANDING_RULES_STAGE_ERROR);
             expect(restoredRules(active.dbPath)).toEqual([prior]);
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+    });
+
+    describe('chat rules', () => {
+        it('restores many independent chat scopes with an exact streamed count', async () => {
+            const active = createTestDb('elepha-restore-chat-rules-active-');
+            const candidate = createTestDb('elepha-restore-chat-rules-many-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const project = candidate.db.prepare('SELECT id, path FROM projects ORDER BY id LIMIT 1').get() as { id: number; path: string };
+            const insert = candidate.db.prepare(
+                `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            );
+            candidate.db.transaction(() => {
+                for (let index = 0; index < 256; index++) {
+                    insert.run(newUlid(), 'codex', `chat-${index}`, project.path, project.id, `Rule ${index}.`, '2026-09-20T00:00:00.000Z');
+                }
+            })();
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const output: string[] = [];
+            const log = vi.spyOn(console, 'log').mockImplementation((message) => output.push(String(message)));
+            try {
+                await runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                });
+            } finally {
+                log.mockRestore();
+            }
+            expect(output).toContain('  session_rules: 256');
+            expect(restoredSessionRules(active.dbPath)).toHaveLength(256);
+        });
+
+        it('rolls back previous chat rules when post-install fingerprint verification fails', async () => {
+            const active = createTestDb('elepha-restore-chat-rules-active-');
+            const candidate = createTestDb('elepha-restore-chat-rules-verify-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const prior = seedRestoreSessionRule(active.db, 'Original active chat rule.');
+            const incoming = seedRestoreSessionRule(candidate.db, 'Candidate chat rule for verification.');
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const originalPrepare = Database.prototype.prepare;
+            let fingerprintChecked = false;
+            const prepare = vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (this: Database.Database, sql: string) {
+                const statement = originalPrepare.call(this, sql) as Database.Statement;
+                if (sql.includes('SELECT id, ulid, tool,') && sql.includes('FROM session_rules')) {
+                    const stored = statement.all() as SessionRuleRow[];
+                    if (stored[0]?.ulid === incoming.ulid) {
+                        fingerprintChecked = true;
+                        vi.spyOn(statement, 'iterate').mockReturnValue(
+                            stored.map((rule) => ({ ...rule, text: 'Changed without changing the count.' })).values(),
+                        );
+                    }
+                }
+                return statement;
+            });
+            try {
+                await expect(
+                    runRestoreOperation(backup, { dbPath: active.dbPath, daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }) }),
+                ).rejects.toThrow(RESTORE_SESSION_RULES_VERIFICATION_ERROR);
+            } finally {
+                prepare.mockRestore();
+            }
+            expect(fingerprintChecked).toBe(true);
+            expect(restoredSessionRules(active.dbPath)).toEqual([prior]);
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+
+        it.each(['plaintext', 'encrypted'] as const)(
+            'previews and restores exact %s chat rules with a recoverable active snapshot',
+            async (mode) => {
+                const active = createTestDb('elepha-restore-chat-rules-active-');
+                const candidate = createTestDb('elepha-restore-chat-rules-candidate-');
+                populate(active.dbPath, 'before');
+                populate(candidate.dbPath, 'after');
+                const prior = seedRestoreSessionRule(active.db, 'Active chat rule.');
+                const incoming = seedRestoreSessionRule(candidate.db, escapeShellSyntax('Never run $(untrusted) or `shell`.'));
+                active.close();
+                candidate.close();
+                const encryption = mode === 'encrypted' ? encryptionRuntime() : undefined;
+                const backup = path.join(candidate.directory, 'full.db');
+                if (encryption !== undefined) {
+                    await encryptDatabase(active.dbPath, encryption);
+                    await encryptDatabase(candidate.dbPath, encryption);
+                    const source = openKeyedDatabase(candidate.dbPath, FIXED_KEY);
+                    try {
+                        exportAll(source, backup, FIXED_KEY);
+                    } finally {
+                        source.close();
+                    }
+                } else fullBackup(candidate.dbPath, backup);
+                const output: string[] = [];
+                const log = vi.spyOn(console, 'log').mockImplementation((message) => output.push(String(message)));
+                let result: Awaited<ReturnType<typeof runRestoreOperation>>;
+                try {
+                    result = await runRestoreOperation(backup, {
+                        dbPath: active.dbPath,
+                        encryption,
+                        daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    });
+                } finally {
+                    log.mockRestore();
+                }
+                expect(output).toContain('  session_rules: 1');
+                expect(output).toContain('Chat rules replacement: 1 active -> 1 candidate.');
+                expect(restoredSessionRules(active.dbPath, encryption === undefined ? undefined : FIXED_KEY)).toEqual([incoming]);
+                expect(result.snapshotPath).toBeDefined();
+                expect(restoredSessionRules(result.snapshotPath ?? '', encryption === undefined ? undefined : FIXED_KEY)).toEqual([prior]);
+            },
+        );
+
+        it('accepts a legacy full backup without chat rules as zero and replaces the active set', async () => {
+            const active = createTestDb('elepha-restore-chat-rules-active-');
+            const candidate = createTestDb('elepha-restore-chat-rules-legacy-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'legacy');
+            seedRestoreSessionRule(active.db, 'Active chat rule.');
+            candidate.db.exec('DROP TABLE session_rules');
+            candidate.db.pragma('wal_checkpoint(TRUNCATE)');
+            const backup = path.join(candidate.directory, 'legacy.db');
+            active.close();
+            candidate.close();
+            copyFileSync(candidate.dbPath, backup);
+            const output: string[] = [];
+            const log = vi.spyOn(console, 'log').mockImplementation((message) => output.push(String(message)));
+            try {
+                await runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                });
+            } finally {
+                log.mockRestore();
+            }
+            expect(output).toContain('  session_rules: 0');
+            expect(output).toContain('Chat rules replacement: 1 active -> 0 candidate.');
+            expect(restoredSessionRules(active.dbPath)).toEqual([]);
+        });
+
+        it.each(['add', 'replace', 'remove'] as const)('rejects active chat-rule %s after confirmation preview', async (mutation) => {
+            const active = createTestDb('elepha-restore-chat-rules-active-');
+            const candidate = createTestDb('elepha-restore-chat-rules-candidate-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            seedRestoreSessionRule(active.db, 'Original chat rule.');
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const snapshot = vi.fn(writeBackup);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    writeBackup: snapshot,
+                    confirm: async () => {
+                        const db = new Database(active.dbPath);
+                        try {
+                            if (mutation === 'add') seedRestoreSessionRule(db, 'Added after preview.');
+                            else if (mutation === 'replace') db.exec("UPDATE session_rules SET text = 'Replaced after preview.'");
+                            else db.exec('DELETE FROM session_rules');
+                        } finally {
+                            db.close();
+                        }
+                        return true;
+                    },
+                }),
+            ).rejects.toThrow(/active chat rules changed/i);
+            expect(snapshot).not.toHaveBeenCalled();
+            expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
+        });
+
+        it('rejects a changed readable staging chat rule before installation', async () => {
+            const active = createTestDb('elepha-restore-chat-rules-active-');
+            const candidate = createTestDb('elepha-restore-chat-rules-stage-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            const prior = seedRestoreSessionRule(active.db, 'Retain active chat rule.');
+            seedRestoreSessionRule(candidate.db, 'Candidate chat rule.');
+            const backup = path.join(candidate.directory, 'full.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const restoreTemp = isolateRestoreTemp();
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    writeBackup: (db, dbPath) => {
+                        const snapshot = writeBackup(db, dbPath);
+                        const directory = stagedRestoreDirectories(restoreTemp)[0];
+                        if (directory === undefined) throw new Error('Missing stage.');
+                        const staged = new Database(path.join(restoreTemp, directory, 'candidate.db'));
+                        try {
+                            staged.exec("UPDATE session_rules SET text = 'Changed staged chat rule.'");
+                            staged.pragma('wal_checkpoint(TRUNCATE)');
+                        } finally {
+                            staged.close();
+                        }
+                        return snapshot;
+                    },
+                }),
+            ).rejects.toThrow(RESTORE_SESSION_RULES_STAGE_ERROR);
+            expect(restoredSessionRules(active.dbPath)).toEqual([prior]);
+        });
+
+        it('rejects unsafe candidate chat authority before confirmation', async () => {
+            const active = createTestDb('elepha-restore-chat-rules-active-');
+            const candidate = createTestDb('elepha-restore-chat-rules-invalid-');
+            populate(active.dbPath, 'before');
+            populate(candidate.dbPath, 'after');
+            seedRestoreSessionRule(candidate.db, 'Valid chat rule.');
+            candidate.db.exec("UPDATE session_rules SET text = 'Never run $(untrusted).' ");
+            const backup = path.join(candidate.directory, 'invalid.db');
+            fullBackup(candidate.dbPath, backup);
+            active.close();
+            candidate.close();
+            const confirm = vi.fn(async () => true);
+            await expect(
+                runRestoreOperation(backup, {
+                    dbPath: active.dbPath,
+                    daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+                    confirm,
+                }),
+            ).rejects.toThrow(/session rule/i);
+            expect(confirm).not.toHaveBeenCalled();
             expect(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
         });
     });

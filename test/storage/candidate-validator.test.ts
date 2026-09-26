@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
     type CandidateSemanticTable,
     readCandidateStandingRules,
+    scanCandidateSessionRules,
     validateCandidateSemantics,
 } from '../../src/storage/candidate-validator.js';
 import { newUlid } from '../../src/storage/ulid.js';
@@ -80,6 +81,139 @@ describe('standing rule candidate validation', () => {
         expect(readCandidateStandingRules(fixture.db)).toHaveLength(1);
         expect(() => readCandidateStandingRules(fixture.db, 'restore')).toThrow('canonical sanitized text');
         expect(fixture.db.prepare('SELECT text FROM standing_rules').get()).toEqual({ text });
+    });
+});
+
+describe('session rule candidate validation', () => {
+    function ruleCandidate() {
+        const fixture = createTestDb('elepha-candidate-chat-rules-');
+        const project = seedProject(fixture);
+        fixture.db.exec(
+            `DROP TABLE session_rules;
+             CREATE TABLE session_rules (id INTEGER PRIMARY KEY, ulid TEXT UNIQUE, tool, native_session_id, checkout_anchor, owner_project_id INTEGER, text, created_at);
+             CREATE INDEX idx_session_rules_scope ON session_rules(tool, native_session_id, checkout_anchor, owner_project_id, id)`,
+        );
+        const ulid = newUlid();
+        fixture.db
+            .prepare('INSERT INTO session_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(1, ulid, 'codex', 'native-chat', project.path, project.id, 'A valid chat rule.', '2026-09-20T00:00:00.000Z');
+        return { fixture, project, ulid };
+    }
+
+    it('accepts a missing legacy table and a well-formed dormant rule', () => {
+        const { fixture } = ruleCandidate();
+        expect(scanCandidateSessionRules(fixture.db)).toBe(1);
+        fixture.db.exec('DROP TABLE session_rules');
+        expect(scanCandidateSessionRules(fixture.db)).toBe(0);
+    });
+
+    it('streams many independent chat scopes without applying a global rule cap', () => {
+        const { fixture, project } = ruleCandidate();
+        fixture.db.exec('DELETE FROM session_rules');
+        const insert = fixture.db.prepare('INSERT INTO session_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+        fixture.db.transaction(() => {
+            for (let index = 0; index < 1_024; index++) {
+                insert.run(
+                    index + 1,
+                    newUlid(),
+                    'codex',
+                    `native-chat-${index}`,
+                    project.path,
+                    project.id,
+                    `Rule ${index}.`,
+                    '2026-09-20T00:00:00.000Z',
+                );
+            }
+        })();
+        let visited = 0;
+        expect(scanCandidateSessionRules(fixture.db, () => visited++)).toBe(1_024);
+        expect(visited).toBe(1_024);
+        const plan = fixture.db
+            .prepare(`EXPLAIN QUERY PLAN SELECT CASE WHEN typeof(tool) = 'text' THEN tool END AS tool
+                FROM session_rules INDEXED BY idx_session_rules_scope
+                ORDER BY session_rules.tool, session_rules.native_session_id, session_rules.checkout_anchor,
+                    session_rules.owner_project_id, session_rules.id`)
+            .all() as Array<{ detail: string }>;
+        expect(plan.some((step) => step.detail.includes('USE TEMP B-TREE'))).toBe(false);
+    });
+
+    it.each([
+        [
+            'missing ULID uniqueness',
+            'CREATE TABLE session_rules (id INTEGER PRIMARY KEY, ulid TEXT, tool, native_session_id, checkout_anchor, owner_project_id INTEGER, text, created_at); CREATE INDEX idx_session_rules_scope ON session_rules(tool, native_session_id, checkout_anchor, owner_project_id, id)',
+        ],
+        [
+            'partial ULID uniqueness',
+            'CREATE TABLE session_rules (id INTEGER PRIMARY KEY, ulid TEXT, tool, native_session_id, checkout_anchor, owner_project_id INTEGER, text, created_at); CREATE UNIQUE INDEX only_some_ulids ON session_rules(ulid) WHERE ulid IS NOT NULL; CREATE INDEX idx_session_rules_scope ON session_rules(tool, native_session_id, checkout_anchor, owner_project_id, id)',
+        ],
+        [
+            'missing scope index',
+            'CREATE TABLE session_rules (id INTEGER PRIMARY KEY, ulid TEXT UNIQUE, tool, native_session_id, checkout_anchor, owner_project_id INTEGER, text, created_at)',
+        ],
+        [
+            'wrong scope order',
+            'CREATE TABLE session_rules (id INTEGER PRIMARY KEY, ulid TEXT UNIQUE, tool, native_session_id, checkout_anchor, owner_project_id INTEGER, text, created_at); CREATE INDEX idx_session_rules_scope ON session_rules(tool, checkout_anchor, native_session_id, owner_project_id, id)',
+        ],
+        [
+            'non-primary ID',
+            'CREATE TABLE session_rules (id INTEGER, ulid TEXT UNIQUE, tool, native_session_id, checkout_anchor, owner_project_id INTEGER, text, created_at); CREATE INDEX idx_session_rules_scope ON session_rules(tool, native_session_id, checkout_anchor, owner_project_id, id)',
+        ],
+    ] as const)('rejects a session-rule schema with %s', (_label, schema) => {
+        const { fixture } = ruleCandidate();
+        fixture.db.exec(`DROP TABLE session_rules; ${schema}`);
+        expect(() => scanCandidateSessionRules(fixture.db)).toThrow(/session rule/i);
+    });
+
+    it.each([
+        ['tool', 'other'],
+        ['native_session_id', ''],
+        ['native_session_id', Buffer.from('native')],
+        ['checkout_anchor', 'relative/path'],
+        ['checkout_anchor', '/a/../b'],
+        ['checkout_anchor', Buffer.from('/absolute')],
+        ['owner_project_id', 999],
+        ['text', 'Never run $(untrusted).'],
+        ['text', '  Padded rule.  '],
+        ['ulid', 'not-a-ulid'],
+    ] as const)('rejects malformed or unsafe %s', (column, value) => {
+        const { fixture } = ruleCandidate();
+        fixture.db.prepare(`UPDATE session_rules SET ${column} = ?`).run(value);
+        expect(() => scanCandidateSessionRules(fixture.db)).toThrow(/session rule/i);
+    });
+
+    it.each(['duplicate-text', 'capacity'] as const)('rejects %s within chat-rule authority', (invalid) => {
+        const { fixture, project } = ruleCandidate();
+        if (invalid === 'capacity') {
+            fixture.db.exec('DELETE FROM session_rules');
+            for (let index = 0; index < 9; index++) {
+                fixture.db
+                    .prepare('INSERT INTO session_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                    .run(
+                        index + 1,
+                        newUlid(),
+                        'codex',
+                        'native-chat',
+                        project.path,
+                        project.id,
+                        `Rule ${index}.`,
+                        '2026-09-20T00:00:00.000Z',
+                    );
+            }
+        } else {
+            fixture.db
+                .prepare('INSERT INTO session_rules VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                .run(
+                    2,
+                    newUlid(),
+                    'codex',
+                    'native-chat',
+                    project.path,
+                    project.id,
+                    invalid === 'duplicate-text' ? 'A valid chat rule.' : 'Different text.',
+                    '2026-09-20T00:00:00.000Z',
+                );
+        }
+        expect(() => scanCandidateSessionRules(fixture.db)).toThrow(/session rule/i);
     });
 });
 

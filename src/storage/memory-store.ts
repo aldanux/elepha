@@ -19,6 +19,7 @@ import {
 import { type OpenTurnRow, type OpenTurnSourceSnapshot, OpenTurnStore } from './open-turn-store.js';
 import { ProjectResolver } from './project-resolver.js';
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
+import type { SessionRuleRow } from './session-rules-store.js';
 import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
 import { sourceTurnDigest } from './source-turn-digest.js';
@@ -59,7 +60,7 @@ export interface IngestedTurnWritePreparation {
 
 // What to purge: at most one project scope, optionally narrowed by time.
 export interface PurgeScope {
-    // Only explicit whole-project deletion includes durable rules. Time filters override this intention.
+    // Only explicit whole-project deletion includes durable project and chat rules. Time filters override this intention.
     deleteStandingRules?: boolean;
     // Purge every session belonging to project rows matching this path or display name.
     projectPath?: string;
@@ -98,6 +99,7 @@ export interface PurgePlan {
     scope: PurgeScope;
     sessions: PurgeSessionPreview[];
     standingRules: Array<StandingRuleRow & { projectPath: string }>;
+    sessionRules: Array<SessionRuleRow & { projectPath: string }>;
     // Project rows that will have neither sessions nor retained rules left.
     emptiedProjects: ProjectRow[];
 }
@@ -748,6 +750,36 @@ export class MemoryStore {
                         `Rekey refused: ${reason} for project ids ${[...group].join(', ')}; rule ULIDs: ${rules.map((rule) => rule.ulid).join(', ')}.`,
                     );
                 }
+                const projectIds = [...group];
+                const sessionRules = this.db
+                    .prepare(
+                        `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
+                         FROM session_rules WHERE owner_project_id IN (${projectIds.map(() => '?').join(',')}) ORDER BY id`,
+                    )
+                    .all(...projectIds) as SessionRuleRow[];
+                const chatScopes = new Map<string, SessionRuleRow[]>();
+                for (const rule of sessionRules) {
+                    const key = JSON.stringify([rule.tool, rule.native_session_id, rule.checkout_anchor]);
+                    const scoped = chatScopes.get(key) ?? [];
+                    scoped.push(rule);
+                    chatScopes.set(key, scoped);
+                }
+                for (const scoped of chatScopes.values()) {
+                    const texts = scoped.map((rule) => rule.text);
+                    const reason =
+                        new Set(texts).size !== texts.length
+                            ? 'duplicate chat rule text'
+                            : scoped.length > STANDING_RULES_MAX_ACTIVE
+                              ? 'chat rule count limit'
+                              : texts.reduce((sum, text) => sum + text.length, 0) > STANDING_RULES_MAX_TOTAL_CHARS
+                                ? 'chat rule character limit'
+                                : undefined;
+                    if (reason !== undefined) {
+                        throw new Error(
+                            `Rekey refused: ${reason} for project ids ${projectIds.join(', ')}; rule ULIDs: ${scoped.map((rule) => rule.ulid).join(', ')}.`,
+                        );
+                    }
+                }
             }
             for (const plan of plans) {
                 for (const victim of plan.merged) {
@@ -756,6 +788,9 @@ export class MemoryStore {
                     this.db.prepare('UPDATE session_rollups SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE open_turns SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
                     this.db.prepare('UPDATE standing_rules SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
+                    this.db
+                        .prepare('UPDATE session_rules SET owner_project_id = ? WHERE owner_project_id = ?')
+                        .run(plan.canonical.id, victim.id);
                     this.db.prepare('DELETE FROM projects WHERE id = ?').run(victim.id);
                 }
                 if (plan.gitRoot !== null) {
@@ -830,6 +865,17 @@ export class MemoryStore {
                       projectPath: projectById.get(rule.project_id)?.path ?? '(unknown project)',
                   }))
                 : [];
+        const sessionRules =
+            scope.deleteStandingRules === true && newerThan === undefined && olderThan === undefined && selectedProjectIds.length > 0
+                ? (
+                      this.db
+                          .prepare(
+                              `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
+                               FROM session_rules WHERE owner_project_id IN (${selectedProjectIds.map(() => '?').join(',')}) ORDER BY id`,
+                          )
+                          .all(...selectedProjectIds) as SessionRuleRow[]
+                  ).map((rule) => ({ ...rule, projectPath: projectById.get(rule.owner_project_id)?.path ?? '(unknown project)' }))
+                : [];
         const countTurns = this.db.prepare('SELECT COUNT(*) as c FROM memories WHERE session_id = ?');
         const filteredRows = this.db.prepare(
             `SELECT ft.memory_id,
@@ -878,20 +924,29 @@ export class MemoryStore {
                 purgedByProject.set(rule.project_id, 0);
             }
         }
+        for (const rule of sessionRules) {
+            if (!purgedByProject.has(rule.owner_project_id)) {
+                purgedByProject.set(rule.owner_project_id, 0);
+            }
+        }
         const totalSessionsByProject = this.db.prepare('SELECT COUNT(*) as c FROM sessions WHERE project_id = ?');
+        const totalSessionRulesByProject = this.db.prepare('SELECT COUNT(*) as c FROM session_rules WHERE owner_project_id = ?');
         const emptiedProjects: ProjectRow[] = [];
         for (const [projectId, purgedCount] of purgedByProject) {
             const total = (totalSessionsByProject.get(projectId) as { c: number }).c;
             const retainedRules =
                 this.standingRules.list([projectId]).length - standingRules.filter((rule) => rule.project_id === projectId).length;
-            if (purgedCount === total && retainedRules === 0) {
+            const retainedSessionRules =
+                (totalSessionRulesByProject.get(projectId) as { c: number }).c -
+                sessionRules.filter((rule) => rule.owner_project_id === projectId).length;
+            if (purgedCount === total && retainedRules === 0 && retainedSessionRules === 0) {
                 const project = projectById.get(projectId);
                 if (project) {
                     emptiedProjects.push(project);
                 }
             }
         }
-        return { scope, sessions, standingRules, emptiedProjects };
+        return { scope, sessions, standingRules, sessionRules, emptiedProjects };
     }
 
     // Applies exactly the still-present sessions and unchanged rules in a previewed plan, in one transaction.
@@ -909,9 +964,18 @@ export class MemoryStore {
         const deleteSession = this.db.prepare('DELETE FROM sessions WHERE id = ?');
         const countProjectSessions = this.db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE project_id = ?');
         const countProjectRules = this.db.prepare('SELECT COUNT(*) AS count FROM standing_rules WHERE project_id = ?');
+        const countSessionRules = this.db.prepare('SELECT COUNT(*) AS count FROM session_rules WHERE owner_project_id = ?');
         const ruleIdentity = this.db.prepare('SELECT id, ulid, project_id, text, created_at FROM standing_rules WHERE id = ?');
         const deleteRule = this.db.prepare(
             'DELETE FROM standing_rules WHERE id = ? AND ulid = ? AND project_id = ? AND text = ? AND created_at = ?',
+        );
+        const chatRuleIdentity = this.db.prepare(
+            'SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at FROM session_rules WHERE id = ?',
+        );
+        const deleteChatRule = this.db.prepare(
+            `DELETE FROM session_rules
+             WHERE id = ? AND ulid = ? AND tool = ? AND native_session_id = ? AND checkout_anchor = ?
+               AND owner_project_id = ? AND text = ? AND created_at = ?`,
         );
         const deleteProject = this.db.prepare('DELETE FROM projects WHERE id = ?');
         const appliedSessions: PurgeSessionPreview[] = [];
@@ -929,6 +993,23 @@ export class MemoryStore {
                     project?.path !== planned.projectPath
                 ) {
                     throw new Error(`Purge plan standing rule ${planned.ulid} (id ${planned.id}) no longer matches the previewed rule.`);
+                }
+            }
+            for (const planned of plan.sessionRules) {
+                const current = chatRuleIdentity.get(planned.id) as SessionRuleRow | undefined;
+                const project = this.getProjectById(planned.owner_project_id);
+                if (
+                    current === undefined ||
+                    current.ulid !== planned.ulid ||
+                    current.tool !== planned.tool ||
+                    current.native_session_id !== planned.native_session_id ||
+                    current.checkout_anchor !== planned.checkout_anchor ||
+                    current.owner_project_id !== planned.owner_project_id ||
+                    current.text !== planned.text ||
+                    current.created_at !== planned.created_at ||
+                    project?.path !== planned.projectPath
+                ) {
+                    throw new Error(`Purge plan chat rule ${planned.ulid} (id ${planned.id}) no longer matches the previewed rule.`);
                 }
             }
             for (const planned of plan.emptiedProjects) {
@@ -963,10 +1044,32 @@ export class MemoryStore {
                     throw new Error(`Purge plan standing rule ${rule.ulid} could not be deleted as previewed.`);
                 }
             }
+            for (const rule of plan.sessionRules) {
+                if (
+                    deleteChatRule.run(
+                        rule.id,
+                        rule.ulid,
+                        rule.tool,
+                        rule.native_session_id,
+                        rule.checkout_anchor,
+                        rule.owner_project_id,
+                        rule.text,
+                        rule.created_at,
+                    ).changes !== 1
+                ) {
+                    throw new Error(`Purge plan chat rule ${rule.ulid} could not be deleted as previewed.`);
+                }
+            }
             for (const p of plan.emptiedProjects) {
                 const remaining = countProjectSessions.get(p.id) as { count: number };
                 const retainedRules = countProjectRules.get(p.id) as { count: number };
-                if (remaining.count === 0 && retainedRules.count === 0 && deleteProject.run(p.id).changes > 0) {
+                const retainedChatRules = countSessionRules.get(p.id) as { count: number };
+                if (
+                    remaining.count === 0 &&
+                    retainedRules.count === 0 &&
+                    retainedChatRules.count === 0 &&
+                    deleteProject.run(p.id).changes > 0
+                ) {
                     emptiedProjects.push(p);
                 }
             }

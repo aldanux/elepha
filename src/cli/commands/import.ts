@@ -85,6 +85,7 @@ interface SessionPlan {
 
 export interface ImportPlan {
     rules: RuleImportPlan;
+    excludedSessionRules: number;
     projects: ProjectTarget[];
     sessions: SessionPlan[];
     counts: {
@@ -108,6 +109,7 @@ export interface ImportRuntime {
 
 export interface ImportResult {
     rules: RuleImportCounts;
+    excludedSessionRules: number;
     cancelled: boolean;
     snapshotPath?: string;
     added: number;
@@ -420,6 +422,9 @@ async function buildPlan(active: Database.Database, candidate: Database.Database
         projects,
         sessions,
         rules: planStandingRuleImport(active, candidate),
+        excludedSessionRules: tableNames(candidate).has('session_rules')
+            ? (candidate.prepare('SELECT COUNT(*) AS count FROM session_rules').get() as { count: number }).count
+            : 0,
         counts: {
             new: sessions.filter((session) => session.disposition === 'new').length,
             existing: sessions.filter((session) => session.disposition === 'existing').length,
@@ -467,6 +472,13 @@ function printPreview(candidatePath: string, overwrite: boolean, plan: ImportPla
             console.log('Confirming this import also adds the previewed standing rules; --overwrite never replaces existing rules.');
         }
     }
+    if (plan.excludedSessionRules > 0) {
+        console.log(sessionRulesImportExcludedMessage(plan.excludedSessionRules));
+    }
+}
+
+export function sessionRulesImportExcludedMessage(count: number): string {
+    return `Chat standing rules: ${count} excluded from portable import.`;
 }
 
 function insertRow(
@@ -845,6 +857,7 @@ export async function runImportOperation(candidatePath: string, overwrite: boole
             return {
                 cancelled: true,
                 rules: { ...plan.rules.counts, added: 0, unchanged: 0 },
+                excludedSessionRules: plan.excludedSessionRules,
                 added: 0,
                 overwritten: 0,
                 skipped:
@@ -876,7 +889,18 @@ export async function runImportOperation(candidatePath: string, overwrite: boole
                 `Standing rules imported: ${rules.added} added, ${rules.unchanged} unchanged, ${rules.unmapped} skipped (unmapped), ${rules.unconsented} skipped (unconsented).`,
             );
         }
-        return { cancelled: false, snapshotPath, added: plan.counts.new, overwritten, skipped, rules };
+        if (plan.excludedSessionRules > 0) {
+            console.log(sessionRulesImportExcludedMessage(plan.excludedSessionRules));
+        }
+        return {
+            cancelled: false,
+            snapshotPath,
+            added: plan.counts.new,
+            overwritten,
+            skipped,
+            rules,
+            excludedSessionRules: plan.excludedSessionRules,
+        };
     } finally {
         candidate.close();
     }

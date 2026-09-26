@@ -174,7 +174,7 @@ export async function withCapturePaused(
 }
 
 export function printPurgePlan(plan: PurgePlan): void {
-    if (plan.sessions.length === 0 && plan.standingRules.length === 0) {
+    if (plan.sessions.length === 0 && plan.standingRules.length === 0 && plan.sessionRules.length === 0) {
         console.log('Nothing matches this scope. Nothing to purge.');
         return;
     }
@@ -183,7 +183,11 @@ export function printPurgePlan(plan: PurgePlan): void {
     const totalFilteredBytes = plan.sessions.reduce((sum, s) => sum + s.filteredBytes, 0);
     const emptiedProjectPaths = new Set(plan.emptiedProjects.map((project) => project.path));
     const projectPaths = [
-        ...new Set([...plan.sessions.map((session) => session.projectPath), ...plan.standingRules.map((rule) => rule.projectPath)]),
+        ...new Set([
+            ...plan.sessions.map((session) => session.projectPath),
+            ...plan.standingRules.map((rule) => rule.projectPath),
+            ...plan.sessionRules.map((rule) => rule.projectPath),
+        ]),
     ].sort((a, b) => a.localeCompare(b));
 
     console.log(`In total: ${plan.sessions.length} session(s), ${totalTurns} turn(s).`);
@@ -193,6 +197,15 @@ export function printPurgePlan(plan: PurgePlan): void {
         for (const rule of plan.standingRules) {
             console.log(
                 `  ${rule.ulid} (id ${rule.id}, project ${rule.project_id}, ${JSON.stringify(rule.projectPath)}, created ${rule.created_at}): ${JSON.stringify(rule.text)}`,
+            );
+        }
+    }
+    if (plan.sessionRules.length > 0) {
+        console.log(`Chat standing rules: ${plan.sessionRules.length} rule(s).`);
+        for (const rule of plan.sessionRules) {
+            console.log(
+                `  ${rule.ulid} (id ${rule.id}, ${rule.tool}:${rule.native_session_id}, checkout ${JSON.stringify(rule.checkout_anchor)}, ` +
+                    `owner ${rule.owner_project_id}, ${JSON.stringify(rule.projectPath)}, created ${rule.created_at}): ${JSON.stringify(rule.text)}`,
             );
         }
     }

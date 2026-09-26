@@ -37,7 +37,9 @@ import { selectSessionEvidence } from '../serving/session-evidence.js';
 import { endedAt, newestActivity, type ServedSession, SessionReader, surfaceLabel, titleOf } from '../serving/session-reader.js';
 import {
     isStandingRulesCommand,
+    parseScopedStandingRulesCommand,
     parseStandingRulesCommand,
+    type ScopedStandingRulesCommand,
     type StandingRulesCommand,
     standingRulesCommandBody,
 } from '../serving/standing-rules.js';
@@ -61,6 +63,7 @@ export type UserPromptCommand =
     | { kind: 'resume'; index: number }
     | { kind: 'query'; query: string; scope: 'global' | 'here' }
     | StandingRulesCommand
+    | ScopedStandingRulesCommand
     | { kind: 'action'; command: 'self-update' };
 
 export interface UserPromptSubmitDependencies {
@@ -76,7 +79,7 @@ export interface UserPromptSubmitDependencies {
 }
 
 export type UserPromptSubmitResult = { output: Record<string, unknown> } | { reason: string };
-type ProjectCommand = Exclude<UserPromptCommand, { kind: 'query' } | StandingRulesCommand>;
+type ProjectCommand = Exclude<UserPromptCommand, { kind: 'query' } | StandingRulesCommand | ScopedStandingRulesCommand>;
 interface CommandBodyResult {
     body: string;
     shownSessionIds?: number[];
@@ -134,7 +137,7 @@ export function parseUserPromptCommand(prompt: string): UserPromptCommand | unde
     if (command === 'elepha:last') {
         return { kind: 'last' };
     }
-    const rules = parseStandingRulesCommand(command);
+    const rules = parseStandingRulesCommand(command) ?? parseScopedStandingRulesCommand(command);
     if (rules) {
         return rules;
     }
@@ -536,23 +539,31 @@ export async function runUserPromptSubmit(
                         }
                     }
                 }
-            } else if (isStandingRulesCommand(command)) {
+            } else if (isStandingRulesCommand(command) || command?.kind === 'rules-scoped') {
                 // Handled synchronously: the project set, the consent check and
                 // the write must not be separated by an awaited boundary.
                 const receiptFailure = new Error('Standing rule receipt failed.');
                 let receipt: UserPromptSubmitResult | undefined;
                 try {
-                    commandOutput = standingRulesCommandBody(db, store, command, payload.cwd, new Date(clock()).toISOString(), (body) => {
-                        try {
-                            receipt = emit(body);
-                        } catch {
-                            log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
-                            throw receiptFailure;
-                        }
-                        if (!('output' in receipt)) {
-                            throw receiptFailure;
-                        }
-                    });
+                    commandOutput = standingRulesCommandBody(
+                        db,
+                        store,
+                        command,
+                        payload.cwd,
+                        new Date(clock()).toISOString(),
+                        (body) => {
+                            try {
+                                receipt = emit(body);
+                            } catch {
+                                log(promptLogLine(tool, payload, 'failed reason=injection_record_failed'));
+                                throw receiptFailure;
+                            }
+                            if (!('output' in receipt)) {
+                                throw receiptFailure;
+                            }
+                        },
+                        { tool, nativeSessionId: payload.session_id, sessionAuthorized: tool !== 'opencode' },
+                    );
                 } catch (error) {
                     if (error === receiptFailure) {
                         return { reason: 'injection_record_failed' };

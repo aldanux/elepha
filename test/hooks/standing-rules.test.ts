@@ -15,6 +15,10 @@ import { detectShellSyntax } from '../../src/security/sanitize.js';
 import * as subprocess from '../../src/security/subprocess-allowlist.js';
 import { DISPLAY_VERBATIM_INSTRUCTIONS, HELP } from '../../src/serving/instructions.js';
 import {
+    parseScopedStandingRulesCommand,
+    SESSION_RULES_AMBIGUOUS,
+    SESSION_RULES_ANCHOR_AMBIGUOUS,
+    SESSION_RULES_CONTEXT_UNVERIFIED,
     STANDING_RULE_REJECTIONS,
     STANDING_RULES_EMPTY,
     STANDING_RULES_HINT,
@@ -33,6 +37,7 @@ import {
     registerParanoidDatabase,
     unlockMemory,
 } from '../../src/storage/paranoid-gate.js';
+import { type SessionRuleRow, SessionRulesStore } from '../../src/storage/session-rules-store.js';
 import type { StandingRuleRow } from '../../src/storage/standing-rules-store.js';
 import { createTestDb, seedConsentRoot, seedProject } from '../helpers/db.js';
 import { fixtureGitEnv } from '../helpers/git.js';
@@ -105,6 +110,15 @@ function storedRules(fixture: RulesFixture): StandingRuleRow[] {
     }
 }
 
+function storedSessionRules(fixture: RulesFixture): SessionRuleRow[] {
+    const db = openUnmanagedDb(fixture.dbPath);
+    try {
+        return db.prepare('SELECT * FROM session_rules ORDER BY id').all() as SessionRuleRow[];
+    } finally {
+        db.close();
+    }
+}
+
 describe('elepha:rules in-chat grammar', () => {
     it('parses only the exact anchored forms', () => {
         expect(parseUserPromptCommand('  elepha:rules  ')).toEqual({ kind: 'rules' });
@@ -146,6 +160,82 @@ describe('elepha:rules in-chat grammar', () => {
     it('names every rule command in the in-chat help', () => {
         for (const command of ['elepha:rules', 'elepha:rules:add', 'elepha:rules:remove', 'elepha:rules:replace']) {
             expect(HELP.split('\n').some((line) => line.startsWith(`${command} `))).toBe(true);
+        }
+        expect(HELP).toContain('elepha:rules — List project standing rules and rules for this chat in this checkout.');
+        expect(HELP).toContain(
+            'Chat standing-rule commands are available only in Claude Code and Codex; OpenCode cannot verify chat identity yet.',
+        );
+    });
+
+    it('parses explicit project and chat scope forms without changing legacy commands', () => {
+        for (const scope of ['project', 'session'] as const) {
+            expect(parseScopedStandingRulesCommand(`elepha:rules:${scope}`)).toEqual({ kind: 'rules-scoped', scope, action: 'list' });
+            expect(parseScopedStandingRulesCommand(`elepha:rules:${scope}:add Text.`)).toEqual({
+                kind: 'rules-scoped',
+                scope,
+                action: 'add',
+                text: 'Text.',
+            });
+            expect(parseScopedStandingRulesCommand(`elepha:rules:${scope}:add`)).toEqual({
+                kind: 'rules-scoped',
+                scope,
+                action: 'add',
+                text: '',
+            });
+            expect(parseScopedStandingRulesCommand(`elepha:rules:${scope}:remove ${ABSENT_RULE_ID}`)).toEqual({
+                kind: 'rules-scoped',
+                scope,
+                action: 'remove',
+                ruleId: ABSENT_RULE_ID,
+            });
+            expect(parseScopedStandingRulesCommand(`elepha:rules:${scope}:replace ${ABSENT_RULE_ID} Changed.`)).toEqual({
+                kind: 'rules-scoped',
+                scope,
+                action: 'replace',
+                ruleId: ABSENT_RULE_ID,
+                text: 'Changed.',
+            });
+            expect(parseScopedStandingRulesCommand(`elepha:rules:${scope}:replace ${ABSENT_RULE_ID}`)).toEqual({
+                kind: 'rules-scoped',
+                scope,
+                action: 'replace',
+                ruleId: ABSENT_RULE_ID,
+                text: '',
+            });
+            for (const action of ['', ':add', ':remove', ':replace']) {
+                const command = `elepha:rules:${scope}${action}`;
+                expect(HELP.split('\n').some((line) => line.startsWith(`${command} `))).toBe(true);
+            }
+        }
+        expect(parseScopedStandingRulesCommand('elepha:rules:add Legacy project rule.')).toBeUndefined();
+        expect(parseUserPromptCommand('elepha:rules:add Legacy project rule.')).toEqual({
+            kind: 'rules-add',
+            text: 'Legacy project rule.',
+        });
+        expect(parseUserPromptCommand('elepha:rules:session:add Chat rule.')).toEqual({
+            kind: 'rules-scoped',
+            scope: 'session',
+            action: 'add',
+            text: 'Chat rule.',
+        });
+    });
+
+    it('rejects malformed or ambiguous explicit scope forms', () => {
+        for (const input of [
+            'elepha:rules:project:list',
+            'elepha:rules:session:list',
+            'elepha:rules:project extra',
+            'elepha:rules:session:',
+            'elepha:rules:project:remove',
+            'elepha:rules:session:remove 01K5ZZZ',
+            `elepha:rules:session:remove ${MALFORMED_RULE_ID}`,
+            `elepha:rules:project:replace ${MALFORMED_RULE_ID} Text.`,
+            'elepha:rules:session:replace 01K5ZZZ Text.',
+            'elepha:rules:personal:add Text.',
+            'Elepha:rules:session:add Text.',
+            'elepha:rules:session:addition Text.',
+        ]) {
+            expect(parseScopedStandingRulesCommand(input), input).toBeUndefined();
         }
     });
 });
@@ -472,7 +562,18 @@ describe('elepha:rules management', () => {
         const fixture = seededDb('elepha-rules-roundtrip-');
 
         const empty = await submit(fixture, 'elepha:rules');
-        expect(empty).toBe([DISPLAY_VERBATIM_INSTRUCTIONS, STANDING_RULES_EMPTY, '', STANDING_RULES_HINT].join('\n'));
+        expect(empty).toBe(
+            [
+                DISPLAY_VERBATIM_INSTRUCTIONS,
+                'Project standing rules (none):',
+                STANDING_RULES_EMPTY,
+                '',
+                STANDING_RULES_HINT,
+                '',
+                'Standing rules for this chat in this checkout (none):',
+                'No standing rules for this chat in this checkout yet. Add one with elepha:rules:session:add <text>.',
+            ].join('\n'),
+        );
 
         const added = await submit(fixture, 'elepha:rules:add Always run the focused test before the suite.');
         const [first] = storedRules(fixture);
@@ -704,6 +805,375 @@ describe('elepha:rules management', () => {
             expect(isMemoryLocked(verification)).toBe(true);
         } finally {
             verification.close();
+        }
+    });
+
+    it('keeps one native chat isolated between two physical checkouts of the same logical project', async () => {
+        const directory = withGrantableTestDir('elepha-rules-checkout-isolation-');
+        const checkoutA = path.join(directory, 'checkout-a');
+        const checkoutB = path.join(directory, 'checkout-b');
+        mkdirSync(checkoutA);
+        mkdirSync(checkoutB);
+        for (const checkout of [checkoutA, checkoutB]) {
+            execFileSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '-q', checkout], { env: fixtureGitEnv() });
+        }
+        const fixture = createTestDb('elepha-rules-checkout-isolation-db-');
+        const first = seedProject(fixture, { path: checkoutA });
+        const second = seedProject(fixture, { path: checkoutB });
+        fixture.db
+            .prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?)')
+            .run('https://example.test/same-project', first.id, second.id);
+        seedConsentRoot(fixture, { path: checkoutA });
+        seedConsentRoot(fixture, { path: checkoutB });
+        fixture.close();
+
+        const scopeA = { dbPath: fixture.dbPath, projectPath: checkoutA };
+        const scopeB = { dbPath: fixture.dbPath, projectPath: checkoutB };
+        expect(await submit(scopeA, 'elepha:rules:project:add Shared project rule.')).toContain('Shared project rule.');
+        expect(await submit(scopeA, 'elepha:rules:session:add Rule for checkout A.')).toContain('Rule for checkout A.');
+        expect(await submit(scopeB, 'elepha:rules:session')).not.toContain('Rule for checkout A.');
+        expect(await submit(scopeB, 'elepha:rules:session:add Rule for checkout B.')).toContain('Rule for checkout B.');
+        const aAgain = await submit(scopeA, 'elepha:rules');
+        expect(aAgain).toContain('Project standing rules (active):');
+        expect(aAgain).toContain('Standing rules for this chat in this checkout (active):');
+        expect(aAgain).toContain('Shared project rule.');
+        expect(aAgain).toContain('Rule for checkout A.');
+        expect(aAgain).not.toContain('Rule for checkout B.');
+        const bAgain = await submit(scopeB, 'elepha:rules');
+        expect(bAgain).toContain('Shared project rule.');
+        expect(bAgain).toContain('Rule for checkout B.');
+        expect(bAgain).not.toContain('Rule for checkout A.');
+        expect(storedSessionRules(scopeA).map((rule) => rule.checkout_anchor)).toEqual([checkoutA, checkoutB]);
+        const [projectRule] = storedRules(scopeA);
+        if (!projectRule) throw new Error('expected a project rule');
+        expect(await submit(scopeB, `elepha:rules:project:replace ${projectRule.ulid} Updated project rule.`)).toContain(
+            'Updated project rule.',
+        );
+        expect(await submit(scopeA, `elepha:rules:project:remove ${projectRule.ulid}`)).toContain('Updated project rule.');
+        expect(storedRules(scopeA)).toEqual([]);
+    });
+
+    it('creates the first approved owner for a chat rule and reports only the current native chat', async () => {
+        const fixture = createTestDb('elepha-rules-first-chat-owner-db-');
+        const projectPath = withGrantableTestDir('elepha-rules-first-chat-owner-');
+        seedConsentRoot(fixture, { path: projectPath });
+        fixture.close();
+        const scope = { dbPath: fixture.dbPath, projectPath };
+        expect(await submit(scope, 'elepha:rules:session:add Private chat rule.')).toContain('Private chat rule.');
+        expect(storedRules(scope)).toEqual([]);
+        expect(storedSessionRules(scope)).toMatchObject([{ checkout_anchor: projectPath, native_session_id: 'rules-chat' }]);
+        const otherChat = injectedBody(
+            await runUserPromptSubmit(payload(projectPath, 'elepha:rules', 'other-chat'), 'codex', {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+            }),
+        );
+        expect(otherChat).not.toContain('Private chat rule.');
+        expect(otherChat).toContain('No standing rules for this chat in this checkout yet.');
+        const [rule] = storedSessionRules(scope);
+        if (!rule) throw new Error('expected a chat rule');
+        expect(await submit(scope, `elepha:rules:session:replace ${rule.ulid} Updated chat rule.`)).toContain('Updated chat rule.');
+        expect(storedSessionRules(scope)[0]?.ulid).toBe(rule.ulid);
+        expect(await submit(scope, `elepha:rules:session:remove ${rule.ulid}`)).toContain('Updated chat rule.');
+        expect(storedSessionRules(scope)).toEqual([]);
+        const db = openUnmanagedDb(fixture.dbPath);
+        try {
+            expect(db.prepare('SELECT COUNT(*) AS count FROM projects').get()).toEqual({ count: 1 });
+        } finally {
+            db.close();
+        }
+    });
+
+    it('uses the caller physical owner for rootless rows sharing one project identity', async () => {
+        const directory = withGrantableTestDir('elepha-rules-rootless-isolation-');
+        const firstPath = path.join(directory, 'first');
+        const nestedPath = path.join(firstPath, 'nested');
+        const secondPath = path.join(directory, 'second');
+        mkdirSync(nestedPath, { recursive: true });
+        mkdirSync(secondPath);
+        const fixture = createTestDb('elepha-rules-rootless-isolation-db-');
+        const first = seedProject(fixture, { path: firstPath });
+        const nested = seedProject(fixture, { path: nestedPath });
+        const second = seedProject(fixture, { path: secondPath });
+        fixture.db
+            .prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?, ?)')
+            .run('https://example.test/one-project', first.id, nested.id, second.id);
+        seedConsentRoot(fixture, { path: firstPath });
+        seedConsentRoot(fixture, { path: secondPath });
+        fixture.close();
+        const firstScope = { dbPath: fixture.dbPath, projectPath: firstPath };
+        const secondScope = { dbPath: fixture.dbPath, projectPath: secondPath };
+        expect(await submit(firstScope, 'elepha:rules:session:add First rootless rule.')).toContain('First rootless rule.');
+        expect(await submit(secondScope, 'elepha:rules:session')).not.toContain('First rootless rule.');
+        expect(await submit(secondScope, 'elepha:rules:session:add Second rootless rule.')).toContain('Second rootless rule.');
+        expect(await submit(firstScope, 'elepha:rules:session')).not.toContain('Second rootless rule.');
+        const nestedScope = { dbPath: fixture.dbPath, projectPath: nestedPath };
+        expect(await submit(nestedScope, 'elepha:rules:session')).toContain('First rootless rule.');
+        expect(await submit(nestedScope, 'elepha:rules:session')).not.toContain('Second rootless rule.');
+        expect(storedSessionRules(firstScope).map((rule) => rule.checkout_anchor)).toEqual([firstPath, secondPath]);
+    });
+
+    it('keeps a rootless chat rule reachable after a shallower approved owner joins the set', async () => {
+        const directory = withGrantableTestDir('elepha-rules-rootless-anchor-drift-');
+        const parentPath = path.join(directory, 'parent');
+        const childPath = path.join(parentPath, 'child');
+        const siblingPath = path.join(parentPath, 'sibling');
+        mkdirSync(childPath, { recursive: true });
+        mkdirSync(siblingPath);
+        const fixture = createTestDb('elepha-rules-rootless-anchor-drift-db-');
+        seedConsentRoot(fixture, { path: parentPath });
+        fixture.close();
+        const scope = { dbPath: fixture.dbPath, projectPath: childPath };
+        expect(await submit(scope, 'elepha:rules:session:add Keep this chat rule.')).toContain('Keep this chat rule.');
+        const [saved] = storedSessionRules(scope);
+        if (!saved) throw new Error('expected chat rule');
+        expect(saved.checkout_anchor).toBe(childPath);
+        const db = openUnmanagedDb(fixture.dbPath);
+        try {
+            new MemoryStore(db).upsertProject(parentPath);
+        } finally {
+            db.close();
+        }
+        expect(await submit(scope, 'elepha:rules:session')).toContain('Keep this chat rule.');
+        const otherChat = injectedBody(
+            await runUserPromptSubmit(payload(childPath, 'elepha:rules:session', 'other-chat'), 'codex', {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+            }),
+        );
+        expect(otherChat).not.toContain('Keep this chat rule.');
+        expect(await submit(scope, 'elepha:rules:session', siblingPath)).not.toContain('Keep this chat rule.');
+        expect(await submit(scope, `elepha:rules:session:remove ${saved.ulid}`)).toContain('Keep this chat rule.');
+        expect(storedSessionRules(scope)).toEqual([]);
+
+        const ambiguous = openUnmanagedDb(fixture.dbPath);
+        try {
+            const owners = ambiguous.prepare('SELECT id, path FROM projects WHERE path IN (?, ?)').all(parentPath, childPath) as Array<{
+                id: number;
+                path: string;
+            }>;
+            const insert = ambiguous.prepare(
+                `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, 'codex', 'rules-chat', ?, ?, ?, ?)`,
+            );
+            for (const owner of owners) {
+                insert.run(
+                    owner.path === parentPath ? `01J${'1'.repeat(23)}` : `01J${'2'.repeat(23)}`,
+                    owner.path,
+                    owner.id,
+                    owner.path,
+                    ISO,
+                );
+            }
+        } finally {
+            ambiguous.close();
+        }
+        const unresolved = await submit(scope, 'elepha:rules:session');
+        expect(unresolved).toContain(SESSION_RULES_ANCHOR_AMBIGUOUS);
+        expect(await submit(scope, `elepha:rules:session:remove 01J${'2'.repeat(23)}`)).toContain(SESSION_RULES_ANCHOR_AMBIGUOUS);
+        expect(storedSessionRules(scope)).toHaveLength(2);
+        const logs: string[] = [];
+        const result = await runSessionStart(
+            JSON.stringify({
+                session_id: 'rules-chat',
+                cwd: childPath,
+                hook_event_name: 'SessionStart',
+                source: 'startup',
+                model: 'test',
+                permission_mode: 'default',
+            }),
+            'codex',
+            {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+                daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
+                readUpdateAvailable: () => undefined,
+                log: (line) => logs.push(line),
+            },
+        );
+        expect(result).toEqual({ reason: SESSION_RULES_AMBIGUOUS });
+        expect(logs).toContain(`session-start codex source=startup session_id=rules-chat: skipped reason=${SESSION_RULES_AMBIGUOUS}`);
+        expect(await submit(scope, 'elepha:rules:project:add Keep the project rule.')).toContain('Keep the project rule.');
+        const projectDelivery = await runSessionStart(
+            JSON.stringify({
+                session_id: 'rules-chat',
+                cwd: childPath,
+                hook_event_name: 'SessionStart',
+                source: 'startup',
+                model: 'test',
+                permission_mode: 'default',
+            }),
+            'codex',
+            {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+                daemonHealth: () => ({ state: 'RUNNING', healthy: true }),
+                readUpdateAvailable: () => undefined,
+                log: (line) => logs.push(line),
+            },
+        );
+        expect(projectDelivery).toHaveProperty('output');
+        expect(JSON.stringify(projectDelivery)).toContain('Keep the project rule.');
+        expect(JSON.stringify(projectDelivery)).not.toContain(`- ${parentPath}`);
+        expect(logs.filter((line) => line.includes(`skipped reason=${SESSION_RULES_AMBIGUOUS}`))).toHaveLength(2);
+    });
+
+    it('rechecks the chosen chat anchor inside the write transaction', async () => {
+        const directory = withGrantableTestDir('elepha-rules-anchor-race-');
+        const parentPath = path.join(directory, 'parent');
+        const childPath = path.join(parentPath, 'child');
+        mkdirSync(childPath, { recursive: true });
+        const fixture = createTestDb('elepha-rules-anchor-race-db-');
+        seedConsentRoot(fixture, { path: parentPath });
+        fixture.close();
+        const scope = { dbPath: fixture.dbPath, projectPath: childPath };
+        await submit(scope, 'elepha:rules:session:add Original child rule.');
+        const db = openUnmanagedDb(fixture.dbPath);
+        try {
+            new MemoryStore(db).upsertProject(parentPath);
+        } finally {
+            db.close();
+        }
+        const originalAdd = SessionRulesStore.prototype.add;
+        const add = vi.spyOn(SessionRulesStore.prototype, 'add').mockImplementation(function (
+            this: SessionRulesStore,
+            sessionScope,
+            text,
+            now,
+        ) {
+            const transactionDb = (this as unknown as { db: ReturnType<typeof openUnmanagedDb> }).db;
+            const parentOwner = transactionDb.prepare('SELECT id FROM projects WHERE path = ?').get(parentPath) as { id: number };
+            transactionDb
+                .prepare(
+                    `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, 'codex', 'rules-chat', ?, ?, ?, ?)`,
+                )
+                .run(`01J${'3'.repeat(23)}`, parentPath, parentOwner.id, 'Competing parent rule.', ISO);
+            return originalAdd.call(this, sessionScope, text, now);
+        });
+        try {
+            expect(await submit(scope, 'elepha:rules:session:add Must not fragment.')).toContain('authorization changed');
+        } finally {
+            add.mockRestore();
+        }
+        expect(storedSessionRules(scope).map((rule) => rule.text)).toEqual(['Original child rule.', 'Competing parent rule.']);
+    });
+
+    it('refuses chat rules outside consent and under a denied physical Git root', async () => {
+        const fixture = seededDb('elepha-rules-chat-consent-');
+        expect(await submit(fixture, 'elepha:rules:session:add Private chat rule.')).toContain('Private chat rule.');
+        const outside = withGrantableTestDir('elepha-rules-chat-outside-');
+        for (const prompt of ['elepha:rules', 'elepha:rules:session', 'elepha:rules:session:add Must not save.']) {
+            const body = await submit(fixture, prompt, outside);
+            expect(body).toBe(`${DISPLAY_VERBATIM_INSTRUCTIONS}\n${STANDING_RULES_UNCONSENTED}`);
+            expect(body).not.toContain('Private chat rule.');
+        }
+
+        const directory = withGrantableTestDir('elepha-rules-chat-denied-root-');
+        const repo = path.join(directory, 'repo');
+        const child = path.join(repo, 'allowed');
+        mkdirSync(child, { recursive: true });
+        execFileSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '-q', repo], { env: fixtureGitEnv() });
+        const rootFixture = createTestDb('elepha-rules-chat-denied-root-db-');
+        seedConsentRoot(rootFixture, { path: child });
+        seedConsentRoot(rootFixture, { path: repo, state: 'denied' });
+        rootFixture.close();
+        expect(await submit({ dbPath: rootFixture.dbPath, projectPath: child }, 'elepha:rules:session:add Must not cross root.')).toContain(
+            STANDING_RULES_UNCONSENTED,
+        );
+        expect(storedSessionRules(fixture).map((rule) => rule.text)).toEqual(['Private chat rule.']);
+    });
+
+    it('does not read or mutate chat rules from an OpenCode hook without verified parentage', async () => {
+        const fixture = seededDb('elepha-rules-opencode-unverified-');
+        const scope = { dbPath: fixture.dbPath, projectPath: fixture.projectPath };
+        expect(await submit(scope, 'elepha:rules:session:add Private chat rule.')).toContain('Private chat rule.');
+        const before = storedSessionRules(scope);
+        const [saved] = before;
+        if (!saved) throw new Error('expected a chat rule');
+        const openCodePayload = (prompt: string) =>
+            JSON.stringify({
+                session_id: 'rules-chat',
+                cwd: fixture.projectPath,
+                hook_event_name: 'UserPromptSubmit',
+                prompt,
+            });
+        for (const prompt of [
+            'elepha:rules:session',
+            'elepha:rules:session:add Must not save.',
+            `elepha:rules:session:remove ${saved.ulid}`,
+            `elepha:rules:session:replace ${saved.ulid} Must not replace.`,
+        ]) {
+            expect(
+                injectedBody(
+                    await runUserPromptSubmit(openCodePayload(prompt), 'opencode', {
+                        dbPath: fixture.dbPath,
+                        now: () => NOW,
+                    }),
+                ),
+            ).toContain(SESSION_RULES_CONTEXT_UNVERIFIED);
+        }
+        const report = injectedBody(
+            await runUserPromptSubmit(openCodePayload('elepha:rules'), 'opencode', {
+                dbPath: fixture.dbPath,
+                now: () => NOW,
+            }),
+        );
+        expect(report).toContain('Standing rules for this chat in this checkout (unavailable):');
+        expect(report).not.toContain('Private chat rule.');
+        expect(report).not.toMatch(/Chat standing rules: \d+ of \d+/);
+        expect(storedSessionRules(scope)).toEqual(before);
+        expect(
+            injectedBody(
+                await runUserPromptSubmit(openCodePayload('elepha:rules:project'), 'opencode', {
+                    dbPath: fixture.dbPath,
+                    now: () => NOW,
+                }),
+            ),
+        ).toContain(STANDING_RULES_EMPTY);
+    });
+
+    it('rolls back first-owner creation and existing chat mutations when the receipt fails', async () => {
+        const first = createTestDb('elepha-rules-chat-first-receipt-db-');
+        const projectPath = withGrantableTestDir('elepha-rules-chat-first-receipt-');
+        seedConsentRoot(first, { path: projectPath });
+        first.close();
+        const failedReceipt = (store: MemoryStore, input: Parameters<MemoryStore['recordInjection']>[0]) => {
+            store.recordInjection(input);
+            return false;
+        };
+        expect(
+            await runUserPromptSubmit(payload(projectPath, 'elepha:rules:session:add No owner.'), 'codex', {
+                dbPath: first.dbPath,
+                now: () => NOW,
+                writeInjection: failedReceipt,
+            }),
+        ).toEqual({ reason: 'injection_record_failed' });
+        const empty = openUnmanagedDb(first.dbPath);
+        try {
+            expect(empty.prepare('SELECT COUNT(*) AS count FROM projects').get()).toEqual({ count: 0 });
+            expect(empty.prepare('SELECT COUNT(*) AS count FROM session_rules').get()).toEqual({ count: 0 });
+        } finally {
+            empty.close();
+        }
+
+        const fixture = seededDb('elepha-rules-chat-receipt-');
+        await submit(fixture, 'elepha:rules:session:add Keep this rule.');
+        const [saved] = storedSessionRules(fixture);
+        if (!saved) throw new Error('expected a chat rule');
+        for (const prompt of [
+            'elepha:rules:session:add Another rule.',
+            `elepha:rules:session:replace ${saved.ulid} Changed.`,
+            `elepha:rules:session:remove ${saved.ulid}`,
+        ]) {
+            expect(
+                await runUserPromptSubmit(payload(fixture.projectPath, prompt), 'codex', {
+                    dbPath: fixture.dbPath,
+                    now: () => NOW,
+                    writeInjection: failedReceipt,
+                }),
+            ).toEqual({ reason: 'injection_record_failed' });
+            expect(storedSessionRules(fixture)).toEqual([saved]);
         }
     });
 });

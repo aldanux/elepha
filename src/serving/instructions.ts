@@ -29,10 +29,19 @@ export const INFO_HELP = 'elepha:info — Show elepha status: sessions here/tota
 // Named without backticks for the same reason as REMEMBER_HERE_UNCONSENTED: the
 // write-time sanitizer escapes shell syntax and the user would read the escapes.
 export const STANDING_RULES_HELP = [
-    'elepha:rules — List this project standing rules with their ids.',
+    'elepha:rules — List project standing rules and rules for this chat in this checkout.',
     'elepha:rules:add <text> — Store a new standing rule for this project.',
     'elepha:rules:remove <id> — Remove one standing rule by its full id.',
     'elepha:rules:replace <id> <text> — Replace the text of one standing rule.',
+    'elepha:rules:project — List standing rules for this project.',
+    'elepha:rules:project:add <text> — Store a project standing rule.',
+    'elepha:rules:project:remove <id> — Remove a project standing rule by its full id.',
+    'elepha:rules:project:replace <id> <text> — Replace a project standing rule.',
+    'Chat standing-rule commands are available only in Claude Code and Codex; OpenCode cannot verify chat identity yet.',
+    'elepha:rules:session — List standing rules for this chat in this checkout.',
+    'elepha:rules:session:add <text> — Store a standing rule for this chat in this checkout.',
+    'elepha:rules:session:remove <id> — Remove a chat standing rule by its full id.',
+    'elepha:rules:session:replace <id> <text> — Replace a chat standing rule.',
 ];
 export const HELP = [
     'In-chat commands:',

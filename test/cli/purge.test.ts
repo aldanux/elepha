@@ -95,24 +95,35 @@ describe('elepha purge orphan project scope', () => {
             'Only durable rule',
             '2026-09-20',
         );
+        db.prepare(
+            `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+             VALUES ('cli-chat-rule', 'codex', 'cli-chat', ?, ?, 'Only durable chat rule', '2026-09-20')`,
+        ).run(project.path, project.id);
         db.close();
         const preview = runPurgeCli(dbPath, '--project', project.path);
         expect(preview.status).toBe(0);
         expect(preview.stdout).toContain('Standing rules: 1 rule(s).');
+        expect(preview.stdout).toContain('Chat standing rules: 1 rule(s).');
+        expect(preview.stdout).toContain('cli-chat-rule');
         expect(preview.stdout).toContain(
             `cli-rule (id 1, project ${project.id}, ${JSON.stringify(project.path)}, created 2026-09-20): "Only durable rule"`,
         );
         expect(databaseRows(dbPath).standing_rules).toHaveLength(1);
         const applied = runTtyPurgeCli(dbPath, 'y\n', '--project', project.path, '--apply');
         expect(applied.status).toBe(0);
-        expect(applied.stdout).toContain('0 session(s) and 1 standing rule(s)?');
+        expect(applied.stdout).toContain('0 session(s) and 1 standing rule(s) and 1 chat standing rule(s)?');
         const [snapshot] = listManagedBackups(dbPath);
         expect(snapshot).toBeDefined();
         expect(databaseRows(snapshot!).standing_rules).toEqual([
             { id: 1, ulid: 'cli-rule', project_id: project.id, text: 'Only durable rule', created_at: '2026-09-20' },
         ]);
+        expect(databaseRows(snapshot!).session_rules).toMatchObject([
+            { ulid: 'cli-chat-rule', owner_project_id: project.id, text: 'Only durable chat rule' },
+        ]);
         expect(applied.stdout).toContain('Deleted 1 standing rule(s).');
+        expect(applied.stdout).toContain('Deleted 1 chat standing rule(s).');
         expect(databaseRows(dbPath).standing_rules).toEqual([]);
+        expect(databaseRows(dbPath).session_rules).toEqual([]);
         expect(databaseRows(dbPath).projects).toEqual([]);
     });
     it('applies only surviving previewed ids when matching sessions appear during confirmation', async () => {

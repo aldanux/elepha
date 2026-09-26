@@ -205,6 +205,96 @@ describe('MemoryStore', () => {
             expect(store.database.pragma('foreign_key_check')).toEqual([]);
         });
 
+        it('moves durable chat-rule owners before deleting a merged project row', () => {
+            const root = store.upsertProject('/chat-rules-repo');
+            const child = store.upsertProject('/chat-rules-repo/child');
+            const insert = store.database.prepare(
+                `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, 'codex', 'same-chat', '/chat-rules-repo', ?, ?, '2026-09-20')`,
+            );
+            insert.run('first-chat-rule', child.id, 'First chat rule');
+            insert.run('second-chat-rule', root.id, 'Second chat rule');
+            const before = store.database.prepare('SELECT * FROM session_rules ORDER BY id').all() as Array<Record<string, unknown>>;
+            store.rekeyProjectsByIdentity(
+                fakeResolver({ '/chat-rules-repo': '/chat-rules-repo', '/chat-rules-repo/child': '/chat-rules-repo' }),
+            );
+            expect(store.database.prepare('SELECT * FROM session_rules ORDER BY id').all()).toEqual(
+                before.map((rule) => ({ ...rule, owner_project_id: root.id })),
+            );
+            expect(store.getProjectById(child.id)).toBeUndefined();
+            expect(store.database.pragma('foreign_key_check')).toEqual([]);
+        });
+
+        it('keeps different physical checkout anchors as independent chat-rule budgets during rekey', () => {
+            const root = store.upsertProject('/independent-checkouts');
+            const child = store.upsertProject('/independent-checkouts/child');
+            store.database
+                .prepare(
+                    `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                     VALUES (?, 'codex', 'same-chat', ?, ?, 'Same text', '2026-09-20')`,
+                )
+                .run('checkout-one-rule', '/checkout-one', root.id);
+            store.database
+                .prepare(
+                    `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                     VALUES (?, 'codex', 'same-chat', ?, ?, 'Same text', '2026-09-20')`,
+                )
+                .run('checkout-two-rule', '/checkout-two', child.id);
+            expect(() =>
+                store.rekeyProjectsByIdentity(
+                    fakeResolver({
+                        '/independent-checkouts': '/independent-checkouts',
+                        '/independent-checkouts/child': '/independent-checkouts',
+                    }),
+                ),
+            ).not.toThrow();
+            expect(store.database.prepare('SELECT checkout_anchor, owner_project_id FROM session_rules ORDER BY id').all()).toEqual([
+                { checkout_anchor: '/checkout-one', owner_project_id: root.id },
+                { checkout_anchor: '/checkout-two', owner_project_id: root.id },
+            ]);
+        });
+
+        it.each(['duplicate', 'count', 'characters'] as const)(
+            'rejects a %s chat-rule scope merge before mutating any project',
+            (conflict) => {
+                const earlier = store.upsertProject('/chat-earlier');
+                const earlierChild = store.upsertProject('/chat-earlier/child');
+                const root = store.upsertProject('/chat-conflict');
+                const child = store.upsertProject('/chat-conflict/child');
+                const insert = store.database.prepare(
+                    `INSERT INTO session_rules (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                     VALUES (?, 'codex', 'same-chat', '/chat-conflict', ?, ?, '2026-09-20')`,
+                );
+                const texts =
+                    conflict === 'duplicate'
+                        ? ['same', 'same']
+                        : conflict === 'count'
+                          ? Array.from({ length: 9 }, (_, i) => `rule ${i}`)
+                          : Array.from({ length: 5 }, (_, i) => `${i}${'x'.repeat(299)}`);
+                texts.forEach((text, index) => {
+                    insert.run(`chat-conflict-${index}`, index % 2 === 0 ? root.id : child.id, text);
+                });
+                const state = () => ({
+                    projects: store.database.prepare('SELECT * FROM projects ORDER BY id').all(),
+                    rules: store.database.prepare('SELECT * FROM session_rules ORDER BY id').all(),
+                });
+                const before = state();
+                expect(() =>
+                    store.rekeyProjectsByIdentity(
+                        fakeResolver({
+                            '/chat-earlier': '/chat-earlier',
+                            '/chat-earlier/child': '/chat-earlier',
+                            '/chat-conflict': '/chat-conflict',
+                            '/chat-conflict/child': '/chat-conflict',
+                        }),
+                    ),
+                ).toThrow(/Rekey refused:.*chat rule.*chat-conflict-0/);
+                expect(state()).toEqual(before);
+                expect(store.getProjectById(earlier.id)).toBeDefined();
+                expect(store.getProjectById(earlierChild.id)).toBeDefined();
+            },
+        );
+
         it('rekeys an exactly full rule budget with escaped shell references byte-for-byte', () => {
             const root = store.upsertProject('/escaped-rules');
             const child = store.upsertProject('/escaped-rules/child');

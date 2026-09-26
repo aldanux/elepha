@@ -20,6 +20,7 @@ import {
     PORTABLE_ENCRYPTED_IMPORT_UNSUPPORTED_MESSAGE,
     reportImportError,
     runImportOperation,
+    sessionRulesImportExcludedMessage,
 } from '../../src/cli/commands/import.js';
 import * as paths from '../../src/config/paths.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
@@ -346,9 +347,33 @@ describe('standing rule project import', () => {
     it('accepts a real legacy portable candidate without standing_rules', async () => {
         const source = createTestDb('elepha-import-rules-legacy-');
         const active = createTestDb('elepha-import-rules-active-');
-        source.db.exec('DROP TABLE standing_rules');
+        source.db.exec('DROP TABLE standing_rules; DROP TABLE session_rules');
         const result = await runImportOperation(fullBackup(source, active), false, { dbPath: active.dbPath, daemonHealth: notRunning });
         expect(result.rules).toEqual({ added: 0, unchanged: 0, unmapped: 0, unconsented: 0 });
+        expect(result.excludedSessionRules).toBe(0);
+    });
+
+    it('reports chat-bound rules in a full candidate but never activates them during portable import', async () => {
+        const source = createTestDb('elepha-import-chat-rules-source-');
+        const active = createTestDb('elepha-import-chat-rules-active-');
+        const project = seedProject(source);
+        source.db
+            .prepare(
+                `INSERT INTO session_rules
+                 (ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at)
+                 VALUES (?, 'codex', ?, ?, ?, ?, ?)`,
+            )
+            .run('01J00000000000000000000004', 'incoming-chat', project.path, project.id, 'Never activate elsewhere.', '2026-09-20');
+        const candidate = fullBackup(source, active);
+        const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        try {
+            const result = await runImportOperation(candidate, false, { dbPath: active.dbPath, daemonHealth: notRunning });
+            expect(result.excludedSessionRules).toBe(1);
+            expect(log.mock.calls.filter(([message]) => message === sessionRulesImportExcludedMessage(1))).toHaveLength(2);
+            expect(tableCount(active.dbPath, 'session_rules')).toBe(0);
+        } finally {
+            log.mockRestore();
+        }
     });
 
     it('merges fragmented local membership and ignores forged exported Git authority', async () => {

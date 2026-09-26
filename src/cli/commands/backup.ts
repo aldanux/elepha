@@ -38,7 +38,7 @@ import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver, type ProjectSet } from '../../storage/project-resolver.js';
 import { errorMessage } from '../../util/error.js';
 import { ensureCreatedDirsPrivate, listRegularFiles } from '../../util/fs.js';
-import { runBackupWizard } from '../backup-wizard.js';
+import { runBackupWizard, sessionRulesExcludedMessage } from '../backup-wizard.js';
 
 const EXPORTED_TABLES = ['projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'] as const;
 
@@ -99,8 +99,15 @@ export function registerBackup(program: Command): void {
                         store,
                         defaultOutput,
                         backupAll: async (output) => exportAll(db, resolveOutput(output, defaultOutput()), exportKey, opts.force),
-                        backupProject: async (project, output) =>
-                            exportProject(db, project, resolveOutput(output, defaultOutput(project)), exportKey, opts.force),
+                        backupProject: async (project, output, reportExcludedSessionRules) =>
+                            exportProject(
+                                db,
+                                project,
+                                resolveOutput(output, defaultOutput(project)),
+                                exportKey,
+                                opts.force,
+                                reportExcludedSessionRules,
+                            ),
                     });
                     return;
                 }
@@ -122,14 +129,21 @@ export function registerBackup(program: Command): void {
                     process.exitCode = 1;
                     return;
                 }
+                let excludedSessionRules = 0;
                 const written = exportProject(
                     db,
                     resolution.project,
                     resolveOutput(opts.out, defaultOutput(resolution.project)),
                     exportKey,
                     opts.force,
+                    (count) => {
+                        excludedSessionRules = count;
+                    },
                 );
                 console.log(`Backup written to ${written}.`);
+                if (excludedSessionRules > 0) {
+                    console.log(sessionRulesExcludedMessage(excludedSessionRules));
+                }
             } finally {
                 encryptionKey?.fill(0);
                 db.close();
@@ -210,20 +224,23 @@ export function exportProject(
     destination: string,
     encryptionKey: Buffer,
     force = false,
+    reportExcludedSessionRules?: (count: number) => void,
 ): string {
     refuseActiveDatabaseDestination(source.name, destination);
     const destinationAuthorization = prepareDestination(destination, force);
     refuseActiveDatabaseDestination(source.name, destination);
+    let excludedSessionRules = 0;
     replaceDestination(
         destination,
         destinationAuthorization,
         (databasePath, identity) => {
             writeEncryptedAttachedDatabase(source, databasePath, identity, (targetSchema) => {
-                cloneProjectDatabase(source, targetSchema, project);
+                excludedSessionRules = cloneProjectDatabase(source, targetSchema, project);
             });
         },
         (databasePath, cipherSalt) => verifyEncryptedExport(databasePath, encryptionKey, EXPORTED_TABLES, cipherSalt),
     );
+    reportExcludedSessionRules?.(excludedSessionRules);
     return destination;
 }
 
@@ -1007,7 +1024,7 @@ function copyProjectRows(source: Database.Database, targetSchema: string, projec
         .run(...projectIds);
 }
 
-function cloneProjectDatabase(source: Database.Database, targetSchema: string, project: ProjectSet): void {
+function cloneProjectDatabase(source: Database.Database, targetSchema: string, project: ProjectSet): number {
     const snapshot = source.transaction(() => {
         const schema = readExportSchema(source);
         const sourceTables = new Set(schema.filter((entry) => entry.type === 'table').map((entry) => entry.name));
@@ -1016,8 +1033,18 @@ function cloneProjectDatabase(source: Database.Database, targetSchema: string, p
             throw new Error(`no such table: ${missingTable}`);
         }
         createExportTables(source, targetSchema, schema);
-        copyProjectRows(source, targetSchema, exactProjectIds(source, project));
+        const projectIds = exactProjectIds(source, project);
+        copyProjectRows(source, targetSchema, projectIds);
         createExportSecondarySchema(source, targetSchema, schema);
+        const hasSessionRules = source.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_rules'").get();
+        if (hasSessionRules === undefined) {
+            return 0;
+        }
+        const ids = projectIds.map(() => '?').join(', ');
+        const row = source.prepare(`SELECT COUNT(*) AS count FROM session_rules WHERE owner_project_id IN (${ids})`).get(...projectIds) as {
+            count: number;
+        };
+        return row.count;
     });
-    snapshot();
+    return snapshot();
 }

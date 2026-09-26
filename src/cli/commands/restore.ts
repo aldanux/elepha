@@ -7,7 +7,7 @@ import type { Command } from 'commander';
 import { PRIVATE_FILE_MODE, SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
 import { writeBackup } from '../../storage/backup.js';
-import { readCandidateStandingRules, validateCandidateSemantics } from '../../storage/candidate-validator.js';
+import { readCandidateStandingRules, scanCandidateSessionRules, validateCandidateSemantics } from '../../storage/candidate-validator.js';
 import {
     type DatabaseEncryptionRuntime,
     databaseKey,
@@ -47,6 +47,7 @@ import {
 } from '../../storage/encrypted-database-export.js';
 import { type InjectionRow, injectionBodyHash, type McpReceiptRow } from '../../storage/injection-store.js';
 import { type ParanoidControlState, readParanoidControlState } from '../../storage/paranoid-gate.js';
+import type { SessionRuleRow } from '../../storage/session-rules-store.js';
 import type { StandingRuleRow } from '../../storage/standing-rules-store.js';
 import { isToolName } from '../../types/index.js';
 import { errorMessage } from '../../util/error.js';
@@ -63,11 +64,15 @@ export const REQUIRED_RESTORE_TABLES = [
     'injections',
     'purged_transcripts',
 ] as const;
-export const RESTORE_COUNT_TABLES = [...REQUIRED_RESTORE_TABLES, 'standing_rules'] as const;
+export const RESTORE_COUNT_TABLES = [...REQUIRED_RESTORE_TABLES, 'standing_rules', 'session_rules'] as const;
 export const RESTORE_STANDING_RULES_CHANGED_ERROR =
     'Restore preview is stale because active standing rules changed. Run restore again to review the current state.';
 export const RESTORE_STANDING_RULES_STAGE_ERROR = 'Restore staging changed the validated standing rules. Nothing was installed.';
 export const RESTORE_STANDING_RULES_VERIFICATION_ERROR = 'Restored standing rules do not match the validated backup.';
+export const RESTORE_SESSION_RULES_CHANGED_ERROR =
+    'Restore preview is stale because active chat rules changed. Run restore again to review the current state.';
+export const RESTORE_SESSION_RULES_STAGE_ERROR = 'Restore staging changed the validated chat rules. Nothing was installed.';
+export const RESTORE_SESSION_RULES_VERIFICATION_ERROR = 'Restored chat rules do not match the validated backup.';
 export const RESTORE_TOMBSTONES_CHANGED_ERROR =
     'Restore preview is stale because active transcript tombstones changed. Run restore again to review the current state.';
 export const RESTORE_CONSENT_CHANGED_ERROR =
@@ -135,6 +140,7 @@ type TranscriptTombstones = Record<TombstoneTable, TranscriptIdentity[]>;
 type TranscriptTombstonePlan = { tombstones: TranscriptTombstones; fingerprint: string };
 type ConsentPlan = { roots: ConsentRoot[]; fingerprint: string };
 type LogicalPlan<T> = { rows: T[]; fingerprint: string };
+type SessionRulesPlan = { count: number; fingerprint: string };
 type TerminalEvictionPlan = LogicalPlan<TerminalEvictionAnchor>;
 type InjectionPlanRow = Omit<InjectionRow, 'id'>;
 type McpReceiptPlanRow = Omit<McpReceiptRow, 'id'>;
@@ -182,11 +188,11 @@ function quoteTable(table: RestoreCountTable): string {
 }
 
 function candidateCounts(db: Database.Database): RestoreCounts {
-    const hasRules = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'standing_rules'").get() !== undefined;
+    const hasTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
     return Object.fromEntries(
         RESTORE_COUNT_TABLES.map((table) => [
             table,
-            table === 'standing_rules' && !hasRules
+            (table === 'standing_rules' || table === 'session_rules') && hasTable.get(table) === undefined
                 ? 0
                 : Number((db.prepare(`SELECT COUNT(*) AS count FROM ${quoteTable(table)}`).get() as { count: number }).count),
         ]),
@@ -442,6 +448,7 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
             throw new Error(`Backup is semantically invalid: ${semanticViolations.join('; ')}`);
         }
         readCandidateStandingRules(staged, 'restore');
+        scanCandidateSessionRules(staged);
         normalizeAndVerifyDurableCapture(staged);
     } finally {
         canonical?.close();
@@ -449,7 +456,12 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
     }
 }
 
-function verifyDatabase(db: Database.Database, expectedCounts: RestoreCounts, expectedRulesFingerprint?: string): string[] {
+function verifyDatabase(
+    db: Database.Database,
+    expectedCounts: RestoreCounts,
+    expectedRulesFingerprint?: string,
+    expectedSessionRulesFingerprint?: string,
+): string[] {
     const missing = missingRequiredTables(db);
     const errors = missing.length > 0 ? [`missing required table(s): ${missing.join(', ')}`] : [];
     if (missing.length > 0) {
@@ -475,6 +487,12 @@ function verifyDatabase(db: Database.Database, expectedCounts: RestoreCounts, ex
             errors.push(RESTORE_STANDING_RULES_VERIFICATION_ERROR);
         }
     }
+    if (expectedSessionRulesFingerprint !== undefined) {
+        const hasRules = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_rules'").get() !== undefined;
+        if (!hasRules || sessionRulesPlan(db).fingerprint !== expectedSessionRulesFingerprint) {
+            errors.push(RESTORE_SESSION_RULES_VERIFICATION_ERROR);
+        }
+    }
     return errors;
 }
 
@@ -494,6 +512,7 @@ function validateCandidate(candidate: Database.Database, candidatePath: string):
                 validationError = `Backup is incomplete (missing required table(s): ${missing.join(', ')}). Project exports cannot be restored; use the future elepha import command instead.`;
             } else {
                 readCandidateStandingRules(candidate, 'restore');
+                scanCandidateSessionRules(candidate);
                 counts = candidateCounts(candidate);
                 const errors = verifyDatabase(candidate, counts);
                 if (errors.length > 0) {
@@ -545,6 +564,7 @@ function printPreview(
     counts: RestoreCounts,
     tombstones: TranscriptTombstones,
     activeRules: number,
+    activeSessionRules: number,
 ): void {
     console.log(`Restore preview: ${candidatePath}`);
     console.log(`Active database: ${dbPath}`);
@@ -553,6 +573,7 @@ function printPreview(
         console.log(`  ${table}: ${counts[table]}`);
     }
     console.log(`Standing rules replacement: ${activeRules} active -> ${counts.standing_rules} candidate.`);
+    console.log(`Chat rules replacement: ${activeSessionRules} active -> ${counts.session_rules} candidate.`);
     console.log(
         `Carried tombstones: purged_transcripts: ${tombstones.purged_transcripts.length}, incognito_transcripts: ${tombstones.incognito_transcripts.length}`,
     );
@@ -678,6 +699,39 @@ function standingRulesPlan(db: Database.Database, validate = false): LogicalPlan
     );
 }
 
+function sessionRulesPlan(db: Database.Database, validate = false): SessionRulesPlan {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_rules'").get();
+    if (validate) {
+        if (exists === undefined) {
+            throw new Error(RESTORE_SESSION_RULES_STAGE_ERROR);
+        }
+    }
+    const hash = createHash('sha256');
+    let count = 0;
+    const include = (row: SessionRuleRow) => {
+        hash.update(JSON.stringify(row));
+        hash.update('\n');
+        count++;
+    };
+    if (exists !== undefined) {
+        if (validate) {
+            scanCandidateSessionRules(db, include);
+        } else {
+            const rows = db
+                .prepare(
+                    `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
+                     FROM session_rules INDEXED BY idx_session_rules_scope
+                     ORDER BY tool, native_session_id, checkout_anchor, owner_project_id, id`,
+                )
+                .iterate() as Iterable<SessionRuleRow>;
+            for (const row of rows) {
+                include(row);
+            }
+        }
+    }
+    return { count, fingerprint: hash.digest('hex') };
+}
+
 async function activeStandingRules(
     dbPath: string,
     encryption?: DatabaseEncryptionRuntime,
@@ -694,6 +748,22 @@ async function activeStandingRules(
     }
 }
 
+async function activeSessionRules(
+    dbPath: string,
+    encryption?: DatabaseEncryptionRuntime,
+    lifecycle?: ExclusiveDatabaseLifecycleLease,
+): Promise<SessionRulesPlan> {
+    if (!existsSync(dbPath)) {
+        return { count: 0, fingerprint: createHash('sha256').digest('hex') };
+    }
+    const db = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
+    try {
+        return sessionRulesPlan(db);
+    } finally {
+        db.close();
+    }
+}
+
 function stagedStandingRules(stagedPath: string, key?: Buffer): LogicalPlan<StandingRuleRow> {
     // The stage is our private copy. A writable handle closes its empty WAL
     // bookkeeping; a read-only WAL reader can leave sidecars that correctly
@@ -702,6 +772,16 @@ function stagedStandingRules(stagedPath: string, key?: Buffer): LogicalPlan<Stan
         key === undefined ? new Database(stagedPath, { fileMustExist: true }) : openKeyedDatabase(stagedPath, key, { fileMustExist: true });
     try {
         return standingRulesPlan(db, true);
+    } finally {
+        db.close();
+    }
+}
+
+function stagedSessionRules(stagedPath: string, key?: Buffer): SessionRulesPlan {
+    const db =
+        key === undefined ? new Database(stagedPath, { fileMustExist: true }) : openKeyedDatabase(stagedPath, key, { fileMustExist: true });
+    try {
+        return sessionRulesPlan(db, true);
     } finally {
         db.close();
     }
@@ -890,6 +970,7 @@ function overlayControlState(
     key?: Buffer,
     controls?: RestoreControls,
     expectedRulesFingerprint?: string,
+    expectedSessionRulesFingerprint?: string,
 ) {
     const restored = key === undefined ? openUnmanagedDb(stagedPath) : openKeyedDatabase(stagedPath, key);
     try {
@@ -1039,6 +1120,12 @@ function overlayControlState(
         if (expectedRulesFingerprint !== undefined && standingRulesPlan(restored, true).fingerprint !== expectedRulesFingerprint) {
             throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
         }
+        if (
+            expectedSessionRulesFingerprint !== undefined &&
+            sessionRulesPlan(restored, true).fingerprint !== expectedSessionRulesFingerprint
+        ) {
+            throw new Error(RESTORE_SESSION_RULES_STAGE_ERROR);
+        }
         const checkpoint = restored.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
         if (checkpoint[0]?.busy !== 0) {
             throw new Error('Could not checkpoint restored control state.');
@@ -1087,12 +1174,13 @@ async function verifyRestoredDatabase(
     dbPath: string,
     expectedCounts: RestoreCounts,
     expectedRulesFingerprint: string,
+    expectedSessionRulesFingerprint: string,
     lifecycle: ExclusiveDatabaseLifecycleLease,
     encryption?: DatabaseEncryptionRuntime,
 ): Promise<void> {
     const restored = await openManagedDatabase(dbPath, { readonly: true, fileMustExist: true, encryption, lifecycle });
     try {
-        const errors = verifyDatabase(restored, expectedCounts, expectedRulesFingerprint);
+        const errors = verifyDatabase(restored, expectedCounts, expectedRulesFingerprint, expectedSessionRulesFingerprint);
         if (errors.length > 0) {
             throw new Error(errors.join('; '));
         }
@@ -1181,6 +1269,10 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         if (candidateRules.rows.length !== counts.standing_rules) {
             throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
         }
+        const candidateSessionRules = stagedSessionRules(stagedPath, retainedEncryption?.key ?? candidateKey);
+        if (candidateSessionRules.count !== counts.session_rules) {
+            throw new Error(RESTORE_SESSION_RULES_STAGE_ERROR);
+        }
         const expectedStageHash = await validatedStageHash(stagedPath);
         const health = (runtime.daemonHealth ?? currentDaemonHealth)();
         if (health.healthy) {
@@ -1193,7 +1285,8 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
         const currentConsentPlan = await activeConsent(dbPath, runtime.encryption);
         const controlPlan = await activeRestoreControls(dbPath, runtime.encryption, retainedEncryption !== undefined);
         const activeRules = await activeStandingRules(dbPath, runtime.encryption);
-        printPreview(dbPath, candidatePath, counts, tombstonePlan.tombstones, activeRules.rows.length);
+        const activeChatRules = await activeSessionRules(dbPath, runtime.encryption);
+        printPreview(dbPath, candidatePath, counts, tombstonePlan.tombstones, activeRules.rows.length, activeChatRules.count);
         if (runtime.confirm && !(await runtime.confirm())) {
             return { cancelled: true };
         }
@@ -1228,6 +1321,9 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
             if ((await activeStandingRules(dbPath, runtime.encryption, lifecycle)).fingerprint !== activeRules.fingerprint) {
                 throw new Error(RESTORE_STANDING_RULES_CHANGED_ERROR);
             }
+            if ((await activeSessionRules(dbPath, runtime.encryption, lifecycle)).fingerprint !== activeChatRules.fingerprint) {
+                throw new Error(RESTORE_SESSION_RULES_CHANGED_ERROR);
+            }
             if ((await validatedStageHash(stagedPath)) !== expectedStageHash) {
                 throw new Error(RESTORE_STAGE_CHANGED_ERROR);
             }
@@ -1238,6 +1334,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 retainedEncryption?.key ?? candidateKey,
                 confirmedControls,
                 candidateRules.fingerprint,
+                candidateSessionRules.fingerprint,
             );
             removeDatabaseCompanions([stagedPath]);
             if (retainedEncryption !== undefined) {
@@ -1262,10 +1359,17 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                     //noinspection ExceptionCaughtLocallyJS
                     throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
                 }
+                if (
+                    stagedSessionRules(stagedPath, retainedEncryption?.key ?? candidateKey).fingerprint !==
+                    candidateSessionRules.fingerprint
+                ) {
+                    //noinspection ExceptionCaughtLocallyJS
+                    throw new Error(RESTORE_SESSION_RULES_STAGE_ERROR);
+                }
             } catch (error) {
                 // Unreadable whole-file corruption retains the existing install
                 // hash failure and atomic rollback contract. This additional
-                // guard classifies only readable standing-rule mutations.
+                // guard classifies only readable standing-rule and chat-rule mutations.
                 if ((error as { code?: string }).code !== 'SQLITE_NOTADB') {
                     throw error;
                 }
@@ -1277,7 +1381,14 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 const installedHash = await sha256File(dbPath);
                 assertInstalledRestoreHash(installedHash, installStageHash);
                 removeAndVerifyDatabaseCompanions(dbPath, lifecycle);
-                await verifyRestoredDatabase(dbPath, overlay.counts, candidateRules.fingerprint, lifecycle, runtime.encryption);
+                await verifyRestoredDatabase(
+                    dbPath,
+                    overlay.counts,
+                    candidateRules.fingerprint,
+                    candidateSessionRules.fingerprint,
+                    lifecycle,
+                    runtime.encryption,
+                );
                 if (retainedEncryption !== undefined) {
                     await assertActiveEncryption(retainedEncryption, dbPath, lifecycle, runtime.encryption);
                 } else {

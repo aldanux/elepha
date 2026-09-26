@@ -8,10 +8,16 @@ import type { HookSource } from '../../src/hooks/common.js';
 import { runSessionStart, type SessionStartDependencies } from '../../src/hooks/session-start.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import * as subprocess from '../../src/security/subprocess-allowlist.js';
-import { STANDING_RULES_AUTHORITY, STANDING_RULES_INVALID } from '../../src/serving/standing-rules.js';
+import {
+    SESSION_RULES_AUTHORITY,
+    SESSION_RULES_INVALID,
+    STANDING_RULES_AUTHORITY,
+    STANDING_RULES_INVALID,
+} from '../../src/serving/standing-rules.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { SessionRulesStore } from '../../src/storage/session-rules-store.js';
 import { createTestDb, seedConsentRoot, seedProject } from '../helpers/db.js';
 import { fixtureGitEnv } from '../helpers/git.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
@@ -41,15 +47,35 @@ function fixture(texts = ['Use Foo.', 'Keep shell references such as $(example) 
     return { ...f, cwd, project, rules };
 }
 
-function payload(cwd: string, source: HookSource = 'startup'): string {
+function payload(cwd: string, source: HookSource = 'startup', sessionId = 'rules-chat'): string {
     return JSON.stringify({
-        session_id: 'rules-chat',
+        session_id: sessionId,
         cwd,
         hook_event_name: 'SessionStart',
         source,
         model: 'test',
         permission_mode: 'default',
     });
+}
+
+function addChatRule(dbPath: string, projectId: number, cwd: string, tool: 'claude-code' | 'codex' | 'opencode', text: string): void {
+    const db = openUnmanagedDb(dbPath);
+    try {
+        expect(
+            new SessionRulesStore(db).add(
+                {
+                    identity: { tool, nativeSessionId: 'rules-chat', checkoutAnchor: cwd },
+                    projectIds: [projectId],
+                    ownerProjectId: projectId,
+                    stillAuthorized: () => true,
+                },
+                text,
+                ISO,
+            ).status,
+        ).toBe('added');
+    } finally {
+        db.close();
+    }
 }
 
 function channels(result: Awaited<ReturnType<typeof runSessionStart>>) {
@@ -79,6 +105,7 @@ describe('SessionStart standing rules', () => {
     for (const tool of ['claude-code', 'codex'] as const) {
         it(`keeps ${tool} child SessionStart output out of the parent's session`, async () => {
             const f = fixture(['Parent rule.']);
+            addChatRule(f.dbPath, f.project.id, f.cwd, tool, 'Parent chat rule.');
             const openDatabase = vi.fn(async (dbPath: string) => openUnmanagedDb(dbPath));
             const daemonHealth = vi.fn(() => ({ state: 'STUCK' as const, healthy: false }));
             const readUpdateAvailable = vi.fn(() => ({ version: '99.0.0', checkedAt: ISO }));
@@ -112,6 +139,7 @@ describe('SessionStart standing rules', () => {
                 }),
             );
             expect(result.rules).toContain('Parent rule.');
+            expect(result.rules).toContain('Parent chat rule.');
             expect(result.notice).toContain('capture may be stalled');
             expect(openDatabase).toHaveBeenCalledTimes(1);
 
@@ -159,6 +187,63 @@ describe('SessionStart standing rules', () => {
             expect(unwrapped(channels(fromPeer).rules ?? '', 'rules')).toBe(expected);
             expect(records(f.dbPath).map(({ body }) => body)).toEqual([expected]);
         }
+    });
+
+    it('binds chat rules to the caller physical Git checkout, not the logical project representative', async () => {
+        const directory = withGrantableTestDir('elepha-session-rules-checkouts-');
+        const firstPath = path.join(directory, 'first');
+        const secondPath = path.join(directory, 'second');
+        for (const checkout of [firstPath, secondPath]) {
+            fs.mkdirSync(checkout);
+            execFileSync('git', ['-c', 'init.templateDir=/dev/null', 'init', '-q', checkout], { env: fixtureGitEnv() });
+        }
+        const f = createTestDb('elepha-session-rules-checkouts-db-');
+        const first = seedProject(f, { path: firstPath });
+        const second = seedProject(f, { path: secondPath });
+        f.db.prepare('UPDATE projects SET git_remote = ? WHERE id IN (?, ?)').run('https://example.test/shared', first.id, second.id);
+        seedConsentRoot(f, { path: firstPath });
+        seedConsentRoot(f, { path: secondPath });
+        expect(
+            f.store.standingRules.add(
+                { projectIds: [first.id, second.id], ownerProjectId: first.id, stillConsented: () => true },
+                'Shared project rule.',
+                ISO,
+            ).status,
+        ).toBe('added');
+        f.close();
+        addChatRule(f.dbPath, first.id, firstPath, 'codex', 'First checkout only.');
+        const firstOutput = channels(await runSessionStart(payload(firstPath), 'codex', { ...QUIET, dbPath: f.dbPath }));
+        expect(unwrapped(firstOutput.rules ?? '', 'rules')).toBe(
+            `${STANDING_RULES_AUTHORITY}\n- Shared project rule.\n\n${SESSION_RULES_AUTHORITY}\n- First checkout only.`,
+        );
+        const secondOutput = channels(await runSessionStart(payload(secondPath), 'codex', { ...QUIET, dbPath: f.dbPath }));
+        expect(unwrapped(secondOutput.rules ?? '', 'rules')).toBe(`${STANDING_RULES_AUTHORITY}\n- Shared project rule.`);
+    });
+
+    it('delivers a first-use rootless chat rule from nested cwd in the same checkout', async () => {
+        const first = createTestDb('elepha-session-rules-first-chat-db-');
+        const projectPath = withGrantableTestDir('elepha-session-rules-first-chat-');
+        const nested = path.join(projectPath, 'nested');
+        fs.mkdirSync(nested);
+        seedConsentRoot(first, { path: projectPath });
+        first.close();
+        const added = await runUserPromptSubmit(
+            JSON.stringify({
+                session_id: 'rules-chat',
+                cwd: projectPath,
+                hook_event_name: 'UserPromptSubmit',
+                prompt: 'elepha:rules:session:add Keep this chat in this checkout.',
+                model: 'test',
+                permission_mode: 'default',
+            }),
+            'codex',
+            { dbPath: first.dbPath, now: () => NOW },
+        );
+        expect(added).toHaveProperty('output');
+        const result = channels(await runSessionStart(payload(nested, 'resume'), 'codex', { ...QUIET, dbPath: first.dbPath }));
+        expect(unwrapped(result.rules ?? '', 'rules')).toBe(`${SESSION_RULES_AUTHORITY}\n- Keep this chat in this checkout.`);
+        const other = await runSessionStart(payload(nested, 'startup', 'other-chat'), 'codex', { ...QUIET, dbPath: first.dbPath });
+        expect(other).toEqual({ reason: 'no_notice' });
     });
 
     it('delivers rules with an approved same-identity worktree missing from disk', async () => {
@@ -343,6 +428,38 @@ describe('SessionStart standing rules', () => {
             for (const rule of f.rules) expect(result.rules).not.toContain(rule.ulid);
         });
 
+        it(`delivers ${tool} chat rules for the same native chat across startup, compact and resume only`, async () => {
+            const f = fixture(['Project rule.']);
+            addChatRule(f.dbPath, f.project.id, f.cwd, tool, 'This chat only.');
+            const combined = `${STANDING_RULES_AUTHORITY}\n- Project rule.\n\n${SESSION_RULES_AUTHORITY}\n- This chat only.`;
+            for (const source of ['startup', 'compact', 'resume'] as const) {
+                const result = channels(await runSessionStart(payload(f.cwd, source), tool, { ...QUIET, dbPath: f.dbPath }));
+                expect(unwrapped(result.rules ?? '', 'rules')).toBe(combined);
+            }
+            for (const source of ['startup', 'clear', ...(tool === 'claude-code' ? ['fork' as const] : [])] as HookSource[]) {
+                const result = channels(await runSessionStart(payload(f.cwd, source, 'new-chat'), tool, { ...QUIET, dbPath: f.dbPath }));
+                expect(unwrapped(result.rules ?? '', 'rules')).toBe(`${STANDING_RULES_AUTHORITY}\n- Project rule.`);
+            }
+            const db = openUnmanagedDb(f.dbPath);
+            try {
+                const recorded = new MemoryStore(db).injectionsForSession(tool, 'rules-chat', ISO);
+                expect(recorded.map(({ body }) => body)).toEqual([combined]);
+                expect(
+                    new MemoryStore(db).injectionsForSession(tool, 'new-chat', ISO).every(({ body }) => !body.includes('This chat only.')),
+                ).toBe(true);
+            } finally {
+                db.close();
+            }
+        });
+
+        it(`delivers ${tool} chat rules without project rules or notices`, async () => {
+            const f = fixture([]);
+            addChatRule(f.dbPath, f.project.id, f.cwd, tool, 'Only an explicit chat rule.');
+            const result = channels(await runSessionStart(payload(f.cwd), tool, { ...QUIET, dbPath: f.dbPath }));
+            expect(unwrapped(result.rules ?? '', 'rules')).toBe(`${SESSION_RULES_AUTHORITY}\n- Only an explicit chat rule.`);
+            expect(result.notice).toBeUndefined();
+        });
+
         it(`records both ${tool} channels independently without mixing their bodies`, async () => {
             const f = fixture();
             const result = channels(
@@ -396,6 +513,52 @@ describe('SessionStart standing rules', () => {
         expect(records(f.dbPath)[0].body.length).toBe(
             STANDING_RULES_AUTHORITY.length + STANDING_RULES_MAX_TOTAL_CHARS + 3 * STANDING_RULES_MAX_ACTIVE,
         );
+    });
+
+    it('keeps valid project rules when the chat-rule aggregate is invalid', async () => {
+        const f = fixture(['Project rule.']);
+        addChatRule(f.dbPath, f.project.id, f.cwd, 'codex', 'Chat rule.');
+        const db = openUnmanagedDb(f.dbPath);
+        db.prepare("UPDATE session_rules SET text = ''").run();
+        db.close();
+        const logs: string[] = [];
+        const result = channels(
+            await runSessionStart(payload(f.cwd), 'codex', { ...QUIET, dbPath: f.dbPath, log: (line) => logs.push(line) }),
+        );
+        expect(result.rules).toContain('Project rule.');
+        expect(result.rules).not.toContain('Chat rule.');
+        expect(records(f.dbPath).map((row) => row.body)).toEqual([`${STANDING_RULES_AUTHORITY}\n- Project rule.`]);
+        expect(logs).toContain(`session-start codex source=startup session_id=rules-chat: skipped reason=${SESSION_RULES_INVALID}`);
+    });
+
+    it('reports an invalid chat-only aggregate without emitting rules', async () => {
+        const f = fixture([]);
+        addChatRule(f.dbPath, f.project.id, f.cwd, 'codex', 'Chat rule.');
+        const db = openUnmanagedDb(f.dbPath);
+        db.prepare("UPDATE session_rules SET text = ''").run();
+        db.close();
+        const logs: string[] = [];
+        expect(await runSessionStart(payload(f.cwd), 'codex', { ...QUIET, dbPath: f.dbPath, log: (line) => logs.push(line) })).toEqual({
+            reason: SESSION_RULES_INVALID,
+        });
+        expect(records(f.dbPath)).toEqual([]);
+        expect(logs).toContain(`session-start codex source=startup session_id=rules-chat: skipped reason=${SESSION_RULES_INVALID}`);
+    });
+
+    it('records the complete chat-rule delivery atomically or emits nothing', async () => {
+        const f = fixture([]);
+        addChatRule(f.dbPath, f.project.id, f.cwd, 'codex', 'Private chat rule.');
+        const result = await runSessionStart(payload(f.cwd), 'codex', {
+            ...QUIET,
+            dbPath: f.dbPath,
+            writeInjection: (store, input) => {
+                expect(store.database.inTransaction).toBe(true);
+                store.recordInjection(input);
+                return false;
+            },
+        });
+        expect(result).toEqual({ reason: 'injection_record_failed' });
+        expect(records(f.dbPath)).toEqual([]);
     });
 
     it.each(['count', 'total', 'single', 'empty', 'malformed'])(
