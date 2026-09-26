@@ -31,6 +31,9 @@ export interface SessionStartPayload extends CommonHookPayload {
 export interface UserPromptSubmitPayload extends CommonHookPayload {
     hook_event_name: 'UserPromptSubmit';
     prompt: string;
+    // Set only by the OpenCode plugin after the host session lookup proved a
+    // top-level chat. Absent means chat-scoped rules stay unavailable.
+    session_root?: true;
 }
 
 export type HookPayload = SessionStartPayload | UserPromptSubmitPayload;
@@ -104,7 +107,14 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
     if (typeof payload.prompt !== 'string') {
         return undefined;
     }
-    return { ...common, hook_event_name: 'UserPromptSubmit', prompt: payload.prompt };
+    // Other tools never send this field; it cannot grant them anything.
+    if (tool !== 'opencode' || !Object.hasOwn(payload, 'session_root')) {
+        return { ...common, hook_event_name: 'UserPromptSubmit', prompt: payload.prompt };
+    }
+    if (payload.session_root !== true) {
+        return undefined;
+    }
+    return { ...common, hook_event_name: 'UserPromptSubmit', prompt: payload.prompt, session_root: true };
 }
 
 export function consentedProject(db: Database.Database, cwd: string): ProjectSet | undefined {

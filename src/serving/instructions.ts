@@ -37,7 +37,7 @@ export const STANDING_RULES_HELP = [
     'elepha:rules:project:add <text> — Store a project standing rule.',
     'elepha:rules:project:remove <id> — Remove a project standing rule by its full id.',
     'elepha:rules:project:replace <id> <text> — Replace a project standing rule.',
-    'Chat standing-rule commands are available only in Claude Code and Codex; OpenCode cannot verify chat identity yet.',
+    'Chat standing-rule commands are available in Claude Code, Codex and top-level OpenCode chats; OpenCode subagent sessions cannot use them.',
     'elepha:rules:session — List standing rules for this chat in this checkout.',
     'elepha:rules:session:add <text> — Store a standing rule for this chat in this checkout.',
     'elepha:rules:session:remove <id> — Remove a chat standing rule by its full id.',
