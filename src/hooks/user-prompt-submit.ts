@@ -265,6 +265,13 @@ export async function runUserPromptSubmit(
         log(promptLogLine(tool, payload, 'failed reason=invalid_payload'));
         return { reason: 'invalid_payload' };
     }
+    // Claude and Codex subagent hooks can carry the parent's session_id.
+    // Without a verified child transcript identity, even a read-only command
+    // would record its output or list cursor against the parent chat.
+    if (payload.agent_id !== undefined) {
+        log(promptLogLine(tool, payload, 'discarded reason=subagent_context'));
+        return { reason: 'subagent_context' };
+    }
     const command = parseUserPromptCommand(payload.prompt);
     // A pasted multiline command result is conversation data, not an invalid command.
     if (!command && payload.prompt.trim().startsWith('elepha:') && /[\r\n]/.test(payload.prompt.trim())) {
