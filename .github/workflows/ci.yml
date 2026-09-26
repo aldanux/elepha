@@ -68,7 +68,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Smoke check encrypted SQLite prebuild
-        run: node .github/scripts/encrypted-sqlite-smoke.mjs
+        run: node .github/scripts/encrypted_sqlite_smoke.mjs
 
       - name: Build
         run: npm run build
