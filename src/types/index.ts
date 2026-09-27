@@ -96,6 +96,11 @@ export interface ParsedTurn {
     resumeMarkerBefore: boolean;
     // Present only for a complete turn the adapter withheld from persistence.
     droppedReason?: 'sentinel' | 'empty' | 'elepha-mcp';
+    // Present when the turn opened on a boundary line whose text earlier
+    // parses stored as turn content and current parses discard (Claude
+    // Code's compact summary). Structural evidence for repairing rows that
+    // still carry that retired text; never persisted.
+    formerlyStoredBoundary?: true;
     // Private ingestion evidence. It is consumed transactionally with a
     // dropped cursor and must never enter memories, rendering, or exports.
     elephaMcpResultReceipts?: ElephaMcpResultReceipt[];

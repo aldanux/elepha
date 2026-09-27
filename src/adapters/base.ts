@@ -389,6 +389,10 @@ export interface TurnBuilderState {
     explicitLifecycleFinished: boolean;
     explicitLifecycleAborted: boolean;
     explicitLifecycleFailedAt: string | undefined;
+    // Set by an adapter whose boundary line was once stored as a turn but
+    // now contributes no text. If nothing follows it, the turn still closes
+    // as a dropped empty turn so later turns keep their persisted indexes.
+    keepsIndexWhenEmpty: boolean;
 }
 
 export interface TurnLifecycleSignal {
@@ -530,6 +534,7 @@ function freshState(): TurnBuilderState {
         explicitLifecycleFinished: false,
         explicitLifecycleAborted: false,
         explicitLifecycleFailedAt: undefined,
+        keepsIndexWhenEmpty: false,
     };
 }
 
@@ -749,6 +754,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                     gitBranch: state.gitBranch,
                     hasExternalContent: state.hasExternalContent,
                     resumeMarkerBefore: state.resumeMarkerBefore,
+                    ...(state.keepsIndexWhenEmpty ? { formerlyStoredBoundary: true as const } : {}),
                 };
                 if (
                     state.elephaMcpCallIds.size === 0 &&
@@ -971,6 +977,9 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                             } else {
                                 yield turn;
                             }
+                        } else if (closed?.keepsIndexWhenEmpty) {
+                            const turn = await parsedTurn(closed, lifecycleStart?.byteStart ?? line.byteStart);
+                            yield { ...turn, droppedReason: turn.droppedReason ?? 'empty' };
                         }
                     }
 

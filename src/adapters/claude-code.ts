@@ -8,6 +8,13 @@
 // they're skipped rather than folded. Local-command wrapper lines
 // (<local-command-caveat>, <command-name>, <local-command-stdout>, ...) and
 // isMeta lines are bookkeeping and are skipped too, never open a turn.
+// isCompactSummary lines are generated context, not human input: they still
+// mark a turn boundary, because an automatic compact lets the assistant
+// continue with no new prompt, but their text is never folded. A manual
+// compact followed by a real prompt thus leaves only an empty synthetic
+// state, which the next boundary closes as a dropped empty turn: earlier
+// parses stored the summary as a turn, so it keeps occupying that index and
+// later turns keep the identities already persisted for them.
 //
 // Every top-level line type this adapter treats as skip is listed explicitly
 // in KNOWN_SKIP_TYPES (verified against real ~/.claude/projects transcripts).
@@ -114,6 +121,7 @@ interface CCLine {
     cwd?: string;
     timestamp?: string;
     isMeta?: boolean;
+    isCompactSummary?: boolean;
     entrypoint?: string;
     gitBranch?: string;
     customTitle?: string;
@@ -133,7 +141,17 @@ function isPureToolResult(content: CCContentBlock[]): boolean {
     return content.length > 0 && content.every((b) => b.type === 'tool_result');
 }
 
+// Claude Code writes its generated compact summary as a user-shaped line
+// after a compact_boundary. The structural flag identifies it; wording does
+// not, since a human may paste the same text.
+function isCompactSummary(line: CCLine): boolean {
+    return line.type === 'user' && line.isCompactSummary === true;
+}
+
 function emptySessionSignals(line: CCLine): EmptySessionSignals {
+    if (isCompactSummary(line)) {
+        return {};
+    }
     const role = line.message?.role;
     const isUser = role === 'user';
     const values = textValues(line.message?.content);
@@ -259,6 +277,9 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
     protected classify(line: unknown, filePath: string): LineClass {
         const l = line as CCLine;
         if (l.type === 'user') {
+            if (isCompactSummary(l)) {
+                return 'boundary';
+            }
             if (l.isMeta) {
                 return 'skip';
             }
@@ -398,6 +419,10 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
         }
 
         if (l.type === 'user') {
+            if (isCompactSummary(l)) {
+                state.keepsIndexWhenEmpty = true;
+                return;
+            }
             if (typeof content === 'string') {
                 state.userMessageParts.push(content);
             } else {

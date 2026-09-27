@@ -163,6 +163,225 @@ describe('ClaudeCodeAdapter.parseTurns against fixture', () => {
     });
 });
 
+describe('ClaudeCodeAdapter compact summary', () => {
+    const summary = 'This session is being continued from a previous conversation that ran out of context.';
+    const line = (value: Record<string, unknown>) => JSON.stringify({ cwd: '/Users/test/demo-project', sessionId: 'compact', ...value });
+
+    function writeCompacted(summaryFlags: Record<string, unknown>): string {
+        const dir = withTempDir('elepha-compact-');
+        const file = path.join(dir, 'session.jsonl');
+        writeFileSync(
+            file,
+            [
+                line({ type: 'system', subtype: 'compact_boundary', timestamp: '2026-08-01T00:00:00.000Z' }),
+                line({
+                    type: 'user',
+                    timestamp: '2026-08-01T00:00:01.000Z',
+                    ...summaryFlags,
+                    message: { role: 'user', content: summary },
+                }),
+                line({ type: 'user', timestamp: '2026-08-01T00:00:02.000Z', message: { role: 'user', content: 'Next step' } }),
+                line({
+                    type: 'assistant',
+                    timestamp: '2026-08-01T00:00:03.000Z',
+                    message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
+                }),
+            ]
+                .map((l) => `${l}\n`)
+                .join(''),
+        );
+        return file;
+    }
+
+    // The structural marker decides, not the wording: Claude Code writes
+    // the generated summary as a user-shaped line after compact_boundary.
+    // Earlier parses stored that summary as its own turn, so the boundary
+    // still occupies its index as a dropped empty turn: later turns keep the
+    // identities already persisted for them.
+    it('drops the isCompactSummary line as an empty turn that keeps its historical index', async () => {
+        const file = writeCompacted({ isCompactSummary: true, isVisibleInTranscriptOnly: true });
+        const turns = await collect(new ClaudeCodeAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+
+        expect(turns.map((t) => [t.turnIndex, t.userMessage, t.assistantText, t.droppedReason])).toEqual([
+            [0, '', '', 'empty'],
+            [1, 'Next step', 'Done.', undefined],
+        ]);
+    });
+
+    // The daemon persists a dropped turn's cursor without storing memory, so
+    // a resume from it must start after the gap, at the next historical index.
+    it('resumes after the dropped compact turn at the next historical index', async () => {
+        const file = writeCompacted({ isCompactSummary: true, isVisibleInTranscriptOnly: true });
+        const adapter = new ClaudeCodeAdapter();
+        const full = await collect(adapter.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+        const resumed = await collect(adapter.parseTurns(file, full[0]!.cursor, { closeTrailingOnIdle: true }));
+
+        expect(resumed.map((t) => [t.turnIndex, t.userMessage, t.droppedReason, t.cursor])).toEqual([
+            [1, 'Next step', undefined, full[1]!.cursor],
+        ]);
+    });
+
+    it('agrees with a full parse when a manual compact arrives after an incremental cursor', async () => {
+        const dir = withTempDir('elepha-compact-manual-resume-');
+        const file = path.join(dir, 'session.jsonl');
+        writeFileSync(file, precompact());
+        const adapter = new ClaudeCodeAdapter();
+        const first = await collect(adapter.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+        expect(first.map((t) => t.userMessage)).toEqual(['First prompt']);
+
+        appendFileSync(
+            file,
+            [
+                line({
+                    type: 'user',
+                    timestamp: '2026-08-01T00:00:03.000Z',
+                    isCompactSummary: true,
+                    isVisibleInTranscriptOnly: true,
+                    message: { role: 'user', content: summary },
+                }),
+            ]
+                .map((l) => `${l}\n`)
+                .join(''),
+        );
+        // A lone summary has no assistant reply yet, so it stays open exactly
+        // like the old summary turn did.
+        expect(await collect(adapter.parseTurns(file, first[0]!.cursor, { closeTrailingOnIdle: true }))).toEqual([]);
+
+        appendFileSync(
+            file,
+            [
+                line({ type: 'user', timestamp: '2026-08-01T00:00:04.000Z', message: { role: 'user', content: 'Next step' } }),
+                line({
+                    type: 'assistant',
+                    timestamp: '2026-08-01T00:00:05.000Z',
+                    message: { role: 'assistant', content: [{ type: 'text', text: 'Done.' }] },
+                }),
+            ]
+                .map((l) => `${l}\n`)
+                .join(''),
+        );
+        const resumed = await collect(adapter.parseTurns(file, first[0]!.cursor, { closeTrailingOnIdle: true }));
+        const full = await collect(adapter.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+
+        const shape = (t: ParsedTurn) => [t.turnIndex, t.userMessage, t.assistantText, t.droppedReason, t.cursor];
+        expect(resumed.map(shape)).toEqual([
+            [1, '', '', 'empty', full[1]!.cursor],
+            [2, 'Next step', 'Done.', undefined, full[2]!.cursor],
+        ]);
+        expect(full.slice(1).map(shape)).toEqual(resumed.map(shape));
+        expect(full.some((t) => t.userMessage.includes(summary))).toBe(false);
+    });
+
+    const precompact = () =>
+        [
+            line({ type: 'user', timestamp: '2026-08-01T00:00:00.000Z', message: { role: 'user', content: 'First prompt' } }),
+            line({
+                type: 'assistant',
+                timestamp: '2026-08-01T00:00:01.000Z',
+                message: { role: 'assistant', content: [{ type: 'text', text: 'Before compact.' }] },
+            }),
+            line({ type: 'system', subtype: 'compact_boundary', timestamp: '2026-08-01T00:00:02.000Z' }),
+        ]
+            .map((l) => `${l}\n`)
+            .join('');
+    // An automatic compact lets the assistant continue with no new human
+    // prompt: summary, then assistant/tool lines, then maybe a real prompt.
+    const autoContinuation = () =>
+        [
+            line({
+                type: 'user',
+                timestamp: '2026-08-01T00:00:03.000Z',
+                isCompactSummary: true,
+                isVisibleInTranscriptOnly: true,
+                message: { role: 'user', content: summary },
+            }),
+            line({
+                type: 'assistant',
+                timestamp: '2026-08-01T00:00:04.000Z',
+                message: {
+                    role: 'assistant',
+                    content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: { file_path: '/Users/test/demo-project/a.ts' } }],
+                },
+            }),
+            line({
+                type: 'user',
+                timestamp: '2026-08-01T00:00:05.000Z',
+                message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'read-1', content: 'ok' }] },
+            }),
+            line({
+                type: 'assistant',
+                timestamp: '2026-08-01T00:00:06.000Z',
+                message: { role: 'assistant', content: [{ type: 'text', text: 'After compact.' }] },
+            }),
+        ]
+            .map((l) => `${l}\n`)
+            .join('');
+
+    it('keeps assistant/tool continuation after an automatic compact as its own turn without the summary text', async () => {
+        const dir = withTempDir('elepha-compact-auto-');
+        const file = path.join(dir, 'session.jsonl');
+        writeFileSync(file, precompact() + autoContinuation());
+        const turns = await collect(new ClaudeCodeAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+
+        expect(turns.map((t) => [t.turnIndex, t.userMessage, t.assistantText, t.toolCalls.map((c) => c.name), t.droppedReason])).toEqual([
+            [0, 'First prompt', 'Before compact.', [], undefined],
+            [1, '', 'After compact.', ['Read'], undefined],
+        ]);
+        expect(turns.some((t) => t.userMessage.includes(summary) || t.assistantText.includes(summary))).toBe(false);
+    });
+
+    it('keeps automatic-compact continuation when an incremental parse starts at the summary line', async () => {
+        const dir = withTempDir('elepha-compact-resume-');
+        const file = path.join(dir, 'session.jsonl');
+        writeFileSync(file, precompact());
+        const adapter = new ClaudeCodeAdapter();
+        const first = await collect(adapter.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+        expect(first.map((t) => t.userMessage)).toEqual(['First prompt']);
+
+        appendFileSync(file, autoContinuation());
+        const resumed = await collect(adapter.parseTurns(file, first[0]!.cursor, { closeTrailingOnIdle: true }));
+
+        expect(resumed.map((t) => [t.turnIndex, t.userMessage, t.assistantText, t.toolCalls.map((c) => c.name), t.droppedReason])).toEqual([
+            [1, '', 'After compact.', ['Read'], undefined],
+        ]);
+    });
+
+    it('keeps a genuine user message with summary-like wording as a turn', async () => {
+        const file = writeCompacted({});
+        const turns = await collect(new ClaudeCodeAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+
+        expect(turns.map((t) => [t.turnIndex, t.userMessage, t.droppedReason])).toEqual([
+            [0, summary, undefined],
+            [1, 'Next step', undefined],
+        ]);
+    });
+
+    it('does not let a compact summary make an internal-command session substantive', async () => {
+        const dir = withTempDir('elepha-compact-empty-');
+        const file = path.join(dir, 'session.jsonl');
+        writeFileSync(
+            file,
+            [
+                line({
+                    type: 'user',
+                    message: { role: 'user', content: '<command-name>/compact</command-name><command-args></command-args>' },
+                }),
+                line({ type: 'system', subtype: 'compact_boundary' }),
+                line({
+                    type: 'user',
+                    isCompactSummary: true,
+                    isVisibleInTranscriptOnly: true,
+                    message: { role: 'user', content: summary },
+                }),
+            ]
+                .map((l) => `${l}\n`)
+                .join(''),
+        );
+
+        await expect(new ClaudeCodeAdapter().classifyEmptySession(file)).resolves.toEqual({ kind: 'internal command' });
+    });
+});
+
 describe('ClaudeCodeAdapter surface/gitBranch/hasExternalContent capture', () => {
     it('captures surface (entrypoint) and gitBranch on emitted turns', async () => {
         const adapter = new ClaudeCodeAdapter();

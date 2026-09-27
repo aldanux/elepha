@@ -19,14 +19,14 @@ import {
 import { titleForTurn } from './session-title.js';
 import { sourceGeneration, sourceSnapshotValidator } from './source-reconciliation.js';
 
-interface RepairSession {
+export interface RepairSession {
     id: number;
     project_path: string;
     source_path: string;
     segment_index: number;
 }
 
-interface DerivedSession {
+export interface DerivedSession {
     renderedChars: number;
     renderedTurns: number;
     title: string | null;
@@ -53,17 +53,77 @@ export interface McpRepairPlan {
     close: () => Promise<void>;
 }
 
-function derivedFor(plan: McpRepairPlan, id: number): DerivedSession {
+// The identity and authorization evidence a source-backed repair plan binds.
+export type RepairAuthority = Pick<McpRepairPlan, 'tool' | 'nativeId' | 'sessions' | 'readGeneration' | 'generation' | 'validateSource'>;
+
+export function derivedFor(plan: Pick<McpRepairPlan, 'derived'>, id: number, label = 'MCP repair'): DerivedSession {
     const derived = plan.derived.get(id);
     if (derived === undefined) {
-        throw new Error('MCP repair session changed after preview');
+        throw new Error(`${label} session changed after preview`);
     }
     return derived;
 }
 
+export function emptyDerivedSessions(sessions: RepairSession[]): Map<number, DerivedSession> {
+    return new Map(
+        sessions.map((session) => [
+            session.id,
+            {
+                renderedChars: 0,
+                renderedTurns: 0,
+                title: null,
+                firstPrompt: null,
+                lastTurnAt: null,
+                trailingBranch: null,
+                trailingFiles: [],
+                observed: 0,
+            },
+        ]),
+    );
+}
+
+// Folds one surviving source turn into its session's metadata, exactly as
+// ingestion derives it, so a repair rebuilds only from turns still stored.
+export function observeSurvivingTurn(derived: DerivedSession, turn: ParsedTurn, firstSegment: boolean): void {
+    const rendered = renderRawTurn(turn, derived.renderedTurns + 1);
+    if (rendered !== null) {
+        derived.renderedChars += rendered.length + (derived.renderedTurns === 0 ? 1 : RAW_TURN_SEPARATOR.length);
+        derived.renderedTurns++;
+    }
+    derived.title = stripShellSyntax(titleForTurn(derived.title, turn, firstSegment));
+    derived.firstPrompt ??= firstPromptSearch(turn.userMessage);
+    derived.lastTurnAt = turn.endedAt;
+    derived.trailingBranch = turn.gitBranch ?? derived.trailingBranch;
+    derived.trailingFiles = dedupePaths([...turn.toolCalls.flatMap((call) => call.filePaths), ...derived.trailingFiles]).slice(
+        0,
+        TRAILING_FILES_CAP,
+    );
+    derived.observed++;
+}
+
+// Durable text, FTS and usage cascade with each exact memory row. The
+// daemon rebuilds invalidated aggregates from the surviving rows.
+export function invalidateRepairedSession(db: Database.Database, id: number, derived: DerivedSession): void {
+    db.prepare('DELETE FROM session_embeddings WHERE session_id = ?').run(id);
+    db.prepare('DELETE FROM session_rollups WHERE session_id = ?').run(id);
+    db.prepare('DELETE FROM durable_capture_status WHERE session_id = ?').run(id);
+    db.prepare(`UPDATE sessions SET rendered_chars = ?, rendered_turns = ?,
+        title = ?, first_prompt_search = ?, last_turn_at = ?,
+        trailing_branch = ?, trailing_files = ? WHERE id = ?`).run(
+        derived.renderedChars,
+        derived.renderedTurns,
+        derived.title,
+        derived.firstPrompt,
+        derived.lastTurnAt,
+        derived.trailingBranch,
+        JSON.stringify(derived.trailingFiles),
+        id,
+    );
+}
+
 // Bind all derived rows, not just counts: a concurrent replacement with the
 // same identifiers must invalidate the preview just as an appended turn does.
-function fingerprint(db: Database.Database, tool: ToolName, nativeId: string): string {
+export function repairFingerprint(db: Database.Database, tool: ToolName, nativeId: string): string {
     const hash = createHash('sha256');
     const scope = 'SELECT id FROM sessions WHERE tool = ? AND native_id = ?';
     const queries = [
@@ -85,7 +145,7 @@ function fingerprint(db: Database.Database, tool: ToolName, nativeId: string): s
     return hash.digest('hex');
 }
 
-function assertAuthorized(store: MemoryStore, plan: McpRepairPlan): void {
+export function assertRepairAuthorized(store: MemoryStore, plan: RepairAuthority, label = 'MCP repair'): void {
     withMemoryReadGeneration(store.database, refuseLocked, () => undefined, plan.readGeneration);
     if (
         !plan.validateSource() ||
@@ -94,11 +154,11 @@ function assertAuthorized(store: MemoryStore, plan: McpRepairPlan): void {
         store.isTranscriptIncognito(plan.tool, plan.nativeId) ||
         plan.sessions.some((session) => store.consent.consentState(session.project_path) !== 'approved')
     ) {
-        throw new Error('MCP repair source or authorization changed; retry required');
+        throw new Error(`${label} source or authorization changed; retry required`);
     }
 }
 
-function refuseLocked(): never {
+export function refuseLocked(): never {
     throw new Error(LOCKED_MEMORY_MESSAGE);
 }
 
@@ -138,27 +198,13 @@ export async function planMcpRepair(
         missingReceipts: [],
         readGeneration,
         generation: sourceGeneration(store, tool, nativeId),
-        fingerprint: fingerprint(db, tool, nativeId),
-        derived: new Map(
-            sessions.map((session) => [
-                session.id,
-                {
-                    renderedChars: 0,
-                    renderedTurns: 0,
-                    title: null,
-                    firstPrompt: null,
-                    lastTurnAt: null,
-                    trailingBranch: null,
-                    trailingFiles: [],
-                    observed: 0,
-                },
-            ]),
-        ),
+        fingerprint: repairFingerprint(db, tool, nativeId),
+        derived: emptyDerivedSessions(sessions),
         validateSource: sourceSnapshotValidator(tool, sourcePath, opened),
         close: () => opened.handle.close(),
     };
     try {
-        assertAuthorized(store, plan);
+        assertRepairAuthorized(store, plan);
         const ledger = new InjectionStore(db);
         const persistedCalls = new Set(ledger.mcpReceiptsForSession(tool, nativeId, plan.generation).map((receipt) => receipt.call_id));
         const sourceLedger = new InjectionStore(db, { includePersistedMcp: false });
@@ -179,23 +225,11 @@ export async function planMcpRepair(
                     throw new Error(`MCP repair cannot reconstruct unrelated stored turn ${turn.turnIndex}`);
                 }
                 for (const memory of stored) {
-                    const derived = derivedFor(plan, memory.session_id);
-                    const rendered = renderRawTurn(turn, derived.renderedTurns + 1);
-                    if (rendered !== null) {
-                        derived.renderedChars += rendered.length + (derived.renderedTurns === 0 ? 1 : RAW_TURN_SEPARATOR.length);
-                        derived.renderedTurns++;
-                    }
-                    derived.title = stripShellSyntax(
-                        titleForTurn(derived.title, turn, sessions.find((s) => s.id === memory.session_id)?.segment_index === 0),
+                    observeSurvivingTurn(
+                        derivedFor(plan, memory.session_id),
+                        turn,
+                        sessions.find((s) => s.id === memory.session_id)?.segment_index === 0,
                     );
-                    derived.firstPrompt ??= firstPromptSearch(turn.userMessage);
-                    derived.lastTurnAt = turn.endedAt;
-                    derived.trailingBranch = turn.gitBranch ?? derived.trailingBranch;
-                    derived.trailingFiles = dedupePaths([
-                        ...turn.toolCalls.flatMap((call) => call.filePaths),
-                        ...derived.trailingFiles,
-                    ]).slice(0, TRAILING_FILES_CAP);
-                    derived.observed++;
                 }
                 continue;
             }
@@ -217,8 +251,8 @@ export async function planMcpRepair(
             //noinspection ExceptionCaughtLocallyJS
             throw new Error('MCP repair receipt ledger differs from source; source reconciliation required');
         }
-        assertAuthorized(store, plan);
-        if (fingerprint(db, tool, nativeId) !== plan.fingerprint) {
+        assertRepairAuthorized(store, plan);
+        if (repairFingerprint(db, tool, nativeId) !== plan.fingerprint) {
             //noinspection ExceptionCaughtLocallyJS
             throw new Error('MCP repair rows changed during preview');
         }
@@ -266,8 +300,8 @@ export function applyMcpRepair(store: MemoryStore, plan: McpRepairPlan): void {
         if (!memoryReadAuthorityMatchesGenerationInTransaction(db, plan.readGeneration)) {
             refuseLocked();
         }
-        assertAuthorized(store, plan);
-        if (fingerprint(db, plan.tool, plan.nativeId) !== plan.fingerprint) {
+        assertRepairAuthorized(store, plan);
+        if (repairFingerprint(db, plan.tool, plan.nativeId) !== plan.fingerprint) {
             throw new Error('MCP repair rows changed after preview');
         }
         const firstSession = plan.sessions[0];
@@ -282,26 +316,9 @@ export function applyMcpRepair(store: MemoryStore, plan: McpRepairPlan): void {
             db.prepare('DELETE FROM memories WHERE id = ?').run(memory.id);
         }
         for (const id of affected) {
-            // Durable text, FTS and usage cascade with each exact memory row.
-            // The daemon rebuilds invalidated aggregates from the surviving rows.
-            db.prepare('DELETE FROM session_embeddings WHERE session_id = ?').run(id);
-            db.prepare('DELETE FROM session_rollups WHERE session_id = ?').run(id);
-            db.prepare('DELETE FROM durable_capture_status WHERE session_id = ?').run(id);
-            const derived = derivedFor(plan, id);
-            db.prepare(`UPDATE sessions SET rendered_chars = ?, rendered_turns = ?,
-                title = ?, first_prompt_search = ?, last_turn_at = ?,
-                trailing_branch = ?, trailing_files = ? WHERE id = ?`).run(
-                derived.renderedChars,
-                derived.renderedTurns,
-                derived.title,
-                derived.firstPrompt,
-                derived.lastTurnAt,
-                derived.trailingBranch,
-                JSON.stringify(derived.trailingFiles),
-                id,
-            );
+            invalidateRepairedSession(db, id, derivedFor(plan, id));
         }
-        assertAuthorized(store, plan);
+        assertRepairAuthorized(store, plan);
         verifyMcpRepair(store, plan);
     }).immediate();
 }
