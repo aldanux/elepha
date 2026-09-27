@@ -51,6 +51,7 @@
         "dev:install": "node scripts/dev-install.mjs",
         "start": "node dist/cli/index.js",
         "test": "vitest run",
+        "bench": "tsx test/performance/benchmark.ts",
         "typecheck": "tsc --noEmit",
         "typecheck:tests": "tsc -p tsconfig.tests.json --noEmit",
         "changeset": "changeset",
