@@ -1,8 +1,10 @@
-import { mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { runRestoreOperation } from '../../src/cli/commands/restore.js';
+import { BACKUP_KEEP } from '../../src/config/constants.js';
+import { listManagedBackups } from '../../src/storage/backup.js';
 import { type DatabaseEncryptionRuntime, databaseKey } from '../../src/storage/database-encryption.js';
 import { openDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { isLiveMemoryCapacityGuardError } from '../../src/storage/live-memory-capacity-guard.js';
@@ -88,6 +90,11 @@ describe('restoring a pre-cleanup backup', () => {
         plain.close();
         key.fill(0);
 
+        const olderBackups = Array.from({ length: BACKUP_KEEP }, (_, index) => `${fixture.dbPath}.bak-1999-01-0${index + 1}`);
+        for (const backup of olderBackups) copyFileSync(fixture.dbPath, backup);
+        const unrelatedBackup = path.join(fixture.directory, 'unrelated.db.bak-1999-01-01');
+        copyFileSync(fixture.dbPath, unrelatedBackup);
+
         const db = await openDb(fixture.dbPath, { encryption: runtime });
         const usage = readLiveMemoryUsage(db);
         const oldest = measureLiveMemoryByNativeSession(db).get(nativeSessionKey('codex', 'oldest'))!.bytes;
@@ -124,6 +131,11 @@ describe('restoring a pre-cleanup backup', () => {
         expect(sessions(db)).toEqual(['current', 'hideme', 'purgeme']);
         const backupPath = readLiveMemoryRetentionReport(db, 10).state?.backup_path;
         expect(backupPath).toBeDefined();
+        expect(path.dirname(backupPath!)).toBe(fixture.directory);
+        expect(statSync(backupPath!).mode & 0o777).toBe(0o600);
+        expect(readFileSync(backupPath!).subarray(0, 16).toString('binary')).not.toBe('SQLite format 3\0');
+        expect(listManagedBackups(fixture.dbPath)).toEqual([...olderBackups.slice(1), backupPath]);
+        expect(existsSync(unrelatedBackup)).toBe(true);
         // Genuine user decisions made after the cleanup: purge one chat, make another incognito.
         const purgeAt = '2026-03-03T00:00:00.000Z';
         db.prepare("UPDATE sessions SET last_ingested_at = ? WHERE native_id = 'purgeme'").run(purgeAt);

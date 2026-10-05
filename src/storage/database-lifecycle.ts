@@ -717,6 +717,20 @@ function assertSQLiteCanonicalFilename(
     }
 }
 
+// db.name retains the construction path, including Linux's short-lived
+// /proc descriptor path. SQLite records the physical filename after opening.
+export function resolveSQLiteMainDatabaseFilename(database: Database.Database): string | undefined {
+    const databases = database.pragma('database_list') as Array<{ seq?: unknown; name?: unknown; file?: unknown }>;
+    const main = databases.find((entry) => entry.name === 'main' && entry.seq === 0);
+    if (main === undefined || main.file === '') {
+        return undefined;
+    }
+    if (typeof main.file !== 'string' || !path.isAbsolute(main.file)) {
+        throw databasePathMutationError(database.name);
+    }
+    return main.file;
+}
+
 function expectedSQLiteFileError(pinned: AuthorizedDescriptor, expected: SQLiteFileIdentitySeal, databasePath: string): unknown {
     try {
         if (pinned.descriptor === undefined) {

@@ -9,6 +9,7 @@ import { chmodSync, closeSync, copyFileSync, readdirSync, rmSync, unlinkSync } f
 import path from 'node:path';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { BACKUP_KEEP, PRIVATE_FILE_MODE } from '../config/constants.js';
+import { resolveSQLiteMainDatabaseFilename } from './database-lifecycle.js';
 import { hasPlaintextDatabaseHeader } from './db.js';
 import {
     createPrivateEmptyDatabaseDescriptor,
@@ -98,10 +99,11 @@ export function backupDatabaseAndReport(db: Database.Database, dbPath: string, l
 // removed so no partial snapshot is mistaken for a recovery source. Must run
 // outside a transaction: SQLite cannot attach a database inside one.
 export function writeVerifiedEncryptedBackup(db: Database.Database, verify: (schema: string) => void): string {
-    if (db.name === ':memory:' || db.name === '') {
+    const dbPath = resolveSQLiteMainDatabaseFilename(db);
+    if (dbPath === undefined) {
         throw new Error('A verified backup requires an on-disk database.');
     }
-    const backupPath = managedBackupPath(db.name);
+    const backupPath = managedBackupPath(dbPath);
     const descriptor = createPrivateEmptyDatabaseDescriptor(backupPath);
     let identity: ReturnType<typeof inspectPrivateEmptyDatabaseDescriptor>;
     try {
@@ -128,6 +130,6 @@ export function writeVerifiedEncryptedBackup(db: Database.Database, verify: (sch
             rmSync(backupPath, { force: true });
         }
     }
-    pruneBackups(db.name, BACKUP_KEEP);
+    pruneBackups(dbPath, BACKUP_KEEP);
     return backupPath;
 }

@@ -22,6 +22,7 @@ import type { Command } from 'commander';
 import { DATABASE_EXPORT_VERIFY_CHUNK_BYTES, DATABASE_HEADER_BYTES, USER_BACKUPS_DIR_NAME } from '../../config/constants.js';
 import { canonicalizeExisting, elephaHome, normalizeForCompare } from '../../config/paths.js';
 import { databaseKey } from '../../storage/database-encryption.js';
+import { resolveSQLiteMainDatabaseFilename } from '../../storage/database-lifecycle.js';
 import { defaultDbPath, isPlaintextDatabaseHeader, openDb, openKeyedDatabase } from '../../storage/db.js';
 import {
     assertDatabaseFileIdentity,
@@ -200,12 +201,13 @@ export function resolveOutput(output: string | undefined, defaultPath: string): 
 
 // Full exports retain every source table in one SQLite snapshot after a WAL checkpoint, unlike pruned safety snapshots.
 export function exportAll(db: Database.Database, destination: string, encryptionKey: Buffer, force = false): string {
-    if (db.name === ':memory:') {
+    const dbPath = resolveSQLiteMainDatabaseFilename(db);
+    if (dbPath === undefined) {
         throw new Error('A full backup requires an on-disk database.');
     }
-    refuseActiveDatabaseDestination(db.name, destination);
+    refuseActiveDatabaseDestination(dbPath, destination);
     const destinationAuthorization = prepareDestination(destination, force);
-    refuseActiveDatabaseDestination(db.name, destination);
+    refuseActiveDatabaseDestination(dbPath, destination);
     const [checkpoint] = db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: unknown }>;
     if (checkpoint?.busy !== 0) {
         throw new Error("Backup aborted: WAL checkpoint did not complete (the daemon may be writing) — run 'elepha pause' or retry.");
@@ -228,9 +230,10 @@ export function exportProject(
     force = false,
     reportExcludedSessionRules?: (count: number) => void,
 ): string {
-    refuseActiveDatabaseDestination(source.name, destination);
+    const dbPath = resolveSQLiteMainDatabaseFilename(source) ?? ':memory:';
+    refuseActiveDatabaseDestination(dbPath, destination);
     const destinationAuthorization = prepareDestination(destination, force);
-    refuseActiveDatabaseDestination(source.name, destination);
+    refuseActiveDatabaseDestination(dbPath, destination);
     let excludedSessionRules = 0;
     replaceDestination(
         destination,

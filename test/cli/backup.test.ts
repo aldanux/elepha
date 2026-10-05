@@ -4106,7 +4106,10 @@ describe('elepha backup exports', () => {
         const { fixture } = seedExportFixture();
         const output = path.join(fixture.directory, 'busy-full.db');
         const original = Buffer.from('keep the previous full backup');
-        vi.spyOn(fixture.db, 'pragma').mockReturnValue([{ busy: 1 }] as never);
+        const pragma = fixture.db.pragma.bind(fixture.db);
+        vi.spyOn(fixture.db, 'pragma').mockImplementation((source, options) =>
+            source === 'wal_checkpoint(TRUNCATE)' ? [{ busy: 1 }] : pragma(source, options),
+        );
 
         expect(() => exportAll(fixture.db, output, FIXED_KEY)).toThrow(
             "Backup aborted: WAL checkpoint did not complete (the daemon may be writing) — run 'elepha pause' or retry.",
