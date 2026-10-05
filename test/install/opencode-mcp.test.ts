@@ -38,15 +38,29 @@ describe('OpenCode installation status', () => {
         const present = { claude: false, codex: false, opencode: true };
         const registeredConfig = JSON.stringify({
             mcp: {
-                [ELEPHA_MCP_SERVER_NAME]: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true },
+                servers: {
+                    [ELEPHA_MCP_SERVER_NAME]: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], codemode: false },
+                },
             },
         });
 
         const registered = installationStatus('', '', '', '/config.toml', registeredConfig, bin, present, renderOpencodePlugin(bin));
+        const legacy = installationStatus(
+            '',
+            '',
+            '',
+            '/config.toml',
+            JSON.stringify({ mcp: { elepha: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true } } }),
+            bin,
+            present,
+            renderOpencodePlugin(bin),
+        );
         const missing = installationStatus('', '', '', '/config.toml', '{}', bin, present);
 
         expect(registered.opencodeMcp).toBe('registered');
         expect(registered.ready).toBe(true);
+        expect(legacy.opencodeMcp).toBe('stale config');
+        expect(legacy.ready).toBe(false);
         expect(missing.opencodeMcp).toBe('not installed');
         expect(missing.ready).toBe(false);
     });

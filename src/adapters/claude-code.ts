@@ -26,24 +26,33 @@
 
 import path from 'node:path';
 import {
+    CLAUDE_COMPACT_SUMMARY_MAX_BYTES,
+    CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES,
     ELEPHA_MCP_CALL_ID_MAX_BYTES,
     ELEPHA_MCP_NAMESPACE,
     ELEPHA_MCP_RESULTS_PER_TURN_MAX,
     ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES,
+    TASK_STATE_REPORT_TOOL,
 } from '../config/constants.js';
 import { claudeProjectsRoot, isWithin, toPosix } from '../config/paths.js';
+import { openProviderTranscript, validateOpenedProviderTranscriptIdentitySync } from '../security/provider-transcript.js';
 import type { EmptySessionAnalysis, ParsedToolCall, SessionAdapterTool, SessionClassification } from '../types/index.js';
 import {
     boundedMcpResult,
     canonicalTimestamp,
     classifyEmptyJsonlSession,
+    consumeTaskStateReportResult,
     type EmptySessionSignals,
+    isTaskStateReportCallId,
     JsonlTurnAdapter,
     type LineClass,
+    OversizedTranscriptRecordError,
+    observeTaskStateReportCall,
     readBoundedLines,
     rememberUnmatchedElephaMcpResult,
     resolveAbsolute,
     safeDiscriminator,
+    TranscriptReadBudgetError,
     type TurnBuilderState,
     textValues,
 } from './base.js';
@@ -84,6 +93,10 @@ const KNOWN_SKIP_TYPES = new Set([
 
 const EXTERNAL_FETCH_TOOLS = new Set(['WebFetch', 'WebSearch']);
 
+// Claude Code names an MCP tool mcp__<server>__<tool>. Only this exact name
+// is the report tool; any other elepha name keeps the whole-turn drop.
+const TASK_STATE_REPORT_TOOL_NAME = `${ELEPHA_MCP_NAMESPACE}__${TASK_STATE_REPORT_TOOL}`;
+
 const FILE_PATH_INPUT_KEY: Record<string, string> = {
     Edit: 'file_path',
     MultiEdit: 'file_path',
@@ -112,15 +125,18 @@ interface CCToolResultBlock {
     type: 'tool_result';
     tool_use_id?: string;
     content?: unknown;
+    is_error?: unknown;
 }
 
 type CCContentBlock = CCTextBlock | CCThinkingBlock | CCToolUseBlock | CCToolResultBlock | { type: string };
 
 interface CCLine {
     type: string;
+    subtype?: string;
     cwd?: string;
     timestamp?: string;
     isMeta?: boolean;
+    userType?: string;
     isCompactSummary?: boolean;
     entrypoint?: string;
     gitBranch?: string;
@@ -131,6 +147,30 @@ interface CCLine {
         content: string | CCContentBlock[];
     };
 }
+
+export type ClaudeCompactSummaryReadResult =
+    | {
+          status: 'available';
+          summary: string;
+          byteStart: number;
+          byteEnd: number;
+          boundaryByteStart: number;
+          previousBoundaryByteStart: number | null;
+          scanStart: number;
+      }
+    | {
+          status: 'unavailable';
+          reason:
+              | 'transcript_outside_store'
+              | 'transcript_missing'
+              | 'transcript_unreadable'
+              | 'source_changed'
+              | 'scan_limit'
+              | 'summary_absent'
+              | 'summary_ambiguous'
+              | 'summary_malformed'
+              | 'summary_oversized';
+      };
 
 function isWrapperText(text: string): boolean {
     const trimmed = text.trim();
@@ -191,6 +231,224 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
 
     nativeSessionId(filePath: string): string {
         return path.basename(filePath, '.jsonl');
+    }
+
+    // Reads only the tail of an opened, contained transcript. The flag is
+    // native Claude metadata; summary wording and human turn text are ignored.
+    async readLatestCompactSummary(filePath: string): Promise<ClaudeCompactSummaryReadResult> {
+        if (!this.matches(filePath)) {
+            return { status: 'unavailable', reason: 'transcript_outside_store' };
+        }
+        const opened = await openProviderTranscript('claude-code', filePath);
+        if ('reason' in opened) {
+            return { status: 'unavailable', reason: opened.reason };
+        }
+
+        try {
+            const start = Math.max(0, opened.stat.size - CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES);
+            let skipFirst = false;
+            if (start > 0) {
+                const previous = Buffer.alloc(1);
+                const { bytesRead } = await opened.handle.read(previous, 0, 1, start - 1);
+                skipFirst = bytesRead !== 1 || previous[0] !== 0x0a;
+            }
+
+            let offset = start;
+            let latest: Extract<ClaudeCompactSummaryReadResult, { status: 'available' }> | undefined;
+            let boundaryByteStart: number | undefined;
+            let previousBoundaryByteStart: number | null = null;
+            let summaryCount = 0;
+            let malformed = false;
+            let oversized = false;
+            let scanFailed = false;
+            try {
+                for await (const record of readBoundedLines(filePath, {
+                    handle: opened.handle,
+                    start,
+                    maxReadBytes: opened.stat.size - start + 1,
+                })) {
+                    const byteStart = offset;
+                    offset += record.byteLength;
+                    if (skipFirst) {
+                        skipFirst = false;
+                        continue;
+                    }
+                    if (!record.terminated) {
+                        malformed = true;
+                        continue;
+                    }
+
+                    let line: CCLine;
+                    try {
+                        const parsed: unknown = JSON.parse(record.text);
+                        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                            malformed = true;
+                            continue;
+                        }
+                        line = parsed as CCLine;
+                    } catch {
+                        malformed = true;
+                        continue;
+                    }
+                    if (line.type === 'system' && line.subtype === 'compact_boundary') {
+                        previousBoundaryByteStart = boundaryByteStart ?? null;
+                        boundaryByteStart = byteStart;
+                        latest = undefined;
+                        summaryCount = 0;
+                        malformed = false;
+                        oversized = false;
+                        continue;
+                    }
+                    if (line.isCompactSummary !== true) {
+                        continue;
+                    }
+                    summaryCount++;
+                    const summary = line.message?.content;
+                    if (line.type !== 'user' || line.message?.role !== 'user' || typeof summary !== 'string' || summary.trim() === '') {
+                        malformed = true;
+                        continue;
+                    }
+                    if (Buffer.byteLength(summary) > CLAUDE_COMPACT_SUMMARY_MAX_BYTES) {
+                        oversized = true;
+                        continue;
+                    }
+                    if (boundaryByteStart !== undefined) {
+                        latest = {
+                            status: 'available',
+                            summary,
+                            byteStart,
+                            byteEnd: offset,
+                            boundaryByteStart,
+                            previousBoundaryByteStart,
+                            scanStart: start,
+                        };
+                    }
+                }
+            } catch (error) {
+                if (error instanceof TranscriptReadBudgetError || error instanceof OversizedTranscriptRecordError) {
+                    scanFailed = true;
+                } else {
+                    return { status: 'unavailable', reason: 'transcript_unreadable' };
+                }
+            }
+
+            const currentStat = await opened.handle.stat().catch(() => undefined);
+            const identity = validateOpenedProviderTranscriptIdentitySync('claude-code', filePath, opened);
+            if (
+                !currentStat ||
+                currentStat.size !== opened.stat.size ||
+                currentStat.mtimeMs !== opened.stat.mtimeMs ||
+                currentStat.ctimeMs !== opened.stat.ctimeMs ||
+                'reason' in identity
+            ) {
+                return { status: 'unavailable', reason: 'source_changed' };
+            }
+            if (scanFailed) {
+                return { status: 'unavailable', reason: 'scan_limit' };
+            }
+            if (summaryCount > 1) {
+                return { status: 'unavailable', reason: 'summary_ambiguous' };
+            }
+            if (oversized) {
+                return { status: 'unavailable', reason: 'summary_oversized' };
+            }
+            if (malformed) {
+                return { status: 'unavailable', reason: 'summary_malformed' };
+            }
+            if (latest) {
+                return latest;
+            }
+            return { status: 'unavailable', reason: start > 0 ? 'scan_limit' : 'summary_absent' };
+        } catch {
+            return { status: 'unavailable', reason: 'transcript_unreadable' };
+        } finally {
+            await opened.handle.close();
+        }
+    }
+
+    // A report is fresh only when no native records were appended between its
+    // captured cursor and the compact boundary. Unknown records abstain too.
+    async verifyEmptyPrecompactGap(
+        filePath: string,
+        afterOffset: number,
+        boundaryByteStart: number,
+    ): Promise<'clear' | 'intervening_source_record' | 'source_changed' | 'gap_unavailable'> {
+        if (
+            !this.matches(filePath) ||
+            !Number.isSafeInteger(afterOffset) ||
+            afterOffset < 0 ||
+            !Number.isSafeInteger(boundaryByteStart) ||
+            boundaryByteStart < afterOffset ||
+            boundaryByteStart - afterOffset > CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES
+        ) {
+            return 'gap_unavailable';
+        }
+        const opened = await openProviderTranscript('claude-code', filePath);
+        if ('reason' in opened) {
+            return 'gap_unavailable';
+        }
+        try {
+            if (boundaryByteStart > opened.stat.size) {
+                return 'source_changed';
+            }
+            let scanned = afterOffset;
+            if (afterOffset < boundaryByteStart) {
+                for await (const record of readBoundedLines(filePath, {
+                    handle: opened.handle,
+                    start: afterOffset,
+                    maxReadBytes: boundaryByteStart - afterOffset + 1,
+                })) {
+                    scanned += record.byteLength;
+                    if (scanned > boundaryByteStart || !record.terminated) {
+                        return 'gap_unavailable';
+                    }
+                    let line: CCLine;
+                    try {
+                        const parsed: unknown = JSON.parse(record.text);
+                        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                            return 'gap_unavailable';
+                        }
+                        line = parsed as CCLine;
+                    } catch {
+                        return 'gap_unavailable';
+                    }
+                    const safeMetadata =
+                        (line.type !== 'system' && KNOWN_SKIP_TYPES.has(line.type)) ||
+                        line.type === 'ai-title' ||
+                        (line.type === 'system' && (line.subtype === 'stop_hook_summary' || line.subtype === 'turn_duration')) ||
+                        (line.type === 'user' &&
+                            line.message?.role === 'user' &&
+                            typeof line.message.content === 'string' &&
+                            ((line.userType === 'external' && line.message.content === '/compact') ||
+                                (line.isMeta === true &&
+                                    /^<command-name>\s*\/compact\s*<\/command-name>(?:<command-args>\s*<\/command-args>)?$/.test(
+                                        line.message.content,
+                                    ))));
+                    if (!safeMetadata) {
+                        return 'intervening_source_record';
+                    }
+                    if (scanned === boundaryByteStart) {
+                        break;
+                    }
+                }
+            }
+            const currentStat = await opened.handle.stat().catch(() => undefined);
+            const identity = validateOpenedProviderTranscriptIdentitySync('claude-code', filePath, opened);
+            if (
+                !currentStat ||
+                currentStat.size !== opened.stat.size ||
+                currentStat.mtimeMs !== opened.stat.mtimeMs ||
+                currentStat.ctimeMs !== opened.stat.ctimeMs ||
+                'reason' in identity
+            ) {
+                return 'source_changed';
+            }
+            return scanned === boundaryByteStart ? 'clear' : 'gap_unavailable';
+        } catch {
+            return 'gap_unavailable';
+        } finally {
+            await opened.handle.close();
+        }
     }
 
     // Claude Code writes custom-title as a standalone UI event. Last title
@@ -302,7 +560,7 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
         }
 
         if (!KNOWN_SKIP_TYPES.has(l.type)) {
-            this.warnUnknownLine(`ClaudeCodeAdapter: unrecognized line type "${safeDiscriminator(l.type)}" in ${filePath}`);
+            this.warnUnrecognizedRecord(`ClaudeCodeAdapter: unrecognized line type "${safeDiscriminator(l.type)}" in ${filePath}`);
         }
         return 'skip';
     }
@@ -336,6 +594,10 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
         for (const block of content) {
             if (block.type === 'tool_use') {
                 const call = block as CCToolUseBlock;
+                if (call.name === TASK_STATE_REPORT_TOOL_NAME) {
+                    observeTaskStateReportCall(state, 'claude-code', call.id, call.input);
+                    continue;
+                }
                 if (!call.name.startsWith(`${ELEPHA_MCP_NAMESPACE}__`)) {
                     continue;
                 }
@@ -347,7 +609,11 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
                     state.elephaMcpCoverageFailure = 'oversized-call-id';
                     continue;
                 }
-                if (state.elephaMcpCallIds.has(call.id) || state.elephaMcpResultReceipts.some((receipt) => receipt.callId === call.id)) {
+                if (
+                    state.elephaMcpCallIds.has(call.id) ||
+                    state.elephaMcpResultReceipts.some((receipt) => receipt.callId === call.id) ||
+                    isTaskStateReportCallId(state, call.id)
+                ) {
                     state.elephaMcpCoverageFailure = 'duplicate-call-id';
                     continue;
                 }
@@ -368,6 +634,9 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
             }
             const resultBlock = block as CCToolResultBlock;
             const callId = resultBlock.tool_use_id;
+            if (consumeTaskStateReportResult(state, 'claude-code', callId, resultBlock.content, resultBlock.is_error === true)) {
+                continue;
+            }
             if (typeof callId === 'string' && Buffer.byteLength(callId) > ELEPHA_MCP_CALL_ID_MAX_BYTES) {
                 if (state.elephaMcpCallIds.has(callId)) {
                     state.elephaMcpCoverageFailure = 'oversized-call-id';
@@ -441,6 +710,10 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
                     state.assistantTextParts.push((block as CCTextBlock).text);
                 } else if (block.type === 'tool_use') {
                     const tb = block as CCToolUseBlock;
+                    // Parsed into the turn's separate report field, never ordinary capture.
+                    if (tb.name === TASK_STATE_REPORT_TOOL_NAME) {
+                        continue;
+                    }
                     const call: ParsedToolCall = {
                         name: tb.name,
                         filePaths: extractFilePaths(tb.name, tb.input ?? {}, state.projectPath),

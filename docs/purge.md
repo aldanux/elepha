@@ -45,8 +45,11 @@ filter can stand alone or narrow the project, `--here`, `--orphan`, `--revoked`,
 `--all` scope. It cannot be combined with `--external-agent-imports`.
 
 `--external-agent-imports` selects Codex sessions identified as imported from external
-agents. `--orphan` selects memory for temporary project directories and directories
-that no longer exist. `--orphan` clears orphaned memory; to also remove the stale entry
+agents. `--orphan` classifies complete Claude Code/Codex native sessions against
+recorded project ownership, relocation evidence and fresh filesystem observations.
+Only confirmed missing directories with a complete bounded check and no protected
+association become deletion candidates. Existing temporary directories are preserved.
+`--orphan` clears confirmed orphaned memory; to also remove the stale entry
 from `elepha consent list`, use [`elepha consent prune`](consent.md#prune-stale-consent-roots).
 `--revoked` selects memory belonging to projects you have revoked. `--all`
 selects every session and project in elepha's memory.
@@ -64,3 +67,53 @@ An empty match stays empty; no scope falls back to deleting everything. See
 [Protecting and recovering memory](storage.md) to create an encrypted
 same-installation archive before a large deletion or to restore a complete database
 for disaster recovery. A backup does not override purge tombstones.
+
+
+## Orphan classification and exact deletion
+
+```console
+elepha purge --orphan
+elepha purge --orphan --details
+elepha purge --orphan --apply
+```
+
+The report separates preserved memory from cleanup candidates. It explains which
+chats have an existing project, relocation evidence, unresolved inspection, or
+a mixture of missing and protected project parts. When no chats qualify for
+deletion, it reports that no cleanup confirmation is needed. Missing provider transcripts,
+historical gaps and revoked consent alone never authorize
+deletion. Possible matches by recorded identity or name preserve memory and
+require explicit association repair; they do not merge projects.
+
+Inspection uses stored project paths and accessible ancestors, not a disk scan,
+provider-corpus replay or model. Project discovery is paged and limited to 2,048
+rows, filesystem inspection to 10,000 path observations and 10 seconds, and native
+membership to 256 segments. Ancestor traversal and retained native rule associations
+have separate bounds; oversized scopes are preserved or refused before deletion. Incomplete inspection, filesystem failures, dangling
+links and ambiguity preserve memory. Details retain at most 64 KiB of newest
+diagnostics and report omitted entries; totals cover all classified units.
+
+A native session containing any protected sibling is preserved in full. Fragment
+cleanup requires segment-scoped no-resurrection support and is not implemented
+in this slice. OpenCode units are reported as unsupported and preserved by this
+classifier; other explicit purge scopes keep their existing behavior.
+
+Before confirmation, every affected project, host/native identity, segment row,
+retained-content count and project/chat rule is displayed. Chat rules are selected
+only for the confirmed host/native identities after checking all their checkout
+associations. Other chats' rules and their owner projects are preserved, including
+chats with no captured session rows. Project standing rules are preserved whenever
+an unselected session or another chat's rules still need that owner. Time filters must cover every sibling before a
+native unit can be selected, and exclude rules. Oversized deletion previews are
+refused rather than truncated. Empty selections stay empty.
+
+Filesystem/association checks run again before mutation; exact owned rows,
+sibling membership, control state and rule scope are revalidated inside
+the purge transaction. Directory recreation or identity/ownership changes abort
+without expanding the confirmed plan. Transactional deletion checks native
+tombstones, dependent state, foreign keys and retained-memory accounting.
+Consent roots and provider files remain untouched.
+
+Noninteractive orphan apply requires explicit `--skip-confirmation`. That option
+skips only the standalone prompt; classification, full preview, capture pause,
+encrypted backup, frozen-plan validation and verification still run.

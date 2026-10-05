@@ -2,22 +2,38 @@ import path from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import * as clack from '@clack/prompts';
 import { isWithin, normalizeForCompare, samePath } from '../config/paths.js';
-import { getSetting, type SettingKey, setSetting } from '../config/settings.js';
+import { getSetting, type SettingKey } from '../config/settings.js';
 import { IngestionDaemon } from '../daemon/index.js';
 import { type DiscoveryResult, detectSessionTools, discoverFolderRepos, discoverSessionProjects } from '../discovery/session-projects.js';
-import { reconcileCaptureService, serviceBackend } from '../install/service-backend.js';
+import { type ReconcileStatus, reconcileCaptureService, serviceBackend } from '../install/service-backend.js';
 import { SessionReader } from '../serving/session-reader.js';
 import type { MemoryStore } from '../storage/memory-store.js';
 import { ProjectResolver } from '../storage/project-resolver.js';
 import { TOOL_METADATA, type ToolName } from '../types/index.js';
+import { errorMessage } from '../util/error.js';
+import { prepareMemoryPlus } from './commands/enable.js';
 import {
-    consentChanges,
-    folderCandidates,
-    groupFolderCandidates,
-    type InitCandidate,
-    type InitMode,
-    individualCandidates,
-} from './init-wizard.js';
+    CONSENT_CONTRACT_DISCLOSURE,
+    SEMANTIC_SEARCH_DISCLOSURE,
+    TERM_SEARCH_DISCLOSURE,
+    TERM_SEARCH_RETAINS_MEMORY_PLUS,
+} from './consent-disclosure.js';
+import {
+    ApplyFailedError,
+    applyInitPlan,
+    capturePreviewState,
+    InitApplyBusyError,
+    type InitPlan,
+    isEmptyPlan,
+    type PlannedRoot,
+    plannedRoot,
+    type RecoveryOutcome,
+    recoverInterruptedInitApply,
+    runPostCommitJobs,
+    SemanticSetupError,
+    StalePreviewError,
+} from './init-apply.js';
+import { consentChanges, folderCandidates, groupFolderCandidates, type InitCandidate, individualCandidates } from './init-wizard.js';
 import { printTagline, printWordmark } from './wordmark.js';
 
 interface InitInput extends Readable {
@@ -47,9 +63,11 @@ export interface InitPrompts {
 
     spinner(): Spinner;
 
-    select(options: { message: string; options: PromptOption[] }): Promise<InitMode | symbol>;
+    select(options: { message: string; options: PromptOption[]; initialValue?: string }): Promise<string | symbol>;
 
     multiselect(options: { message: string; options: PromptOption[]; initialValues: string[] }): Promise<string[] | symbol>;
+
+    confirm(options: { message: string }): Promise<boolean | symbol>;
 
     isCancel(value: unknown): boolean;
 
@@ -67,11 +85,15 @@ export interface InitOptions {
     discover?: () => Promise<DiscoveryResult>;
     detectTools?: () => Promise<DiscoveryResult['detectedTools']>;
     configPath?: string;
-    daemon?: Pick<IngestionDaemon, 'backfillApprovedRoots'>;
-    reconcile?: (approvedRoots: number) => void;
+    daemon?: Pick<IngestionDaemon, 'backfillApprovedRootsReport'>;
+    reconcile?: (approvedRoots: number) => ReconcileStatus | undefined;
+    // Installs and verifies the local semantic model; tests stub it so no model downloads.
+    prepareSemanticSearch?: () => Promise<void>;
     // Test seam; production routes every visual element through @clack/prompts.
     prompts?: InitPrompts;
 }
+
+type SearchMode = 'semantic' | 'term';
 
 function print(output: Writable, message: string): void {
     output.write(`${message}\n`);
@@ -97,8 +119,9 @@ function clackPrompts(input: InitInput, output: InitOutput): InitPrompts {
         intro: (title) => clack.intro(title, common),
         note: (message, title) => clack.note(message, title, common),
         spinner: () => clack.spinner({ output }),
-        select: (options) => clack.select({ ...options, ...common }) as Promise<InitMode | symbol>,
+        select: (options) => clack.select({ ...options, ...common }) as Promise<string | symbol>,
         multiselect: (options) => clack.multiselect({ ...options, ...common }) as Promise<string[] | symbol>,
+        confirm: (options) => clack.confirm({ ...options, ...common }),
         isCancel: clack.isCancel,
         cancel: (message) => clack.cancel(message, common),
         outro: (message) => clack.outro(message, common),
@@ -114,7 +137,79 @@ function cancellation(prompts: InitPrompts): number {
     return 0;
 }
 
+// Progress for the post-confirmation model setup. The labels say the mode is
+// not active yet: the setting flips only after setup and the commit succeed.
+function spinnerProgress(prompts: InitPrompts) {
+    return (message: string) => {
+        const spinner = prompts.spinner();
+        spinner.start(`${message} (not active yet)`);
+        return {
+            done: () => spinner.stop(`${message}: done`),
+            fail: () => spinner.stop(`${message}: failed`),
+        };
+    };
+}
+
+function gapReport(gaps: string[]): string {
+    return gaps.length === 0
+        ? ''
+        : `\n\nIncomplete, retryable:\n${gaps.map((gap) => `- ${gap}`).join('\n')}\nYour confirmed choices are saved and already captured turns are kept.`;
+}
+
+async function finishRecovery(
+    recovery: RecoveryOutcome,
+    prompts: InitPrompts,
+    options: InitOptions,
+    command: string,
+    reconcile: NonNullable<InitOptions['reconcile']>,
+): Promise<number> {
+    const rerun = `Run \`elepha ${command}\` again to review your choices.`;
+    const keptNewer = (keys: string[]): string =>
+        keys.length === 0 ? '' : ` Settings changed since then were kept as they are: ${keys.join(', ')}.`;
+    if (recovery.kind === 'busy') {
+        prompts.cancel(
+            `Another elepha setup (process ${recovery.pid}) is applying choices. Nothing was changed; try again when it finishes.`,
+        );
+        return 1;
+    }
+    if (recovery.kind === 'failed') {
+        prompts.cancel(
+            `An interrupted setup could not be undone (${recovery.error}). Nothing else was changed; fix the cause and run \`elepha ${command}\` again. No new choices are accepted until it is resolved.`,
+        );
+        return 1;
+    }
+    if (recovery.kind === 'undone') {
+        prompts.cancel(
+            `An interrupted setup was undone before it committed; your previous consent and settings are in effect.${keptNewer(recovery.superseded)} ${rerun}`,
+        );
+        return 1;
+    }
+    if (recovery.kind === 'conflict') {
+        prompts.cancel(
+            `An interrupted setup overlaps decisions made after it (${recovery.roots.join(', ')}). Nothing was overwritten; current consent${
+                recovery.settings.length > 0 ? ` and settings (${recovery.settings.join(', ')})` : ''
+            } stay as they are. ${rerun}`,
+        );
+        return 1;
+    }
+    const post = await runPostCommitJobs({
+        store: options.store,
+        daemon: options.daemon ?? new IngestionDaemon({ store: options.store }),
+        reconcile,
+        backfillRoots: recovery.backfillRoots,
+    });
+    post.gaps.unshift(...recovery.rootGaps);
+    prompts.outro(
+        `Finished an interrupted setup with the choices you confirmed earlier${
+            post.backfilledTurns > 0 ? ` · ${plural(post.backfilledTurns, 'turn')} imported` : ''
+        }.${keptNewer(recovery.superseded)}${gapReport(post.gaps)}\n\nRun \`elepha ${command}\` again to make further changes.`,
+    );
+    return post.gaps.length > 0 ? 1 : 0;
+}
+
 // Interactive consent onboarding. It intentionally has no non-interactive mode.
+// Every prompt only stages a choice; nothing is written before the final
+// review is confirmed, so cancelling at any step leaves everything unchanged.
 export async function runInit(options: InitOptions): Promise<number> {
     const input = options.input ?? process.stdin;
     const output = options.output ?? process.stdout;
@@ -131,7 +226,23 @@ export async function runInit(options: InitOptions): Promise<number> {
     }
 
     const prompts = options.prompts ?? clackPrompts(input, output);
+    const reconcile = options.reconcile ?? ((approvedRoots: number) => reconcileCaptureService(serviceBackend(), approvedRoots));
+    let recovery: RecoveryOutcome | undefined;
+    try {
+        recovery = recoverInterruptedInitApply(options.store, options.configPath);
+    } catch (recoveryError) {
+        prompts.cancel(`${errorMessage(recoveryError)} No new choices were applied.`);
+        return 1;
+    }
+    if (recovery !== undefined) {
+        return finishRecovery(recovery, prompts, options, command, reconcile);
+    }
+
+    // Everything the preview shows is pinned here; apply refuses the plan if
+    // consent or these settings change before it commits.
+    const preview = capturePreviewState(options.store, options.configPath);
     const detectedTools = await (options.detectTools ?? detectSessionTools)();
+    let selectedTools: Set<string> | undefined;
     if (detectedTools.length === 0) {
         prompts.note('Tools detected: none');
     } else {
@@ -143,27 +254,20 @@ export async function runInit(options: InitOptions): Promise<number> {
         const initialTools = detectedTools.filter(
             (tool) => getSetting(CAPTURE_SETTING_FOR_TOOL[tool], undefined, options.configPath).value === true,
         );
-        let selectedTools: string[] | symbol;
         for (;;) {
-            selectedTools = await prompts.multiselect({
+            const selection = await prompts.multiselect({
                 message: 'Which tools should elepha capture?',
                 options: detectedTools.map((tool) => ({ value: tool, label: toolLabel(tool) })),
                 initialValues: initialTools,
             });
-            if (prompts.isCancel(selectedTools) || !Array.isArray(selectedTools)) {
+            if (prompts.isCancel(selection) || !Array.isArray(selection)) {
                 return cancellation(prompts);
             }
-            if (selectedTools.length > 0) {
+            if (selection.length > 0) {
+                selectedTools = new Set(selection);
                 break;
             }
             prompts.note('At least one capture tool must remain enabled.', 'Capture unchanged');
-        }
-        const selected = new Set(selectedTools);
-        for (const tool of detectedTools.filter((tool) => selected.has(tool))) {
-            setSetting(CAPTURE_SETTING_FOR_TOOL[tool], 'true', options.configPath);
-        }
-        for (const tool of detectedTools.filter((tool) => !selected.has(tool))) {
-            setSetting(CAPTURE_SETTING_FOR_TOOL[tool], 'false', options.configPath);
         }
     }
     const scan = prompts.spinner();
@@ -171,7 +275,9 @@ export async function runInit(options: InitOptions): Promise<number> {
     const discovery = await (options.discover ?? discoverSessionProjects)();
     scan.stop();
     if (discovery.projects.length === 0) {
-        prompts.outro(`No eligible git projects found in local sessions. Run \`elepha ${command}\` again whenever you want.`);
+        prompts.outro(
+            `No eligible git projects found in local sessions. Nothing was changed. Run \`elepha ${command}\` again whenever you want.`,
+        );
         return 0;
     }
 
@@ -229,22 +335,16 @@ export async function runInit(options: InitOptions): Promise<number> {
 
     const changes = consentChanges(candidates, selectedRoots);
     const selectedCandidates = candidates.filter((candidate) => selectedRoots.includes(candidate.root));
-    const newlyApproved = selectedCandidates.filter((candidate) => !candidate.approved);
-    const daemon = options.daemon ?? new IngestionDaemon({ store: options.store });
-    const backfill = prompts.spinner();
-    backfill.start('Backfilling newly approved projects…');
-    for (const root of changes.grantRoots) {
-        options.store.consent.grant(root);
-    }
-    const backfilledTurns =
-        newlyApproved.length === 0 ? 0 : await daemon.backfillApprovedRoots(newlyApproved.map((candidate) => candidate.root));
-
-    const pausedRoots = new Set<string>();
+    const approvedConsents = options.store.consent.list('approved');
+    const pausedRoots = new Map<string, string>();
+    const pause = (root: string): void => {
+        pausedRoots.set(normalizeForCompare(root), root);
+    };
     for (const root of changes.revokeRoots) {
-        pausedRoots.add(root);
-        for (const consent of options.store.consent.list('approved')) {
+        pause(root);
+        for (const consent of approvedConsents) {
             if (isWithin(root, consent.path)) {
-                pausedRoots.add(consent.path);
+                pause(consent.path);
             }
         }
     }
@@ -256,24 +356,128 @@ export async function runInit(options: InitOptions): Promise<number> {
         // approved root that strictly contains a candidate and is not itself
         // selected. Deletion stays with `elepha purge`.
         const selected = new Set(selectedRoots.map((root) => normalizeForCompare(root)));
-        for (const consent of options.store.consent.list('approved')) {
+        for (const consent of approvedConsents) {
             if (selected.has(normalizeForCompare(consent.path))) {
                 continue;
             }
             if (candidates.some((candidate) => isWithin(consent.path, candidate.root) && !samePath(consent.path, candidate.root))) {
-                pausedRoots.add(consent.path);
+                pause(consent.path);
                 pausedFolders.push(consent.path);
             }
         }
     }
-    for (const root of pausedRoots) {
-        options.store.consent.revoke(root);
+    const grants: PlannedRoot[] = changes.grantRoots.map(plannedRoot);
+    const revokes: PlannedRoot[] = [...pausedRoots.values()]
+        .filter((root) => !changes.grantRoots.some((grant) => samePath(grant, root)))
+        .map(plannedRoot);
+
+    // Search mode is an `init` choice; `elepha consent` never alters it.
+    const memoryPlus = getSetting('memory-plus', {}, options.configPath);
+    let search: SearchMode | undefined;
+    if (entry === 'init') {
+        // First setup recommends local semantic search; a returning user sees
+        // the mode they already chose. Neither installs anything yet.
+        const choice = await prompts.select({
+            message: 'How should elepha search your memory?',
+            options: [
+                { value: 'semantic', label: 'Local semantic search — by meaning, any language (recommended)' },
+                { value: 'term', label: 'Term-only search — matching words only' },
+            ],
+            initialValue: memoryPlus.source === 'config' && !memoryPlus.value ? 'term' : 'semantic',
+        });
+        if (prompts.isCancel(choice) || (choice !== 'semantic' && choice !== 'term')) {
+            return cancellation(prompts);
+        }
+        search = choice;
     }
+
+    const targetSettings: InitPlan['settings'] = {};
+    for (const tool of detectedTools) {
+        targetSettings[CAPTURE_SETTING_FOR_TOOL[tool]] = selectedTools?.has(tool) ?? false;
+    }
+    if (search !== undefined) {
+        targetSettings['memory-plus'] = search === 'semantic';
+    }
+    // A search choice made for the first time is recorded even when it matches
+    // the default, so the next run preselects what the user actually chose.
+    const settingsChanged = Object.entries(targetSettings).some(([key, value]) => {
+        const current = getSetting(key as keyof typeof targetSettings, {}, options.configPath);
+        return current.value !== value || (key === 'memory-plus' && current.source !== 'config');
+    });
+    const plan: InitPlan = {
+        settings: settingsChanged ? targetSettings : {},
+        grants,
+        revokes,
+        prepareSemanticSearch: search === 'semantic' && !memoryPlus.value,
+        preview,
+    };
+    if (isEmptyPlan(plan)) {
+        prompts.outro(`Nothing to change. elepha's memory settings already match your choices.`);
+        return 0;
+    }
+
+    const review: string[] = [];
+    if (detectedTools.length > 0) {
+        const on = detectedTools.filter((tool) => selectedTools?.has(tool)).map(toolLabel);
+        const off = detectedTools.filter((tool) => !selectedTools?.has(tool)).map(toolLabel);
+        review.push(`Capture: ${on.join(', ')}${off.length > 0 ? ` · off: ${off.join(', ')}` : ''}`);
+    }
+    if (grants.length > 0) {
+        review.push('Approve:', ...grants.map((planned) => `  + ${planned.canonical}`));
+    }
+    if (revokes.length > 0) {
+        review.push('Pause (captured memory is kept):', ...revokes.map((planned) => `  - ${planned.canonical}`));
+    }
+    if (grants.length === 0 && revokes.length === 0) {
+        review.push('Projects: no consent changes');
+    }
+    if (search === 'semantic') {
+        review.push('', `Search: local semantic search${memoryPlus.value ? ' (already on)' : ''}`, SEMANTIC_SEARCH_DISCLOSURE);
+    } else if (search === 'term') {
+        review.push('', 'Search: term-only', TERM_SEARCH_DISCLOSURE, ...(memoryPlus.value ? [TERM_SEARCH_RETAINS_MEMORY_PLUS] : []));
+    }
+    review.push('', CONSENT_CONTRACT_DISCLOSURE);
+    prompts.note(review.join('\n'), 'Review before applying');
+    const confirmed = await prompts.confirm({ message: 'Apply these choices?' });
+    if (prompts.isCancel(confirmed) || confirmed !== true) {
+        return cancellation(prompts);
+    }
+
+    let backfillRoots: string[];
+    try {
+        backfillRoots = await applyInitPlan(plan, {
+            store: options.store,
+            configPath: options.configPath,
+            prepareSemanticSearch: options.prepareSemanticSearch ?? (() => prepareMemoryPlus({ progress: spinnerProgress(prompts) })),
+        });
+    } catch (applyError) {
+        if (applyError instanceof StalePreviewError) {
+            prompts.cancel(`${applyError.message} Nothing was changed. Run \`elepha ${command}\` again for a fresh preview.`);
+        } else if (applyError instanceof SemanticSetupError) {
+            prompts.cancel(`${applyError.message} Nothing was changed; your previous search mode, settings and consent remain in effect.`);
+        } else if (applyError instanceof InitApplyBusyError) {
+            prompts.cancel(
+                `Another elepha setup is applying choices. Nothing was changed; run \`elepha ${command}\` again when it finishes.`,
+            );
+        } else if (applyError instanceof ApplyFailedError && applyError.restored) {
+            prompts.cancel(`${applyError.message} Nothing was changed.`);
+        } else {
+            prompts.cancel(`${errorMessage(applyError)} Run \`elepha ${command}\` again to check and recover the interrupted setup.`);
+        }
+        return 1;
+    }
+
+    const backfill = prompts.spinner();
+    backfill.start('Importing already-written sessions for newly approved projects…');
+    const post = await runPostCommitJobs({
+        store: options.store,
+        daemon: options.daemon ?? new IngestionDaemon({ store: options.store }),
+        reconcile,
+        backfillRoots,
+    });
     backfill.stop();
 
-    (options.reconcile ?? ((approvedRoots) => reconcileCaptureService(serviceBackend(), approvedRoots)))(
-        options.store.consent.list('approved').length,
-    );
+    const newlyApproved = selectedCandidates.filter((candidate) => !candidate.approved);
     const rememberedProjects = selectedCandidates.reduce((total, candidate) => total + candidate.projectCount, 0);
     const newlyAddedProjects = newlyApproved.reduce((total, candidate) => total + candidate.projectCount, 0);
     const consentedNoSessions = selectedCandidates
@@ -282,16 +486,22 @@ export async function runInit(options: InitOptions): Promise<number> {
     const pausedProjects = candidates
         .filter((candidate) => !selectedRoots.includes(candidate.root) && (candidate.approved || candidate.paused))
         .reduce((total, candidate) => total + candidate.projectCount, 0);
+    const searchSummary =
+        plan.settings['memory-plus'] === undefined
+            ? ''
+            : plan.settings['memory-plus']
+              ? ' · local semantic search on (existing sessions are indexed in the background)'
+              : ' · term-only search';
     prompts.outro(
         `elepha's memory: ${plural(rememberedProjects, 'project')}${newlyAddedProjects > 0 ? ` (${newlyAddedProjects} new)` : ''}${
             consentedNoSessions > 0 ? ` · ${consentedNoSessions} with no sessions yet` : ''
         }${
-            backfilledTurns > 0 ? ` · ${plural(backfilledTurns, 'turn')} imported` : ''
+            post.backfilledTurns > 0 ? ` · ${plural(post.backfilledTurns, 'turn')} imported` : ''
         }${pausedProjects > 0 ? ` · ${plural(pausedProjects, 'project')} paused` : ''}${
             pausedFolders.length > 0
                 ? ` · auto-sync paused for ${plural(pausedFolders.length, 'folder')} (${pausedFolders.map((root) => path.basename(root)).join(', ')})`
                 : ''
-        }\n\nRun \`elepha ${command}\` anytime to change what's remembered, or \`elepha purge --revoked\` to clear revoked projects from elepha's memory.`,
+        }${searchSummary}${gapReport(post.gaps)}\n\nRun \`elepha ${command}\` anytime to change what's remembered, or \`elepha purge --revoked\` to clear revoked projects from elepha's memory.`,
     );
-    return 0;
+    return post.gaps.length > 0 ? 1 : 0;
 }

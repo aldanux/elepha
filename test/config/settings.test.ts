@@ -1,7 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { DURABLE_CAPTURE_MAX_BYTES } from '../../src/config/constants.js';
 import { DEFAULT_MEMORY_CONFIG, readMemoryConfig } from '../../src/config/memory-config.js';
 import { getSetting, listSettings, SETTING_KEYS, setSetting, unsetSetting } from '../../src/config/settings.js';
 import { withTempDir } from '../helpers/tmp.js';
@@ -151,7 +150,6 @@ describe('settings', () => {
         expect(DEFAULT_MEMORY_CONFIG.captureCodex).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.captureOpencode).toBe(true);
         expect(DEFAULT_MEMORY_CONFIG.durableCapture).toBe(false);
-        expect(DEFAULT_MEMORY_CONFIG.durableCaptureMaxBytes).toBe(DURABLE_CAPTURE_MAX_BYTES);
         expect(readMemoryConfig(file)).toEqual({ config: DEFAULT_MEMORY_CONFIG });
     });
 
@@ -169,11 +167,13 @@ describe('settings', () => {
         expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, captureOpencode: false } });
     });
 
-    it('loads a positive integer durable capture byte cap into daemon memory config', () => {
+    // Live-memory capacity is fixed; the retired per-copy byte cap no longer
+    // configures anything.
+    it('ignores the retired durable capture byte cap', () => {
         const file = configPath();
         writeFileSync(file, '{"durable-capture-max-bytes":4096}\n');
 
-        expect(readMemoryConfig(file)).toEqual({ config: { ...DEFAULT_MEMORY_CONFIG, durableCaptureMaxBytes: 4096 } });
+        expect(readMemoryConfig(file)).toEqual({ config: DEFAULT_MEMORY_CONFIG });
     });
 
     it('rejects disabling all three capture tools without changing the final config write', () => {

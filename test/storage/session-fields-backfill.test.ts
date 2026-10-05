@@ -19,10 +19,7 @@ const FIXTURE = `{"type":"attachment","uuid":"u0","timestamp":"2026-08-01T10:00:
 // Codex-shaped fixture - session_meta carries originator + git.branch (only
 // on that one line and session-constant), a
 // turn_context, a user response_item + matching user_message event_msg
-// (the boundary), and an assistant response_item (the close). Modeled on
-// the real minimal with-git fixture at
-// test/fixtures/codex/rollout-2026-08-10-019fa000-0000-7000-8000-000000000001-with-git.jsonl
-// rather than invented from scratch.
+// (the boundary), and an assistant response_item (the close).
 const CODEX_FIXTURE = `{"timestamp":"2026-08-10T09:00:00.000Z","type":"session_meta","payload":{"session_id":"codex-sess-1","id":"codex-sess-1","cwd":"/tmp/proj","originator":"codex-tui","cli_version":"0.147.0","source":"cli","git":{"commit_hash":"deadbeef0000000000000000000000000000000","branch":"feature/codex-coverage","repository_url":null}}}
 {"timestamp":"2026-08-10T09:00:01.000Z","type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/tmp/proj","workspace_roots":["/tmp/proj"]}}
 {"timestamp":"2026-08-10T09:00:01.500Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello from codex"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}

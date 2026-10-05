@@ -97,7 +97,7 @@ describe('bounded transcript value parsing', () => {
         const filePath = path.join(directory, 'budget.jsonl');
         writeFileSync(filePath, `${JSON.stringify({ type: 'session_meta', payload: { padding: 'x'.repeat(4096) } })}\n`);
         const iterator = new CodexAdapter().parseTurns(filePath, undefined, { maxReadBytes: 128 });
-        await expect(iterator.next()).rejects.toBeInstanceOf(TranscriptReadBudgetError);
+        await expect(iterator[Symbol.asyncIterator]().next()).rejects.toBeInstanceOf(TranscriptReadBudgetError);
     });
 
     it('traverses deeply nested values iteratively and stops at the depth limit', () => {

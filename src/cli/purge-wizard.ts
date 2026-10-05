@@ -112,7 +112,7 @@ function scopeOptions(): PromptOption[] {
         { value: 'newer-than', label: 'Sessions ingested after a date or duration' },
         { value: 'older-than', label: 'Sessions older than a date or duration' },
         { value: 'external-agent-imports', label: 'External-agent imports' },
-        { value: 'orphan', label: 'Orphaned or temporary projects' },
+        { value: 'orphan', label: 'Confirmed missing project sessions' },
         { value: 'revoked', label: 'Revoked projects' },
         { value: 'all', label: 'Everything' },
     ];
@@ -168,9 +168,10 @@ export function buildPurgeScope(store: MemoryStore, options: PurgeScopeOptions):
     if (options.here && hereProject === undefined) {
         throw new PurgeHereScopeError();
     }
-    const selectedProjects = options.orphan ? projects.filter((project) => !isLiveProjectPath(project.path)) : [];
+
     const revokedProjects = options.revoked ? projects.filter((project) => store.consent.isRevoked(project.path)) : [];
     return {
+        orphan: options.orphan,
         deleteStandingRules:
             options.newerThan === undefined &&
             options.olderThan === undefined &&
@@ -180,7 +181,7 @@ export function buildPurgeScope(store: MemoryStore, options: PurgeScopeOptions):
             hereProject !== undefined
                 ? hereProject.projectIds
                 : options.orphan
-                  ? selectedProjects.map((project) => project.id)
+                  ? []
                   : options.revoked
                     ? revokedProjects.map((project) => project.id)
                     : undefined,

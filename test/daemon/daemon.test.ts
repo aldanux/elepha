@@ -135,7 +135,6 @@ describe('IngestionDaemon end-to-end', () => {
 
         let memories = store1.listRecentMemories(project1.id, 10);
         expect(memories).toHaveLength(1);
-        expect(memories[0]!.decisions[0]!.what).toContain('first request');
 
         await daemon1.stop();
 

@@ -61,7 +61,6 @@ import {
 import { DATABASE_LIFECYCLE_AMBIGUOUS, DATABASE_LIFECYCLE_BUSY, databaseLifecyclePaths } from '../../src/storage/database-lifecycle.js';
 import { type DatabaseMigrationRuntime, migratePrimaryDatabaseToEncrypted } from '../../src/storage/database-migration.js';
 import { openDb, openKeyedDatabase, openManagedDatabase, openUnmanagedDb, rekeyDatabaseConnection } from '../../src/storage/db.js';
-import { DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import { assertCanonicalDurableCaptureSchema, DURABLE_CAPTURE_SCHEMA_MISMATCH } from '../../src/storage/durable-capture-integrity.js';
 import {
     BACKUP_SOURCE_COMPANION_ERROR,
@@ -81,14 +80,22 @@ import {
     unlockMemory,
 } from '../../src/storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
-import { applyManualSplit, planManualSplit } from '../../src/storage/resegmentation.js';
 import { planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import type { SessionRuleRow } from '../../src/storage/session-rules-store.js';
 import { sourceTurnDigest } from '../../src/storage/source-turn-digest.js';
 import type { StandingRuleRow } from '../../src/storage/standing-rules-store.js';
+import { TURN_EMBEDDINGS_REINDEX_TRIGGER, TURN_EMBEDDINGS_TABLE } from '../../src/storage/turn-embeddings.js';
+import {
+    RETIRED_TURN_SEARCH_FTS_TABLE,
+    RETIRED_TURN_SEARCH_STATE_TABLE,
+    TURN_SEARCH_CLEANUP_TRIGGER,
+    TURN_SEARCH_INDEX_TABLE,
+} from '../../src/storage/turn-search-index.js';
 import { newUlid } from '../../src/storage/ulid.js';
-import type { ParsedTurn, SessionAdapter, SessionAdapterMap } from '../../src/types/index.js';
+import type { ParsedTurn, SessionAdapter } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { independentLiveMemoryBytes, ledgerBytes } from '../helpers/live-memory.js';
+import { NONCANONICAL_RETIRED_SETS, retiredTurnSearchObjects, seedRetiredTurnSearchSchema } from '../helpers/retired-turn-search.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -328,7 +335,8 @@ function sessionNativeIds(dbPath: string): string[] {
     }
 }
 
-function populate(dbPath: string, suffix: string): void {
+// Turn vectors can only reference turns whose filtered copy was retained.
+function populate(dbPath: string, suffix: string, durableCapture = false): void {
     const db = openUnmanagedDb(dbPath);
     const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
     const project = store.upsertProject(path.join(path.dirname(dbPath), `project-${suffix}`));
@@ -352,6 +360,7 @@ function populate(dbPath: string, suffix: string): void {
         session.id,
         project.id,
         { decisions: [], pending_items: [], status: 'ok' },
+        durableCapture,
     );
     db.prepare('INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES (?, ?, ?, ?, ?)').run(
         `consent-${suffix}`,
@@ -414,6 +423,29 @@ function restoredSessionRules(dbPath: string, key?: Buffer): SessionRuleRow[] {
     }
 }
 
+// Stores one derived vector per indexed memory; returns how many were stored.
+function seedTurnVectors(db: Database.Database): number {
+    return db
+        .prepare(
+            `INSERT INTO ${TURN_EMBEDDINGS_TABLE}
+               (memory_id, project_id, source_digest, text_hash, model, model_revision, dimensions, vector, computed_at)
+             SELECT t.memory_id, m.project_id, t.source_digest, 'text-hash', 'model', 'revision', 2, ?, '2026-09-27T00:00:00.000Z'
+             FROM ${TURN_SEARCH_INDEX_TABLE} t JOIN memories m ON m.id = t.memory_id`,
+        )
+        .run(Buffer.alloc(8)).changes;
+}
+
+// Copies a database elepha itself refuses to open, without migrating it.
+function rawBackup(sourcePath: string, destination: string): void {
+    const db = new Database(sourcePath);
+    try {
+        db.pragma('wal_checkpoint(TRUNCATE)');
+        copyFileSync(sourcePath, destination);
+    } finally {
+        db.close();
+    }
+}
+
 function fullBackup(sourcePath: string, destination: string): void {
     const db = openUnmanagedDb(sourcePath);
     try {
@@ -457,9 +489,13 @@ function removeConsentRootUlid(dbPath: string): void {
 }
 
 function replaceWithLegacySessionsTable(db: Database.Database): void {
-    // Legacy backups predate vectors; retaining the new table would rewrite
-    // its foreign key to sessions_old while constructing this fixture.
-    db.exec('DROP TABLE session_embeddings');
+    // Legacy backups predate vectors, task-state requests, and OpenCode
+    // receipts; retaining those newer tables would rewrite their foreign keys
+    // to sessions_old while constructing this fixture.
+    db.exec(`DROP TABLE session_embeddings;
+        DROP TABLE task_state_requests;
+        DROP TABLE opencode_compaction_receipts;
+        DROP TABLE opencode_task_state_receipts;`);
     db.pragma('foreign_keys = OFF');
     try {
         db.exec(`
@@ -1374,6 +1410,9 @@ describe('elepha restore', () => {
         const restored = openKeyedDatabase(active.dbPath, FIXED_KEY, { readonly: true });
         expect(restored.pragma('integrity_check')).toEqual([{ integrity_check: 'ok' }]);
         expect(restored.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all()).toEqual(expectedSchema);
+        expect(expectedSchema).toContainEqual(
+            expect.objectContaining({ type: 'trigger', name: TURN_SEARCH_CLEANUP_TRIGGER, tbl_name: 'memories' }),
+        );
         expect(restored.prepare("SELECT * FROM open_turns WHERE native_session_id = 'encrypted-open-turn'").get()).toEqual(
             expectedOpenTurn,
         );
@@ -1591,8 +1630,11 @@ describe('elepha restore', () => {
 
         const restored = await openDb(active.dbPath, { encryption });
         const store = new MemoryStore(restored);
-        expect(restored.prepare('SELECT * FROM source_generations').all()).toEqual([
+        // Capture records each captured session's starting generation; the
+        // active MCP generation is carried over unchanged.
+        expect(restored.prepare('SELECT * FROM source_generations ORDER BY native_id').all()).toEqual([
             { tool: 'codex', native_id: 'current-mcp-session', generation: 1 },
+            { tool: 'codex', native_id: 'session-mcp-receipt-restore', generation: 0 },
         ]);
         expect(restored.prepare('SELECT source_generation, call_id, body FROM mcp_receipts ORDER BY source_generation').all()).toEqual([
             { source_generation: 0, call_id: 'old-call', body: inactiveBody },
@@ -1665,7 +1707,6 @@ describe('elepha restore', () => {
 
         const restored = await openDb(active.dbPath, { encryption });
         const restoredStore = new MemoryStore(restored);
-        const backfill = new DurableCaptureBackfillStore(restored, restoredStore.consent);
         const anchor = restored
             .prepare(
                 `SELECT s.id, s.project_id, s.tool, s.native_id, s.segment_index, s.source_path, s.started_at, s.last_ingested_at,
@@ -1710,37 +1751,11 @@ describe('elepha restore', () => {
             false,
             { decisions: [], pending_items: [], status: 'ok' },
             false,
-            undefined,
-            undefined,
             { projectIdentity: { gitRoot: null, gitRemote: null, gitRootCommit: null }, gitCommitCount: null },
         );
         expect
             .soft(ingested)
             .toEqual(expect.objectContaining({ inserted: true, session: expect.objectContaining({ id: anchor.id, segment_index: 2 }) }));
-        const candidates = backfill.listCandidates([project.id, Number(anchor.project_id)], 10);
-        const results = [];
-        for (const candidate of candidates) {
-            const work = backfill.begin(candidate, '2026-09-06T02:01:00.000Z');
-            const touched = new Set<number>();
-            for (const turnIndex of work?.missingTurnIndexes ?? []) {
-                const result = backfill.record(
-                    candidate,
-                    turnIndex,
-                    filterTurn({
-                        userMessage: 'terminalresurrectionneedle',
-                        assistantText: 'backfilled response',
-                        toolCalls: [],
-                    }),
-                    '2026-09-06T02:01:00.000Z',
-                );
-                results.push(result);
-                if ('sessionId' in result) touched.add(result.sessionId);
-            }
-            backfill.finish(candidate, touched, 'success', '2026-09-06T02:01:01.000Z');
-        }
-
-        expect.soft(candidates).toEqual([]);
-        expect.soft(results).toEqual([]);
         expect
             .soft(
                 restored
@@ -1820,11 +1835,9 @@ describe('elepha restore', () => {
             hasExternalContent: false,
             resumeMarkerBefore: false,
         });
-        const candidates = new DurableCaptureBackfillStore(restored, store.consent).listCandidates([project.id], 10);
 
         expect.soft(restored.prepare('SELECT body FROM injections').all()).toEqual([{ body }]);
         expect.soft(quoteBack).toBe(true);
-        expect.soft(candidates).toEqual([]);
         expect.soft(restored.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?').get(session.id)).toEqual({
             state: 'evicted',
         });
@@ -2583,6 +2596,222 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         }
     });
 
+    it.each([
+        [
+            'a modified body on memories',
+            `CREATE TRIGGER ${TURN_SEARCH_CLEANUP_TRIGGER} AFTER DELETE ON memories
+             BEGIN DELETE FROM purged_transcripts; END;`,
+            DURABLE_CAPTURE_SCHEMA_MISMATCH,
+            TURN_SEARCH_CLEANUP_TRIGGER,
+        ],
+        [
+            'a different table',
+            `CREATE TRIGGER ${TURN_SEARCH_CLEANUP_TRIGGER} AFTER DELETE ON sessions
+             BEGIN DELETE FROM purged_transcripts; END;`,
+            RESTORE_CONTROL_TRIGGER_ERROR,
+            TURN_SEARCH_CLEANUP_TRIGGER,
+        ],
+        [
+            'a modified body on the search index',
+            `CREATE TRIGGER ${TURN_EMBEDDINGS_REINDEX_TRIGGER} AFTER UPDATE ON ${TURN_SEARCH_INDEX_TABLE}
+             BEGIN DELETE FROM purged_transcripts; END;`,
+            DURABLE_CAPTURE_SCHEMA_MISMATCH,
+            TURN_EMBEDDINGS_REINDEX_TRIGGER,
+        ],
+    ])('rejects a derived-index trigger with %s', async (_label, replacement, expectedError, triggerName) => {
+        const active = createTestDb('elepha-restore-turn-search-trigger-active-');
+        const candidate = createTestDb('elepha-restore-turn-search-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'turn-search-trigger.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.exec(`DROP TRIGGER ${triggerName}; ${replacement}`);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toBe(expectedError);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
+    it('clears restored turn vectors while keeping the restored memories and their search coverage', async () => {
+        const active = createTestDb('elepha-restore-turn-vectors-active-');
+        const candidate = createTestDb('elepha-restore-turn-vectors-candidate-');
+        const backup = path.join(candidate.directory, 'turn-vectors.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after', true);
+        expect(seedTurnVectors(candidate.db)).toBe(1);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const backupCounts = counts(backup);
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            expect(restored.prepare(`SELECT COUNT(*) AS count FROM ${TURN_EMBEDDINGS_TABLE}`).get()).toEqual({ count: 0 });
+            expect(restored.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: backupCounts.memories });
+            expect(restored.prepare(`SELECT COUNT(*) AS count FROM ${TURN_SEARCH_INDEX_TABLE}`).get()).toEqual({ count: 1 });
+        } finally {
+            restored.close();
+        }
+    });
+
+    it('rejects a backup whose turn vector table drops the vector length constraint', async () => {
+        const active = createTestDb('elepha-restore-turn-vector-schema-active-');
+        const candidate = createTestDb('elepha-restore-turn-vector-schema-candidate-');
+        const backup = path.join(candidate.directory, 'turn-vector-schema.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.exec(`
+            DROP TABLE ${TURN_EMBEDDINGS_TABLE};
+            CREATE TABLE ${TURN_EMBEDDINGS_TABLE} (
+              memory_id      INTEGER PRIMARY KEY REFERENCES ${TURN_SEARCH_INDEX_TABLE}(memory_id) ON DELETE CASCADE,
+              project_id     INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+              source_digest  TEXT NOT NULL,
+              text_hash      TEXT NOT NULL,
+              model          TEXT NOT NULL,
+              model_revision TEXT NOT NULL,
+              dimensions     INTEGER NOT NULL CHECK (dimensions > 0),
+              vector         BLOB NOT NULL,
+              computed_at    TEXT NOT NULL
+            );
+            CREATE INDEX idx_turn_embeddings_project ON ${TURN_EMBEDDINGS_TABLE}(project_id);
+        `);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toContain(`${TURN_EMBEDDINGS_TABLE}: declaration structure differs`);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
+    it('restores a backup carrying the retired turn-search postings and converges it on the current schema', async () => {
+        const active = createTestDb('elepha-restore-retired-postings-active-');
+        const candidate = createTestDb('elepha-restore-retired-postings-candidate-');
+        const backup = path.join(candidate.directory, 'retired-postings.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after', true);
+        const currentSchema = candidate.db.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all();
+        const coverage = candidate.db.prepare(`SELECT * FROM ${TURN_SEARCH_INDEX_TABLE} ORDER BY memory_id`).all();
+        const copies = candidate.db.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all();
+        expect(coverage).toHaveLength(1);
+        seedRetiredTurnSearchSchema(candidate.db, 1);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            expect(retiredTurnSearchObjects(restored)).toEqual([]);
+            expect(restored.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all()).toEqual(
+                currentSchema,
+            );
+            expect(restored.prepare(`SELECT * FROM ${TURN_SEARCH_INDEX_TABLE} ORDER BY memory_id`).all()).toEqual(coverage);
+            expect(restored.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all()).toEqual(copies);
+        } finally {
+            restored.close();
+        }
+    });
+
+    // A trigger attached to the marker is refused by the earlier restore-control
+    // trigger gate; every other set reaches the post-migration schema check.
+    it.each(
+        NONCANONICAL_RETIRED_SETS.map(
+            ([label, substitution]) =>
+                [
+                    label,
+                    substitution,
+                    substitution.includes(`ON ${RETIRED_TURN_SEARCH_STATE_TABLE} BEGIN`)
+                        ? RESTORE_CONTROL_TRIGGER_ERROR
+                        : DURABLE_CAPTURE_SCHEMA_MISMATCH,
+                ] as const,
+        ),
+    )('rejects a backup with %s before confirmation', async (_label, substitution, expectedError) => {
+        const active = createTestDb('elepha-restore-retired-set-active-');
+        const candidate = createTestDb('elepha-restore-retired-set-candidate-');
+        const backup = path.join(candidate.directory, 'retired-set.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after', true);
+        seedRetiredTurnSearchSchema(candidate.db, 1);
+        candidate.db.exec(substitution);
+        rawBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const backupBytes = readFileSync(backup);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toBe(expectedError);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+        expect.soft(readFileSync(backup)).toEqual(backupBytes);
+    });
+
+    it('rejects a backup whose retired turn-search postings have a substituted definition before confirmation', async () => {
+        const active = createTestDb('elepha-restore-turn-fts-active-');
+        const candidate = createTestDb('elepha-restore-turn-fts-candidate-');
+        const backup = path.join(candidate.directory, 'turn-fts.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.exec(`
+            CREATE VIRTUAL TABLE ${RETIRED_TURN_SEARCH_FTS_TABLE} USING fts5(
+              user_text, assistant_text, content='', contentless_delete=1, detail=none
+            );
+        `);
+        rawBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toBe(DURABLE_CAPTURE_SCHEMA_MISMATCH);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
     it('accepts ALTER-derived clause order and identifier quoting', async () => {
         const active = createTestDb('elepha-restore-clause-order-active-');
         const candidate = createTestDb('elepha-restore-clause-order-candidate-');
@@ -2839,6 +3068,64 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         }
     });
 
+    it('remeasures a forged live-memory total and admits no substituted ledger trigger', async () => {
+        const active = createTestDb('elepha-restore-live-memory-active-');
+        const candidate = createTestDb('elepha-restore-live-memory-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        candidate.db.prepare('UPDATE live_memory_usage SET total_bytes = ? WHERE id = 1').run(424_242);
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await expect(
+            runRestoreOperation(backup, {
+                dbPath: active.dbPath,
+                daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            }),
+        ).resolves.toMatchObject({ cancelled: false });
+
+        const restored = new Database(active.dbPath, { readonly: true, fileMustExist: true });
+        try {
+            expect.soft(ledgerBytes(restored)).toBeGreaterThan(0);
+            expect.soft(ledgerBytes(restored)).toBe(independentLiveMemoryBytes(restored));
+        } finally {
+            restored.close();
+        }
+    });
+
+    it('rejects a same-name live-memory ledger trigger with a substituted body before migration can fire it', async () => {
+        const active = createTestDb('elepha-restore-ledger-trigger-active-');
+        const candidate = createTestDb('elepha-restore-ledger-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+        // Edit the copy directly: opening it through elepha would reinstall the canonical trigger.
+        const substituted = new Database(backup);
+        substituted.exec(`
+            DROP TRIGGER live_memory_turn_embeddings_ad;
+            CREATE TRIGGER live_memory_turn_embeddings_ad AFTER DELETE ON turn_embeddings
+            BEGIN DELETE FROM purged_transcripts; END;
+        `);
+        substituted.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+
+        expect.soft(outcome).toBe(RESTORE_CONTROL_TRIGGER_ERROR);
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+    });
+
     it('normalizes every legacy summarizer and durable text field before installing a candidate', async () => {
         const active = createTestDb('elepha-restore-sanitize-active-');
         const candidate = createTestDb('elepha-restore-sanitize-candidate-');
@@ -3049,6 +3336,11 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             'CREATE INDEX extra_memory_index ON memories(turn_index)',
             `DROP TRIGGER filtered_turns_ai;
              CREATE TRIGGER filtered_turns_ai AFTER INSERT ON filtered_turns BEGIN SELECT 1; END`,
+            `ALTER TABLE ${TURN_SEARCH_INDEX_TABLE} ADD COLUMN unexpected TEXT`,
+            `CREATE VIRTUAL TABLE ${RETIRED_TURN_SEARCH_FTS_TABLE} USING fts5(user_text, assistant_text, content='', contentless_delete=1, detail=none)`,
+            // Retirement is migration's job; an unmigrated leftover is still a mismatch.
+            `CREATE TABLE ${RETIRED_TURN_SEARCH_STATE_TABLE} (id INTEGER PRIMARY KEY CHECK (id = 1), postings_version INTEGER NOT NULL)`,
+            `CREATE VIRTUAL TABLE ${RETIRED_TURN_SEARCH_FTS_TABLE} USING fts5(user_text, assistant_text, content='', contentless_delete=1, detail=column)`,
         ];
         try {
             for (const mutation of mutations) {
@@ -3426,6 +3718,83 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect.soft(consentRows(active.dbPath)).toEqual(expectedConsent);
         expect.soft(sessionNativeIds(active.dbPath)).toEqual(['session-before']);
         expect.soft(consentRows(active.dbPath)).not.toContainEqual(expect.objectContaining({ path: '/tmp/expanded', state: 'approved' }));
+    });
+
+    // The canonical embedding-refresh triggers are admitted only by exact
+    // definition; reusing one of their names must not smuggle in a new body.
+    it.each([
+        ['turn_embedding_refresh_consent_ai', 'AFTER INSERT ON consent_roots', RESTORE_CONSENT_TRIGGER_ERROR],
+        ['turn_embedding_refresh_project_ad', 'AFTER DELETE ON projects', RESTORE_CONTROL_TRIGGER_ERROR],
+    ])('rejects an altered canonical %s trigger before preview or active mutation', async (name, event, expectedError) => {
+        const active = createTestDb('elepha-restore-altered-trigger-active-');
+        const candidate = createTestDb('elepha-restore-altered-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        expect(candidate.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(name)).toBeDefined();
+        candidate.db.exec(`
+            DROP TRIGGER ${name};
+            CREATE TRIGGER ${name} ${event} BEGIN
+              INSERT OR IGNORE INTO consent_roots
+              VALUES (NULL, 'evil-ulid', '/tmp/expanded', 'approved', '2026-09-06T00:00:00.000Z', 'cli', NULL);
+            END;
+        `);
+        fullBackup(candidate.dbPath, backup);
+        const expectedConsent = consentRows(active.dbPath);
+        active.close();
+        candidate.close();
+        const activeBytes = readFileSync(active.dbPath);
+        const confirmation = vi.fn(async () => true);
+        const output: string[] = [];
+        const log = vi.spyOn(console, 'log').mockImplementation((message: unknown) => output.push(String(message)));
+
+        const outcome = await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: confirmation,
+        }).then(
+            () => ({ status: 'resolved' as const, message: undefined }),
+            (error: unknown) => ({ status: 'rejected' as const, message: error instanceof Error ? error.message : String(error) }),
+        );
+        log.mockRestore();
+
+        expect.soft(outcome).toEqual({ status: 'rejected', message: expectedError });
+        expect.soft(confirmation).not.toHaveBeenCalled();
+        expect.soft(output).not.toContain(`Restore preview: ${backup}`);
+        expect.soft(readFileSync(active.dbPath)).toEqual(activeBytes);
+        expect.soft(consentRows(active.dbPath)).toEqual(expectedConsent);
+    });
+
+    // A backup that predates a canonical trigger is admitted and migration
+    // recreates it, so the restored database keeps the authority-epoch contract.
+    it('restores a backup missing a canonical authority trigger and recreates it', async () => {
+        const active = createTestDb('elepha-restore-missing-trigger-active-');
+        const candidate = createTestDb('elepha-restore-missing-trigger-candidate-');
+        const backup = path.join(candidate.directory, 'full.db');
+        populate(active.dbPath, 'before');
+        populate(candidate.dbPath, 'after');
+        const triggers =
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name IN ('consent_roots', 'projects') ORDER BY name";
+        const expectedTriggers = candidate.db.prepare(triggers).pluck().all();
+        expect(expectedTriggers).toHaveLength(6);
+        candidate.db.exec('DROP TRIGGER turn_embedding_refresh_consent_ad');
+        fullBackup(candidate.dbPath, backup);
+        active.close();
+        candidate.close();
+
+        await runRestoreOperation(backup, {
+            dbPath: active.dbPath,
+            daemonHealth: () => ({ state: 'NOT RUNNING', healthy: false }),
+            confirm: async () => true,
+        });
+
+        expect(sessionNativeIds(active.dbPath)).toEqual(['session-after']);
+        const restored = openUnmanagedDb(active.dbPath);
+        try {
+            expect(restored.prepare(triggers).pluck().all()).toEqual(expectedTriggers);
+        } finally {
+            restored.close();
+        }
     });
 
     it.each([
@@ -4126,15 +4495,14 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         });
         type IntegratedDaemon = {
             persistTurn(adapter: SessionAdapter, parsed: ParsedTurn): Promise<boolean>;
-            backfillDurableCapture(): Promise<void>;
         };
-        const daemonWith = (store: MemoryStore, adapter: SessionAdapter, maxBytes: number): IntegratedDaemon =>
+        const daemonWith = (store: MemoryStore, adapter: SessionAdapter): IntegratedDaemon =>
             new IngestionDaemon({
                 store,
                 adapters: [adapter],
                 watchRoots: [],
                 readConfig: () => ({
-                    config: { ...DEFAULT_MEMORY_CONFIG, durableCapture: true, durableCaptureMaxBytes: maxBytes },
+                    config: { ...DEFAULT_MEMORY_CONFIG, durableCapture: true },
                 }),
             }) as unknown as IntegratedDaemon;
 
@@ -4443,52 +4811,22 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         restoredQuote.startedAt = '2026-09-06T11:00:00.000Z';
         restoredQuote.endedAt = '2026-09-06T11:02:00.000Z';
         const liveAdapter = adapterForTurns([]);
-        const liveDaemon = daemonWith(restoredStore, liveAdapter, 1_000_000);
+        const liveDaemon = daemonWith(restoredStore, liveAdapter);
         await expect(liveDaemon.persistTurn(liveAdapter, liveTurn)).resolves.toBe(true);
         await expect(liveDaemon.persistTurn(liveAdapter, restoredQuote)).resolves.toBe(false);
         expect(restoredStore.findSession('codex', 'hook-quote-session')).toBeUndefined();
 
-        const backfillSource = sourceFor('backfill-taint');
-        const backfillSession = restoredStore.upsertSession(
-            'codex',
-            'backfill-taint',
-            restoredStore.upsertProject(liveProjectPath).id,
-            backfillSource,
-        );
-        const backfillTaint = turn('backfill-taint', backfillSource, liveProjectPath, 0, `\n|| backfilltaintneedle\u009b`, 'backfill');
-        const backfillQuoteBody = 'backfill hook output must not be copied';
-        const backfillQuote = turn('backfill-taint', backfillSource, liveProjectPath, 1, 'quote follows', backfillQuoteBody);
-        restoredStore.recordTurn(backfillTaint, backfillSession.id, backfillSession.project_id, {
-            decisions: [],
-            pending_items: [],
-            status: 'ok',
-        });
-        restoredStore.recordTurn(backfillQuote, backfillSession.id, backfillSession.project_id, {
-            decisions: [],
-            pending_items: [],
-            status: 'ok',
-        });
-        restoredStore.recordInjection({
-            tool: 'codex',
-            nativeSessionId: backfillSession.native_id,
-            injectedAt: '2026-09-06T10:01:00.500Z',
-            injectionId: 'backfill-injection',
-            body: backfillQuoteBody,
-        });
-        const backfillAdapter = adapterForTurns([backfillTaint, backfillQuote]);
-        await daemonWith(restoredStore, backfillAdapter, 1_000_000).backfillDurableCapture();
         const capturedBeforeCap = restored
             .prepare(
                 `SELECT s.native_id, m.turn_index, ft.user_prompt, ft.assistant_response, ft.tool_calls
                  FROM filtered_turns ft
                  JOIN memories m ON m.id = ft.memory_id
                  JOIN sessions s ON s.id = m.session_id
-                 WHERE s.native_id IN ('live-taint', 'backfill-taint')
+                 WHERE s.native_id IN ('live-taint')
                  ORDER BY s.native_id, m.turn_index`,
             )
             .all() as Array<Record<string, string | number>>;
         expect(capturedBeforeCap.map(({ native_id, turn_index }) => ({ native_id, turn_index }))).toEqual([
-            { native_id: 'backfill-taint', turn_index: 0 },
             { native_id: 'live-taint', turn_index: 0 },
         ]);
         for (const row of capturedBeforeCap) {
@@ -4498,45 +4836,11 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
             }
         }
         expect(JSON.stringify(capturedBeforeCap)).not.toContain(currentHookBody);
-        expect(JSON.stringify(capturedBeforeCap)).not.toContain(backfillQuoteBody);
 
-        const capSource = sourceFor('cap-session');
-        const capTurns = [
-            turn('cap-session', capSource, liveProjectPath, 0, 'capevictionneedle zero', 'response zero'),
-            turn('cap-session', capSource, liveProjectPath, 1, 'capevictionneedle one', 'response one'),
-        ];
-        const capAdapter = adapterForTurns(capTurns);
-        const capDaemon = daemonWith(restoredStore, capAdapter, 1);
-        await expect(capDaemon.persistTurn(capAdapter, capTurns[0]!)).resolves.toBe(true);
-        await expect(capDaemon.persistTurn(capAdapter, capTurns[1]!)).resolves.toBe(true);
-        const capSession = restoredStore.findSession('codex', 'cap-session');
-        if (!capSession) throw new Error('Cap session was not recorded');
-        const adapters = { codex: capAdapter, 'claude-code': capAdapter } as SessionAdapterMap;
-        const split = await planManualSplit(restored, adapters, capSession.id, 1);
-        applyManualSplit(restored, split);
-        await capDaemon.backfillDurableCapture();
-        expect(
-            restored
-                .prepare(
-                    `SELECT s.segment_index, d.state
-                     FROM sessions s
-                     JOIN durable_capture_status d ON d.session_id = s.id
-                     WHERE s.native_id = 'cap-session'
-                     ORDER BY s.segment_index`,
-                )
-                .all(),
-        ).toEqual([
-            { segment_index: 0, state: 'evicted' },
-            { segment_index: 1, state: 'evicted' },
-        ]);
-        expect(restored.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'capevictionneedle'").all()).toEqual(
-            [],
-        );
         expect(
             restored.prepare('SELECT rowid FROM filtered_turns_fts WHERE rowid NOT IN (SELECT memory_id FROM filtered_turns)').all(),
         ).toEqual([]);
         expect(restored.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual(measuredUsage());
-        expect((measuredUsage() as { total_bytes: number }).total_bytes).toBeLessThanOrEqual(1);
 
         const encryptedExport = path.join(active.directory, 'integrated-full-export.db');
         exportAll(restored, encryptedExport, FIXED_KEY);

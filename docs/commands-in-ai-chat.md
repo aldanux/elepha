@@ -22,11 +22,17 @@ This page is the full guide for in-chat recall commands.
 | `elepha:help`            | Show the in-chat command list.                                                                                                            |
 
 **What a search looks at.** Search looks at session titles and how you opened each session; at what a session concluded
-where it has a rollup; and, for sessions recorded with durable capture, at the stored filtered
+where it has a rollup; and, for turns with a durable copy, at the stored filtered
 conversation. It never reads raw transcripts, thinking, tool output, or fetched external
 content, and it searches the local index, not the provider's files at query time. Opening a
-session renders the newest available filtered turns from a complete durable copy or the
-source transcript. Recall is bounded and reports when older turns were omitted.
+Claude Code or Codex session renders the newest filtered turns only when its retained
+database copy covers the whole session. Missing, stale, incompatible or unreadable
+copies return the actual evidence gap; reads never replay the provider transcript or
+start recovery. Query evidence can still use an individually current interaction or a
+stored summary, explicitly scoped rather than claiming a complete episode. A complete
+copy serves identically if its source changes or disappears; missing response phases
+remain unclassified. OpenCode retains its legacy source rendering. Recall is bounded
+and reports when older turns were omitted.
 
 **Free text, not just keywords.** `elepha:query` accepts plain phrases such as "the codex
 token fix" or "when we changed the purchase button". Filler words are ignored and the

@@ -129,7 +129,7 @@ describe('runDestructiveOp daemon liveness gate', () => {
     it('closes the operation database before resuming capture', async () => {
         const calls: string[] = [];
         serviceBackend.mockReturnValue(fakeService(calls));
-        defaultDbPath.mockReturnValue('test/fixtures/missing-elepha.db');
+        defaultDbPath.mockReturnValue(path.join(withTempDir('destructive-close-'), 'missing-elepha.db'));
         daemonHealth
             .mockReturnValueOnce({
                 state: 'RUNNING (pid 42, heartbeat 1s ago)',

@@ -1,14 +1,14 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
-import { DURABLE_CAPTURE_MAX_BYTES } from '../config/constants.js';
 import { dedupePaths } from '../config/paths.js';
 import { filterTurn } from '../rendering/filtered-turn.js';
 import { RAW_TURN_SEPARATOR, renderRawTurn } from '../rendering/raw-turn-renderer.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 import type { ParsedTurn, SummarizationOutput, ToolName, TurnDecision } from '../types/index.js';
-import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
+import { DurableCaptureStore } from './durable-capture-store.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 import type { SessionStore } from './session-store.js';
 import { sourceTurnDigest } from './source-turn-digest.js';
+import { TurnSearchIndex } from './turn-search-index.js';
 
 // Rule 3 for a per-turn decision. Both fields take the ESCAPE policy, not
 // strip: a decision may legitimately need to name the syntax it ruled out.
@@ -63,16 +63,65 @@ export interface MemoryRow {
     reingested_at: string | null;
 }
 
+const INSERT_MEMORY_SQL = `INSERT OR IGNORE INTO memories
+           (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at, summarizer_status, has_external_content)
+         VALUES (@project_id, @session_id, @turn_index, @tool, @turn_started_at, @decisions, @files_touched, @pending_items, @now, @summarizer_status, @has_external_content)`;
+
+const FIRST_PROMPT_SEARCH_IF_FIRST_SQL = `UPDATE sessions SET first_prompt_search = ?
+                 WHERE id = ? AND first_prompt_search IS NULL
+                   AND ? = (SELECT MIN(turn_index) FROM memories WHERE session_id = ?)`;
+
+// Row-scoped cleanup never blocks the rest of the native transcript.
+
+// Source identity a later replay can check this memory against, for the
+// adapters that key turns by a stable source identity.
+function recordSourceIdentity(db: Database, memoryId: number | bigint, turn: ParsedTurn): void {
+    if (turn.sourceKey === undefined) {
+        return;
+    }
+    db.prepare('UPDATE memories SET source_digest = ?, provenance = ? WHERE id = ?').run(
+        sourceTurnDigest(turn),
+        JSON.stringify(
+            turn.provenance
+                ? {
+                      protocolVersion: stripShellSyntax(turn.provenance.protocolVersion),
+                      producerVersion: stripShellSyntax(turn.provenance.producerVersion),
+                      modelAliases: turn.provenance.modelAliases.map(stripShellSyntax),
+                  }
+                : null,
+        ),
+        memoryId,
+    );
+}
+
+function incrementRenderedStats(db: Database, sessionDbId: number, turn: ParsedTurn): void {
+    const stats = db.prepare('SELECT rendered_chars, rendered_turns FROM sessions WHERE id = ?').get(sessionDbId) as {
+        rendered_chars: number | null;
+        rendered_turns: number | null;
+    };
+    const rendered = renderRawTurn(turn, (stats.rendered_turns ?? 0) + 1);
+    if (rendered !== null) {
+        db.prepare(
+            `UPDATE sessions
+             SET rendered_chars = CASE WHEN rendered_chars IS NULL OR rendered_chars = 0 THEN ? ELSE rendered_chars + ? END,
+                 rendered_turns = CASE WHEN rendered_turns IS NULL THEN NULL ELSE rendered_turns + 1 END
+             WHERE id = ?`,
+        ).run(rendered.length + 1, rendered.length + RAW_TURN_SEPARATOR.length, sessionDbId);
+    }
+}
+
 export class TurnStore {
     private readonly durableCapture: DurableCaptureStore;
+    private readonly turnSearch: TurnSearchIndex;
     private readonly stmts: {
         insertMemory: Statement;
         reingestMemory: Statement;
+        memoryIdForTurn: Statement;
+        deleteFilteredTurn: Statement;
         hasMemoryForNativeTurn: Statement;
-        isTranscriptPurged: Statement;
+        isTranscriptCaptureBlocked: Statement;
+        ensureSourceGeneration: Statement;
         listRecentMemories: Statement;
-        renderedStats: Statement;
-        incrementRenderedStats: Statement;
         setFirstPromptSearch: Statement;
         reingestFirstPromptSearch: Statement;
     };
@@ -82,12 +131,9 @@ export class TurnStore {
         private readonly sessions: SessionStore,
     ) {
         this.durableCapture = new DurableCaptureStore(db);
+        this.turnSearch = new TurnSearchIndex(db);
         this.stmts = {
-            insertMemory: db.prepare(
-                `INSERT OR IGNORE INTO memories
-           (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at, summarizer_status, has_external_content)
-         VALUES (@project_id, @session_id, @turn_index, @tool, @turn_started_at, @decisions, @files_touched, @pending_items, @now, @summarizer_status, @has_external_content)`,
-            ),
+            insertMemory: db.prepare(INSERT_MEMORY_SQL),
             // Reingest path: overwrites an existing row instead of ignoring the
             // conflict, so a naive re-run can't silently no-op against rows
             // already occupying (session_id, turn_index) from the broken
@@ -106,26 +152,24 @@ export class TurnStore {
            reingested_at = excluded.reingested_at,
            has_external_content = excluded.has_external_content`,
             ),
+            memoryIdForTurn: db.prepare('SELECT id FROM memories WHERE session_id = ? AND turn_index = ?'),
+            deleteFilteredTurn: db.prepare('DELETE FROM filtered_turns WHERE memory_id = ?'),
             hasMemoryForNativeTurn: db.prepare(
                 `SELECT 1 FROM memories m
          JOIN sessions s ON s.id = m.session_id
          WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ?
          LIMIT 1`,
             ),
-            isTranscriptPurged: db.prepare('SELECT 1 FROM purged_transcripts WHERE tool = ? AND native_id = ?'),
+            // A purge and an automatic retention removal both keep this native session from being captured again.
+            isTranscriptCaptureBlocked: db.prepare(
+                `SELECT 1 FROM purged_transcripts WHERE tool = @tool AND native_id = @nativeId
+                 UNION ALL SELECT 1 FROM live_memory_retention_removals WHERE tool = @tool AND native_id = @nativeId`,
+            ),
+            // The first captured turn records the native session's starting source
+            // generation, so retention can tell a known generation from a missing one.
+            ensureSourceGeneration: db.prepare('INSERT OR IGNORE INTO source_generations (tool, native_id, generation) VALUES (?, ?, 0)'),
             listRecentMemories: db.prepare('SELECT * FROM memories WHERE project_id = ? ORDER BY turn_started_at DESC LIMIT ?'),
-            renderedStats: db.prepare('SELECT rendered_chars, rendered_turns FROM sessions WHERE id = ?'),
-            incrementRenderedStats: db.prepare(
-                `UPDATE sessions
-                 SET rendered_chars = CASE WHEN rendered_chars IS NULL OR rendered_chars = 0 THEN ? ELSE rendered_chars + ? END,
-                     rendered_turns = CASE WHEN rendered_turns IS NULL THEN NULL ELSE rendered_turns + 1 END
-                 WHERE id = ?`,
-            ),
-            setFirstPromptSearch: db.prepare(
-                `UPDATE sessions SET first_prompt_search = ?
-                 WHERE id = ? AND first_prompt_search IS NULL
-                   AND ? = (SELECT MIN(turn_index) FROM memories WHERE session_id = ?)`,
-            ),
+            setFirstPromptSearch: db.prepare(FIRST_PROMPT_SEARCH_IF_FIRST_SQL),
             reingestFirstPromptSearch: db.prepare(
                 `UPDATE sessions SET first_prompt_search = ?
                  WHERE id = ? AND ? = (SELECT MIN(turn_index) FROM memories WHERE session_id = ?)`,
@@ -157,18 +201,8 @@ export class TurnStore {
     // silent data loss). For deliberately overwriting an already-stored turn
     // with a re-summarized result, use reingestTurn instead - IGNORE here
     // would silently discard the fix.
-    recordTurn(
-        turn: ParsedTurn,
-        sessionDbId: number,
-        projectId: number,
-        summary: SummarizationOutput,
-        durableCapture = false,
-        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
-        evictionPlan?: DurableEvictionPlan,
-    ): boolean {
-        const run = this.db.transaction(() =>
-            this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes, evictionPlan),
-        );
+    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput, durableCapture = false): boolean {
+        const run = this.db.transaction(() => this.recordTurnInTransaction(turn, sessionDbId, projectId, summary, durableCapture));
         return run();
     }
 
@@ -179,13 +213,12 @@ export class TurnStore {
         projectId: number,
         summary: SummarizationOutput,
         durableCapture = false,
-        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
-        evictionPlan?: DurableEvictionPlan,
     ): boolean {
         if (turn.droppedReason !== undefined) {
             return false;
         }
-        if (this.stmts.isTranscriptPurged.get(turn.tool, turn.sessionId) !== undefined) {
+
+        if (this.stmts.isTranscriptCaptureBlocked.get({ tool: turn.tool, nativeId: turn.sessionId }) !== undefined) {
             return false;
         }
         const now = new Date().toISOString();
@@ -202,43 +235,31 @@ export class TurnStore {
             summarizer_status: summary.status,
             has_external_content: turn.hasExternalContent ? 1 : 0,
         });
-        if (info.changes > 0 && turn.sourceKey !== undefined) {
-            this.db.prepare('UPDATE memories SET source_digest = ?, provenance = ? WHERE id = ?').run(
-                sourceTurnDigest(turn),
-                JSON.stringify(
-                    turn.provenance
-                        ? {
-                              protocolVersion: stripShellSyntax(turn.provenance.protocolVersion),
-                              producerVersion: stripShellSyntax(turn.provenance.producerVersion),
-                              modelAliases: turn.provenance.modelAliases.map(stripShellSyntax),
-                          }
-                        : null,
-                ),
-                info.lastInsertRowid,
-            );
+        if (info.changes > 0) {
+            this.stmts.ensureSourceGeneration.run(turn.tool, turn.sessionId);
         }
-        if (info.changes > 0 && durableCapture) {
-            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now, durableCaptureMaxBytes, evictionPlan);
+        if (info.changes > 0) {
+            recordSourceIdentity(this.db, info.lastInsertRowid, turn);
         }
-        this.sessions.advanceSessionCursorAt(sessionDbId, turn.cursor, now);
+        // A coverage row exists only for a retained copy. With capture off, or
+        // when a legacy eviction refuses the copy, the turn stays unindexed: a
+        // visible coverage gap rather than a hit on transcript-only text.
+        if (
+            info.changes > 0 &&
+            durableCapture &&
+            this.durableCapture.record(info.lastInsertRowid, sessionDbId, filterTurn(turn), now) === 'retained'
+        ) {
+            this.turnSearch.record(info.lastInsertRowid, turn, now);
+            this.durableCapture.refreshStatus(sessionDbId, now);
+        }
+        this.sessions.advanceSessionCursorAt(sessionDbId, turn, now);
         this.sessions.updateTrailingState(sessionDbId, turn);
         if (info.changes > 0) {
             this.stmts.setFirstPromptSearch.run(firstPromptSearch(turn.userMessage), sessionDbId, turn.turnIndex, sessionDbId);
             this.sessions.updateSessionTitle(sessionDbId, turn);
-            this.recordRenderedTurn(sessionDbId, turn);
+            incrementRenderedStats(this.db, sessionDbId, turn);
         }
         return info.changes > 0;
-    }
-
-    private recordRenderedTurn(sessionDbId: number, turn: ParsedTurn): void {
-        const stats = this.stmts.renderedStats.get(sessionDbId) as {
-            rendered_chars: number | null;
-            rendered_turns: number | null;
-        };
-        const rendered = renderRawTurn(turn, (stats.rendered_turns ?? 0) + 1);
-        if (rendered !== null) {
-            this.stmts.incrementRenderedStats.run(rendered.length + 1, rendered.length + RAW_TURN_SEPARATOR.length, sessionDbId);
-        }
     }
 
     // Overwrites an existing (session_id, turn_index) row with a fresh
@@ -249,10 +270,16 @@ export class TurnStore {
     // rather than delete-then-insert so there is no window where the row is
     // gone - a crash mid-reingest leaves either the old or the new value,
     // never neither.
-    reingestTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput): void {
+    //
+    // The filtered copy and its coverage row are replaced in the same
+    // transaction. When no replacement can be retained (capture off, or a
+    // legacy eviction) the old coverage is withdrawn; an old copy stays stored
+    // but predates reingested_at, so readers report it as stale, never current.
+    reingestTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput, durableCapture = false): void {
         if (turn.droppedReason !== undefined) {
             throw new Error('dropped turns cannot be written as memories');
         }
+
         const now = new Date().toISOString();
         this.stmts.reingestMemory.run({
             project_id: projectId,
@@ -267,6 +294,16 @@ export class TurnStore {
             summarizer_status: summary.status,
             has_external_content: turn.hasExternalContent ? 1 : 0,
         });
+        // ON CONFLICT DO UPDATE keeps the existing id but does not report it.
+        const memory = this.stmts.memoryIdForTurn.get(sessionDbId, turn.turnIndex) as { id: number };
+        this.turnSearch.withdraw(memory.id);
+        if (durableCapture) {
+            this.stmts.deleteFilteredTurn.run(memory.id);
+            if (this.durableCapture.record(memory.id, sessionDbId, filterTurn(turn), now) === 'retained') {
+                this.turnSearch.record(memory.id, turn, now);
+                this.durableCapture.refreshStatus(sessionDbId, now);
+            }
+        }
         this.stmts.reingestFirstPromptSearch.run(firstPromptSearch(turn.userMessage), sessionDbId, turn.turnIndex, sessionDbId);
     }
 

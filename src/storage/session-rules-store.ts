@@ -4,6 +4,7 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { STANDING_RULE_MAX_CHARS, STANDING_RULES_MAX_ACTIVE, STANDING_RULES_MAX_TOTAL_CHARS } from '../config/constants.js';
 import type { ToolName } from '../types/index.js';
+
 import { sanitizedStandingRuleText } from './standing-rules-store.js';
 import { newUlid } from './ulid.js';
 

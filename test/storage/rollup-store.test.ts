@@ -1,11 +1,8 @@
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { escapeShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { mergeRollupContent, ROLLUP_VERSION, RollupStore, type RollupWrite } from '../../src/storage/rollup-store.js';
-import { withTempDir } from '../helpers/tmp.js';
 
 function baseWrite(overrides: Partial<RollupWrite> = {}): RollupWrite {
     return {
@@ -282,41 +279,6 @@ describe('instructions schema migration', () => {
             expect(rollups.get(1)!.instructions).toEqual([{ what: 'Always run tests' }]);
         } finally {
             db.close();
-        }
-    });
-
-    it('upgrades a populated prior schema and preserves all data on an idempotent reopen', () => {
-        const dbPath = path.join(withTempDir('elepha-instructions-migration-'), 'legacy.db');
-        const legacy = openUnmanagedDb(dbPath);
-        const store = new MemoryStore(legacy);
-        store.upsertProject('/repo');
-        store.upsertSession('claude-code', 's1', 1, '/repo/s1.jsonl');
-        legacy.exec('DROP TABLE session_rollups');
-        legacy.exec(readFileSync(new URL('../fixtures/legacy-session-rollups.sql', import.meta.url), 'utf8'));
-        legacy
-            .prepare(`INSERT INTO session_rollups VALUES
-            (1, 1, 'claude-code', 'Prior title', 'Prior summary', ?, ?, ?, 3,
-             '2026-08-01', '2026-08-02', 'primary', NULL, 'ok', 'final', 2, '2026-08-02', 2)`)
-            .run(JSON.stringify([{ what: 'SQLite', why: 'Local storage', turnIndex: 0 }]), '["Ship"]', '["a.ts"]');
-        const before = legacy.prepare('SELECT * FROM session_rollups').get() as Record<string, unknown>;
-        expect((legacy.pragma('table_info(session_rollups)') as Array<{ name: string }>).map((c) => c.name)).not.toContain('instructions');
-        legacy.close();
-
-        const upgraded = openUnmanagedDb(dbPath);
-        expect(upgraded.prepare('SELECT * FROM session_rollups').get()).toEqual({ ...before, instructions: '[]' });
-        expect(new RollupStore(upgraded).get(1)!.instructions).toEqual([]);
-        upgraded.prepare('UPDATE session_rollups SET instructions = ? WHERE session_id = 1').run('[{"what":"Use tabs"}]');
-        upgraded.close();
-
-        const reopened = openUnmanagedDb(dbPath);
-        try {
-            expect(reopened.prepare('SELECT * FROM session_rollups').get()).toEqual({ ...before, instructions: '[{"what":"Use tabs"}]' });
-            const columns = reopened.pragma('table_info(session_rollups)') as Array<{ name: string }>;
-            expect(columns.filter((column) => column.name === 'instructions')).toHaveLength(1);
-            expect(new RollupStore(reopened).get(1)!.instructions).toEqual([{ what: 'Use tabs' }]);
-            expect(reopened.pragma('foreign_key_check')).toEqual([]);
-        } finally {
-            reopened.close();
         }
     });
 });

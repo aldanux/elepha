@@ -29,6 +29,8 @@ import * as subprocessAllowlist from '../../src/security/subprocess-allowlist.js
 import { writeBackup } from '../../src/storage/backup.js';
 import { rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
+import { isLiveMemoryCapacityGuardError } from '../../src/storage/live-memory-capacity-guard.js';
+import { readLiveMemoryUsage } from '../../src/storage/live-memory-usage.js';
 import type { ProjectRow } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { readProjectSessions } from '../../src/storage/session-read-model.js';
@@ -40,6 +42,7 @@ import {
 import { StandingRulesStore } from '../../src/storage/standing-rules-store.js';
 import { newUlid } from '../../src/storage/ulid.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession, type TestDatabase } from '../helpers/db.js';
+import { dropLiveMemoryLedger } from '../helpers/live-memory.js';
 import { testScratchRoot } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -761,6 +764,26 @@ describe('elepha import', () => {
         expect(retired.stderr).toContain("unknown option '--replace'");
     }, 15000);
 
+    it('refuses a merge that would bring live memory to capacity and imports nothing', async () => {
+        const active = createTestDb('elepha-import-capacity-active-');
+        const backupSource = createTestDb('elepha-import-capacity-source-');
+        addSession(backupSource, seedProject(backupSource), 'capacity-session', 'capacity');
+        const backup = fullBackup(backupSource, active);
+        const capacity = readLiveMemoryUsage(active.db) + 1;
+        const before = portableRows(active.dbPath);
+        active.close();
+        backupSource.close();
+
+        const refused = await runImportOperation(backup, false, {
+            dbPath: active.dbPath,
+            daemonHealth: notRunning,
+            liveMemoryCapacityBytes: capacity,
+        }).catch((error: unknown) => error);
+
+        expect(isLiveMemoryCapacityGuardError(refused)).toBe(true);
+        expect(portableRows(active.dbPath)).toEqual(before);
+    });
+
     it('sanitizes and caps first_prompt_search when adding a new session', async () => {
         const active = createTestDb('elepha-import-first-prompt-active-');
         const backupSource = createTestDb('elepha-import-first-prompt-source-');
@@ -787,6 +810,7 @@ describe('elepha import', () => {
         addSession(backupSource, seedProject(backupSource), 'legacy-session', 'legacy');
         const backup = fullBackup(backupSource, active);
         const legacyBackup = new Database(backup);
+        dropLiveMemoryLedger(legacyBackup);
         legacyBackup.exec('ALTER TABLE sessions DROP COLUMN first_prompt_search');
         legacyBackup.exec('ALTER TABLE session_rollups DROP COLUMN instructions');
         legacyBackup.close();

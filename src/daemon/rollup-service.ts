@@ -26,9 +26,9 @@ import type { SessionKind } from '../types/index.js';
 // three batches in - that's the CLI's "Rolled up 10 session(s)" false
 // success line, fixed at the source.
 export interface RollupOutcome {
+    deferred?: 'locked';
     wrote: boolean;
     complete: boolean;
-    deferred?: 'locked';
 }
 
 // True if the session's stored watermark still matches what this batch's

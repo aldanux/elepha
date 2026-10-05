@@ -11,7 +11,7 @@ import {
 import { publicSessionId } from '../../src/serving/session-id.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
-import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedCopyCoverage, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
 function fixture() {
     const f = createTestDb('session-evidence-');
@@ -32,6 +32,7 @@ function fixture() {
                 `${'Earlier background. '.repeat(75)}Refund ${turnIndex}: preserve receipts`,
                 DURABLE_CAPTURE_FILTER_VERSION,
             );
+        seedCopyCoverage(f, memory.id);
     }
     f.db
         .prepare(`INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)

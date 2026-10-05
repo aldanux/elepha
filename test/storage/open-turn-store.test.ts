@@ -2,8 +2,9 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { filterTurn } from '../../src/rendering/filtered-turn.js';
-import { SessionReader } from '../../src/serving/session-reader.js';
-import { DurableEvictionPlan, storedProjectionBytes } from '../../src/storage/durable-capture-store.js';
+import { SessionReader, STORED_EVIDENCE_REASONS } from '../../src/serving/session-reader.js';
+import { LIVE_MEMORY_RETENTION_POLICY, LiveMemoryCaptureDeferredError } from '../../src/storage/live-memory-retention.js';
+import { MemoryStore } from '../../src/storage/memory-store.js';
 import { sourceTurnDigest } from '../../src/storage/source-turn-digest.js';
 import type { OpenTailObservation, ParsedTurn, SummarizationOutput } from '../../src/types/index.js';
 import { createTestDb } from '../helpers/db.js';
@@ -161,23 +162,55 @@ describe('open turn staging', () => {
         expect(publicSession.incomplete_last_observed).toBe(true);
         const servedText = responseText(await mcp.getSession({ id: publicSession.id }));
         expect(servedText).toContain('Incomplete last-observed snapshot');
+        expect(servedText).toContain(STORED_EVIDENCE_REASONS.missing);
+        fixture.db.prepare('UPDATE open_turns SET durable_filter_version = 0').run();
+        const incompatible = responseText(await mcp.getSession({ id: publicSession.id }));
+        expect(incompatible).toContain('Incomplete last-observed snapshot');
+        expect(incompatible).not.toContain('Partial investigation.');
+        fixture.db.prepare('UPDATE open_turns SET durable_filter_version = ?').run(snapshot!.durableProjection!.filterVersion);
+        const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValue(AbortSignal.abort());
+        const timedOut = await mcp.getSession({ id: publicSession.id });
+        expect(timedOut.structuredContent).toMatchObject({ reason: 'deadline' });
+        expect(responseText(timedOut)).not.toContain('Incomplete last-observed snapshot');
+        timeout.mockRestore();
         expect(servedText).toContain('"complete":false');
         expect(servedText).toContain('"filtered_interaction"');
         expect(servedText).toContain('Investigate the issue.');
     });
 
-    it('keeps the staged summary but drops its recoverable projection when the durable byte cap binds', () => {
-        const fixture = createTestDb('elepha-open-turn-durable-cap-');
+    it('defers staging at live-memory capacity instead of evicting any retained copy', () => {
+        const fixture = createTestDb('elepha-open-turn-capacity-');
         const projectPath = path.join(fixture.directory, 'project');
-        const sourcePath = path.join(fixture.directory, 'rollout.jsonl');
+        const project = fixture.store.upsertProject(projectPath);
         fixture.store.consent.grant(projectPath);
-        const candidate = turn(projectPath, sourcePath);
+        const canonicalSource = path.join(fixture.directory, 'canonical.jsonl');
+        const canonicalSession = fixture.store.upsertSession('codex', 'canonical-native', project.id, canonicalSource);
+        fixture.store.recordTurn(
+            turn(projectPath, canonicalSource, { sessionId: 'canonical-native' }),
+            canonicalSession.id,
+            project.id,
+            summary,
+            true,
+        );
+        const copies = fixture.db.prepare('SELECT memory_id, user_prompt FROM filtered_turns').all();
+        expect(copies).toHaveLength(1);
+        const candidate = turn(projectPath, path.join(fixture.directory, 'staged.jsonl'), { sessionId: 'staged-native' });
         fixture.store.observeOpenTurn(observation(candidate), { kind: 'main' }, 0, source(), '2026-09-18T08:47:18.000Z');
+        // Capacity is already exceeded and every chat is inside the active window.
+        const full = new MemoryStore(fixture.db, {
+            liveMemoryRetention: {
+                ...LIVE_MEMORY_RETENTION_POLICY,
+                capacityBytes: 1,
+                targetBytes: 0,
+                warningBytes: 0,
+                activeWindowMs: Number.MAX_SAFE_INTEGER,
+            },
+        });
 
-        expect(
-            fixture.store.stageOpenTurnSummary(
+        expect(() =>
+            full.stageOpenTurnSummary(
                 'codex',
-                'open-native',
+                'staged-native',
                 'revision-1',
                 sourceTurnDigest(candidate),
                 summary,
@@ -185,142 +218,11 @@ describe('open turn staging', () => {
                 filterTurn(candidate),
                 projectPath,
                 () => true,
-                1,
             ),
-        ).toBe(true);
+        ).toThrow(LiveMemoryCaptureDeferredError);
 
-        expect(fixture.store.findOpenTurn('codex', 'open-native')).toMatchObject({
-            staged_at: '2026-09-18T08:52:18.000Z',
-            durable_included: null,
-            durable_user_prompt: null,
-        });
-        expect(fixture.db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get()).toEqual({ total_bytes: 0 });
-    });
-
-    it('evicts an older recoverable canonical capture before a newer staged projection', () => {
-        const fixture = createTestDb('elepha-open-turn-mixed-eviction-');
-        const projectPath = path.join(fixture.directory, 'project');
-        const project = fixture.store.upsertProject(projectPath);
-        fixture.store.consent.grant(projectPath);
-        const canonicalSource = path.join(fixture.directory, 'canonical.jsonl');
-        const canonicalSession = fixture.store.upsertSession('codex', 'canonical-native', project.id, canonicalSource);
-        const canonical = turn(projectPath, canonicalSource, { sessionId: 'canonical-native' });
-        fixture.store.recordTurn(canonical, canonicalSession.id, project.id, summary, true);
-        fixture.db.prepare('UPDATE sessions SET last_ingested_at = ? WHERE id = ?').run('2026-01-01T00:00:00.000Z', canonicalSession.id);
-
-        const stagedSource = path.join(fixture.directory, 'staged.jsonl');
-        const stagedCandidate = turn(projectPath, stagedSource, { sessionId: 'staged-native' });
-        const stagedRow = fixture.store.observeOpenTurn(
-            observation(stagedCandidate),
-            { kind: 'main' },
-            0,
-            source(),
-            '2026-09-18T08:47:18.000Z',
-        )!;
-        const projection = filterTurn(stagedCandidate);
-        const plan = DurableEvictionPlan.from(
-            new Map([
-                [
-                    `session:${canonicalSession.id}`,
-                    {
-                        kind: 'session' as const,
-                        id: canonicalSession.id,
-                        tool: 'codex' as const,
-                        source_path: canonicalSource,
-                        recoverable: true,
-                    },
-                ],
-            ]),
-            {
-                kind: 'open-turn',
-                id: stagedRow.session_id,
-                tool: 'codex',
-                source_path: stagedSource,
-                recoverable: true,
-            },
-        );
-
-        expect(
-            fixture.store.stageOpenTurnSummary(
-                'codex',
-                'staged-native',
-                'revision-1',
-                sourceTurnDigest(stagedCandidate),
-                summary,
-                '2026-09-18T08:52:18.000Z',
-                projection,
-                projectPath,
-                () => true,
-                storedProjectionBytes(projection),
-                undefined,
-                plan,
-            ),
-        ).toBe(true);
-        expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
-        expect(fixture.store.findOpenTurn('codex', 'staged-native')?.durable_user_prompt).toBe(stagedCandidate.userMessage);
-    });
-
-    it('evicts the oldest recoverable staged projection before a newer staged projection', () => {
-        const fixture = createTestDb('elepha-open-turn-staged-eviction-');
-        const projectPath = path.join(fixture.directory, 'project');
-        fixture.store.consent.grant(projectPath);
-        const first = turn(projectPath, path.join(fixture.directory, 'first.jsonl'), { sessionId: 'first-open' });
-        const second = turn(projectPath, path.join(fixture.directory, 'second.jsonl'), { sessionId: 'second-open' });
-        const firstRow = fixture.store.observeOpenTurn(observation(first), { kind: 'main' }, 0, source(), '2026-09-18T08:47:18.000Z')!;
-        expect(
-            fixture.store.stageOpenTurnSummary(
-                'codex',
-                'first-open',
-                'revision-1',
-                sourceTurnDigest(first),
-                summary,
-                '2026-09-18T08:52:18.000Z',
-                filterTurn(first),
-            ),
-        ).toBe(true);
-        const secondRow = fixture.store.observeOpenTurn(observation(second), { kind: 'main' }, 0, source(), '2026-09-18T09:00:00.000Z')!;
-        const secondProjection = filterTurn(second);
-        const plan = DurableEvictionPlan.from(
-            new Map([
-                [
-                    `open-turn:${firstRow.session_id}`,
-                    {
-                        kind: 'open-turn' as const,
-                        id: firstRow.session_id,
-                        tool: 'codex' as const,
-                        source_path: first.sourcePath,
-                        recoverable: true,
-                    },
-                ],
-            ]),
-            {
-                kind: 'open-turn',
-                id: secondRow.session_id,
-                tool: 'codex',
-                source_path: second.sourcePath,
-                recoverable: true,
-            },
-        );
-
-        expect(
-            fixture.store.stageOpenTurnSummary(
-                'codex',
-                'second-open',
-                'revision-1',
-                sourceTurnDigest(second),
-                summary,
-                '2026-09-18T09:05:00.000Z',
-                secondProjection,
-                projectPath,
-                () => true,
-                storedProjectionBytes(secondProjection),
-                undefined,
-                plan,
-            ),
-        ).toBe(true);
-        expect(fixture.store.findOpenTurn('codex', 'first-open')).toMatchObject({ staged_at: '2026-09-18T08:52:18.000Z' });
-        expect(fixture.store.findOpenTurn('codex', 'first-open')?.durable_user_prompt).toBeNull();
-        expect(fixture.store.findOpenTurn('codex', 'second-open')?.durable_user_prompt).toBe(second.userMessage);
+        expect(fixture.store.findOpenTurn('codex', 'staged-native')).toMatchObject({ staged_at: null, durable_user_prompt: null });
+        expect(fixture.db.prepare('SELECT memory_id, user_prompt FROM filtered_turns').all()).toEqual(copies);
     });
 
     it('revises one row for repeated failures and prevents a stale same-metadata summary from winning', () => {

@@ -15,8 +15,7 @@ Other managers:
 - [asdf](https://asdf-vm.com/guide/getting-started.html): install an exact 24.x release with the Node.js plugin, then `asdf set -u nodejs <installed-24.x-version>`; remove conflicting project or shell overrides.
 - [Homebrew](https://formulae.brew.sh/formula/node@24): `brew install node@24`, then put `$(brew --prefix node@24)/bin` first in your shell's `PATH`. Homebrew has no default alias; its stable `opt/node@24` path selects the release.
 
-The end-user runtime floor stays at Node 22.12.0. CI explicitly tests Node 22 and 24
-and does not derive its versions from `.nvmrc`.
+The end-user runtime floor is Node 22.15.0. CI explicitly tests Node 22 and 24 and does not derive its versions from `.nvmrc`.
 
 ## Day-to-day loop
 

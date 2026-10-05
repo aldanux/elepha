@@ -97,7 +97,6 @@ describe('Codex guardian ingestion exclusion', () => {
             rollupService: new RollupService({ store: f.store, rollups, provider: { rollup, merge }, idleCloseMs: 0 }),
         });
         const background = daemon as unknown as {
-            backfillDurableCapture(): Promise<void>;
             backfillFirstPromptSearch(): Promise<void>;
             sweepIdleSessions(): Promise<number>;
         };
@@ -108,19 +107,10 @@ describe('Codex guardian ingestion exclusion', () => {
             });
             return { promise, resolve };
         };
-        const durableDone = checkpoint();
         const promptDone = checkpoint();
         const sweepDone = checkpoint();
-        const durable = background.backfillDurableCapture.bind(daemon);
         const prompt = background.backfillFirstPromptSearch.bind(daemon);
         const sweep = background.sweepIdleSessions.bind(daemon);
-        vi.spyOn(background, 'backfillDurableCapture').mockImplementation(async () => {
-            try {
-                await durable();
-            } finally {
-                durableDone.resolve();
-            }
-        });
         vi.spyOn(background, 'backfillFirstPromptSearch').mockImplementation(async () => {
             try {
                 await prompt();
@@ -137,7 +127,7 @@ describe('Codex guardian ingestion exclusion', () => {
         });
         daemon.start();
         try {
-            await Promise.all([durableDone.promise, promptDone.promise, sweepDone.promise]);
+            await Promise.all([promptDone.promise, sweepDone.promise]);
             expect(parse).not.toHaveBeenCalled();
             expect(rollup).not.toHaveBeenCalled();
             expect(merge).not.toHaveBeenCalled();

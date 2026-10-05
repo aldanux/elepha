@@ -33,8 +33,9 @@ structurally impossible here. Read them before touching ingestion, adapters, or 
 subprocess boundary.
 
 **Rule 1 — A transcript path never reaches a shell.** Read transcripts only through
-filesystem APIs. The three places that touch transcripts (`src/adapters/**`,
-`src/daemon/index.ts`, `src/daemon/readability-guard.ts`) must not import
+filesystem APIs. The places that touch transcripts (`src/adapters/**`,
+`src/daemon/index.ts`,
+`src/daemon/readability-guard.ts`) must not import
 `node:child_process` or call any subprocess function. If a reader cannot spawn
 anything, a transcript path structurally cannot reach a shell.
 
@@ -44,12 +45,16 @@ subprocesses live in `src/security/subprocess-allowlist.ts`: a fixed set of read
 fixed lifecycle verbs, the resolved npm backend with fixed package-management argv
 for self-update and the isolated Memory-Plus runtime install (enforced by
 `test/security/npm-allowlist.test.ts`), and fixed read-only macOS `/bin/ps` and `/usr/sbin/lsof` probes for
-installer-owned legacy MCP retirement, and the generated OpenCode hook clients invoking
-only the installed elepha launcher with fixed `hook user-prompt-submit --tool opencode`
-or `hook standing-rules --tool opencode` argv and JSON payloads on stdin. The command
-client stays synchronous; the rules client is asynchronous with bounded timeout and
-output. Both clients are rendered by the allowlist module; their fixed argv,
-`shell: false`, and stdin boundaries are enforced by
+installer-owned legacy MCP retirement, and the generated OpenCode hook
+clients invoking only the installed elepha launcher with fixed
+`hook user-prompt-submit --tool opencode`,
+`hook standing-rules --tool opencode`,
+`hook compaction-receipt --tool opencode`, or
+`hook task-state-receipt --tool opencode` argv and JSON payloads on
+stdin. The command client stays synchronous; the rules and receipt
+clients are asynchronous with bounded timeout and output. All clients
+are rendered by the allowlist module; their fixed argv, `shell: false`,
+and stdin boundaries are enforced by
 `test/install/opencode-plugin.test.ts`. Those probes accept only a configured database
 path or a validated OS process ID; Linux uses `/proc` without subprocesses. Every
 subprocess uses an argv array with `shell: false`. **No
@@ -141,9 +146,17 @@ logging tool, which is exactly the fragile pattern elepha is built to avoid.
 ## Change conventions (put new code in its home)
 
 - **Constants, not inline literals.** Limits, budgets, timeouts, thresholds, and
-  keep-counts live in `src/config/constants.ts`. The version comes from
+  keep-counts have one named source. Group related values in focused config modules;
+  do not keep adding unrelated domains to `src/config/constants.ts`. Move existing
+  values when their owning subsystem is changed, preserving a stable import boundary
+  where needed; do not run a standalone cosmetic extraction. The version comes from
   `src/config/version.ts` (read from `package.json`, never hardcoded); the Node floor
   is a single constant mirrored by `engines.node`.
+- **Keep modules cohesive.** Each adapter owns only its host's transcript format and
+  delivery details; shared storage, retrieval, consent, and policy have one home.
+  Extract a focused helper when multiple callers need the same behavior or a module
+  gains a second responsibility. Do not create speculative abstractions or grow a
+  single adapter, daemon, or config file into the home for unrelated behavior.
 - **Hot paths have a budget.** Hooks run under a watchdog and ingestion runs for every
   turn, so give recurring work explicit time, byte, and retention limits, compute fixed
   values once outside loops, and finish filesystem and Git work before opening a write
@@ -185,6 +198,10 @@ logging tool, which is exactly the fragile pattern elepha is built to avoid.
 
 ## Tests
 
+- **Test behavior, not incidental text.** Prefer observable state and end-to-end
+  outcomes over assertions about helper implementation, cosmetic copy, punctuation,
+  or formatting. Keep exact output assertions only where bytes are part of a
+  machine, security, or destructive-operation contract.
 - **Treat a failing test as a report about the source.** Fix the implementation rather
   than weakening, relaxing, or deleting an assertion to make the suite pass. If an
   assertion is genuinely wrong, explain why in the pull request before changing it,

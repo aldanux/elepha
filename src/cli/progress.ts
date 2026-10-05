@@ -2,6 +2,8 @@ import { styleText } from 'node:util';
 import { CLI_PROGRESS_FRAME_DELAY_MS } from '../config/constants.js';
 
 export interface CliProgress {
+    update?(message: string): void;
+    clear?(): void;
     done(message?: string): void;
     fail(message?: string): void;
 }
@@ -9,6 +11,7 @@ export interface CliProgress {
 const PROGRESS_FRAMES = ['◒', '◐', '◓', '◑'] as const;
 
 function startDotlessCliProgress(message: string): CliProgress {
+    let label = message;
     let frame = 0;
     let running = true;
     const render = (text: string): void => {
@@ -16,7 +19,7 @@ function startDotlessCliProgress(message: string): CliProgress {
     };
     const tick = (): void => {
         const currentFrame = PROGRESS_FRAMES[frame] ?? PROGRESS_FRAMES[0];
-        render(`${styleText('magenta', currentFrame, { stream: process.stdout })}  ${message}`);
+        render(`${styleText('magenta', currentFrame, { stream: process.stdout })}  ${label}`);
         frame = (frame + 1) % PROGRESS_FRAMES.length;
     };
     const finish = (symbol: string, color: 'green' | 'red', finalMessage: string): void => {
@@ -33,10 +36,21 @@ function startDotlessCliProgress(message: string): CliProgress {
     timer.unref();
 
     return {
-        done(finalMessage = message) {
+        update(nextMessage) {
+            label = nextMessage;
+            if (running) {
+                tick();
+            }
+        },
+        clear() {
+            if (running) {
+                render('');
+            }
+        },
+        done(finalMessage = label) {
             finish('◇', 'green', `${finalMessage} ✔`);
         },
-        fail(finalMessage = message) {
+        fail(finalMessage = label) {
             finish('▲', 'red', `${finalMessage} ✖`);
         },
     };

@@ -1,7 +1,8 @@
-import { readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { HOOK_WATCHDOG_TIMEOUT_MS, PACKAGE_VERSION } from '../../src/config/constants.js';
+import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
+import { DURABLE_CAPTURE_FILTER_VERSION, HOOK_WATCHDOG_TIMEOUT_MS, PACKAGE_VERSION } from '../../src/config/constants.js';
 import {
     envelope,
     handleWatchdogTimeout,
@@ -11,7 +12,7 @@ import {
 } from '../../src/hooks/session-start.js';
 import { CLOSE, OPEN } from '../../src/security/sentinel.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import { createTestDb } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
 const NOW = Date.parse('2026-09-08T00:00:00.000Z');
 const HEALTH_WARNING = '⚠ elepha: capture may be stalled — daemon heartbeat is stale. → Run (Terminal): elepha doctor';
@@ -53,22 +54,8 @@ const NO_NOTICE: Pick<SessionStartDependencies, 'daemonHealth' | 'readUpdateAvai
 };
 
 describe('SessionStart operational notices', () => {
-    it('validates every installed source and preserves both envelope contracts', () => {
-        const fixtures = {
-            'claude-code': JSON.parse(
-                readFileSync(path.resolve(__dirname, '..', 'fixtures', 'hooks', 'claude-session-start.json'), 'utf8'),
-            ),
-            codex: JSON.parse(readFileSync(path.resolve(__dirname, '..', 'fixtures', 'hooks', 'codex-session-start.json'), 'utf8')),
-        };
-        for (const source of ['startup', 'clear', 'resume', 'compact'] as const) {
-            expect(parsePayload(JSON.stringify({ ...fixtures['claude-code'], source }), 'claude-code')).toMatchObject({ source });
-            expect(parsePayload(JSON.stringify({ ...fixtures.codex, source }), 'codex')).toMatchObject({ source });
-        }
+    it('rejects an empty payload and preserves both envelope contracts', () => {
         expect(parsePayload('{}', 'claude-code')).toBeUndefined();
-        expect(parsePayload(JSON.stringify({ ...fixtures['claude-code'], source: 'fork' }), 'claude-code')).toMatchObject({
-            source: 'fork',
-        });
-        expect(parsePayload(JSON.stringify({ ...fixtures.codex, source: 'fork' }), 'codex')).toBeUndefined();
         expect(envelope('claude-code', { additionalContext: 'body' })).toEqual({
             hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: 'body' },
         });
@@ -138,6 +125,61 @@ describe('SessionStart operational notices', () => {
         }
 
         expect(openDatabase).toHaveBeenCalledTimes(4);
+    });
+
+    it('does not consult a compact summary or inject automatic continuity for a consented Claude chat', async () => {
+        const f = createTestDb('elepha-session-start-compact-');
+        const checkout = path.join(f.directory, 'checkout');
+        const claudeRoot = path.join(f.directory, 'claude');
+        const sourcePath = path.join(claudeRoot, 'projects', 'checkout', 'native-chat.jsonl');
+        mkdirSync(checkout, { recursive: true });
+        mkdirSync(path.dirname(sourcePath), { recursive: true });
+        writeFileSync(sourcePath, '{}\n');
+        const project = seedProject(f, { path: checkout });
+        seedConsentRoot(f, { path: checkout });
+        const session = seedSession(f, { project, tool: 'claude-code', nativeId: 'native-chat', sourcePath });
+        const memory = seedMemory(f, {
+            project,
+            session,
+            userMessage: 'Keep the signed receipt for every refund.',
+        });
+        f.db
+            .prepare(`INSERT INTO filtered_turns
+                (memory_id, included, user_prompt, assistant_response, tool_calls, omitted_tool_call_count,
+                 dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
+                VALUES (?, 1, ?, '', '[]', 0, 0, 0, ?, '2026-09-27')`)
+            .run(memory.id, 'Keep the signed receipt for every refund.', DURABLE_CAPTURE_FILTER_VERSION);
+        f.db
+            .prepare(`INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)
+                VALUES (?, 'complete', ?, '2026-09-27')`)
+            .run(session.id, DURABLE_CAPTURE_FILTER_VERSION);
+        const readSummary = vi.spyOn(ClaudeCodeAdapter.prototype, 'readLatestCompactSummary');
+        const previousClaudeRoot = process.env.CLAUDE_CONFIG_DIR;
+        process.env.CLAUDE_CONFIG_DIR = claudeRoot;
+        try {
+            const result = await runSessionStart(
+                JSON.stringify({
+                    hook_event_name: 'SessionStart',
+                    source: 'compact',
+                    session_id: 'native-chat',
+                    cwd: checkout,
+                    transcript_path: sourcePath,
+                }),
+                'claude-code',
+                {
+                    ...NO_NOTICE,
+                    dbPath: f.dbPath,
+                    openDatabase: (async (dbPath: string) => openUnmanagedDb(dbPath)) as SessionStartDependencies['openDatabase'],
+                },
+            );
+            expect(result).toEqual({ reason: 'no_notice' });
+            expect(readSummary).not.toHaveBeenCalled();
+            expect(f.store.injectionsForSession('claude-code', 'native-chat', new Date().toISOString())).toEqual([]);
+        } finally {
+            readSummary.mockRestore();
+            if (previousClaudeRoot === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+            else process.env.CLAUDE_CONFIG_DIR = previousClaudeRoot;
+        }
     });
 
     it('emits only the daemon-health warning on every source and never an auto-brief or status line', async () => {

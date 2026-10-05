@@ -12,51 +12,15 @@ import { ElephaMcpService, mcpToolDefinitions } from '../../src/mcp/tools.js';
 import { omissionMarker } from '../../src/rendering/raw-turn-renderer.js';
 import { dataBlockClose, dataBlockOpen } from '../../src/serving/instructions.js';
 import { publicSessionId } from '../../src/serving/session-id.js';
-import { SessionReader } from '../../src/serving/session-reader.js';
+import { SessionReader, STORED_EVIDENCE_REASONS } from '../../src/serving/session-reader.js';
 import { ConsentStore } from '../../src/storage/consent-store.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
+import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
-import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
+import type { ParsedTurn } from '../../src/types/index.js';
 import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
-
-class FixtureAdapter implements SessionAdapter {
-    readonly tool: SessionAdapterTool;
-
-    constructor(
-        tool: SessionAdapterTool,
-        private readonly turnsByPath: Map<string, ParsedTurn[]>,
-        private readonly beforeParse?: () => Promise<void>,
-    ) {
-        this.tool = tool;
-    }
-
-    readonly watchGlobs = ['*.jsonl'];
-
-    matches(): boolean {
-        return true;
-    }
-
-    async classifySession(): Promise<{ kind: 'primary' }> {
-        return { kind: 'primary' };
-    }
-
-    async classifyEmptySession() {
-        return undefined;
-    }
-
-    nativeSessionId(filePath: string): string {
-        return path.basename(filePath, '.jsonl');
-    }
-
-    async *parseTurns(filePath: string): AsyncIterable<ParsedTurn> {
-        await this.beforeParse?.();
-        for (const turn of this.turnsByPath.get(filePath) ?? []) {
-            yield turn;
-        }
-    }
-}
 
 function text(response: unknown): string {
     if (typeof response !== 'object' || response === null) {
@@ -313,22 +277,30 @@ describe('elepha MCP server surface', () => {
         const renderResumed = new Promise<void>((resolve) => {
             resumeRender = resolve;
         });
-        const adapter = new FixtureAdapter('codex', turns, async () => {
-            if (!pauseNextRender) return;
-            pauseNextRender = false;
-            markRenderStarted();
-            await renderResumed;
-        });
-        const service = new ElephaMcpService(fixture.db, mcpResponseShaper, {
-            codex: adapter,
-            'claude-code': new FixtureAdapter('claude-code', turns),
-        });
+        fixture.db.prepare('DELETE FROM memories WHERE session_id = ?').run(session.id);
+        fixture.store.recordTurn(
+            turns.get(sourcePath)![0]!,
+            session.id,
+            project.id,
+            { decisions: [], pending_items: [], status: 'not_configured' },
+            true,
+        );
+        const service = new ElephaMcpService(fixture.db, mcpResponseShaper);
         const publicId = Buffer.from(
             JSON.stringify({ tool: session.tool, nativeId: session.native_id, segmentIndex: session.segment_index }),
         ).toString('base64url');
         const liveConsent = vi.spyOn(ProjectResolver.prototype, 'listConsented');
         const storedConsent = vi.spyOn(ProjectResolver.prototype, 'listConsentedStored');
-        const render = vi.spyOn(SessionReader.prototype, 'render');
+        const originalRender = SessionReader.prototype.render;
+        const render = vi.spyOn(SessionReader.prototype, 'render').mockImplementation(async function (this: SessionReader, ...args) {
+            const result = await originalRender.apply(this, args);
+            if (pauseNextRender) {
+                pauseNextRender = false;
+                markRenderStarted();
+                await renderResumed;
+            }
+            return result;
+        });
         const timeout = vi.spyOn(AbortSignal, 'timeout');
 
         const normal = await service.getSession({ id: publicId });
@@ -602,11 +574,21 @@ describe('elepha MCP server surface', () => {
                     ('beta-root', ?, 'approved', '2026-08-16T00:00:00.000Z', 'cli')`,
         ).run(realpathSync(known), realpathSync(empty), realpathSync(alpha), realpathSync(beta));
 
-        const adapters: SessionAdapterMap = {
-            codex: new FixtureAdapter('codex', turnsByPath),
-            'claude-code': new FixtureAdapter('claude-code', turnsByPath),
-        };
-        const service = new ElephaMcpService(db, mcpResponseShaper, adapters);
+        const capture = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        for (const turns of turnsByPath.values()) {
+            const stored = capture.findSession('codex', turns[0]!.sessionId)!;
+            db.prepare('DELETE FROM memories WHERE session_id = ?').run(stored.id);
+            for (const turn of turns) {
+                capture.recordTurn(
+                    turn,
+                    stored.id,
+                    stored.project_id,
+                    { decisions: [], pending_items: [], status: 'not_configured' },
+                    true,
+                );
+            }
+        }
+        const service = new ElephaMcpService(db, mcpResponseShaper);
 
         const listed = service.listSessions({ project: known, include_all: true });
         if (listed.structuredContent === undefined) {
@@ -625,7 +607,7 @@ describe('elepha MCP server surface', () => {
         expect(sessions.find((session) => session.title === UNTITLED_EPISODE)).toMatchObject({ turn_count: 1 });
         const episodeResponses = await Promise.all(sessions.map((session) => service.getSession({ id: session.id })));
         const served = episodeResponses.find((response) => text(response).includes('## Turn 1'));
-        const missingResponse = episodeResponses.find((response) => text(response).includes('unavailable on disk'));
+        const missingResponse = episodeResponses.find((response) => response.structuredContent?.reason === STORED_EVIDENCE_REASONS.missing);
         if (served === undefined) {
             throw new Error('fixture did not produce a served episode');
         }
@@ -717,8 +699,8 @@ describe('elepha MCP server surface', () => {
         expect(unknown.structuredContent).toMatchObject({ empty: true, reason: 'unknown_project' });
         expect(text(ambiguous)).toContain('Several projects match');
         expect(ambiguous.structuredContent).toMatchObject({ ambiguous: true });
-        expect(text(missingResponse!)).toContain('unavailable on disk');
-        expect(missingResponse?.structuredContent).toMatchObject({ empty: true, reason: 'transcript_missing' });
+        expect(text(missingResponse!)).toContain('Retained evidence');
+        expect(missingResponse?.structuredContent).toMatchObject({ empty: true, reason: STORED_EVIDENCE_REASONS.missing });
 
         const listedProjects = service.listProjects();
         if (listedProjects.structuredContent === undefined) {
@@ -753,12 +735,8 @@ describe('elepha MCP server surface', () => {
             resumeMarkerBefore: false,
         }));
         for (const turn of overflowTurns) {
-            db.prepare(
-                `INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at, summarizer_status)
-                 VALUES (?, ?, ?, 'codex', ?, '[]', '[]', '[]', ?, 'not_configured')`,
-            ).run(knownId, overflowId, turn.turnIndex, turn.startedAt, turn.endedAt);
+            capture.recordTurn(turn, overflowId, knownId, { decisions: [], pending_items: [], status: 'not_configured' }, true);
         }
-        turnsByPath.set(overflowSource, overflowTurns);
         const overflowPublicId = Buffer.from(JSON.stringify({ tool: 'codex', nativeId: 'overflow-session', segmentIndex: 0 })).toString(
             'base64url',
         );

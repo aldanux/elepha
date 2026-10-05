@@ -32,6 +32,7 @@ export interface StoredSession {
     project_id: number;
     source_path: string;
     cursor: string | null;
+    cursor_context: string | null;
     title: string | null;
     first_prompt_search: string | null;
     started_at: string;
@@ -77,6 +78,8 @@ export interface PlannedSegment {
     surface: SessionRowSurface | null;
     kind: SessionRowKind | null;
     cursor: string | null;
+    // Moves with cursor: the resume context issued with it.
+    cursorContext: string | null;
     title: string;
     firstPromptSearch: string;
     renderedChars: number;
@@ -221,6 +224,7 @@ function newSegment(
         surface: normalizedSurface(turn.tool, turn.surface),
         kind,
         cursor: null,
+        cursorContext: null,
         title: '',
         firstPromptSearch: '',
         renderedChars: 0,
@@ -269,6 +273,7 @@ function buildSegments(
     existingByIndex: Map<number, StoredSession>,
     kind: SessionRowKind | null,
     latestCursor: string | null,
+    latestCursorContext: string | null,
 ): { segments: PlannedSegment[]; cuts: PlannedCut[] } {
     const segments: PlannedSegment[] = [];
     const cuts: PlannedCut[] = [];
@@ -313,6 +318,7 @@ function buildSegments(
 
     if (segments.length > 0) {
         segments[segments.length - 1].cursor = latestCursor;
+        segments[segments.length - 1].cursorContext = latestCursorContext;
     }
     for (const segment of segments) {
         segment.title = titleForPlannedSegment(segment, parsed);
@@ -334,6 +340,7 @@ function groupRequiresWrite(rows: StoredSession[], memories: StoredMemory[], seg
             row.project_id !== segment.projectId ||
             row.source_path !== rows[rows.length - 1].source_path ||
             row.cursor !== segment.cursor ||
+            row.cursor_context !== segment.cursorContext ||
             row.title !== segment.title ||
             row.first_prompt_search !== segment.firstPromptSearch ||
             row.started_at !== segment.startedAt ||
@@ -422,6 +429,7 @@ export async function planResegmentation(db: Database, adapters: SessionAdapterM
                 existingByIndex,
                 toSessionRowKind(classification.kind),
                 latest.cursor,
+                latest.cursor_context,
             );
             const requiresWrite = groupRequiresWrite(rows, memories, segments);
             groups.push({
@@ -541,13 +549,14 @@ function ensureCorrectionsTable(db: Database): void {
 
 function updateSessionFromSegment(db: Database, sessionId: number, sourcePath: string, segment: PlannedSegment): void {
     db.prepare(
-        `UPDATE sessions SET segment_index = ?, project_id = ?, source_path = ?, cursor = ?, title = ?, first_prompt_search = ?, started_at = ?, last_ingested_at = ?,
+        `UPDATE sessions SET segment_index = ?, project_id = ?, source_path = ?, cursor = ?, cursor_context = ?, title = ?, first_prompt_search = ?, started_at = ?, last_ingested_at = ?,
          surface = ?, git_branch = ?, kind = ?, last_turn_at = ?, trailing_branch = ?, trailing_files = ?, rendered_chars = ?, rendered_turns = ? WHERE id = ?`,
     ).run(
         segment.segmentIndex,
         segment.projectId,
         sourcePath,
         segment.cursor,
+        segment.cursorContext,
         segment.title,
         segment.firstPromptSearch,
         segment.startedAt,
@@ -568,9 +577,9 @@ function insertSessionFromSegment(db: Database, tool: ToolName, nativeId: string
     const info = db
         .prepare(
             `INSERT INTO sessions
-             (tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
+             (tool, native_id, segment_index, project_id, source_path, cursor, cursor_context, started_at, last_ingested_at,
               title, first_prompt_search, surface, git_branch, kind, last_turn_at, trailing_branch, trailing_files, rendered_chars, rendered_turns, git_commit_count)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
             tool,
@@ -579,6 +588,7 @@ function insertSessionFromSegment(db: Database, tool: ToolName, nativeId: string
             segment.projectId,
             sourcePath,
             segment.cursor,
+            segment.cursorContext,
             segment.startedAt,
             segment.lastIngestedAt,
             segment.title,
@@ -745,6 +755,7 @@ function segmentFromRange(
     parsed: Map<number, ParsedTurn>,
     kind: SessionRowKind | null,
     cursor: string | null,
+    cursorContext: string | null,
 ): PlannedSegment {
     const first = memories[0];
     const firstTurn = parsed.get(first.turn_index);
@@ -760,6 +771,7 @@ function segmentFromRange(
         appendTurn(segment, memory, turn);
     }
     segment.cursor = cursor;
+    segment.cursorContext = cursorContext;
     segment.title = titleForPlannedSegment(segment, parsed);
     segment.firstPromptSearch = firstPromptSearchForPlannedSegment(segment, parsed);
     return segment;
@@ -796,8 +808,16 @@ export async function planManualSplit(
         direction: 'split',
         source,
         atTurnIndex,
-        left: segmentFromRange(source.segment_index, source.id, memories.slice(0, splitAt), parsed, kind, null),
-        right: segmentFromRange(source.segment_index + 1, null, memories.slice(splitAt), parsed, kind, source.cursor),
+        left: segmentFromRange(source.segment_index, source.id, memories.slice(0, splitAt), parsed, kind, null, null),
+        right: segmentFromRange(
+            source.segment_index + 1,
+            null,
+            memories.slice(splitAt),
+            parsed,
+            kind,
+            source.cursor,
+            source.cursor_context,
+        ),
         laterSessionIds: laterRows.map((row) => row.id),
         rollupsInvalidated: countInvalidatedRollups(db, [source.id]),
     };
@@ -886,6 +906,7 @@ export async function planManualMerge(
             parsed,
             toSessionRowKind(classification.kind),
             right.cursor ?? left.cursor,
+            right.cursor === null ? left.cursor_context : right.cursor_context,
         ),
         laterSessionIds: later.map((row) => row.id),
         rollupsInvalidated: countInvalidatedRollups(db, [left.id, right.id]),

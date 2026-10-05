@@ -3,10 +3,11 @@ import { SESSION_KIND_REVISION, TRAILING_FILES_CAP } from '../config/constants.j
 import { dedupePaths } from '../config/paths.js';
 import { stripShellSyntax } from '../security/sanitize.js';
 import { gitRevListCountHead } from '../security/subprocess-allowlist.js';
-import type { ParsedTurn, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
+import type { ParsedTurn, ResumeContext, SessionRowKind, SessionRowSurface, ToolName } from '../types/index.js';
 import type { ProjectRow } from './project-store.js';
 import { SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 import { titleForTurn } from './session-title.js';
+import { decodeResumeContext, encodeResumeContext } from './source-resume-context.js';
 
 export interface SessionRow {
     id: number;
@@ -15,7 +16,9 @@ export interface SessionRow {
     segment_index: number;
     project_id: number;
     source_path: string;
+    source_format: 'native' | 'opencode-v2';
     cursor: string | null;
+    cursor_context: string | null;
     started_at: string;
     last_ingested_at: string;
     surface: SessionRowSurface | null;
@@ -38,6 +41,7 @@ export type SessionMetadata = {
     gitBranch?: string | null;
     kind?: SessionRowKind | null;
     customTitle?: string;
+    sourceFormat?: 'native' | 'opencode-v2';
 };
 
 // `trailing_files` is stored as JSON text in SQLite but exposed as
@@ -70,10 +74,10 @@ export class SessionStore {
             findSession: db.prepare('SELECT * FROM sessions WHERE tool = ? AND native_id = ? ORDER BY segment_index DESC LIMIT 1'),
             findSessionSegment: db.prepare('SELECT * FROM sessions WHERE tool = ? AND native_id = ? AND segment_index = ?'),
             insertSession: db.prepare(
-                `INSERT INTO sessions (tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at, surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, title, custom_title, git_commit_count)
-         VALUES (@tool, @native_id, @segment_index, @project_id, @source_path, NULL, @now, @now, @surface, @git_branch, @kind, @kind_revision, NULL, NULL, '[]', NULL, @custom_title, @git_commit_count)`,
+                `INSERT INTO sessions (tool, native_id, segment_index, project_id, source_path, source_format, cursor, started_at, last_ingested_at, surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, title, custom_title, git_commit_count)
+         VALUES (@tool, @native_id, @segment_index, @project_id, @source_path, @source_format, NULL, @now, @now, @surface, @git_branch, @kind, @kind_revision, NULL, NULL, '[]', NULL, @custom_title, @git_commit_count)`,
             ),
-            updateSessionCursor: db.prepare('UPDATE sessions SET cursor = ?, last_ingested_at = ? WHERE id = ?'),
+            updateSessionCursor: db.prepare('UPDATE sessions SET cursor = ?, cursor_context = ?, last_ingested_at = ? WHERE id = ?'),
             listSessionsWithMemoriesSince: db.prepare(
                 `SELECT DISTINCT s.* FROM sessions s
          JOIN memories m ON m.session_id = s.id
@@ -106,6 +110,7 @@ export class SessionStore {
             native_id: nativeId,
             project_id: projectId,
             source_path: sourcePath,
+            source_format: meta?.sourceFormat ?? 'native',
             segment_index: 0,
             now,
             surface: meta?.surface ?? null,
@@ -165,6 +170,7 @@ export class SessionStore {
             segment_index: segmentIndex,
             project_id: projectId,
             source_path: sourcePath,
+            source_format: meta?.sourceFormat ?? previous.source_format,
             now,
             surface: meta?.surface ?? null,
             git_branch: meta?.gitBranch ?? null,
@@ -220,17 +226,24 @@ export class SessionStore {
     }
 
     getSessionCursor(tool: ToolName, nativeId: string): string | undefined {
-        const row = this.stmts.findSession.get(tool, nativeId) as Record<string, unknown> | undefined;
-        return row ? (hydrateSessionRow(row).cursor ?? undefined) : undefined;
+        return this.getSessionResume(tool, nativeId)?.cursor;
+    }
+
+    // The stored cursor and the resume context issued with it.
+    getSessionResume(tool: ToolName, nativeId: string): { cursor: string; context: ResumeContext | undefined } | undefined {
+        const row = this.stmts.findSession.get(tool, nativeId) as { cursor: string | null; cursor_context: string | null } | undefined;
+        return row?.cursor ? { cursor: row.cursor, context: decodeResumeContext(row.cursor_context) } : undefined;
     }
 
     // Advances an already-known session after a deliberately dropped turn.
-    advanceSessionCursor(sessionDbId: number, cursor: string): void {
-        this.advanceSessionCursorAt(sessionDbId, cursor, new Date().toISOString());
+    advanceSessionCursor(sessionDbId: number, turn: Pick<ParsedTurn, 'cursor' | 'resumeContext'>): void {
+        this.advanceSessionCursorAt(sessionDbId, turn, new Date().toISOString());
     }
 
-    advanceSessionCursorAt(sessionDbId: number, cursor: string, now: string): void {
-        this.stmts.updateSessionCursor.run(cursor, now, sessionDbId);
+    // The cursor and its resume context are always written together, so a
+    // stored context never describes a different position.
+    advanceSessionCursorAt(sessionDbId: number, turn: Pick<ParsedTurn, 'cursor' | 'resumeContext'>, now: string): void {
+        this.stmts.updateSessionCursor.run(turn.cursor, encodeResumeContext(turn.resumeContext), now, sessionDbId);
     }
 
     // Applies the shared sanitized title rules to a persisted session.

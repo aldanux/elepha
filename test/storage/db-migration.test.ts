@@ -2,6 +2,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import { describe, expect, it } from 'vitest';
 import { openUnmanagedDb, SQLITE_SOURCE_WATERMARK_SCHEMA } from '../../src/storage/db.js';
+import { dropLiveMemoryLedger } from '../helpers/live-memory.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 describe('sessions table migration', () => {
@@ -9,6 +10,7 @@ describe('sessions table migration', () => {
         const directory = withGrantableTestDir('elepha-assistant-structure-migration-');
         const dbPath = path.join(directory, 'test.db');
         const prior = openUnmanagedDb(dbPath);
+        dropLiveMemoryLedger(prior);
         prior.exec(`
           INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/legacy', '2026-01-01', '2026-01-01');
           INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
@@ -84,6 +86,7 @@ describe('sessions table migration', () => {
                 'segment_index',
                 'project_id',
                 'source_path',
+                'source_format',
                 'cursor',
                 'started_at',
                 'last_ingested_at',
@@ -183,8 +186,125 @@ describe('sessions table migration', () => {
             SQLITE_SOURCE_WATERMARK_SCHEMA.tool,
             SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath,
             SQLITE_SOURCE_WATERMARK_SCHEMA.watermark,
+            SQLITE_SOURCE_WATERMARK_SCHEMA.cursorId,
         ]);
         db.close();
+    });
+
+    it('labels existing V2 cursors without changing historical OpenCode rows and reopens idempotently', () => {
+        const directory = withGrantableTestDir('elepha-opencode-format-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/legacy', '2026-01-01', '2026-01-01');
+          INSERT INTO sessions (tool, native_id, project_id, source_path, cursor, started_at, last_ingested_at)
+          VALUES ('opencode', 'legacy-v1', 1, '/provider/opencode.db', '2100|msg_4', '2026-01-01', '2026-01-01'),
+                 ('opencode', 'captured-v2', 1, '/provider/opencode.db', 'v2:3|msg_captured_3', '2026-01-01', '2026-01-01');
+          ALTER TABLE sessions DROP COLUMN source_format;
+        `);
+        prior.close();
+
+        for (let reopen = 0; reopen < 2; reopen++) {
+            const migrated = openUnmanagedDb(dbPath);
+            expect(migrated.prepare('SELECT native_id, source_format, cursor FROM sessions ORDER BY native_id').all()).toEqual([
+                { native_id: 'captured-v2', source_format: 'opencode-v2', cursor: 'v2:3|msg_captured_3' },
+                { native_id: 'legacy-v1', source_format: 'native', cursor: '2100|msg_4' },
+            ]);
+            expect(migrated.pragma('foreign_key_check')).toEqual([]);
+            migrated.close();
+        }
+    });
+
+    it('adds task-state manifests to a populated prior database and preserves rows across two reopens', () => {
+        const directory = withGrantableTestDir('elepha-task-state-manifest-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/legacy', '2026-01-01', '2026-01-01');
+          INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
+          VALUES ('codex', 'legacy', 1, '/legacy.jsonl', '2026-01-01', '2026-01-01');
+          INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at)
+          VALUES (1, 1, 0, 'codex', '2026-01-01', '[]', '[]', '[]', '2026-01-01');
+          DROP TABLE task_state_manifests;
+        `);
+        const original = {
+            projects: prior.prepare('SELECT * FROM projects').all(),
+            sessions: prior.prepare('SELECT * FROM sessions').all(),
+            memories: prior.prepare('SELECT * FROM memories').all(),
+        };
+        prior.close();
+
+        for (let reopen = 0; reopen < 2; reopen++) {
+            const migrated = openUnmanagedDb(dbPath);
+            expect((migrated.pragma('table_info(task_state_manifests)') as Array<{ name: string }>).map((column) => column.name)).toEqual([
+                'memory_id',
+                'report',
+                'reporting_source',
+                'source_locators',
+                'coverage_state',
+                'resolved_source_count',
+                'total_source_count',
+                'coverage_reason',
+                'created_at',
+            ]);
+            expect(migrated.pragma('foreign_key_list(task_state_manifests)')).toEqual(
+                expect.arrayContaining([expect.objectContaining({ table: 'memories', from: 'memory_id', on_delete: 'CASCADE' })]),
+            );
+            expect(migrated.prepare('SELECT * FROM projects').all()).toEqual(original.projects);
+            expect(migrated.prepare('SELECT * FROM sessions').all()).toEqual(original.sessions);
+            expect(migrated.prepare('SELECT * FROM memories').all()).toEqual(original.memories);
+            expect(migrated.prepare('SELECT memory_id FROM task_state_manifests').all()).toEqual(reopen === 0 ? [] : [{ memory_id: 1 }]);
+            const insert = migrated.prepare(`INSERT INTO task_state_manifests
+                (memory_id, report, reporting_source, source_locators, coverage_state,
+                 resolved_source_count, total_source_count, coverage_reason, created_at)
+                VALUES (?, '{}', '{}', '[]', 'incomplete', 0, 0, 'no_source_backed_items', '2026-01-01')`);
+            if (reopen === 0) {
+                insert.run(1);
+            }
+            expect(() => insert.run(999)).toThrow();
+            expect(migrated.pragma('foreign_key_check')).toEqual([]);
+            migrated.close();
+        }
+    });
+
+    it('adds one-use task-state requests to a populated prior database and reopens idempotently', () => {
+        const directory = withGrantableTestDir('elepha-task-state-request-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+            INSERT INTO projects (id, path, first_seen_at, last_seen_at) VALUES (1, '/legacy', '2026-01-01', '2026-01-01');
+            INSERT INTO sessions (id, tool, native_id, project_id, source_path, started_at, last_ingested_at, kind)
+            VALUES (1, 'codex', 'legacy', 1, '/legacy.jsonl', '2026-01-01', '2026-01-01', 'main');
+            INSERT INTO injections (id, tool, native_session_id, injected_at, injection_id, body_hash, body)
+            VALUES (1, 'codex', 'legacy', '2026-01-01', 'injected', 'hash', 'request');
+            DROP TABLE task_state_requests;
+        `);
+        prior.close();
+
+        for (let reopen = 0; reopen < 2; reopen++) {
+            const migrated = openUnmanagedDb(dbPath);
+            expect(migrated.pragma('foreign_key_list(task_state_requests)')).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({ table: 'injections', from: 'injection_row_id', on_delete: 'CASCADE' }),
+                    expect.objectContaining({ table: 'sessions', from: 'session_id', on_delete: 'CASCADE' }),
+                ]),
+            );
+            expect(migrated.prepare('SELECT request_id FROM task_state_requests').all()).toEqual(
+                reopen === 0 ? [] : [{ request_id: '01J00000000000000000000000' }],
+            );
+            if (reopen === 0) {
+                const insert = migrated.prepare(`INSERT INTO task_state_requests
+                    (request_id, injection_row_id, session_id, tool, native_session_id, mode,
+                     physical_checkout, checkout_dev, checkout_ino, consent_ulid, consent_decided_at, source_path,
+                     source_generation, after_turn_index, issued_at)
+                    VALUES (?, ?, 1, 'codex', 'legacy', 'precompact_manifest',
+                            '/legacy', '1', '1', 'grant', '2026-01-01', '/legacy.jsonl', 0, -1, '2026-01-01')`);
+                insert.run('01J00000000000000000000000', 1);
+                expect(() => insert.run('01J00000000000000000000001', 999)).toThrow();
+            }
+            expect(migrated.pragma('foreign_key_check')).toEqual([]);
+            migrated.close();
+        }
     });
 
     it('adds MCP receipts to an existing database and leaves the migration idempotent on reopen', () => {
@@ -340,7 +460,118 @@ describe('sessions table migration', () => {
 
         const reopened = openUnmanagedDb(dbPath);
         expect(reopened.prepare(`SELECT * FROM ${SQLITE_SOURCE_WATERMARK_SCHEMA.table}`).all()).toEqual([
-            { tool: 'opencode', source_path: '/provider/opencode.db', watermark: 123 },
+            { tool: 'opencode', source_path: '/provider/opencode.db', watermark: 123, cursor_id: null },
+        ]);
+        reopened.close();
+    });
+
+    it('adds a cursor ID to an existing V2 watermark row and preserves the timestamp on reopen', () => {
+        const directory = withGrantableTestDir('elepha-sqlite-cursor-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const legacy = openUnmanagedDb(dbPath);
+        legacy.exec(`DROP TABLE ${SQLITE_SOURCE_WATERMARK_SCHEMA.table};
+            CREATE TABLE ${SQLITE_SOURCE_WATERMARK_SCHEMA.table} (
+                tool TEXT NOT NULL, source_path TEXT NOT NULL, watermark INTEGER NOT NULL,
+                PRIMARY KEY (tool, source_path)
+            );
+            INSERT INTO ${SQLITE_SOURCE_WATERMARK_SCHEMA.table} VALUES ('opencode', '/provider/opencode.db#session_v2', 123);`);
+        legacy.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect(migrated.prepare(`SELECT * FROM ${SQLITE_SOURCE_WATERMARK_SCHEMA.table}`).all()).toEqual([
+            { tool: 'opencode', source_path: '/provider/opencode.db#session_v2', watermark: 123, cursor_id: null },
+        ]);
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare(`SELECT * FROM ${SQLITE_SOURCE_WATERMARK_SCHEMA.table}`).all()).toEqual([
+            { tool: 'opencode', source_path: '/provider/opencode.db#session_v2', watermark: 123, cursor_id: null },
+        ]);
+        reopened.close();
+    });
+
+    it('adds a metadata-only V2 pending queue to a prior database and reopens idempotently', () => {
+        const directory = withGrantableTestDir('elepha-opencode-v2-pending-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec('DROP TABLE opencode_v2_pending');
+        prior.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        const columns = (migrated.pragma('table_info(opencode_v2_pending)') as Array<{ name: string }>).map((column) => column.name);
+        expect(columns).toEqual([
+            'source_path',
+            'native_id',
+            'observed_seq',
+            'observed_updated',
+            'retry_rank',
+            'needs_continuation',
+            'resume_cursor',
+        ]);
+        migrated
+            .prepare(`INSERT INTO opencode_v2_pending
+                (source_path, native_id, observed_seq, observed_updated, needs_continuation)
+                VALUES ('/provider/opencode.db', 'ses_pending', 3, 400, 0)`)
+            .run();
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT * FROM opencode_v2_pending').all()).toEqual([
+            {
+                source_path: '/provider/opencode.db',
+                native_id: 'ses_pending',
+                observed_seq: 3,
+                observed_updated: 400,
+                retry_rank: 0,
+                needs_continuation: 0,
+                resume_cursor: null,
+            },
+        ]);
+        reopened.close();
+    });
+
+    it('adds the metadata-only V2 handoff table to a prior database and reopens idempotently', () => {
+        const directory = withGrantableTestDir('elepha-opencode-v2-handoff-migration-');
+        const dbPath = path.join(directory, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec('DROP TABLE opencode_v2_handoffs');
+        prior.close();
+
+        const migrated = openUnmanagedDb(dbPath);
+        const columns = (migrated.pragma('table_info(opencode_v2_handoffs)') as Array<{ name: string }>).map((column) => column.name);
+        expect(columns).toEqual([
+            'native_id',
+            'source_path',
+            'status',
+            'v1_cursor',
+            'turn_index_offset',
+            'observed_seq',
+            'observed_updated',
+            'observed_v1_updated',
+            'needs_continuation',
+            'reason',
+        ]);
+        migrated
+            .prepare(`INSERT INTO opencode_v2_handoffs
+                (native_id, source_path, status, v1_cursor, turn_index_offset, observed_seq, observed_updated, observed_v1_updated)
+                VALUES ('ses_handoff', '/provider/opencode.db', 'active', '2100|msg_4', 2, 8, 300, 200)`)
+            .run();
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        expect(reopened.prepare('SELECT * FROM opencode_v2_handoffs').all()).toEqual([
+            {
+                native_id: 'ses_handoff',
+                source_path: '/provider/opencode.db',
+                status: 'active',
+                v1_cursor: '2100|msg_4',
+                turn_index_offset: 2,
+                observed_seq: 8,
+                observed_updated: 300,
+                observed_v1_updated: 200,
+                needs_continuation: 0,
+                reason: null,
+            },
         ]);
         reopened.close();
     });
@@ -357,7 +588,7 @@ describe('sessions table migration', () => {
           DROP TABLE durable_capture_status;
           CREATE TABLE durable_capture_status (
             session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-            state TEXT NOT NULL CHECK (state IN ('complete','complete_truncated','disabled_gap','backfilling','source_unavailable','parse_error','revoked','incognito')),
+            state TEXT NOT NULL CHECK (state IN ('complete','complete_truncated','disabled_gap','parse_error','revoked','incognito')),
             filter_version INTEGER NOT NULL,
             updated_at TEXT NOT NULL
           );
@@ -512,10 +743,61 @@ describe('shown-session-list tool migration', () => {
 });
 
 describe('migration idempotency and reversibility', () => {
+    it('adds resume contexts beside stored cursors in a populated prior database and reopens idempotently', () => {
+        const dir = withTempDir('elepha-resume-context-columns-');
+        const dbPath = path.join(dir, 'test.db');
+        const prior = openUnmanagedDb(dbPath);
+        prior.exec(`
+          INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/legacy', '2026-01-01', '2026-01-01');
+          INSERT INTO sessions (tool, native_id, project_id, source_path, cursor, started_at, last_ingested_at)
+          VALUES ('codex', 'legacy', 1, '/legacy.jsonl', '120|1|0123456789abcdef', '2026-01-01', '2026-01-01');
+          INSERT INTO memories (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at)
+          VALUES (1, 1, 0, 'codex', '2026-01-01', '[]', '[]', '[]', '2026-01-01');
+          INSERT INTO filtered_turns (memory_id, included, user_prompt, assistant_response, filter_version, captured_at)
+          VALUES (1, 1, 'Legacy question', 'Legacy answer', 1, '2026-01-01');
+          INSERT INTO turn_search_index
+            (memory_id, coverage, locator, source_cursor, source_digest, omitted_user_chars, omitted_assistant_chars, filter_version, indexed_at)
+          VALUES (1, 'included', 'available', '120|1|0123456789abcdef', 'digest', 0, 0, 1, '2026-01-01');
+          ALTER TABLE sessions DROP COLUMN cursor_context;
+          ALTER TABLE turn_search_index DROP COLUMN source_context;
+        `);
+        prior.close();
+
+        const state = (db: Database.Database) => ({
+            sessionColumns: (db.pragma('table_info(sessions)') as Array<{ name: string }>).filter((c) => c.name === 'cursor_context')
+                .length,
+            coverageColumns: (db.pragma('table_info(turn_search_index)') as Array<{ name: string }>).filter(
+                (c) => c.name === 'source_context',
+            ).length,
+            session: db.prepare('SELECT cursor, cursor_context FROM sessions').get(),
+            coverage: db.prepare('SELECT source_cursor, source_context, source_digest FROM turn_search_index').get(),
+        });
+        const expected = {
+            sessionColumns: 1,
+            coverageColumns: 1,
+            session: { cursor: '120|1|0123456789abcdef', cursor_context: null },
+            coverage: { source_cursor: '120|1|0123456789abcdef', source_context: null, source_digest: 'digest' },
+        };
+        const migrated = openUnmanagedDb(dbPath);
+        expect(state(migrated)).toEqual(expected);
+        migrated.close();
+        const reopened = openUnmanagedDb(dbPath);
+        expect(state(reopened)).toEqual(expected);
+        reopened.close();
+    });
+
+    it('creates resume-context columns in a fresh database', () => {
+        const db = openUnmanagedDb(':memory:');
+        expect((db.pragma('table_info(sessions)') as Array<{ name: string }>).map((c) => c.name)).toContain('cursor_context');
+        expect((db.pragma('table_info(turn_search_index)') as Array<{ name: string }>).map((c) => c.name)).toContain('source_context');
+        db.close();
+    });
+
     it('adds first_prompt_search to an existing sessions table and leaves historical rows NULL on reopen', () => {
         const dir = withTempDir('elepha-first-prompt-search-column-');
         const dbPath = path.join(dir, 'test.db');
         const prior = openUnmanagedDb(dbPath);
+        dropLiveMemoryLedger(prior);
         prior.exec(`
           INSERT INTO projects (path, display_name, first_seen_at, last_seen_at)
           VALUES ('/legacy', 'legacy', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
@@ -835,5 +1117,61 @@ describe('migration idempotency and reversibility', () => {
         const violations = migrated.pragma('foreign_key_check');
         expect(violations).toEqual([]);
         migrated.close();
+    });
+
+    it('creates session-dependent tables against the rebuilt sessions table and keeps them on reopen', () => {
+        const dir = withTempDir('elepha-migration-session-dependents-');
+        const dbPath = path.join(dir, 'test.db');
+        const raw = new Database(dbPath);
+        raw.exec(`
+      CREATE TABLE projects (
+        id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, display_name TEXT,
+        git_root TEXT, git_remote TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+      );
+      CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY, tool TEXT NOT NULL, native_id TEXT NOT NULL,
+        project_id INTEGER NOT NULL REFERENCES projects(id), source_path TEXT NOT NULL,
+        cursor TEXT, started_at TEXT NOT NULL, last_ingested_at TEXT NOT NULL,
+        UNIQUE (tool, native_id)
+      );
+      INSERT INTO projects (path, first_seen_at, last_seen_at) VALUES ('/p', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+      INSERT INTO sessions (tool, native_id, project_id, source_path, started_at, last_ingested_at)
+      VALUES ('opencode', 'legacy-1', 1, '/provider/opencode.db', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    `);
+        raw.close();
+        const sessionParents = (db: Database.Database) =>
+            ['task_state_requests', 'opencode_compaction_receipts', 'opencode_task_state_receipts'].map((table) => [
+                table,
+                (db.pragma(`foreign_key_list(${table})`) as Array<{ table: string; from: string }>)
+                    .filter((key) => key.from === 'session_id')
+                    .map((key) => key.table),
+            ]);
+        const expectedParents = [
+            ['task_state_requests', ['sessions']],
+            ['opencode_compaction_receipts', ['sessions']],
+            ['opencode_task_state_receipts', ['sessions']],
+        ];
+
+        const migrated = openUnmanagedDb(dbPath);
+        expect(sessionParents(migrated)).toEqual(expectedParents);
+        migrated
+            .prepare(
+                `INSERT INTO opencode_compaction_receipts (session_id, summary, reason, observed_at, coverage)
+                 VALUES (1, 'summary', 'auto', '2026-01-01T00:00:00.000Z', 'volatile_unverified')`,
+            )
+            .run();
+        migrated.close();
+
+        const reopened = openUnmanagedDb(dbPath);
+        try {
+            expect(sessionParents(reopened)).toEqual(expectedParents);
+            expect(reopened.prepare('SELECT COUNT(*) FROM opencode_compaction_receipts').pluck().get()).toBe(1);
+            // The session foreign key must cascade from the live sessions table.
+            reopened.prepare('DELETE FROM sessions WHERE id = 1').run();
+            expect(reopened.prepare('SELECT COUNT(*) FROM opencode_compaction_receipts').pluck().get()).toBe(0);
+            expect(reopened.pragma('foreign_key_check')).toEqual([]);
+        } finally {
+            reopened.close();
+        }
     });
 });

@@ -92,33 +92,39 @@ export function transformOpencodeMcp(text: string, bin: string, uninstall = fals
             throw new Error('OpenCode opencode.json is malformed');
         }
     }
-    const servers = (config.mcp && typeof config.mcp === 'object' && !Array.isArray(config.mcp) ? config.mcp : {}) as Record<
-        string,
-        unknown
-    >;
+    if (config.mcp !== undefined && (!config.mcp || typeof config.mcp !== 'object' || Array.isArray(config.mcp))) {
+        throw new Error('OpenCode opencode.json has invalid MCP configuration');
+    }
+    const mcp = (config.mcp ?? {}) as Record<string, unknown>;
+    if (mcp.servers !== undefined && (!mcp.servers || typeof mcp.servers !== 'object' || Array.isArray(mcp.servers))) {
+        throw new Error('OpenCode opencode.json has invalid MCP servers');
+    }
+    const servers = (mcp.servers ?? {}) as Record<string, unknown>;
+    const legacy = mcp[ELEPHA_MCP_SERVER_NAME];
     const current = servers[ELEPHA_MCP_SERVER_NAME];
-    const expected = { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true };
+    const expected = { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], codemode: false };
+    if ((legacy !== undefined && !isElephaOpencodeMcp(legacy)) || (current !== undefined && !isElephaOpencodeMcp(current))) {
+        throw new Error('conflicting user-owned OpenCode MCP server named elepha');
+    }
     let changed = false;
     if (uninstall) {
-        if (current !== undefined) {
-            if (!isElephaOpencodeMcp(current)) {
-                throw new Error('conflicting user-owned OpenCode MCP server named elepha');
+        if (legacy !== undefined || current !== undefined) {
+            const nextMcp = { ...mcp };
+            delete nextMcp[ELEPHA_MCP_SERVER_NAME];
+            if (current !== undefined) {
+                const nextServers = { ...servers };
+                delete nextServers[ELEPHA_MCP_SERVER_NAME];
+                nextMcp.servers = nextServers;
             }
-            const next = { ...servers };
-            delete next[ELEPHA_MCP_SERVER_NAME];
-            config.mcp = next;
+            config.mcp = nextMcp;
             changed = true;
         }
-    } else if (current === undefined) {
-        config.mcp = { ...servers, [ELEPHA_MCP_SERVER_NAME]: expected };
+    } else if (legacy !== undefined || current === undefined || !isDeepStrictEqual(current, expected)) {
+        const nextMcp = { ...mcp };
+        delete nextMcp[ELEPHA_MCP_SERVER_NAME];
+        nextMcp.servers = { ...servers, [ELEPHA_MCP_SERVER_NAME]: expected };
+        config.mcp = nextMcp;
         changed = true;
-    } else if (isElephaOpencodeMcp(current)) {
-        if (!isDeepStrictEqual(current, expected)) {
-            config.mcp = { ...servers, [ELEPHA_MCP_SERVER_NAME]: expected };
-            changed = true;
-        }
-    } else {
-        throw new Error('conflicting user-owned OpenCode MCP server named elepha');
     }
     if (pluginPath !== undefined) {
         changed = applyOpencodePluginRegistration(config, pluginPath, uninstall) || changed;
@@ -225,22 +231,42 @@ export function hasClaudeMcp(text: string, bin: string): 'registered' | 'invalid
     }
 }
 
-export function hasOpencodeMcp(text: string, bin: string): 'registered' | 'disabled' | 'invalid' | 'not installed' | 'stale binary' {
+export function hasOpencodeMcp(
+    text: string,
+    bin: string,
+): 'registered' | 'disabled' | 'invalid' | 'not installed' | 'stale binary' | 'stale config' {
     if (!text.trim()) {
         return 'not installed';
     }
     try {
-        const config = JSON.parse(text) as { mcp?: Record<string, unknown> };
-        const entry = config.mcp?.[ELEPHA_MCP_SERVER_NAME];
-        if (!entry) {
+        const config = JSON.parse(text) as { mcp?: unknown };
+        if (config.mcp === undefined) {
+            return 'not installed';
+        }
+        if (!config.mcp || typeof config.mcp !== 'object' || Array.isArray(config.mcp)) {
+            return 'invalid';
+        }
+        const mcp = config.mcp as Record<string, unknown>;
+        if (mcp.servers !== undefined && (!mcp.servers || typeof mcp.servers !== 'object' || Array.isArray(mcp.servers))) {
+            return 'invalid';
+        }
+        const legacy = mcp[ELEPHA_MCP_SERVER_NAME];
+        const entry = (mcp.servers as Record<string, unknown> | undefined)?.[ELEPHA_MCP_SERVER_NAME];
+        if (legacy !== undefined) {
+            return isElephaOpencodeMcp(legacy) && (entry === undefined || isElephaOpencodeMcp(entry)) ? 'stale config' : 'invalid';
+        }
+        if (entry === undefined) {
             return 'not installed';
         }
         if (!isElephaOpencodeMcp(entry)) {
             return 'invalid';
         }
         const server = entry as Record<string, unknown>;
-        if (server.enabled === false) {
+        if (server.disabled === true) {
             return 'disabled';
+        }
+        if (server.codemode !== false) {
+            return 'stale config';
         }
         return (server.command as unknown[])[0] === bin ? 'registered' : 'stale binary';
     } catch {

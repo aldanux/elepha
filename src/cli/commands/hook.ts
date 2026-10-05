@@ -1,5 +1,7 @@
 import type { Command } from 'commander';
 import { isHookTool } from '../../hooks/common.js';
+import { runOpencodeCompactionReceiptCli } from '../../hooks/opencode-compaction-receipt.js';
+import { runOpencodeTaskStateReceiptCli } from '../../hooks/opencode-task-state-receipt.js';
 import { runSessionStartCli } from '../../hooks/session-start.js';
 import { runStandingRulesHookCli } from '../../hooks/standing-rules.js';
 import { runUserPromptSubmitCli } from '../../hooks/user-prompt-submit.js';
@@ -14,6 +16,24 @@ export function registerHook(program: Command): void {
                 return;
             }
             await runStandingRulesHookCli();
+        });
+    hook.command('compaction-receipt')
+        .requiredOption('--tool <tool>', 'opencode')
+        .action(async (opts: { tool: string }) => {
+            if (opts.tool !== 'opencode') {
+                process.exitCode = 0;
+                return;
+            }
+            await runOpencodeCompactionReceiptCli();
+        });
+    hook.command('task-state-receipt')
+        .requiredOption('--tool <tool>', 'opencode')
+        .action(async (opts: { tool: string }) => {
+            if (opts.tool !== 'opencode') {
+                process.exitCode = 0;
+                return;
+            }
+            await runOpencodeTaskStateReceiptCli();
         });
     hook.command('session-start')
         .requiredOption('--tool <tool>', 'claude-code, codex, or opencode')

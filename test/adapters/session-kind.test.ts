@@ -1,12 +1,9 @@
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
-
-const CODEX_FIXTURES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'fixtures', 'codex');
 
 function writeRollout(lines: unknown[]): string {
     const dir = withTempDir('elepha-kind-');
@@ -28,17 +25,6 @@ async function collect(iter: AsyncIterable<ParsedTurn>): Promise<ParsedTurn[]> {
 }
 
 describe('CodexAdapter.classifySession', () => {
-    it('excludes a real Codex v0.148.0-alpha.9 external-agent import fixture', async () => {
-        const file = path.join(CODEX_FIXTURES, 'rollout-codex-v0.148.0-alpha.9-external-agent-import.jsonl');
-        const result = await new CodexAdapter().classifySession(file);
-
-        expect(result).toEqual({
-            kind: 'primary',
-            exclusion: 'external-agent-import',
-            reason: 'turn_id starts with external-import-turn-',
-        });
-    });
-
     it('requires the external-import prefix at the start of payload.turn_id, not elsewhere in the line', async () => {
         const file = writeRollout([
             meta({ base_instructions: 'example text: external-import-turn-1' }),

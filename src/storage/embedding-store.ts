@@ -6,12 +6,14 @@ import type { EmbeddingModel } from '../embeddings/provider-config.js';
 import { embeddingSourceHash, embeddingSourceText, MalformedEmbeddingSourceError } from '../embeddings/source.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { ConsentStore } from './consent-store.js';
+import { runSessionLiveMemoryWrite } from './live-memory-retention.js';
 import {
     type AuthenticatedReadGeneration,
     LOCKED_MEMORY_MESSAGE,
     memoryReadAuthorityMatchesGenerationInTransaction,
     withMemoryReadGeneration,
 } from './paranoid-gate.js';
+
 import { ProjectResolver } from './project-resolver.js';
 import { readEmbeddingSession, type ServedSession } from './session-read-model.js';
 
@@ -270,6 +272,7 @@ export class EmbeddingStore {
                     if (JSON.stringify(current) !== JSON.stringify(source)) {
                         throw new EmbeddingSourceChangedError();
                     }
+
                     this.db
                         .prepare(`INSERT INTO session_embeddings
                     (session_id, rollup_session_id, project_id, source_hash, model, model_revision, dimensions, vector, computed_at)
@@ -291,7 +294,7 @@ export class EmbeddingStore {
                         );
                 });
                 try {
-                    write.immediate();
+                    runSessionLiveMemoryWrite(this.db, source.sessionId, () => write.immediate());
                 } catch (error) {
                     // Re-authenticate only after rollback releases the writer.
                     this.rejectSource(source.sessionId, error, generation, authority);

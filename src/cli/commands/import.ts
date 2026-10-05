@@ -3,6 +3,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
+import { LIVE_MEMORY_CAPACITY_BYTES } from '../../config/live-memory-retention.js';
 import { canonicalizeExisting, isWithin, isWithinProviderStore, normalizeForCompare } from '../../config/paths.js';
 import { readSessionMetadata } from '../../discovery/session-projects.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
@@ -13,7 +14,11 @@ import { readCandidateStandingRules, validateCandidateSemantics } from '../../st
 import { ConsentStore } from '../../storage/consent-store.js';
 import { defaultDbPath, hasPlaintextDatabaseHeader, openManagedDatabase } from '../../storage/db.js';
 import { firstPromptSearch } from '../../storage/first-prompt-search.js';
+
+import { LIVE_MEMORY_RETENTION_REMOVALS_TABLE } from '../../storage/live-memory-retention-schema.js';
+import { assertLiveMemoryBulkWrite, readLiveMemoryUsage } from '../../storage/live-memory-usage.js';
 import { MemoryStore } from '../../storage/memory-store.js';
+
 import { ProjectResolver } from '../../storage/project-resolver.js';
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from '../../storage/project-store.js';
 import {
@@ -105,6 +110,8 @@ export interface ImportRuntime {
     confirm?: (plan: ImportPlan) => Promise<boolean>;
     // Test seam for proving that any failure after writes begin rolls the transaction back.
     beforeVerify?: (db: Database.Database) => void;
+    // Test seam for the fixed live-memory capacity, so a test need not allocate gigabytes.
+    liveMemoryCapacityBytes?: number;
 }
 
 export interface ImportResult {
@@ -640,6 +647,9 @@ function applyMerge(
     const sessionProjectIds = applyProjects(db, plan, overwrite, projectIdentities);
     const sessionIds = new Map<number, number>();
     const importedSessionIds = new Set<number>();
+    // Importing a session the user explicitly selected lifts an automatic
+    // retention removal of that native session; purge and incognito still veto.
+    const liftRetentionRemoval = db.prepare(`DELETE FROM ${LIVE_MEMORY_RETENTION_REMOVALS_TABLE} WHERE tool = ? AND native_id = ?`);
 
     for (const session of plan.sessions) {
         if (
@@ -664,6 +674,8 @@ function applyMerge(
             db.prepare('DELETE FROM session_rollups WHERE session_id = ?').run(localSessionId);
             updateSession(db, session.row, localSessionId, projectId);
             importedSessionIds.add(session.row.id);
+            liftRetentionRemoval.run(session.row.tool, session.row.native_id);
+
             continue;
         }
 
@@ -676,6 +688,7 @@ function applyMerge(
         });
         sessionIds.set(session.row.id, localSessionId);
         importedSessionIds.add(session.row.id);
+        liftRetentionRemoval.run(session.row.tool, session.row.native_id);
     }
 
     const memories = candidate.prepare('SELECT * FROM memories WHERE session_id = ? ORDER BY id');
@@ -772,6 +785,7 @@ async function applyImport(
     overwrite: boolean,
     snapshotWriter: (db: Database.Database, dbPath: string) => string,
     beforeVerify?: (db: Database.Database) => void,
+    liveMemoryCapacityBytes: number = LIVE_MEMORY_CAPACITY_BYTES,
 ): Promise<string> {
     const active = await openManagedDatabase(dbPath, { fileMustExist: true });
     let snapshotPath: string | undefined;
@@ -808,8 +822,11 @@ async function applyImport(
             }
         }
         snapshotPath = snapshotWriter(active, dbPath);
+
         const merge = active.transaction(() => {
+            const liveMemoryBefore = readLiveMemoryUsage(active);
             assertPlanStillAuthorized(active, plan);
+
             assertStandingRuleImportAuthorized(active, plan.rules, false);
             for (const projectIdentity of projectIdentities.values()) {
                 if (projectIdentity.gitRoot !== null && consent.consentStateForCanonicalPath(projectIdentity.gitRoot) !== 'approved') {
@@ -818,8 +835,12 @@ async function applyImport(
             }
             const verifyRuleTargets = applyStandingRuleImport(active, plan.rules, projectIdentities);
             applyMerge(active, candidate, plan, overwrite, projectIdentities);
+            // Import cannot run automatic cleanup, so an over-capacity merge
+            // is refused whole rather than committed.
+            assertLiveMemoryBulkWrite(active, liveMemoryBefore, liveMemoryCapacityBytes);
             beforeVerify?.(active);
             verifyRuleTargets();
+
             const foreignKeys = active.pragma('foreign_key_check') as unknown[];
             if (foreignKeys.length > 0) {
                 throw new Error(`foreign_key_check found ${foreignKeys.length} violation(s)`);
@@ -872,6 +893,7 @@ export async function runImportOperation(candidatePath: string, overwrite: boole
             overwrite,
             runtime.writeBackup ?? writeBackup,
             runtime.beforeVerify,
+            runtime.liveMemoryCapacityBytes,
         );
         const overwritten = overwrite ? plan.counts.existing : 0;
         const skipped =

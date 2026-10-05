@@ -133,6 +133,30 @@ describe('ProjectResolver', () => {
         expect(project.projectIds).toHaveLength(9);
     });
 
+    it('preserves normalized ancestor ordering, host case semantics and prefix siblings with fresh stored membership', () => {
+        const ancestor = path.join(root, 'CaseAnchor');
+        const sibling = `${ancestor}Suffix`;
+        const grandchild = `${ancestor}/child/grandchild`;
+        const child = `${ancestor}/./child`;
+        const caseMember = `${path.join(root, 'caseanchor')}/leaf`;
+        const grandchildId = addProject(grandchild, { createDirectory: false });
+        const siblingId = addProject(sibling, { createDirectory: false });
+        const caseId = addProject(caseMember, { createDirectory: false });
+        const childId = addProject(child, { createDirectory: false });
+        const ancestorId = addProject(`${ancestor}/`, { createDirectory: false });
+        const grouped = resolver();
+        const paths = process.platform === 'darwin' ? [`${ancestor}/`, child, caseMember, grandchild] : [`${ancestor}/`, child, grandchild];
+        const ids = process.platform === 'darwin' ? [ancestorId, childId, caseId, grandchildId] : [ancestorId, childId, grandchildId];
+        const sets = grouped.listStored();
+        expect(sets.find((set) => set.projectIds.includes(ancestorId))).toMatchObject({ paths, projectIds: ids });
+        expect(sets.find((set) => set.projectIds.includes(siblingId))).toMatchObject({ paths: [sibling], projectIds: [siblingId] });
+        expect(sets).toHaveLength(process.platform === 'darwin' ? 2 : 3);
+        expect(grouped.storedProjectForAuthorization(ancestorId)?.projectIds).toEqual(ids);
+        db.prepare('UPDATE projects SET path=? WHERE id=?').run(`${sibling}/subtree`, grandchildId);
+        expect(grouped.storedProjectForAuthorization(ancestorId)?.projectIds).toEqual(ids.filter((id) => id !== grandchildId));
+        expect(grouped.storedProjectForAuthorization(siblingId)?.projectIds).toEqual([siblingId, grandchildId]);
+    });
+
     it('prefix-groups missing paths without probing them for a git root', () => {
         const ext = path.join(root, 'missing-elepha-ext');
         const paths = [ext, path.join(ext, 'extension'), path.join(ext, 'extension/src'), path.join(ext, 'extension/src/popup')];

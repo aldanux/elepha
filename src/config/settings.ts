@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, readFileSync } from 'node:fs';
-import { writeJson } from '../util/fs.js';
+import { atomicWrite, writeJson } from '../util/fs.js';
 import { PRIVATE_FILE_MODE } from './constants.js';
+import { assertNoPendingInitApply } from './init-apply-journal.js';
 import { elephaConfigPath } from './paths.js';
 
 const UPDATE_CHECK_KEY = 'update-check';
@@ -177,6 +178,7 @@ export function setSetting(key: string, value: string, filePath: string = elepha
     if (!validKey(key)) {
         throw unknownKeyError(key);
     }
+    assertNoPendingInitApply(filePath);
     const config = readConfigForMutation(filePath).config;
     const parsedValue = parseSetting(key, value);
     if (
@@ -191,10 +193,57 @@ export function setSetting(key: string, value: string, filePath: string = elepha
     return getSetting(key, {}, filePath);
 }
 
+// A batch of settings: a string sets the key, null removes it so its default applies.
+export type SettingsUpdate = Partial<Record<SettingKey, string | null>>;
+
+// Validates a batch against the current file and returns the merged object
+// without writing it, so a caller can refuse a plan before committing anything
+// else. The capture invariant is checked on the merged result.
+function mergedSettings(values: SettingsUpdate, filePath: string): ConfigObject {
+    const config = readConfigForMutation(filePath).config;
+    for (const [key, value] of Object.entries(values)) {
+        if (!validKey(key)) {
+            throw unknownKeyError(key);
+        }
+        if (value === null) {
+            delete config[key];
+        } else if (value !== undefined) {
+            config[key] = parseSetting(key, value);
+        }
+    }
+    if (CAPTURE_SETTING_KEYS.every((captureKey) => !captureEnabled(config, captureKey))) {
+        throw new Error('at least one capture tool must remain enabled');
+    }
+    return config;
+}
+
+export function validateSettings(values: SettingsUpdate, filePath: string = elephaConfigPath()): void {
+    mergedSettings(values, filePath);
+}
+
+// One validated, atomic replacement of config.json: either every selected key
+// lands or the previous file stays intact. Unrelated keys are preserved. This
+// is the onboarding writer and deliberately skips the pending-apply guard.
+export function setSettings(values: SettingsUpdate, filePath: string = elephaConfigPath()): void {
+    const config = mergedSettings(values, filePath);
+    atomicWrite(filePath, `${JSON.stringify(config)}\n`, PRIVATE_FILE_MODE);
+}
+
+// The typed values config.json itself holds for these keys, without defaults:
+// undefined means absent or not a valid value. Unreadable config is an error.
+export function configuredSettings<K extends SettingKey>(
+    keys: readonly K[],
+    filePath: string = elephaConfigPath(),
+): Record<K, SettingValueFor<K> | undefined> {
+    const config = readConfigForMutation(filePath).config;
+    return Object.fromEntries(keys.map((key) => [key, configuredSetting(key, config[key])])) as Record<K, SettingValueFor<K> | undefined>;
+}
+
 export function unsetSetting(key: string, filePath: string = elephaConfigPath()): EffectiveSetting {
     if (!validKey(key)) {
         throw unknownKeyError(key);
     }
+    assertNoPendingInitApply(filePath);
     if (!existsSync(filePath)) {
         return getSetting(key, {}, filePath);
     }

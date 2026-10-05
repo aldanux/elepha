@@ -2,7 +2,6 @@
 // config is an error, whereas an absent config keeps the capture defaults.
 
 import { readFileSync } from 'node:fs';
-import { DURABLE_CAPTURE_MAX_BYTES } from './constants.js';
 import { elephaConfigPath } from './paths.js';
 
 export interface MemoryConfig {
@@ -10,7 +9,6 @@ export interface MemoryConfig {
     captureCodex?: boolean;
     captureOpencode?: boolean;
     durableCapture?: boolean;
-    durableCaptureMaxBytes?: number;
 }
 
 export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
@@ -18,7 +16,6 @@ export const DEFAULT_MEMORY_CONFIG: Readonly<MemoryConfig> = {
     captureCodex: true,
     captureOpencode: true,
     durableCapture: false,
-    durableCaptureMaxBytes: DURABLE_CAPTURE_MAX_BYTES,
 };
 
 export function readMemoryConfig(filePath: string = elephaConfigPath()): { config: MemoryConfig } | { error: string } {
@@ -53,10 +50,6 @@ export function readMemoryConfig(filePath: string = elephaConfigPath()): { confi
     }
     if (typeof settings['durable-capture'] === 'boolean') {
         output.durableCapture = settings['durable-capture'];
-    }
-    const durableCaptureMaxBytes = settings['durable-capture-max-bytes'];
-    if (typeof durableCaptureMaxBytes === 'number' && Number.isSafeInteger(durableCaptureMaxBytes) && durableCaptureMaxBytes > 0) {
-        output.durableCaptureMaxBytes = durableCaptureMaxBytes;
     }
     return { config: output };
 }

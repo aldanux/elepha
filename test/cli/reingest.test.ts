@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import Database from 'better-sqlite3-multiple-ciphers';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
@@ -8,6 +9,7 @@ import { openUnmanagedDb } from '../../src/storage/db.js';
 import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import type { ParsedTurn, SummarizationOutput } from '../../src/types/index.js';
 import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
+import { expectLiveMemoryCurrent } from '../helpers/live-memory.js';
 
 const mocks = vi.hoisted(() => ({ summarize: vi.fn() }));
 
@@ -111,6 +113,9 @@ describe('elepha reingest provider-store containment', () => {
         });
         expect(mocks.summarize).toHaveBeenCalledWith({ userMessage: 'request', assistantText: 'response' });
         expect(stdout.some((line) => line.includes('Reingested 1 turn(s) across 1/1 session(s)'))).toBe(true);
+        const reingested = new Database(fixture.dbPath, { readonly: true, fileMustExist: true });
+        expectLiveMemoryCurrent(reingested);
+        reingested.close();
     });
 
     it('refreshes first_prompt_search from the reingested minimum turn only', async () => {
@@ -203,7 +208,8 @@ describe('elepha reingest provider-store containment', () => {
         const { projectPath } = seedCandidate(fixture, sourcePath);
         const seeded = openUnmanagedDb(fixture.dbPath);
         seeded.exec(`
-            INSERT INTO source_generations (tool, native_id, generation) VALUES ('codex', 'native-1', 0);
+            INSERT INTO source_generations (tool, native_id, generation) VALUES ('codex', 'native-1', 0)
+            ON CONFLICT (tool, native_id) DO UPDATE SET generation = excluded.generation;
             INSERT INTO mcp_receipts
                 (tool, native_session_id, source_generation, source_turn_index, call_id, observed_at, body_hash, body)
             VALUES ('codex', 'native-1', 0, 1, 'bound-call', NULL, 'seed-hash', 'Original exact result body.');
@@ -249,7 +255,8 @@ describe('elepha reingest provider-store containment', () => {
         const { projectPath, startedAt } = seedCandidate(fixture, sourcePath);
         const seeded = openUnmanagedDb(fixture.dbPath);
         seeded.exec(`
-            INSERT INTO source_generations (tool, native_id, generation) VALUES ('codex', 'native-1', 0);
+            INSERT INTO source_generations (tool, native_id, generation) VALUES ('codex', 'native-1', 0)
+            ON CONFLICT (tool, native_id) DO UPDATE SET generation = excluded.generation;
             INSERT INTO mcp_receipts
                 (tool, native_session_id, source_generation, source_turn_index, call_id, observed_at, body_hash, body)
             VALUES ('codex', 'native-1', 0, 0, 'missing-call', NULL, 'seed-hash', 'Receipt missing from source.');

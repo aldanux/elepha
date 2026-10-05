@@ -17,18 +17,46 @@ does not protect against malware already running as your user.
 
 ## Durable conversation copies
 
-[Durable capture](capture.md#durable-capture) can store a sanitized copy of each
-eligible turn inside the encrypted database. With durable capture off, the database's
-session content remains derivable from retained source transcripts. With it on, a
-sanitized copy can become the only surviving record after the source tool deletes a
-transcript. Use a full backup when that copy must survive disk or database loss.
+[Durable capture](capture.md#durable-capture) stores a sanitized copy of each newly
+captured Claude Code and Codex turn inside the encrypted database automatically;
+OpenCode copies still require the legacy `durable-capture` setting. Ordinary Claude
+Code and Codex reads use only retained database evidence; missing or incompatible
+copies remain gaps even when the source is readable. Complete current copies serve
+independently of source presence or contents; summaries and individually current
+turns do not certify whole-session completeness. A sanitized copy can become the
+only surviving record after the source tool deletes a transcript. Use a full backup
+when that copy must survive disk or database loss.
 
-The durable store is capped by `durable-capture-max-bytes`, which defaults to
-1,073,741,824 bytes (1 GiB). When the cap is exceeded, elepha evicts the oldest
-recoverable durable copies first, then the active session if necessary, before copies
-whose source is unavailable. Eviction remains attached to the native session across
-later capture and re-segmentation; it does not silently refill. See
-[Configuration](configuration.md#durable-store-size) for the exact JSON setting.
+Durable copies count toward the fixed live-memory capacity described in
+[Live-memory capacity](#live-memory-capacity); no individual copy is evicted to make
+room.
+
+## Live-memory capacity
+
+elepha keeps its whole live memory (session titles and summaries, per-turn memories,
+rollups, task-state reports, durable copies and their search index, staged failed
+turns, and embedding vectors) under a fixed capacity of 5,000,000,000 bytes, counted
+as logical stored bytes rather than database file size. `elepha status` shows current
+usage. From 4 GB, a new chat opening shows a warning at most once a week; from 4.75 GB,
+every new chat opening warns.
+
+When a capture would bring usage to 5 GB, elepha removes whole native sessions (every
+segment and everything derived from them), oldest source start first, only as many as
+needed to get back to at most 4.75 GB including the new turn. Only sessions whose
+durable copy is complete in every segment qualify. It never removes a single turn, a
+chat that is still active or has a staged turn, a session whose capture, source
+generation or consent is unsettled, or a parent session another retained chat still
+references.
+Projects, consent, and standing rules are kept. Before removing anything it writes an
+encrypted, verified backup beside the database; the removal and the new turn commit
+together or not at all, and a removed session is never re-captured from its transcript.
+Restoring that backup with `elepha restore` brings the removed sessions back; purge and
+incognito decisions still apply. Bulk operations that cannot clean up, such as import,
+restore and backfills, refuse a result that would reach 5 GB and change nothing.
+`elepha status` lists removed sessions. If cleanup cannot safely reach the target,
+nothing is removed and the new turn is deferred; `elepha status` names each deferred
+chat and the reason, and capture retries automatically. Use [Deleting memory](purge.md)
+to free space manually.
 
 ## Same-installation recovery
 

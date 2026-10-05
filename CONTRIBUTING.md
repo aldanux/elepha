@@ -23,7 +23,7 @@ Issues.
 
 ## Prerequisites
 
-elepha is a TypeScript project and requires **Node.js 22.12.0 or newer**, as declared in
+elepha is a TypeScript project and requires **Node.js 22.15.0 or newer**, as declared in
 [package.json](package.json). The development dependencies include TypeScript, so no
 global TypeScript installation is required.
 

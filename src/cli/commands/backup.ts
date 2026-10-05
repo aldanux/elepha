@@ -34,8 +34,10 @@ import {
     writeEncryptedAttachedDatabase,
     writeEncryptedDatabaseSnapshot,
 } from '../../storage/encrypted-database-export.js';
+import { LIVE_MEMORY_TRIGGER_NAMES } from '../../storage/live-memory-usage.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver, type ProjectSet } from '../../storage/project-resolver.js';
+import { TURN_SEARCH_CLEANUP_TRIGGER } from '../../storage/turn-search-index.js';
 import { errorMessage } from '../../util/error.js';
 import { ensureCreatedDirsPrivate, listRegularFiles } from '../../util/fs.js';
 import { runBackupWizard, sessionRulesExcludedMessage } from '../backup-wizard.js';
@@ -956,6 +958,9 @@ function replaceDestination(
     throw failure;
 }
 
+// The derived turn search index and the live-memory ledger are not exported,
+// so their triggers on exported tables are left out too; every other trigger
+// on an exported table is kept.
 function readExportSchema(source: Database.Database): SchemaRow[] {
     const placeholders = EXPORTED_TABLES.map(() => '?').join(', ');
     return source
@@ -964,9 +969,10 @@ function readExportSchema(source: Database.Database): SchemaRow[] {
              FROM sqlite_master
              WHERE sql IS NOT NULL
                AND ((type = 'table' AND name IN (${placeholders}))
-                 OR (type IN ('index', 'trigger') AND tbl_name IN (${placeholders})))`,
+                 OR (type IN ('index', 'trigger') AND tbl_name IN (${placeholders})))
+               AND NOT (type = 'trigger' AND (name = ? OR name IN (SELECT value FROM json_each(?))))`,
         )
-        .all(...EXPORTED_TABLES, ...EXPORTED_TABLES) as SchemaRow[];
+        .all(...EXPORTED_TABLES, ...EXPORTED_TABLES, TURN_SEARCH_CLEANUP_TRIGGER, JSON.stringify(LIVE_MEMORY_TRIGGER_NAMES)) as SchemaRow[];
 }
 
 function createExportTables(source: Database.Database, targetSchema: string, schema: SchemaRow[]): void {

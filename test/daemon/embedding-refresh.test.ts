@@ -13,6 +13,7 @@ import { embeddingConfiguration } from '../../src/embeddings/provider-config.js'
 import * as refresh from '../../src/embeddings/refresh.js';
 import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
 import { withMemoryReadGeneration } from '../../src/storage/paranoid-gate.js';
+import { TURN_EMBEDDING_REFRESH_STATE_TABLE, TURN_EMBEDDINGS_TABLE } from '../../src/storage/turn-embeddings.js';
 import { createTestDb, seedConsentRoot, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 const thread = vi.hoisted(() => ({
@@ -53,12 +54,17 @@ afterEach(() => {
     thread.created.mockClear();
 });
 
-function fixture() {
+function fixture(options: { durableCapture?: boolean } = {}) {
     const f = createTestDb('automatic-embeddings-');
     vi.stubEnv('ELEPHA_HOME', f.directory);
+    // The daemon reads capture configuration once, at construction.
+    if (options.durableCapture) {
+        setSetting('durable-capture', 'true');
+    }
     vi.stubEnv('OPENAI_API_KEY', '');
     vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(f.directory, '.claude'));
     const project = seedProject(f);
+    mkdirSync(project.path, { recursive: true });
     seedConsentRoot(f, { path: project.path });
     const session = seedSession(f, { project, title: 'Existing semantic history' });
     const model = embeddingConfiguration(true)!;
@@ -109,6 +115,121 @@ function fixture() {
 }
 
 describe('automatic daemon embedding refresh', () => {
+    it('reports a turn inference failure, refreshes session vectors, and retries the turn on the next tick', async () => {
+        const f = fixture();
+        for (const turnIndex of [0, 1]) {
+            expect(
+                f.store.recordTurn(
+                    {
+                        tool: 'codex',
+                        sessionId: f.session.native_id,
+                        sourcePath: f.session.source_path,
+                        projectPath: f.project.path,
+                        turnIndex,
+                        startedAt: '2026-09-27T00:00:00.000Z',
+                        endedAt: '2026-09-27T00:00:01.000Z',
+                        userMessage: `Question ${turnIndex}`,
+                        assistantText: `Answer ${turnIndex}`,
+                        toolCalls: [],
+                        cursor: `${turnIndex}:1:abc`,
+                        hasExternalContent: false,
+                        resumeMarkerBefore: false,
+                    },
+                    f.session.id,
+                    f.project.id,
+                    { decisions: [], pending_items: [], status: 'not_configured' },
+                    true,
+                ),
+            ).toBe(true);
+        }
+        const runtime = path.join(memoryPlusPackagePath(), 'runtime.cjs');
+        writeFileSync(
+            runtime,
+            `module.exports = { env: {}, pipeline: async () => Object.assign(async (text) => {
+                if (text.includes('user:')) throw new Error('turn inference failed');
+                return { data: Array(384).fill(0.25) };
+            }, { tokenizer: { encode: () => [1] }, dispose: async () => {} }) };`,
+        );
+        setSetting('memory-plus', 'true');
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+        f.daemon.start();
+        try {
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+            await vi.waitFor(() => expect(f.errors).toHaveLength(1));
+            expect(f.errors[0]).toContain('Turn');
+            expect(f.errors[0]).toContain('turn inference failed');
+            await vi.waitFor(() => expect(f.current()).toBe(true));
+            await vi.waitFor(() => expect(f.logs.some((line) => line.startsWith('[elepha] automatic indexing:'))).toBe(true));
+            expect(f.db.prepare(`SELECT memory_id FROM ${TURN_EMBEDDINGS_TABLE}`).all()).toEqual([]);
+            expect(
+                (
+                    f.db.prepare(`SELECT before_memory_id FROM ${TURN_EMBEDDING_REFRESH_STATE_TABLE}`).get() as {
+                        before_memory_id: number | null;
+                    }
+                ).before_memory_id,
+            ).toBeNull();
+
+            writeFileSync(
+                runtime,
+                `const { parentPort, workerData } = require('node:worker_threads');
+                module.exports = { env: {}, pipeline: async () => Object.assign(async () => {
+                    parentPort.postMessage('embedding-entered');
+                    Atomics.wait(new Int32Array(workerData.testGate), 0, 0);
+                    return { data: Array(384).fill(0.25) };
+                }, { tokenizer: { encode: () => [1] }, dispose: async () => {} }) };`,
+            );
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+            await f.entered;
+            f.release();
+            await vi.waitFor(() => expect(f.db.prepare(`SELECT memory_id FROM ${TURN_EMBEDDINGS_TABLE}`).all()).toHaveLength(2));
+            expect(thread.created).toHaveBeenCalledTimes(2);
+            expect(f.errors).toHaveLength(1);
+        } finally {
+            f.release();
+            await f.daemon.stop();
+        }
+    }, 15000);
+
+    it('generates a durable turn vector in the isolated periodic worker while preserving session vectors', async () => {
+        const f = fixture();
+        const parsed = {
+            tool: 'codex' as const,
+            sessionId: f.session.native_id,
+            sourcePath: f.session.source_path,
+            projectPath: f.project.path,
+            turnIndex: 0,
+            startedAt: '2026-09-27T00:00:00.000Z',
+            endedAt: '2026-09-27T00:00:01.000Z',
+            userMessage: 'Where is the worker integration?',
+            assistantText: 'The refresh worker runs this bounded turn pass.',
+            toolCalls: [],
+            cursor: '100:1:abc',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+        expect(
+            f.store.recordTurn(parsed, f.session.id, f.project.id, { decisions: [], pending_items: [], status: 'not_configured' }, true),
+        ).toBe(true);
+        setSetting('memory-plus', 'true');
+        vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+        f.daemon.start();
+        try {
+            await vi.advanceTimersByTimeAsync(EMBEDDING_REFRESH_INTERVAL_MS);
+            await f.entered;
+            expect(f.db.prepare(`SELECT memory_id FROM ${TURN_EMBEDDINGS_TABLE}`).all()).toEqual([]);
+            f.release();
+            await vi.waitFor(() => expect(f.logs.filter((line) => line.startsWith('[elepha] automatic indexing:'))).toHaveLength(1));
+            expect(f.errors).toEqual([]);
+            expect(f.db.prepare(`SELECT memory_id FROM ${TURN_EMBEDDINGS_TABLE}`).all()).toHaveLength(1);
+            await vi.waitFor(() => expect(f.current()).toBe(true));
+            expect(thread.created).toHaveBeenCalledOnce();
+            expect(f.errors).toEqual([]);
+        } finally {
+            f.release();
+            await f.daemon.stop();
+        }
+    }, 15000);
+
     it('observes disable during an active worker, retains completed vectors and starts no subsequent passes', async () => {
         const f = fixture();
         setSetting('memory-plus', 'true');
@@ -180,7 +301,9 @@ describe('automatic daemon embedding refresh', () => {
     });
 
     it('captures a watched turn while a synchronous model call is blocked in the periodic worker, without overlapping passes', async () => {
-        const f = fixture();
+        // Turn vectors are generated only from stored filtered evidence, never
+        // from the provider transcript, so the live turn must be durably captured.
+        const f = fixture({ durableCapture: true });
         setSetting('memory-plus', 'true');
         vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
         f.daemon.start();

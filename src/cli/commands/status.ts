@@ -1,12 +1,17 @@
 import type { Command } from 'commander';
+import { LIVE_MEMORY_REMOVALS_STATUS_LIMIT } from '../../config/live-memory-retention.js';
 import { daemonHealth, integrationHealth } from '../../install/health-checks.js';
+import { liveMemoryWarningStatusLine } from '../../serving/live-memory-warning.js';
 import { openDb } from '../../storage/db.js';
+import { readLiveMemoryRetentionReport } from '../../storage/live-memory-retention.js';
+import { readLiveMemoryUsage } from '../../storage/live-memory-usage.js';
+import { LIVE_MEMORY_WARNING_POLICY } from '../../storage/live-memory-warning.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { parseSince } from '../../storage/stats.js';
 import { SummarizerCallLog } from '../../summarizer/call-log.js';
 import { synthesisProviderName } from '../../summarizer/provider-config.js';
 import { errorMessage } from '../../util/error.js';
-import { synthesisStatusReport } from '../status.js';
+import { liveMemoryRetentionLines, liveMemoryUsageLine, synthesisStatusReport } from '../status.js';
 
 // Daemon liveness, derived from the same heartbeat file `status` reports.
 // `daemonHealth` is shared so `rollup --rebuild` can refuse to race a live
@@ -26,6 +31,7 @@ export function registerStatus(program: Command): void {
                 : 'never';
             const turns24h = store.getStats(parseSince('24h')).totalMemories;
             const pendingConsent = store.consent.list('pending').length;
+            const liveMemoryBytes = readLiveMemoryUsage(store.database);
 
             // Provider health is part of the verdict only when synthesis is
             // configured. Capture-only is the normal default, so historical call
@@ -38,6 +44,14 @@ export function registerStatus(program: Command): void {
                 console.log(`consent: ${pendingConsent} root(s) pending approval`);
             }
             console.log(synthesis.line);
+            console.log(liveMemoryUsageLine(liveMemoryBytes));
+            const liveMemoryWarning = liveMemoryWarningStatusLine(store.database, LIVE_MEMORY_WARNING_POLICY);
+            if (liveMemoryWarning !== undefined) {
+                console.log(liveMemoryWarning);
+            }
+            for (const line of liveMemoryRetentionLines(readLiveMemoryRetentionReport(store.database, LIVE_MEMORY_REMOVALS_STATUS_LIMIT))) {
+                console.log(line);
+            }
             try {
                 const integration = integrationHealth();
                 const { bin, status: install } = integration;

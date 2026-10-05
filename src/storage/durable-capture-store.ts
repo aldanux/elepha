@@ -1,194 +1,34 @@
-import type { Stats } from 'node:fs';
-import type { FileHandle } from 'node:fs/promises';
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import {
     ASSISTANT_STRUCTURE_MAX_FINALS,
     DURABLE_CAPTURE_FILTER_VERSION,
-    DURABLE_CAPTURE_MAX_BYTES,
     type DurableCaptureState,
     SESSION_CHAR_BUDGET,
 } from '../config/constants.js';
 import { transformAssistantStructure } from '../rendering/assistant-structure.js';
 import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
-import {
-    openProviderTranscript,
-    type ProviderTranscriptIdentitySyncValidator,
-    type ProviderTranscriptOpener,
-    validateOpenedProviderTranscriptIdentitySync,
-} from '../security/provider-transcript.js';
 import { detectShellSyntax, escapeShellSyntax } from '../security/sanitize.js';
-import type { ToolName } from '../types/index.js';
+import { TURN_SEARCH_INDEX_TABLE } from './turn-search-index.js';
 
-interface EvictionCandidate {
-    kind: 'session' | 'open-turn';
-    id: number;
-    tool: ToolName;
-    source_path: string;
-}
+// A reingest that retains a replacement writes the copy and its coverage row
+// in one transaction, stamped with the reingest time. A reingested turn whose
+// copy is older, or has no coverage row, still holds superseded text; the
+// coverage test does not depend on the two timestamps differing. Requires the
+// aliases m (memories) and ft (filtered_turns).
+export const SUPERSEDED_COPY_SQL = `(m.reingested_at IS NOT NULL AND (ft.captured_at IS NULL OR ft.captured_at < m.reingested_at
+    OR NOT EXISTS (SELECT 1 FROM ${TURN_SEARCH_INDEX_TABLE} tsi WHERE tsi.memory_id = m.id)))`;
 
-interface FrozenEvictionCandidate extends EvictionCandidate {
-    recoverable: boolean;
-}
-
-interface FrozenCurrentEvictionCandidate {
-    kind: 'session' | 'open-turn';
-    id?: number;
-    tool: ToolName;
-    source_path: string;
-    recoverable: boolean;
-}
-
-export interface DurableEvictionCurrentSource {
-    kind?: 'session' | 'open-turn';
-    sessionId?: number;
-    tool: ToolName;
-    sourcePath: string;
-}
-
-export class DurableEvictionPlan {
-    private constructor(
-        private readonly candidates: ReadonlyMap<string, FrozenEvictionCandidate>,
-        private readonly current: FrozenCurrentEvictionCandidate,
-    ) {}
-
-    static from(candidates: ReadonlyMap<string, FrozenEvictionCandidate>, current: FrozenCurrentEvictionCandidate): DurableEvictionPlan {
-        return new DurableEvictionPlan(candidates, current);
-    }
-
-    isRecoverable(candidate: EvictionCandidate): boolean {
-        const frozen = this.candidates.get(`${candidate.kind}:${candidate.id}`);
-        return frozen?.recoverable === true && frozen.tool === candidate.tool && frozen.source_path === candidate.source_path;
-    }
-
-    isCurrentRecoverable(candidate: EvictionCandidate): boolean {
-        return (
-            this.current.recoverable &&
-            this.current.kind === candidate.kind &&
-            (this.current.id === undefined || this.current.id === candidate.id) &&
-            this.current.tool === candidate.tool &&
-            this.current.source_path === candidate.source_path
-        );
-    }
-}
-
-export interface DurableEvictionValidationDependencies {
-    openTranscript?: ProviderTranscriptOpener;
-    validateIdentity?: ProviderTranscriptIdentitySyncValidator;
-    beforeFinalIdentityCheck?: () => void;
-    // Test seam for an external pathname change after the policy linearizes.
-    afterFinalIdentityCheck?: () => void;
-}
-
-type NonPromise<T> = T extends PromiseLike<unknown> ? never : T;
-
-function runSynchronousAction<T>(
-    action: (plan: DurableEvictionPlan | undefined) => NonPromise<T>,
-    plan: DurableEvictionPlan | undefined,
-): T {
-    const result = action(plan);
-    if (result && (typeof result === 'object' || typeof result === 'function') && 'then' in result) {
-        throw new TypeError('durable eviction transaction action must be synchronous');
-    }
-    return result as T;
-}
-
-// Opens candidate sources before the write transaction, then performs final
-// pathname identity checks and the synchronous write without another await.
-// Every opened handle remains held until that write commits or rolls back.
-export async function withValidatedDurableEvictionSources<T>(
-    db: Database,
-    projection: FilteredTurnProjection,
-    maxBytes: number,
-    currentSource: DurableEvictionCurrentSource,
-    action: (plan: DurableEvictionPlan | undefined) => NonPromise<T>,
-    dependencies: DurableEvictionValidationDependencies = {},
-): Promise<T> {
-    const usage = db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1').get() as { total_bytes: number };
-    if (usage.total_bytes + storedProjectionBytes(projection) <= maxBytes) {
-        return runSynchronousAction(action, undefined);
-    }
-    const openTranscript = dependencies.openTranscript ?? openProviderTranscript;
-    const validateIdentity = dependencies.validateIdentity ?? validateOpenedProviderTranscriptIdentitySync;
-    const candidates = db
-        .prepare(
-            `SELECT kind, id, tool, source_path FROM (
-                 SELECT 'session' AS kind, s.id, s.tool, s.source_path, s.last_ingested_at AS durable_at
-                 FROM sessions s
-                 JOIN memories m ON m.session_id = s.id
-                 JOIN filtered_turns ft ON ft.memory_id = m.id
-                 GROUP BY s.id
-                 UNION ALL
-                 SELECT 'open-turn' AS kind, ot.session_id AS id, ot.tool, ot.source_path, ot.staged_at AS durable_at
-                 FROM open_turns ot
-                 WHERE ot.durable_user_prompt IS NOT NULL
-             )
-             ORDER BY durable_at, id, kind`,
-        )
-        .all() as EvictionCandidate[];
-    const currentKind = currentSource.kind ?? 'session';
-    const historicalCandidates = candidates.filter(
-        (candidate) => candidate.id !== currentSource.sessionId || candidate.kind !== currentKind,
-    );
-    const opened: Array<{ candidate: EvictionCandidate; handle: FileHandle; stat: Stats }> = [];
-    const frozen = new Map<string, FrozenEvictionCandidate>();
-    const currentCandidate = {
-        kind: currentKind,
-        id: currentSource.sessionId,
-        tool: currentSource.tool,
-        source_path: currentSource.sourcePath,
-    };
-    let currentOpened: { handle: FileHandle; stat: Stats } | undefined;
-    let frozenCurrent: FrozenCurrentEvictionCandidate = { ...currentCandidate, recoverable: false };
-
-    let value: T | undefined;
-    let failed = false;
-    let failure: unknown;
-    try {
-        for (const candidate of historicalCandidates) {
-            const result = await openTranscript(candidate.tool, candidate.source_path);
-            if ('reason' in result) {
-                frozen.set(`${candidate.kind}:${candidate.id}`, { ...candidate, recoverable: false });
-            } else {
-                opened.push({ candidate, handle: result.handle, stat: result.stat });
-            }
-        }
-        const currentResult = await openTranscript(currentCandidate.tool, currentCandidate.source_path);
-        if (!('reason' in currentResult)) {
-            currentOpened = { handle: currentResult.handle, stat: currentResult.stat };
-        }
-        dependencies.beforeFinalIdentityCheck?.();
-        for (const source of opened) {
-            const identity = validateIdentity(source.candidate.tool, source.candidate.source_path, source);
-            frozen.set(`${source.candidate.kind}:${source.candidate.id}`, {
-                ...source.candidate,
-                recoverable: !('reason' in identity),
-            });
-        }
-        if (currentOpened) {
-            const identity = validateIdentity(currentCandidate.tool, currentCandidate.source_path, currentOpened);
-            frozenCurrent = { ...currentCandidate, recoverable: !('reason' in identity) };
-        }
-        dependencies.afterFinalIdentityCheck?.();
-        value = runSynchronousAction(action, DurableEvictionPlan.from(frozen, frozenCurrent));
-    } catch (error) {
-        failed = true;
-        failure = error;
-    }
-    const handles = [...opened.map((source) => source.handle), ...(currentOpened ? [currentOpened.handle] : [])];
-    const closures = await Promise.allSettled(
-        handles.map(async (handle) => {
-            await handle.close();
-        }),
-    );
-    if (failed) {
-        throw failure;
-    }
-    const closeFailure = closures.find((result) => result.status === 'rejected');
-    if (closeFailure?.status === 'rejected') {
-        throw closeFailure.reason;
-    }
-    return value as T;
-}
+// A memory's stored evidence is current only as a retained copy written under
+// the current filter that no later reingest superseded. Row presence alone
+// proves neither; matching per-turn coverage must also authenticate any
+// stored memory digest. Requires the aliases m (memories) and ft (filtered_turns,
+// left-joined).
+export const NOT_CURRENT_COPY_SQL = `(ft.memory_id IS NULL OR ft.filter_version <> ${DURABLE_CAPTURE_FILTER_VERSION}
+    OR ${SUPERSEDED_COPY_SQL}
+    OR NOT EXISTS (SELECT 1 FROM ${TURN_SEARCH_INDEX_TABLE} tsi WHERE tsi.memory_id = m.id
+        AND tsi.filter_version = ft.filter_version
+        AND length(tsi.source_digest) = 64 AND tsi.source_digest NOT GLOB '*[^a-f0-9]*'
+        AND (m.source_digest IS NULL OR m.source_digest = tsi.source_digest)))`;
 
 interface MutableTextEntry {
     kind: 'text';
@@ -297,27 +137,11 @@ export function boundedSanitizedProjection(projection: FilteredTurnProjection): 
     };
 }
 
-export function storedProjectionBytes(projection: FilteredTurnProjection): number {
-    const stored = projection.included
-        ? boundedSanitizedProjection(projection)
-        : { userPrompt: '', assistantResponse: '', assistantStructure: null, toolCalls: [], omittedBeforeChars: 0, droppedToolRefCount: 0 };
-    return (
-        Buffer.byteLength(stored.userPrompt) +
-        Buffer.byteLength(stored.assistantResponse) +
-        Buffer.byteLength(stored.assistantStructure ?? '') +
-        Buffer.byteLength(JSON.stringify(stored.toolCalls))
-    );
-}
-
 export class DurableCaptureStore {
     private readonly insertFilteredTurn: Statement;
     private readonly sessionCaptureState: Statement;
     private readonly upsertStatus: Statement;
     private readonly statusForSession: Statement;
-    private readonly totalBytes: Statement;
-    private readonly evictionCandidates: Statement;
-    private readonly deleteSessionTurns: Statement;
-    private readonly clearOpenTurn: Statement;
 
     constructor(db: Database) {
         this.insertFilteredTurn = db.prepare(
@@ -327,12 +151,14 @@ export class DurableCaptureStore {
              VALUES (@memory_id, @included, @user_prompt, @assistant_response, @tool_calls, @omitted_tool_call_count,
                      @dropped_tool_ref_count, @omitted_before_chars, @filter_version, @captured_at, @assistant_structure)`,
         );
+        // A parse failure in ordinary ingestion keeps coverage incomplete.
         this.sessionCaptureState = db.prepare(
             `SELECT CASE
+                WHEN EXISTS (SELECT 1 FROM durable_capture_status WHERE session_id = ? AND state = 'parse_error') THEN 'parse_error'
                 WHEN EXISTS (
                     SELECT 1 FROM memories m
                     LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
-                    WHERE m.session_id = ? AND ft.memory_id IS NULL
+                    WHERE m.session_id = ? AND ${NOT_CURRENT_COPY_SQL}
                 ) THEN 'disabled_gap'
                 WHEN EXISTS (
                     SELECT 1 FROM filtered_turns ft
@@ -351,37 +177,6 @@ export class DurableCaptureStore {
                updated_at = excluded.updated_at`,
         );
         this.statusForSession = db.prepare('SELECT state FROM durable_capture_status WHERE session_id = ?');
-        this.totalBytes = db.prepare('SELECT total_bytes FROM durable_capture_usage WHERE id = 1');
-        this.evictionCandidates = db.prepare(
-            `SELECT kind, id, tool, source_path FROM (
-                 SELECT 'session' AS kind, s.id, s.tool, s.source_path, s.last_ingested_at AS durable_at
-                 FROM sessions s
-                 JOIN memories m ON m.session_id = s.id
-                 JOIN filtered_turns ft ON ft.memory_id = m.id
-                 GROUP BY s.id
-                 UNION ALL
-                 SELECT 'open-turn' AS kind, ot.session_id AS id, ot.tool, ot.source_path, ot.staged_at AS durable_at
-                 FROM open_turns ot
-                 WHERE ot.durable_user_prompt IS NOT NULL
-             )
-             ORDER BY durable_at, id, kind`,
-        );
-        this.deleteSessionTurns = db.prepare(
-            'DELETE FROM filtered_turns WHERE memory_id IN (SELECT id FROM memories WHERE session_id = ?)',
-        );
-        this.clearOpenTurn = db.prepare(
-            `UPDATE open_turns SET
-               durable_included = NULL,
-               durable_user_prompt = NULL,
-               durable_assistant_response = NULL,
-               durable_assistant_structure = NULL,
-               durable_tool_calls = NULL,
-               durable_omitted_tool_call_count = NULL,
-               durable_dropped_tool_ref_count = NULL,
-               durable_omitted_before_chars = NULL,
-               durable_filter_version = NULL
-             WHERE session_id = ? AND tool = ?`,
-        );
     }
 
     record(
@@ -389,9 +184,9 @@ export class DurableCaptureStore {
         sessionId: number,
         projection: FilteredTurnProjection,
         capturedAt: string,
-        maxBytes = DURABLE_CAPTURE_MAX_BYTES,
-        evictionPlan?: DurableEvictionPlan,
     ): DurableCaptureRecordResult {
+        // Sessions whose copies the retired per-copy size limit evicted keep
+        // that terminal state; nothing evicts an individual copy any more.
         const status = this.statusForSession.get(sessionId) as { state: DurableCaptureState } | undefined;
         if (status?.state === 'evicted') {
             return 'not_retained';
@@ -424,92 +219,24 @@ export class DurableCaptureStore {
             filter_version: projection.filterVersion,
             captured_at: capturedAt,
         });
-        const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
+        const row = this.sessionCaptureState.get(sessionId, sessionId, sessionId) as { state: DurableCaptureState };
         this.upsertStatus.run(sessionId, row.state, projection.filterVersion, capturedAt);
-        return this.enforceMaxBytes(sessionId, maxBytes, capturedAt, evictionPlan);
-    }
-
-    enforceOpenTurnMaxBytes(
-        sessionId: number,
-        maxBytes: number,
-        updatedAt: string,
-        evictionPlan?: DurableEvictionPlan,
-    ): DurableCaptureRecordResult {
-        return this.enforceMaxBytes({ kind: 'open-turn', id: sessionId }, maxBytes, updatedAt, evictionPlan);
+        return 'retained';
     }
 
     setStatus(sessionId: number, state: DurableCaptureState, updatedAt: string): void {
         this.upsertStatus.run(sessionId, state, DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
     }
 
+    // The state the stored rows and any ingestion parse failure support now,
+    // without recording it.
+    computedState(sessionId: number): DurableCaptureState {
+        return (this.sessionCaptureState.get(sessionId, sessionId, sessionId) as { state: DurableCaptureState }).state;
+    }
+
     refreshStatus(sessionId: number, updatedAt: string): DurableCaptureState {
-        const row = this.sessionCaptureState.get(sessionId, sessionId) as { state: DurableCaptureState };
-        this.setStatus(sessionId, row.state, updatedAt);
-        return row.state;
-    }
-
-    private enforceMaxBytes(
-        current: { kind: 'session' | 'open-turn'; id: number } | number,
-        maxBytes: number,
-        updatedAt: string,
-        evictionPlan?: DurableEvictionPlan,
-    ): DurableCaptureRecordResult {
-        let totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
-        if (totalBytes <= maxBytes) {
-            return 'retained';
-        }
-        const currentCandidate = typeof current === 'number' ? { kind: 'session' as const, id: current } : current;
-        const candidates = this.evictionCandidates.all() as EvictionCandidate[];
-        const recoverable: EvictionCandidate[] = [];
-        const unavailable: EvictionCandidate[] = [];
-        let recoverableCurrent: EvictionCandidate | undefined;
-        let currentEvicted = false;
-        // Both lists retain the oldest-first SQL order. Exhausting the
-        // recoverable list first protects copies whose provider transcript
-        // has already disappeared and therefore cannot be rebuilt.
-        for (const candidate of candidates) {
-            if (candidate.id === currentCandidate.id && candidate.kind === currentCandidate.kind) {
-                if (evictionPlan?.isCurrentRecoverable(candidate) === true) {
-                    recoverableCurrent = candidate;
-                } else {
-                    unavailable.push(candidate);
-                }
-                continue;
-            }
-            (evictionPlan?.isRecoverable(candidate) === true ? recoverable : unavailable).push(candidate);
-        }
-        for (const victim of recoverable) {
-            this.evict(victim, updatedAt);
-            totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
-            if (totalBytes <= maxBytes) {
-                return 'retained';
-            }
-        }
-        if (recoverableCurrent) {
-            this.evict(recoverableCurrent, updatedAt);
-            currentEvicted = true;
-            totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
-            if (totalBytes <= maxBytes) {
-                return 'not_retained';
-            }
-        }
-        for (const victim of unavailable) {
-            this.evict(victim, updatedAt);
-            currentEvicted ||= victim.id === currentCandidate.id && victim.kind === currentCandidate.kind;
-            totalBytes = (this.totalBytes.get() as { total_bytes: number }).total_bytes;
-            if (totalBytes <= maxBytes) {
-                return currentEvicted ? 'not_retained' : 'retained';
-            }
-        }
-        return 'not_retained';
-    }
-
-    private evict(candidate: EvictionCandidate, updatedAt: string): void {
-        if (candidate.kind === 'open-turn') {
-            this.clearOpenTurn.run(candidate.id, candidate.tool);
-            return;
-        }
-        this.deleteSessionTurns.run(candidate.id);
-        this.upsertStatus.run(candidate.id, 'evicted', DURABLE_CAPTURE_FILTER_VERSION, updatedAt);
+        const state = this.computedState(sessionId);
+        this.setStatus(sessionId, state, updatedAt);
+        return state;
     }
 }

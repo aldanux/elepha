@@ -16,7 +16,7 @@
 // calls across CLI versions 0.136.0-0.147.0: the custom_tool_call envelope
 // was 100% of them, 0 used function_call. An earlier version of this adapter
 // assumed function_call/arguments without a real sample and missed every
-// apply_patch call as a result. Versioned real-sample fixtures guard the shape.
+// apply_patch call as a result.
 //
 // Genuine MCP calls have two observed envelopes. CLI rollouts use
 // response_item function_call/function_call_output. Codex Desktop can wrap
@@ -37,6 +37,7 @@ import {
     ELEPHA_MCP_RESULTS_PER_TURN_MAX,
     ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES,
     SESSION_KIND_PREAMBLE_MAX_BYTES,
+    TASK_STATE_REPORT_TOOL,
 } from '../config/constants.js';
 import { codexHome, codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
 import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionAdapterTool, SessionClassification } from '../types/index.js';
@@ -44,15 +45,18 @@ import {
     boundedMcpResult,
     canonicalTimestamp,
     classifyEmptyJsonlSession,
+    consumeTaskStateReportResult,
     type EmptySessionSignals,
+    isTaskStateReportCallId,
     JsonlTurnAdapter,
     type LineClass,
     OversizedTranscriptRecordError,
+    observeTaskStateReportCall,
+    type ParserDecisionTracker,
     readBoundedLines,
     rememberUnmatchedElephaMcpResult,
     resolveAbsolute,
     safeDiscriminator,
-    TranscriptReadBudgetError,
     type TurnBuilderState,
     type TurnLifecycleSignal,
     textValues,
@@ -84,6 +88,8 @@ const KNOWN_EVENT_MSG_SKIP = new Set([
     'task_started',
     'task_complete',
     'thread_settings_applied',
+    // Native goal snapshots are control metadata, never conversation or instructions.
+    'thread_goal_updated',
     'patch_apply_end',
     'mcp_tool_call_end',
     'web_search_end',
@@ -138,6 +144,9 @@ interface CodexPayload {
         type?: unknown;
         id?: unknown;
         server?: unknown;
+        tool?: unknown;
+        arguments?: unknown;
+        status?: unknown;
         result?: unknown;
     };
     error?: unknown;
@@ -156,6 +165,12 @@ interface CodexSessionIndexLine {
     id?: string;
     thread_name?: string;
     updated_at?: string;
+}
+
+// The CLI pair names the report tool under the elepha namespace; Desktop's
+// McpToolCall item names the server and tool separately.
+function isTaskStateReportFunctionCall(payload: CodexPayload): boolean {
+    return payload.type === 'function_call' && payload.namespace === ELEPHA_MCP_NAMESPACE && payload.name === TASK_STATE_REPORT_TOOL;
 }
 
 function hasToolCall(payloadType: string | undefined): boolean {
@@ -419,10 +434,21 @@ function extractReadFileePaths(name: string | undefined, argumentsRaw: string | 
     }
 }
 
+type UserBoundary = 'event_msg' | 'response_item';
+
+interface UserBoundaryState {
+    sawUserResponse: boolean;
+    boundary?: UserBoundary;
+}
+
 export class CodexAdapter extends JsonlTurnAdapter {
     readonly tool: SessionAdapterTool = 'codex';
     readonly watchGlobs = ['*/*/*/rollout-*.jsonl'];
-    private readonly userBoundaryByFile = new Map<string, 'event_msg' | 'response_item'>();
+    // session_meta and turn_context set the working directory, surface and
+    // branch for every following turn, and a session may declare them only
+    // once in its header.
+    override readonly carriesContextAcrossTurns = true;
+    private readonly userBoundaryByFile = new Map<string, UserBoundary>();
     private readonly desktopMcpCallIds = new WeakMap<TurnBuilderState, Set<string>>();
 
     matches(filePath: string): boolean {
@@ -479,62 +505,57 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // before the response, it is the historical boundary; otherwise the
     // role:user response_item is the complete record. Resolve that once per
     // parse so a rollout containing the duplicate pair does not emit twice.
-    private async userBoundaryFor(
-        filePath: string,
-        options: { handle?: FileHandle; signal?: AbortSignal; maxReadBytes?: number } = {},
-    ): Promise<'event_msg' | 'response_item'> {
-        let sawUserResponse = false;
-
-        try {
-            for await (const { text } of readBoundedLines(filePath, { handle: options.handle, maxReadBytes: options.maxReadBytes })) {
-                if (options.signal?.aborted) {
-                    return 'response_item';
+    // Which record opens a user turn: newer Codex writes an event_msg
+    // user_message beside the response_item prompt, older Codex only the
+    // response_item. The first decisive record settles it for the whole
+    // transcript, and the decision is recorded with every cursor so a resumed
+    // parse never rescans from the start to make it again.
+    protected override decisionTracker(): ParserDecisionTracker {
+        return {
+            initial: (): UserBoundaryState => ({ sawUserResponse: false }),
+            observe: (state, raw) => {
+                const current = state as UserBoundaryState;
+                if (current.boundary !== undefined) {
+                    return current;
                 }
-                let line: CodexLine;
-                try {
-                    line = JSON.parse(text) as CodexLine;
-                } catch {
-                    continue;
-                }
-                const payload = line.payload;
-                if (line.type === 'event_msg' && payload?.type === 'user_message') {
-                    return 'event_msg';
+                const line = raw as CodexLine;
+                const payload = line?.payload;
+                if (line?.type === 'event_msg' && payload?.type === 'user_message') {
+                    return { ...current, boundary: 'event_msg' };
                 }
                 if (
-                    line.type === 'response_item' &&
+                    line?.type === 'response_item' &&
                     payload?.type === 'message' &&
                     payload.role === 'user' &&
                     !this.isResumeMarkerLine(line)
                 ) {
-                    sawUserResponse = true;
-                    continue;
+                    return { ...current, sawUserResponse: true };
                 }
                 // A user prompt followed by the assistant without an
                 // event_msg is the response_item-only format. No later
                 // transcript line can turn that completed turn into the
                 // duplicate form.
-                if (sawUserResponse && line.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant') {
-                    return 'response_item';
+                if (
+                    current.sawUserResponse &&
+                    line?.type === 'response_item' &&
+                    payload?.type === 'message' &&
+                    payload.role === 'assistant'
+                ) {
+                    return { ...current, boundary: 'response_item' };
                 }
-            }
-        } catch (error) {
-            if (error instanceof OversizedTranscriptRecordError || error instanceof TranscriptReadBudgetError) {
-                throw error;
-            }
-            // The daemon's readability guard owns a visible failure. The
-            // response envelope is the conservative fallback if a direct
-            // adapter caller races a disappearing file.
-        }
-
-        return 'response_item';
+                return current;
+            },
+            decided: (state) => {
+                const boundary = (state as UserBoundaryState | undefined)?.boundary;
+                return boundary === undefined ? undefined : { userBoundary: boundary };
+            },
+            valid: (decisions) => decisions.userBoundary === 'event_msg' || decisions.userBoundary === 'response_item',
+        };
     }
 
-    override async *parseTurns(filePath: string, sinceCursor?: string, options?: Parameters<JsonlTurnAdapter['parseTurns']>[2]) {
-        this.userBoundaryByFile.set(filePath, await this.userBoundaryFor(filePath, options));
-        if (options?.signal?.aborted) {
-            return;
-        }
-        yield* super.parseTurns(filePath, sinceCursor, options);
+    // Undecided keeps the response envelope, the conservative default.
+    protected override applyDecisions(filePath: string, decisions: Readonly<Record<string, string>> | undefined): void {
+        this.userBoundaryByFile.set(filePath, decisions?.userBoundary === 'event_msg' ? 'event_msg' : 'response_item');
     }
 
     // Codex encodes session provenance in the first session_meta line.
@@ -722,7 +743,9 @@ export class CodexAdapter extends JsonlTurnAdapter {
                 return this.userBoundaryByFile.get(filePath) === 'event_msg' ? 'boundary' : 'skip';
             }
             if (!KNOWN_EVENT_MSG_SKIP.has(p.type)) {
-                this.warnUnknownLine(`CodexAdapter: unrecognized event_msg.payload.type "${safeDiscriminator(p.type)}" in ${filePath}`);
+                this.warnUnrecognizedRecord(
+                    `CodexAdapter: unrecognized event_msg.payload.type "${safeDiscriminator(p.type)}" in ${filePath}`,
+                );
             }
             return 'skip';
         }
@@ -746,13 +769,15 @@ export class CodexAdapter extends JsonlTurnAdapter {
                 return 'content';
             }
             if (!KNOWN_RESPONSE_ITEM_SKIP.has(p.type)) {
-                this.warnUnknownLine(`CodexAdapter: unrecognized response_item.payload.type "${safeDiscriminator(p.type)}" in ${filePath}`);
+                this.warnUnrecognizedRecord(
+                    `CodexAdapter: unrecognized response_item.payload.type "${safeDiscriminator(p.type)}" in ${filePath}`,
+                );
             }
             return 'skip';
         }
 
         if (!KNOWN_TOP_LEVEL_SKIP.has(l.type)) {
-            this.warnUnknownLine(`CodexAdapter: unrecognized top-level type "${safeDiscriminator(l.type)}" in ${filePath}`);
+            this.warnUnrecognizedRecord(`CodexAdapter: unrecognized top-level type "${safeDiscriminator(l.type)}" in ${filePath}`);
         }
         return 'skip';
     }
@@ -802,6 +827,16 @@ export class CodexAdapter extends JsonlTurnAdapter {
             if (item?.type !== 'McpToolCall' || item.server !== ELEPHA_MCP_SERVER) {
                 return;
             }
+            if (item.tool === TASK_STATE_REPORT_TOOL) {
+                // One Desktop item carries both the call and its result.
+                const result = item.result;
+                const isError =
+                    (item.status !== undefined && item.status !== 'completed') ||
+                    (result !== null && typeof result === 'object' && (result as { isError?: unknown }).isError === true);
+                observeTaskStateReportCall(state, 'codex-desktop', item.id, item.arguments);
+                consumeTaskStateReportResult(state, 'codex-desktop', item.id, result, isError);
+                return;
+            }
             const callId = item.id;
             if (typeof callId === 'string' && this.desktopCallsFor(state).has(callId)) {
                 state.elephaMcpCoverageFailure = 'duplicate-call-id';
@@ -837,6 +872,10 @@ export class CodexAdapter extends JsonlTurnAdapter {
         if (l.type !== 'response_item') {
             return;
         }
+        if (isTaskStateReportFunctionCall(payload)) {
+            observeTaskStateReportCall(state, 'codex-cli', payload.call_id, payload.arguments);
+            return;
+        }
         if (payload.type === 'function_call' && payload.namespace === ELEPHA_MCP_NAMESPACE) {
             const callId = payload.call_id;
             if (typeof callId === 'string' && this.desktopCallsFor(state).has(callId)) {
@@ -849,6 +888,9 @@ export class CodexAdapter extends JsonlTurnAdapter {
             return;
         }
         const callId = payload.call_id;
+        if (consumeTaskStateReportResult(state, 'codex-cli', callId, payload.output, false)) {
+            return;
+        }
         if (typeof callId === 'string' && this.desktopCallsFor(state).has(callId)) {
             const receipt = state.elephaMcpResultReceipts.find((candidate) => candidate.callId === callId);
             const duplicate = boundedMcpResult(payload.output);
@@ -887,7 +929,11 @@ export class CodexAdapter extends JsonlTurnAdapter {
             state.elephaMcpCoverageFailure = 'oversized-call-id';
             return undefined;
         }
-        if (state.elephaMcpCallIds.has(callId) || state.elephaMcpResultReceipts.some((receipt) => receipt.callId === callId)) {
+        if (
+            state.elephaMcpCallIds.has(callId) ||
+            state.elephaMcpResultReceipts.some((receipt) => receipt.callId === callId) ||
+            isTaskStateReportCallId(state, callId)
+        ) {
             state.elephaMcpCoverageFailure = 'duplicate-call-id';
             return undefined;
         }
@@ -994,6 +1040,11 @@ export class CodexAdapter extends JsonlTurnAdapter {
                     : extractExecFilePaths(p.input, state.projectPath);
             const call: ParsedToolCall = { name: p.name ?? 'unknown', filePaths, text: p.input ?? '' };
             state.toolCalls.push(call);
+            return;
+        }
+
+        // Parsed into the turn's separate report field, never ordinary capture.
+        if (l.type === 'response_item' && isTaskStateReportFunctionCall(p)) {
             return;
         }
 

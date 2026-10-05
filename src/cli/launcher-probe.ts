@@ -36,7 +36,7 @@ export function formatLauncherProbeFailure(failure: LauncherProbeFailure): strin
     const semanticMinimum = /^\d+\.\d+\.\d+$/.test(failure.minimum);
     const legacyMajor = /^[1-9]\d*$/.test(failure.minimum);
     const expectedEngine = semanticMinimum
-        ? `>=${failure.minimum}`
+        ? `canonical >=N.N.N at or above ${failure.minimum}`
         : legacyMajor
           ? `canonical >=${failure.minimum}.N.N`
           : 'canonical >=N.N.N';
@@ -56,6 +56,16 @@ export function formatLauncherProbeFailure(failure: LauncherProbeFailure): strin
         `bin.elepha: expected not constrained, observed ${value(failure.declaredBin)}`,
         `resolved package root: expected readable package root, observed ${failure.packageRoot}`,
     ].join('\n');
+}
+
+function versionBelow(version: string, minimum: string): boolean {
+    const versionParts = version.split('.').map(Number);
+    const minimumParts = minimum.split('.').map(Number);
+    return (
+        versionParts[0] < minimumParts[0] ||
+        (versionParts[0] === minimumParts[0] && versionParts[1] < minimumParts[1]) ||
+        (versionParts[0] === minimumParts[0] && versionParts[1] === minimumParts[1] && versionParts[2] < minimumParts[2])
+    );
 }
 
 // The launcher verifies that the currently running package is elepha and the
@@ -101,21 +111,34 @@ export function launcherProbe(minimum: string): LauncherProbeResult {
             return failed('engines.node', 'canonical >=N.N.N', value(enginesNode), details());
         }
         requiredMinimum = engineMatch[1];
-        if (semanticMinimum ? requiredMinimum !== semanticMinimum : Number(requiredMinimum.split('.')[0]) !== legacyMinimumMajor) {
-            const expected = semanticMinimum ? `>=${semanticMinimum}` : `canonical >=${legacyMinimumMajor}.N.N`;
+        // Self-update replaces the package but never regenerates the launcher,
+        // so a launcher may carry an older floor than the package it starts. An
+        // older or equal floor is compatible; a newer one means the package is
+        // older than the launcher expects.
+        if (
+            semanticMinimum ? versionBelow(requiredMinimum, semanticMinimum) : Number(requiredMinimum.split('.')[0]) !== legacyMinimumMajor
+        ) {
+            const expected = semanticMinimum ? `canonical >=N.N.N at or above ${semanticMinimum}` : `canonical >=${legacyMinimumMajor}.N.N`;
             return failed('engines.node', expected, value(enginesNode), details());
         }
-        const minimumParts = requiredMinimum.split('.').map(Number);
-        const nodeParts = nodeVersion.split('.').map(Number);
-        if (
-            nodeParts[0] < minimumParts[0] ||
-            (nodeParts[0] === minimumParts[0] && nodeParts[1] < minimumParts[1]) ||
-            (nodeParts[0] === minimumParts[0] && nodeParts[1] === minimumParts[1] && nodeParts[2] < minimumParts[2])
-        ) {
+        // The runtime always meets the installed package's floor, never merely
+        // the launcher's older one.
+        if (versionBelow(nodeVersion, requiredMinimum)) {
             return failed('node version', `>=${requiredMinimum}`, nodeVersion, details());
         }
         return { passes: true };
     } catch (error) {
         return failed('package resolution', 'readable installed elepha package', errorMessage(error), details());
     }
+}
+
+// Shared by the CLI command and the package entry's fast path, so both report
+// the same diagnostic and exit status.
+export function runLauncherProbe(minimum: string): number {
+    const result = launcherProbe(minimum);
+    if (result.passes) {
+        return 0;
+    }
+    console.error(formatLauncherProbeFailure(result.failure));
+    return 66;
 }

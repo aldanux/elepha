@@ -4,7 +4,7 @@ import type { Command } from 'commander';
 import { CodexAdapter } from '../../adapters/codex.js';
 import { BACKUP_KEEP } from '../../config/constants.js';
 import { backupDatabaseAndReport } from '../../storage/backup.js';
-import { defaultDbPath, openDb } from '../../storage/db.js';
+import { defaultDbPath, openDb, openManagedDatabase } from '../../storage/db.js';
 import {
     applyExternalAgentImportPurge,
     type ExternalImportPurgePlan,
@@ -12,7 +12,10 @@ import {
     verifyExternalAgentImportPurge,
 } from '../../storage/external-agent-import-purge.js';
 import { MemoryStore, type PurgePlan, type PurgeScope } from '../../storage/memory-store.js';
+import { verifyOrphanPurge } from '../../storage/orphan-classification.js';
+
 import { runDestructiveOp } from '../destructive-op.js';
+import { printOrphanClassification } from '../orphan-report.js';
 import { buildPurgeScope, PurgeHereScopeError, runPurgeWizard } from '../purge-wizard.js';
 import { confirmYesNo, printPurgePlan, withCapturePaused } from '../shared.js';
 
@@ -27,11 +30,15 @@ interface PurgeCommandOptions {
     all: boolean;
     apply: boolean;
     skipConfirmation: boolean;
+    details: boolean;
 }
 
 interface PurgeOperationOptions {
-    applyRequested: boolean;
     plan?: PurgePlan;
+    applyRequested: boolean;
+
+    details?: boolean;
+
     confirm?: (plan: PurgePlan) => Promise<boolean>;
 }
 
@@ -51,7 +58,8 @@ export function registerPurge(program: Command): void {
         .option('--newer-than <durationOrDate>', 'purge sessions last ingested at or after this time (e.g. "7d", "24h", or an ISO date)')
         .option('--older-than <durationOrDate>', 'purge sessions last ingested at or before this time (e.g. "30d", or an ISO date)')
         .option('--external-agent-imports', 'purge Codex rows whose source rollouts carry external-import turn ids')
-        .option('--orphan', 'purge memory whose project directory is temporary or no longer exists')
+        .option('--orphan', 'inspect chats and select only those with confirmed missing project directories')
+        .option('--details', 'show bounded orphan classification diagnostics')
         .option('--revoked', 'purge memory for projects you have revoked')
         .option('--all', 'purge everything - every session, every project row')
         .option('--apply', 'actually perform the deletion (default is a dry run that only prints the plan)')
@@ -103,37 +111,47 @@ export function registerPurge(program: Command): void {
                 return;
             }
 
-            const db = await openDb();
-            if (opts.externalAgentImports) {
-                await runExternalAgentImportPurge(db, { applyRequested: opts.apply });
-                return;
-            }
-
-            const store = new MemoryStore(db);
-            let scope: PurgeScope;
+            const db = opts.orphan ? await openManagedDatabase(undefined, { readonly: !opts.apply, fileMustExist: true }) : await openDb();
             try {
-                scope = buildPurgeScope(store, opts);
-            } catch (error) {
-                if (error instanceof PurgeHereScopeError) {
-                    console.error(error.message);
-                    process.exitCode = 1;
+                if (opts.externalAgentImports) {
+                    await runExternalAgentImportPurge(db, { applyRequested: opts.apply });
                     return;
                 }
-                throw error;
+
+                const store = new MemoryStore(db);
+                let scope: PurgeScope;
+                try {
+                    scope = buildPurgeScope(store, opts);
+                } catch (error) {
+                    if (error instanceof PurgeHereScopeError) {
+                        console.error(error.message);
+                        process.exitCode = 1;
+                        return;
+                    }
+                    throw error;
+                }
+                await runPurgeOperation(store, scope, {
+                    applyRequested: opts.apply,
+                    details: opts.details,
+                    confirm: async (plan) => {
+                        if (opts.skipConfirmation || (!opts.orphan && !process.stdout.isTTY)) {
+                            return true;
+                        }
+                        if (opts.orphan && (!process.stdin.isTTY || !process.stdout.isTTY)) {
+                            throw new Error('Orphan cleanup requires interactive confirmation or explicit --skip-confirmation');
+                        }
+                        if (await confirmPurgeDeletion(plan.sessions.length, plan.standingRules.length, plan.sessionRules.length)) {
+                            return true;
+                        }
+                        console.log('Cancelled — nothing was deleted.');
+                        return false;
+                    },
+                });
+            } finally {
+                if (db.open) {
+                    db.close();
+                }
             }
-            await runPurgeOperation(store, scope, {
-                applyRequested: opts.apply,
-                confirm: async (plan) => {
-                    if (!process.stdout.isTTY || opts.skipConfirmation) {
-                        return true;
-                    }
-                    if (await confirmPurgeDeletion(plan.sessions.length, plan.standingRules.length, plan.sessionRules.length)) {
-                        return true;
-                    }
-                    console.log('Cancelled — nothing was deleted.');
-                    return false;
-                },
-            });
         });
 }
 
@@ -149,8 +167,24 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
         applyRequested: options.applyRequested,
         db: store.database,
         operationLabel: 'purge',
+
         plan: () => options.plan ?? store.planPurge(scope),
-        describe: printPurgePlan,
+        describe: (plan) => {
+            if (plan.orphanEvidence) {
+                printOrphanClassification(plan.orphanEvidence.classification, options.details, plan.orphanEvidence.identities.length);
+            }
+            printPurgePlan(plan);
+            if (plan.orphanEvidence) {
+                console.log(
+                    `Rule scope: ${plan.standingRules.length} project standing rule(s), ${plan.sessionRules.length} chat standing rule(s); chat rules only for confirmed chats; project rules only where no unselected session or chat rule needs the owner.`,
+                );
+                for (const s of plan.sessions) {
+                    console.log(
+                        `  [${s.id}] project [${s.projectId}] ${JSON.stringify(s.projectPath)}, ${JSON.stringify(s.tool)}:${JSON.stringify(s.nativeId)}, segment ${s.segmentIndex}; ${s.turnCount} memories, ${s.filteredTurnCount} retained turns, ${s.filteredBytes} retained bytes`,
+                    );
+                }
+            }
+        },
         isEmpty: (plan) => plan.sessions.length === 0 && plan.standingRules.length === 0 && plan.sessionRules.length === 0,
         messages: {
             dryRun:
@@ -219,6 +253,9 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
                 }
                 remainingFtsTerms += (withFtsTerms.get(ids) as { count: number }).count;
             }
+            if (appliedPlan?.orphanEvidence) {
+                verifyOrphanPurge(store, appliedPlan);
+            }
             if (remainingRules.length > 0) {
                 verificationFailed = true;
                 console.error(`\nVERIFICATION FAILED: ${remainingRules.length} standing rule(s) from the applied purge still remain.`);
@@ -238,6 +275,8 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
                         `and ${remainingFtsTerms} filtered FTS term(s) from the applied purge still remain.`,
                 );
                 process.exitCode = 1;
+            }
+            if (!verificationFailed && appliedPlan) {
             }
         },
     });

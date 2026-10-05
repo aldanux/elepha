@@ -19,7 +19,14 @@ import {
     type SharedDatabaseLifecycleLease,
 } from './database-lifecycle.js';
 import { assertDatabaseMigrationInactive } from './database-migration.js';
+
+import { migrateLiveMemoryRetention } from './live-memory-retention-schema.js';
+import { migrateLiveMemoryUsage } from './live-memory-usage.js';
+import { migrateLiveMemoryWarning } from './live-memory-warning.js';
 import { initializeParanoidAuthority, registerParanoidDatabase } from './paranoid-gate.js';
+
+import { migrateTurnEmbeddings } from './turn-embeddings.js';
+import { assertRetiredTurnSearchSchemaAdmissible, migrateTurnSearchIndex } from './turn-search-index.js';
 
 export function defaultDbPath(): string {
     const override = process.env.ELEPHA_DB_PATH?.trim();
@@ -31,6 +38,7 @@ export const SQLITE_SOURCE_WATERMARK_SCHEMA = {
     tool: 'tool',
     sourcePath: 'source_path',
     watermark: 'watermark',
+    cursorId: 'cursor_id',
 } as const;
 
 type ToolCheckedTable = 'sessions' | 'shown_session_lists';
@@ -83,7 +91,11 @@ CREATE TABLE IF NOT EXISTS sessions (
   segment_index    INTEGER NOT NULL DEFAULT 0,
   project_id       INTEGER NOT NULL REFERENCES projects(id),
   source_path      TEXT NOT NULL,
+  source_format    TEXT NOT NULL DEFAULT 'native' CHECK (source_format IN ('native','opencode-v2')),
   cursor           TEXT,
+  -- The adapter's resume context for cursor: source records the parse
+  -- re-reads and verifies before resuming. Written with cursor, never alone.
+  cursor_context   TEXT,
   started_at       TEXT NOT NULL,
   last_ingested_at TEXT NOT NULL,
   surface          TEXT CHECK (surface IN ('cli','desktop')),
@@ -130,6 +142,22 @@ CREATE TABLE IF NOT EXISTS memories (
   UNIQUE (session_id, turn_index)
 );
 CREATE INDEX IF NOT EXISTS idx_memories_project_time ON memories(project_id, turn_started_at);
+
+-- A private snapshot of one report-bearing turn. Source locators stay as
+-- evidence metadata; source turns may later be reingested or removed.
+CREATE TABLE IF NOT EXISTS task_state_manifests (
+  memory_id               INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+  report                  TEXT NOT NULL,
+  reporting_source        TEXT NOT NULL,
+  source_locators         TEXT NOT NULL,
+  coverage_state          TEXT NOT NULL CHECK (coverage_state IN ('verified', 'incomplete')),
+  resolved_source_count   INTEGER NOT NULL CHECK (resolved_source_count >= 0),
+  total_source_count      INTEGER NOT NULL CHECK (total_source_count >= resolved_source_count),
+  coverage_reason         TEXT,
+  created_at              TEXT NOT NULL,
+  CHECK ((coverage_state = 'verified' AND resolved_source_count = total_source_count AND coverage_reason IS NULL)
+      OR (coverage_state = 'incomplete' AND coverage_reason IS NOT NULL))
+);
 
 CREATE TABLE IF NOT EXISTS filtered_turns (
   memory_id               INTEGER PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
@@ -348,8 +376,96 @@ CREATE TABLE IF NOT EXISTS ${SQLITE_SOURCE_WATERMARK_SCHEMA.table} (
   ${SQLITE_SOURCE_WATERMARK_SCHEMA.tool}        TEXT NOT NULL,
   ${SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath}  TEXT NOT NULL,
   ${SQLITE_SOURCE_WATERMARK_SCHEMA.watermark}   INTEGER NOT NULL,
+  ${SQLITE_SOURCE_WATERMARK_SCHEMA.cursorId}    TEXT,
   PRIMARY KEY (${SQLITE_SOURCE_WATERMARK_SCHEMA.tool}, ${SQLITE_SOURCE_WATERMARK_SCHEMA.sourcePath})
 );
+
+CREATE TABLE IF NOT EXISTS opencode_v2_pending (
+  source_path TEXT NOT NULL,
+  native_id TEXT NOT NULL,
+  observed_seq INTEGER NOT NULL,
+  observed_updated INTEGER NOT NULL,
+  retry_rank INTEGER NOT NULL DEFAULT 0,
+  needs_continuation INTEGER NOT NULL DEFAULT 0 CHECK (needs_continuation IN (0,1)),
+  resume_cursor TEXT,
+  PRIMARY KEY (source_path, native_id)
+);
+CREATE INDEX IF NOT EXISTS idx_opencode_v2_pending_retry ON opencode_v2_pending(source_path, retry_rank, native_id);
+
+-- A same-ID OpenCode session moves from frozen V1 history to V2 capture only
+-- through a verified migration boundary. The offset keeps every V2 turn index
+-- above every V1 index of the same native session; no transcript text is stored.
+CREATE TABLE IF NOT EXISTS opencode_v2_handoffs (
+  native_id TEXT PRIMARY KEY,
+  source_path TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('waiting','active','abstained')),
+  v1_cursor TEXT,
+  turn_index_offset INTEGER,
+  observed_seq INTEGER NOT NULL,
+  observed_updated INTEGER NOT NULL,
+  observed_v1_updated INTEGER NOT NULL,
+  needs_continuation INTEGER NOT NULL DEFAULT 0 CHECK (needs_continuation IN (0,1)),
+  reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_opencode_v2_handoffs_continuation ON opencode_v2_handoffs(source_path, needs_continuation, native_id);
+`;
+
+// Tables with a foreign key to sessions that legacy databases never had. They
+// are created only after every migration that may rebuild sessions, so each
+// foreign key names the final table rather than one renamed mid-migration.
+const SESSION_DEPENDENT_SCHEMA = `
+-- A report may become durable only after a hook issued this exact request
+-- through an already recorded injection. One current request per mode/chat.
+CREATE TABLE IF NOT EXISTS task_state_requests (
+  request_id          TEXT PRIMARY KEY,
+  injection_row_id    INTEGER NOT NULL UNIQUE REFERENCES injections(id) ON DELETE CASCADE,
+  session_id          INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  tool                TEXT NOT NULL,
+  native_session_id   TEXT NOT NULL,
+  mode                TEXT NOT NULL CHECK (mode IN ('precompact_manifest','postcompact_retained')),
+  physical_checkout   TEXT NOT NULL,
+  checkout_dev        TEXT NOT NULL,
+  checkout_ino        TEXT NOT NULL,
+  consent_ulid        TEXT NOT NULL,
+  consent_decided_at  TEXT NOT NULL,
+  source_path         TEXT NOT NULL,
+  source_generation   INTEGER NOT NULL CHECK (source_generation >= 0),
+  after_turn_index    INTEGER NOT NULL CHECK (after_turn_index >= -1),
+  issued_at           TEXT NOT NULL,
+  consumed_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_state_requests_chat
+ON task_state_requests(tool, native_session_id, mode);
+
+-- Host-observed compaction text is unverified and never used as source-backed
+-- evidence. A session FK makes native transcript purge remove it as well.
+CREATE TABLE IF NOT EXISTS opencode_compaction_receipts (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  summary TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  coverage TEXT NOT NULL CHECK (coverage = 'volatile_unverified')
+);
+CREATE INDEX IF NOT EXISTS idx_opencode_compaction_receipts_session ON opencode_compaction_receipts(session_id, id);
+
+-- Correlated host tool-call observations remain unverified and never satisfy
+-- source-backed task-state manifest requirements.
+CREATE TABLE IF NOT EXISTS opencode_task_state_receipts (
+  id INTEGER PRIMARY KEY,
+  session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  assistant_message_id TEXT NOT NULL,
+  call_id TEXT NOT NULL,
+  started_event_id TEXT NOT NULL,
+  called_event_id TEXT NOT NULL,
+  success_event_id TEXT NOT NULL UNIQUE,
+  request_id TEXT NOT NULL,
+  report_digest TEXT NOT NULL,
+  observed_at TEXT NOT NULL,
+  coverage TEXT NOT NULL CHECK (coverage = 'volatile_unverified'),
+  UNIQUE (session_id, assistant_message_id, call_id)
+);
+CREATE INDEX IF NOT EXISTS idx_opencode_task_state_receipts_session ON opencode_task_state_receipts(session_id, id);
 `;
 
 // No migration framework exists yet (single-table-additive product, pre-1.0).
@@ -360,6 +476,12 @@ CREATE TABLE IF NOT EXISTS ${SQLITE_SOURCE_WATERMARK_SCHEMA.table} (
 function migrate(db: Database.Database): void {
     migrateSessionsTable(db);
     migrateDurableCaptureStatus(db);
+    const watermarkColumns = (db.pragma(`table_info(${SQLITE_SOURCE_WATERMARK_SCHEMA.table})`) as Array<{ name: string }>).map(
+        (column) => column.name,
+    );
+    if (!watermarkColumns.includes(SQLITE_SOURCE_WATERMARK_SCHEMA.cursorId)) {
+        db.exec(`ALTER TABLE ${SQLITE_SOURCE_WATERMARK_SCHEMA.table} ADD COLUMN ${SQLITE_SOURCE_WATERMARK_SCHEMA.cursorId} TEXT`);
+    }
     const memoryColumns = (db.pragma('table_info(memories)') as Array<{ name: string }>).map((column) => column.name);
     for (const column of ['source_digest', 'provenance']) {
         if (!memoryColumns.includes(column)) {
@@ -479,8 +601,20 @@ function migrate(db: Database.Database): void {
     if (!sessionColumns.includes('git_commit_count')) {
         db.exec('ALTER TABLE sessions ADD COLUMN git_commit_count INTEGER');
     }
+    // Existing cursors have no recorded context. The adapter derives it once
+    // from the source when it needs one, and the next advance records it.
+    if (!sessionColumns.includes('cursor_context')) {
+        db.exec('ALTER TABLE sessions ADD COLUMN cursor_context TEXT');
+    }
     if (!sessionColumns.includes('kind_revision')) {
         db.exec('ALTER TABLE sessions ADD COLUMN kind_revision INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!sessionColumns.includes('source_format')) {
+        db.exec(
+            "ALTER TABLE sessions ADD COLUMN source_format TEXT NOT NULL DEFAULT 'native' CHECK (source_format IN ('native','opencode-v2'))",
+        );
+        // Existing V2 captures have a distinct cursor; all other rows retain their source reader.
+        db.exec("UPDATE sessions SET source_format = 'opencode-v2' WHERE tool = 'opencode' AND cursor GLOB 'v2:*'");
     }
     migrateSessionsToolConstraint(db);
     migrateShownSessionListsToolConstraint(db);
@@ -510,6 +644,17 @@ function migrate(db: Database.Database): void {
     }
     if (rollupColumns.includes('substantive')) {
         db.exec('ALTER TABLE session_rollups DROP COLUMN substantive');
+    }
+}
+
+function migrateSessionDependentTables(db: Database.Database): void {
+    db.exec(SESSION_DEPENDENT_SCHEMA);
+    const requestColumns = (db.pragma('table_info(task_state_requests)') as Array<{ name: string }>).map((column) => column.name);
+    for (const column of ['consent_ulid', 'consent_decided_at']) {
+        if (!requestColumns.includes(column)) {
+            // Legacy in-flight requests lack an epoch and cannot be consumed.
+            db.exec(`ALTER TABLE task_state_requests ADD COLUMN ${column} TEXT`);
+        }
     }
 }
 
@@ -807,7 +952,9 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
             segment_index       INTEGER NOT NULL DEFAULT 0,
             project_id          INTEGER NOT NULL REFERENCES projects(id),
             source_path         TEXT NOT NULL,
+            source_format       TEXT NOT NULL DEFAULT 'native' CHECK (source_format IN ('native','opencode-v2')),
             cursor              TEXT,
+            cursor_context      TEXT,
             started_at          TEXT NOT NULL,
             last_ingested_at    TEXT NOT NULL,
             surface             TEXT CHECK (surface IN ('cli','desktop')),
@@ -826,10 +973,10 @@ function migrateSessionsToolConstraint(db: Database.Database): void {
             UNIQUE (tool, native_id, segment_index)
           );
           INSERT INTO sessions_new
-            (id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
+            (id, tool, native_id, segment_index, project_id, source_path, source_format, cursor, cursor_context, started_at, last_ingested_at,
              surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, rendered_chars,
              rendered_turns, title, custom_title, first_prompt_search, git_commit_count)
-          SELECT id, tool, native_id, segment_index, project_id, source_path, cursor, started_at, last_ingested_at,
+          SELECT id, tool, native_id, segment_index, project_id, source_path, source_format, cursor, cursor_context, started_at, last_ingested_at,
                  surface, git_branch, kind, kind_revision, last_turn_at, trailing_branch, trailing_files, rendered_chars,
                  rendered_turns, title, custom_title, first_prompt_search, git_commit_count
           FROM sessions;
@@ -1008,11 +1155,27 @@ function isPrimaryDatabasePath(dbPath: string): boolean {
 }
 
 function initializeDatabase(db: Database.Database, dbPath: string): Database.Database {
+    // Refuse a substituted legacy turn-search set before any migration can
+    // fire one of its triggers or change the evidence it guards.
+    assertRetiredTurnSearchSchemaAdmissible(db);
+
     db.pragma('journal_mode = WAL');
     db.pragma('foreign_keys = ON');
+    // Retire abandoned repair control state without touching captured evidence.
+    db.transaction(() => {
+        db.exec(`DROP TABLE IF EXISTS historical_capture_audits;
+            DROP TABLE IF EXISTS historical_checkout_bindings;
+            DROP TABLE IF EXISTS project_repair_projects;
+            DROP TABLE IF EXISTS project_repair_owners;
+            DROP TABLE IF EXISTS purged_memory_entries;`);
+        if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'durable_capture_status'").get() !== undefined) {
+            db.exec("UPDATE durable_capture_status SET state = 'disabled_gap' WHERE state IN ('backfilling', 'source_unavailable')");
+        }
+    })();
     initializeParanoidAuthoritySchema(db);
     db.exec(SCHEMA);
     migrate(db);
+    migrateSessionDependentTables(db);
     // Create the optional cache after legacy session-table rebuilds so its
     // foreign keys always reference the final session table.
     db.exec(`CREATE TABLE IF NOT EXISTS session_embeddings (
@@ -1030,6 +1193,14 @@ function initializeDatabase(db: Database.Database, dbPath: string): Database.Dat
     initializeParanoidAuthority(db);
     migrateDurableCaptureFts(db);
     migrateDurableCaptureUsage(db);
+    migrateTurnSearchIndex(db);
+    migrateTurnEmbeddings(db);
+    // Last among schema migrations: every counted table exists and no later
+    // step rebuilds one, which would drop its ledger triggers.
+    migrateLiveMemoryUsage(db);
+    migrateLiveMemoryWarning(db);
+    migrateLiveMemoryRetention(db);
+
     grandfatherConsentRoots(db);
     canonicalizeConsentRoots(db);
     if (dbPath !== ':memory:') {

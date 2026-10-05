@@ -22,7 +22,7 @@ the built-in default.
 | `capture-claude-code` | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of Claude Code sessions. At least one capture tool must remain enabled.                                                                                                                            |
 | `capture-codex`       | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of Codex sessions. At least one capture tool must remain enabled.                                                                                                                                  |
 | `capture-opencode`    | `true`, `false`, `1`, `0`, `on`, `off` | `true`   | Controls capture of OpenCode sessions. At least one capture tool must remain enabled. Restart the capture service after changing it.                                                                                |
-| `durable-capture`     | `true`, `false`, `1`, `0`, `on`, `off` | `false`  | Stores sanitized conversation copies for provider-independent content search and session revival. Restart the capture service after changing it.                                                                    |
+| `durable-capture`     | `true`, `false`, `1`, `0`, `on`, `off` | `false`  | Legacy key: enables new OpenCode copies. New Claude Code and Codex copies are automatic ([details](capture.md#durable-capture)). Restart the capture service after changing it.                                     |
 | `memory-plus`         | `true`, `false`, `1`, `0`, `on`, `off` | `false`  | Enables manual vector generation after optional model setup. Run `elepha enable memory-plus` for setup and privacy confirmation.                                                                                    |
 | `query-matching`      | `strict`, `lax`                        | `strict` | Controls how closely recall results must match a multi-term query. A query that returns nothing under `strict` may return relevant partial matches under `lax`; the normal ranking and quality filters still apply. |
 
@@ -57,36 +57,12 @@ that remains, normally the built-in default. To restore the default update behav
 elepha config unset update-check
 ```
 
-## Durable store size
+## Live-memory capacity
 
-`durable-capture-max-bytes` caps the total stored user prompts, assistant responses,
-and path-bearing tool-call references kept by durable capture. It defaults to
-1,073,741,824 bytes (1 GiB) and accepts a positive safe integer number of bytes.
-
-This key is read from `$ELEPHA_HOME/config.json` by the capture service but is not a
-CLI-managed setting: it does not appear in `elepha config list`, and `elepha config
-get/set/unset` do not accept it. Add it to the top-level JSON object directly, keeping
-any existing keys:
-
-```json
-{
-    "durable-capture": true,
-    "durable-capture-max-bytes": 1073741824
-}
-```
-
-Restart the service after editing the value:
-
-```console
-elepha restart
-```
-
-When stored content exceeds the cap, elepha evicts the oldest sessions' copies,
-starting with sessions whose original transcript can be opened and rebuilt. The
-active session is not exempt if further space is required. Once a native session is
-evicted, later turns and re-segmentation do not refill its durable copy; recall may
-still use the source transcript while it remains readable. Invalid or absent values
-leave the 1 GiB default in effect.
+Live-memory capacity is fixed at 5,000,000,000 bytes and is not configurable. The
+retired `durable-capture-max-bytes` key is ignored if it is still present in
+`$ELEPHA_HOME/config.json`. See [Live-memory capacity](storage.md#live-memory-capacity)
+for the warning and cleanup behavior.
 
 ## Memory-Plus foundation (optional)
 

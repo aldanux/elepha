@@ -14,7 +14,9 @@ export type FileSkipCategory =
     | 'excluded session'
     | 'unexpected error'
     | 'outside watched store'
-    | 'unapproved root';
+    | 'unapproved root'
+    | 'capacity deferred'
+    | 'retention removed';
 
 export interface FileSkip {
     category: FileSkipCategory;

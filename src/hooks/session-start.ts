@@ -11,6 +11,7 @@ import { terminalHandoff } from '../markers.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { prepareStandingRulesDelivery } from '../serving/standing-rules.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
+import { LIVE_MEMORY_WARNING_POLICY, type LiveMemoryWarningPolicy } from '../storage/live-memory-warning.js';
 import { MemoryStore } from '../storage/memory-store.js';
 import {
     type AuthenticatedReadGeneration,
@@ -19,6 +20,7 @@ import {
 } from '../storage/paranoid-gate.js';
 import { type HookTool, parsePayload, readStdin, type SessionStartPayload } from './common.js';
 import { appendHookLog } from './hook-log.js';
+import { chatOpeningLiveMemoryWarning } from './live-memory-warning.js';
 import { recordHookOutput } from './output.js';
 
 export interface SessionStartDependencies {
@@ -33,6 +35,7 @@ export interface SessionStartDependencies {
     // Synchronous checkpoint after physical resolution, before the DB-only
     // authorization and recording transaction. Used to exercise stale plans.
     beforeDelivery?: (db: Database.Database) => void;
+    liveMemoryWarning?: LiveMemoryWarningPolicy;
 }
 
 export type HookResult = { output: Record<string, unknown> } | { reason: string };
@@ -191,12 +194,24 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                         worktreeRoot !== undefined && store.consent.claimWorktreeConsentNotice(worktreeRoot, nudgedAt)
                             ? worktreeConsentNotice(worktreeRoot)
                             : undefined;
-                    const notices = [body, worktreeNotice].filter((notice) => !!notice).join('\n');
+                    // Scheduled inside this transaction: a failed record below also rolls the schedule back.
+                    const warningNotice = chatOpeningLiveMemoryWarning(
+                        db,
+                        tool,
+                        payload.source,
+                        dependencies.liveMemoryWarning ?? LIVE_MEMORY_WARNING_POLICY,
+                        now,
+                        (outcome) => log(sessionLogLine(tool, payload, outcome)),
+                    );
+                    const notices = [body, worktreeNotice, warningNotice].filter((notice) => !!notice).join('\n');
                     if (rules === undefined && !notices) {
                         return { reason: invalidRulesReason ?? 'no_notice' };
                     }
                     const additionalContext = rules === undefined ? undefined : record(rules, 'rules');
                     const systemMessage = notices ? record(notices, 'notify') : undefined;
+                    if (additionalContext === undefined && systemMessage === undefined) {
+                        return { reason: 'no_notice' };
+                    }
                     return { output: envelope(tool, { additionalContext, systemMessage }) };
                 })
                 .immediate();
@@ -224,13 +239,13 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
 }
 
 // CLI boundary: no diagnostics or partial JSON may reach stdout.
-export async function runSessionStartCli(tool: HookTool): Promise<void> {
+export async function runSessionStartCli(tool: HookTool, dependencies: SessionStartDependencies = {}): Promise<void> {
     const watchdog = setTimeout(() => {
         handleWatchdogTimeout(tool);
     }, HOOK_WATCHDOG_TIMEOUT_MS);
     try {
         const input = await readStdin();
-        const result = await runSessionStart(input, tool);
+        const result = await runSessionStart(input, tool, dependencies);
         if ('output' in result) {
             process.stdout.write(JSON.stringify(result.output));
         } else {

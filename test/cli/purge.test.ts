@@ -9,6 +9,7 @@ import { consentedProject } from '../../src/hooks/common.js';
 import { listManagedBackups } from '../../src/storage/backup.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { expectLiveMemoryCurrent } from '../helpers/live-memory.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
@@ -44,6 +45,7 @@ function runPurgeCli(dbPath: string, ...args: string[]) {
 function runTtyPurgeCli(dbPath: string, input: string, ...args: string[]) {
     const source = [
         "Object.defineProperty(process.stdout, 'isTTY', { value: true });",
+        "Object.defineProperty(process.stdin, 'isTTY', { value: true });",
         `process.argv = [process.execPath, 'purge', ...${JSON.stringify(args)}];`,
         `await import(${JSON.stringify(elephaCli)});`,
     ].join('\n');
@@ -216,13 +218,14 @@ describe('elepha purge orphan project scope', () => {
             const orphanDryRun = runPurgeCli(dbPath, '--orphan');
             expect(orphanDryRun.status).toBe(0);
             expect(orphanDryRun.stdout).toContain('elepha memory in these projects:');
-            expect(orphanDryRun.stdout).toContain(`  ${tempPath}  (project entry will be removed — no sessions left)`);
+            expect(orphanDryRun.stdout).not.toContain(`  ${tempPath}  (project entry will be removed — no sessions left)`);
             expect(orphanDryRun.stdout).toContain(`  ${missingPath}  (project entry will be removed — no sessions left)`);
             expect(orphanDryRun.stdout).not.toContain(`[${tempSession.id}]`);
-            expect(orphanDryRun.stdout).not.toContain(`[${missingSession.id}]`);
+            expect(orphanDryRun.stdout).toContain(`[${missingSession.id}]`);
+            expect(orphanDryRun.stdout).toContain('segment 0');
             expect(orphanDryRun.stdout).not.toContain(`[${liveSession.id}]`);
             expect(orphanDryRun.stdout).not.toContain('last ingested');
-            expect(orphanDryRun.stdout).toContain('In total: 2 session(s), 0 turn(s).');
+            expect(orphanDryRun.stdout).toContain('In total: 1 session(s), 0 turn(s).');
             expect(orphanDryRun.stdout).toContain(
                 "This is a preview — nothing was deleted. This clears elepha's memory only — your original AI coding session history on disk is untouched. Re-run with --apply to delete (a backup is saved first).",
             );
@@ -230,15 +233,19 @@ describe('elepha purge orphan project scope', () => {
             expect(new MemoryStore(verified).getProjectById(temp.id)).toBeDefined();
             verified.close();
 
-            const orphanApply = runPurgeCli(dbPath, '--orphan', '--apply');
+            const refusedNoninteractive = runPurgeCli(dbPath, '--orphan', '--apply');
+            expect(refusedNoninteractive.status).toBe(1);
+            expect(listManagedBackups(dbPath)).toEqual([]);
+
+            const orphanApply = runPurgeCli(dbPath, '--orphan', '--apply', '--skip-confirmation');
             expect(orphanApply.status).toBe(0);
             expect(orphanApply.stdout).toContain('Saved a backup of your memory database (keeping the last 5).');
-            expect(orphanApply.stdout).toContain("Deleted 2 session(s) across 2 project(s) from elepha's memory.");
+            expect(orphanApply.stdout).toContain("Deleted 1 session(s) across 1 project(s) from elepha's memory.");
             expect(orphanApply.stdout).not.toContain('Delete these');
             expect(orphanApply.stdout).not.toContain('Verified: nothing matching this scope remains.');
             verified = openUnmanagedDb(dbPath);
             const verifiedStore = new MemoryStore(verified);
-            expect(verifiedStore.getProjectById(temp.id)).toBeUndefined();
+            expect(verifiedStore.getProjectById(temp.id)).toBeDefined();
             expect(verifiedStore.getProjectById(missing.id)).toBeUndefined();
             expect(verifiedStore.getProjectById(live.id)).toBeDefined();
             expect(verifiedStore.listMemoriesForSession(liveSession.id)).toEqual([]);
@@ -290,6 +297,7 @@ describe('elepha purge orphan project scope', () => {
             const verified = openUnmanagedDb(dbPath);
             expect(verified.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 0 });
             expect(verified.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+            expectLiveMemoryCurrent(verified);
             expect(
                 verified.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'clipurgeuniqueneedle'").all(),
             ).toEqual([]);

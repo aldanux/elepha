@@ -1,8 +1,22 @@
 import type { ParsedTurn } from '../types/index.js';
 
-// Complete textual surface used by both Rule 4 guards.
-export function turnText(turn: Pick<ParsedTurn, 'userMessage' | 'assistantText' | 'toolCalls'>): string {
-    return [turn.userMessage, turn.assistantText, ...turn.toolCalls.map((call) => JSON.stringify(call))].join('\n');
+// Complete textual surface used by both Rule 4 guards. A task-state report
+// is included so injected context cannot be laundered through it. Its text
+// stays raw, not JSON: escaping would split quoted lines and weaken
+// quote-back matching.
+export function turnText(turn: Pick<ParsedTurn, 'userMessage' | 'assistantText' | 'toolCalls' | 'taskStateReport'>): string {
+    const report = turn.taskStateReport;
+    const reportItems = report
+        ? [report.objective, ...report.decisions, ...report.constraints, ...report.pending_items].filter(
+              (item): item is NonNullable<typeof item> => item !== null,
+          )
+        : [];
+    return [
+        turn.userMessage,
+        turn.assistantText,
+        ...turn.toolCalls.map((call) => JSON.stringify(call)),
+        ...reportItems.flatMap((item) => [item.text, ...(item.sources?.map((source) => source.quote) ?? [])]),
+    ].join('\n');
 }
 
 export function normalizeForNearVerbatim(text: string): string {
@@ -42,6 +56,7 @@ export function nearVerbatimStatusNormalized(
     const now = options.now ?? Date.now;
     const deadline = options.deadline ?? Number.POSITIVE_INFINITY;
     const expired = (): boolean => now() >= deadline;
+
     if (expired()) {
         return 'incomplete';
     }
@@ -52,7 +67,6 @@ export function nearVerbatimStatusNormalized(
     if (normalizedTurn === '' || normalizedInjection === '') {
         return 'no-match';
     }
-
     for (const line of injection.split(/\r?\n/)) {
         if (expired()) {
             return 'incomplete';
@@ -68,14 +82,15 @@ export function nearVerbatimStatusNormalized(
             }
         }
     }
-
     if (normalizedInjection.length < SHINGLE_SIZE) {
         return 'no-match';
     }
     const injectionShingles = new Set<string>();
     for (let index = 0; index <= normalizedInjection.length - SHINGLE_SIZE; index++) {
-        if (index % DEADLINE_CHECK_INTERVAL === 0 && expired()) {
-            return 'incomplete';
+        if (index % DEADLINE_CHECK_INTERVAL === 0) {
+            if (expired()) {
+                return 'incomplete';
+            }
         }
         injectionShingles.add(normalizedInjection.slice(index, index + SHINGLE_SIZE));
     }
@@ -85,15 +100,17 @@ export function nearVerbatimStatusNormalized(
     const required = Math.ceil(injectionShingles.size * 0.6);
     let present = 0;
     for (let index = 0; index <= normalizedTurn.length - SHINGLE_SIZE; index++) {
-        if (index % DEADLINE_CHECK_INTERVAL === 0 && expired()) {
-            return 'incomplete';
+        if (index % DEADLINE_CHECK_INTERVAL === 0) {
+            if (expired()) {
+                return 'incomplete';
+            }
         }
         if (injectionShingles.delete(normalizedTurn.slice(index, index + SHINGLE_SIZE))) {
             present++;
             if (present >= required) {
-                return expired() ? 'incomplete' : 'match';
+                return 'match';
             }
         }
     }
-    return expired() ? 'incomplete' : 'no-match';
+    return 'no-match';
 }

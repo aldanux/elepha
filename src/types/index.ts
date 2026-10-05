@@ -1,5 +1,6 @@
 import type { FileHandle } from 'node:fs/promises';
 import type Database from 'better-sqlite3-multiple-ciphers';
+import type { TASK_STATE_REPORT_MODES } from '../config/constants.js';
 import type { AssistantStructure } from '../rendering/assistant-structure.js';
 
 export const TOOL_METADATA = {
@@ -33,6 +34,60 @@ export interface ElephaMcpResultReceipt {
     body: string;
     observedAt: string | null;
 }
+
+export type TaskStateReportMode = (typeof TASK_STATE_REPORT_MODES)[number];
+
+export interface TaskStateReportSource {
+    role: 'user' | 'assistant';
+    quote: string;
+}
+
+export interface TaskStateReportPrecompactItem {
+    text: string;
+    sources: TaskStateReportSource[];
+}
+
+export interface TaskStateReportPostcompactItem {
+    text: string;
+    sources?: never;
+}
+
+export type TaskStateReportItem = TaskStateReportPrecompactItem | TaskStateReportPostcompactItem;
+
+// Validated report_task_state input exactly as the working AI submitted it.
+export type TaskStateReportInput =
+    | {
+          mode: 'precompact_manifest';
+          request_id: string;
+          objective: TaskStateReportPrecompactItem | null;
+          decisions: TaskStateReportPrecompactItem[];
+          constraints: TaskStateReportPrecompactItem[];
+          pending_items: TaskStateReportPrecompactItem[];
+      }
+    | {
+          mode: 'postcompact_retained';
+          request_id: string;
+          objective: TaskStateReportPostcompactItem | null;
+          decisions: TaskStateReportPostcompactItem[];
+          constraints: TaskStateReportPostcompactItem[];
+          pending_items: TaskStateReportPostcompactItem[];
+      };
+
+export type TaskStateReport = TaskStateReportInput & { callId: string };
+
+// Why a report call observed in a turn yielded no report. The turn keeps its
+// ordinary content; only the report is withheld.
+export type TaskStateReportFailureReason =
+    | 'non-root-session'
+    | 'missing-call-id'
+    | 'oversized-call-id'
+    | 'duplicate-call-id'
+    | 'malformed-input'
+    | 'oversized-input'
+    | 'multiple-reports'
+    | 'conflicting-duplicate'
+    | 'missing-result'
+    | 'unexpected-result';
 
 export type OpenTailReceiptCoverage = { state: 'complete'; turn: ParsedTurn } | { state: 'incomplete'; reason: string; turn: ParsedTurn };
 
@@ -69,9 +124,14 @@ export interface ParsedTurn {
     // Plain-text assistant reply. Thinking blocks excluded.
     assistantText: string;
     assistantStructure?: AssistantStructure;
+    // Adapter-derived provisional EOF closure; never part of source identity.
+    provisionalIdle?: true;
     toolCalls: ParsedToolCall[];
     // Opaque resume token marking the end of this turn in sourcePath. Stored as sessions.cursor.
     cursor: string;
+    // What a parse resuming at `cursor` needs to reconstruct the same turns.
+    // Present only when it was read from the source; persisted with the cursor.
+    resumeContext?: ResumeContext;
     // Raw surface discriminator as emitted by the tool (Claude Code:
     // `entrypoint`, e.g. "cli"/"claude-desktop"; Codex: `originator`, e.g.
     // "codex-tui"/"codex_exec"/"Codex Desktop"). Last-seen-wins across the
@@ -95,20 +155,61 @@ export interface ParsedTurn {
     // marker line's own payload is classified as skipped plumbing and never ingested.
     resumeMarkerBefore: boolean;
     // Present only for a complete turn the adapter withheld from persistence.
-    droppedReason?: 'sentinel' | 'empty' | 'elepha-mcp';
-    // Present when the turn opened on a boundary line whose text earlier
-    // parses stored as turn content and current parses discard (Claude
-    // Code's compact summary). Structural evidence for repairing rows that
-    // still carry that retired text; never persisted.
-    formerlyStoredBoundary?: true;
+    droppedReason?: 'sentinel' | 'report-input-unscanned' | 'empty' | 'elepha-mcp' | 'opencode-v2-elepha-mcp';
     // Private ingestion evidence. It is consumed transactionally with a
     // dropped cursor and must never enter memories, rendering, or exports.
     elephaMcpResultReceipts?: ElephaMcpResultReceipt[];
+    // A verified report_task_state call from this turn. Kept out of toolCalls
+    // so it never enters ordinary capture; Rule 4 checks still cover its text.
+    // Parse-time evidence only: nothing persists it yet.
+    taskStateReport?: TaskStateReport;
+    // Present instead of taskStateReport when a report call could not be verified.
+    taskStateReportFailure?: TaskStateReportFailureReason;
     sourceKey?: string;
     provenance?: { protocolVersion: string; producerVersion: string; modelAliases: string[] };
     // Validated synchronously again inside the ingestion transaction.
     validateSource?: () => boolean;
 }
+
+// One complete source record, newline included, whose content sets a parser
+// context field. The digest covers the record text, so a resumed parse can
+// prove the record still says what it said when the cursor was issued.
+export interface SourceContextRecord {
+    field: 'cwd' | 'surface' | 'branch';
+    offset: number;
+    length: number;
+    digest: string;
+}
+
+export interface ResumeContext {
+    // Records that set the working directory, surface and branch in effect at
+    // the cursor. A resumed parse re-reads and verifies each one.
+    records: readonly SourceContextRecord[];
+    // Adapter decisions made from records before the cursor, such as which
+    // Codex record type opens a turn. Like the cursor's own position and turn
+    // index, they hold only while the cursor still authenticates.
+    decisions?: Readonly<Record<string, string>>;
+}
+
+// A shared allowance of source bytes. Every read a parse makes, including
+// cursor and context authentication, is charged against it before it happens.
+export interface SourceReadBudget {
+    remaining: number;
+}
+
+// Progress of reconstructing the resume context for a cursor issued without
+// one. Opaque to callers; the adapter re-authenticates it before continuing.
+export interface ResumeContextDerivation {
+    endOffset: number;
+    offset: number;
+    fingerprint: string;
+    records: SourceContextRecord[];
+    decisionState: unknown;
+}
+
+export type ResumeContextDerivationResult =
+    | { state: 'complete'; context: ResumeContext }
+    | { state: 'partial'; progress: ResumeContextDerivation };
 
 export interface ParseTurnsOptions {
     // When true, a trailing buffered turn with no subsequent turn-boundary line
@@ -119,13 +220,36 @@ export interface ParseTurnsOptions {
     closeTrailingOnIdle?: boolean;
     // Reads from this already-opened file without taking ownership of the handle.
     handle?: FileHandle;
+    // The resumeContext issued with `sinceCursor`. Each record is re-read and
+    // verified against the opened source before the parse resumes; a record
+    // that no longer matches refuses the read like any other cursor desync.
+    // Required to resume an adapter whose context carries across turns.
+    resumeContext?: ResumeContext;
+    // Called when the parse refuses to resume because the source no longer
+    // matches the cursor or its context, as distinct from having nothing new.
+    onDesync?: () => void;
+    // Shared byte allowance; takes precedence over maxReadBytes. The caller
+    // sees exactly what the parse consumed.
+    readBudget?: SourceReadBudget;
     // Stops a bounded read between transcript lines without changing cursor semantics.
     signal?: AbortSignal;
     // Serving can stop before assembling an oversized historical interaction.
+    // Bounds every source read the parse makes, not only the resumed tail.
     maxReadBytes?: number;
+    // Replay an authenticated historical prefix using the opened source handle.
+    endByteOffset?: number;
     // Receives a failed lifecycle held open at EOF. It is deliberately not an
     // item in the ParsedTurn iterator: canonical consumers see final turns only.
     onOpenTail?: (observation: OpenTailObservation) => void;
+    // Receives how many complete (newline-terminated) records failed to parse
+    // as JSON and were skipped. Called once per parse, only when non-zero, so
+    // a caller can report lost records without reading the human-facing log.
+    onMalformedRecords?: (count: number) => void;
+    // Receives how many complete records had a shape the adapter does not
+    // recognize and therefore skipped. Called once per parse, only when
+    // non-zero. Known host records an adapter deliberately ignores are not
+    // counted: they are not lost content.
+    onUnrecognizedRecords?: (count: number) => void;
 }
 
 // What kind of transcript a session file holds. Drives whether it is ingested
@@ -216,6 +340,41 @@ export interface SessionAdapter {
     // emitted once provably closed.
     // cursor advances once per emitted turn, never per parsed line.
     parseTurns(filePath: string, sinceCursor?: string, options?: ParseTurnsOptions): AsyncIterable<ParsedTurn>;
+    // Where a cursor this adapter issued resumes: its source position and the
+    // index of the next turn. Reads nothing.
+    cursorPosition?(cursor: string): SourceCursorPosition;
+    // The same position, but only while the opened source still holds the
+    // bytes that were read when the cursor was issued; undefined once the
+    // source was truncated or rewritten before it.
+    authenticateCursor?(cursor: string, handle: FileHandle, readBudget?: SourceReadBudget): Promise<SourceCursorPosition | undefined>;
+    // True when a turn's working directory or provenance can come from
+    // records before its boundary, so resuming at a cursor needs that cursor's
+    // resumeContext to reconstruct the same turn.
+    readonly carriesContextAcrossTurns?: boolean;
+    // Whether a stored context holds everything a resumed parse needs, so it
+    // need not be reconstructed.
+    resumeContextComplete?(context: ResumeContext): boolean;
+    // Whether every context record still matches the opened source and lies
+    // before `beforeOffset`.
+    authenticateResumeContext?(
+        context: ResumeContext,
+        handle: FileHandle,
+        beforeOffset: number,
+        readBudget?: SourceReadBudget,
+    ): Promise<boolean>;
+    // One bounded, cancellable step of reconstructing the resume context for
+    // a cursor at `endOffset`, continuing from earlier progress when that
+    // progress still authenticates. Reads only before `endOffset`.
+    deriveResumeContext?(
+        handle: FileHandle,
+        endOffset: number,
+        options: { from?: ResumeContextDerivation; readBudget: SourceReadBudget; signal?: AbortSignal },
+    ): Promise<ResumeContextDerivationResult>;
+}
+
+export interface SourceCursorPosition {
+    byteOffset: number;
+    nextTurnIndex: number;
 }
 
 export type SessionAdapterMap = Record<SessionAdapterTool, SessionAdapter>;

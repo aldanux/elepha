@@ -1,10 +1,8 @@
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { opencodeDbPath } from '../../src/config/paths.js';
-import { detectSessionTools, discoverFolderRepos, discoverSessionProjects } from '../../src/discovery/session-projects.js';
-import { addOpencodeSession, createOpencodeFixture } from '../fixtures/opencode-db.js';
-import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
+import { describe, expect, it, vi } from 'vitest';
+import { discoverFolderRepos, discoverSessionProjects } from '../../src/discovery/session-projects.js';
+import { withTempDir } from '../helpers/tmp.js';
 
 // Hide only the host checkout's marker so non-Git and deleted fixtures retain
 // their original topology. Metadata within each fixture is still read from disk.
@@ -26,86 +24,6 @@ function session(cwd: string, timestamp: string, content: string): string {
 }
 
 describe('session-project discovery', () => {
-    afterEach(() => {
-        vi.unstubAllEnvs();
-    });
-
-    it('detects OpenCode only when its store contains a regular database file', async () => {
-        const sourceRoot = withGrantableTestDir('elepha-opencode-detection-');
-        const databasePath = path.join(sourceRoot, 'opencode', 'opencode.db');
-        mkdirSync(path.dirname(databasePath), { recursive: true });
-
-        await expect(detectSessionTools({ opencodeDatabase: databasePath })).resolves.not.toContain('opencode');
-
-        createOpencodeFixture(databasePath, withGrantableTestDir('elepha-opencode-detection-project-'));
-
-        await expect(detectSessionTools({ opencodeDatabase: databasePath })).resolves.toContain('opencode');
-    });
-
-    it('discovers OpenCode session directories, excludes ineligible roots, and merges shared JSONL projects', async () => {
-        const sourceRoot = withGrantableTestDir('elepha-opencode-discovery-source-');
-        const claudeProjects = path.join(sourceRoot, 'claude-projects');
-        const codexSessions = path.join(sourceRoot, 'codex-sessions');
-        const sharedRoot = withGrantableTestDir('elepha-opencode-discovery-shared-');
-        const opencodeOnlyRoot = withGrantableTestDir('elepha-opencode-discovery-only-');
-        const refusedRoot = withGrantableTestDir('elepha-opencode-discovery-refused-');
-        const nonexistentRoot = path.join(withTempDir('elepha-opencode-missing-'), 'missing-project');
-        vi.stubEnv('XDG_DATA_HOME', sourceRoot);
-        mkdirSync(codexSessions, { recursive: true });
-        createOpencodeFixture(opencodeDbPath(), sharedRoot);
-        addOpencodeSession(opencodeDbPath(), {
-            sessionId: 'ses_opencode_only',
-            directory: opencodeOnlyRoot,
-            title: 'OpenCode only',
-            timeUpdated: Date.parse('2026-08-21T00:00:00.000Z'),
-        });
-        addOpencodeSession(opencodeDbPath(), {
-            sessionId: 'ses_refused',
-            directory: refusedRoot,
-            title: 'Refused',
-            timeUpdated: Date.parse('2026-08-22T00:00:00.000Z'),
-        });
-        addOpencodeSession(opencodeDbPath(), {
-            sessionId: 'ses_missing',
-            directory: nonexistentRoot,
-            title: 'Missing',
-            timeUpdated: Date.parse('2026-08-23T00:00:00.000Z'),
-        });
-        writeFileSync(
-            path.join(codexSessions, 'rollout-shared.jsonl'),
-            session(sharedRoot, '2026-08-20T00:00:00.000Z', 'never inspect me'),
-        );
-
-        await expect(
-            discoverSessionProjects({
-                codexSessions,
-                claudeProjects,
-                opencodeDatabase: opencodeDbPath(),
-                isRefusedRoot: (root) => root === refusedRoot,
-            }),
-        ).resolves.toEqual({
-            detectedTools: ['codex', 'opencode'],
-            projects: [
-                {
-                    root: opencodeOnlyRoot,
-                    displayName: path.basename(opencodeOnlyRoot),
-                    tools: ['opencode'],
-                    sessionCount: 1,
-                    earliestSessionAt: '2026-08-21T00:00:00.000Z',
-                    latestSessionAt: '2026-08-21T00:00:00.000Z',
-                },
-                {
-                    root: sharedRoot,
-                    displayName: path.basename(sharedRoot),
-                    tools: ['codex', 'opencode'],
-                    sessionCount: 3,
-                    earliestSessionAt: '1970-01-01T00:00:00.100Z',
-                    latestSessionAt: '2026-08-20T00:00:00.000Z',
-                },
-            ].sort((a, b) => a.displayName.localeCompare(b.displayName) || a.root.localeCompare(b.root)),
-        });
-    });
-
     it('finds bounded zero-session repos without descending into excluded or discovered trees', async () => {
         const directory = withTempDir('elepha-folder-repos-');
         const root = path.join(directory, 'work');

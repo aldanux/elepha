@@ -25,11 +25,30 @@ function setOutputExitCode(output: CliOutputSink, code: number): void {
     }
 }
 
-export async function confirmYesNo(question: string): Promise<boolean> {
+export async function confirmYesNo(question: string, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) {
+        return false;
+    }
     const prompt = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const answer = await new Promise<string>((resolve) => prompt.question(question, resolve));
-    prompt.close();
-    return /^(y|yes)$/i.test(answer.trim());
+    let cancel: (() => void) | undefined;
+    try {
+        const answer = await new Promise<string>((resolve) => {
+            cancel = () => {
+                prompt.close();
+                resolve('');
+            };
+            signal?.addEventListener('abort', cancel, { once: true });
+            prompt.once('close', () => resolve(''));
+            prompt.once('SIGINT', () => resolve(''));
+            prompt.question(question, resolve);
+        });
+        return !signal?.aborted && /^(y|yes)$/i.test(answer.trim());
+    } finally {
+        if (cancel) {
+            signal?.removeEventListener('abort', cancel);
+        }
+        prompt.close();
+    }
 }
 
 export function printInstallation(result: Awaited<ReturnType<typeof installElepha>>, action: 'install' | 'uninstall'): void {

@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { SourceReconciliation } from '../../src/storage/source-reconciliation.js';
-import type { ParsedTurn } from '../../src/types/index.js';
+import { sourceTurnDigest } from '../../src/storage/source-turn-digest.js';
+import type { ParsedTurn, TaskStateReport } from '../../src/types/index.js';
 
 function mcpTurn(overrides: Partial<ParsedTurn> = {}): ParsedTurn {
     return {
@@ -100,5 +101,45 @@ describe('source reconciliation Rule 4 receipts', () => {
                 userMessage: replacement.elephaMcpResultReceipts?.[0]?.body ?? '',
             }),
         ).toBe('match');
+    });
+});
+
+describe('source reconciliation task-state reports', () => {
+    it('preserves the existing digest for turns without a report', () => {
+        expect(sourceTurnDigest(mcpTurn())).toBe('a74bd804794f92e2eb4fb8a3a8d7dd6429c59e19e2d65fdfc192c9e9c40d3633');
+    });
+
+    it('retracts a stored turn when only its report changes', () => {
+        const store = new MemoryStore(openUnmanagedDb(':memory:'));
+        const report: TaskStateReport = {
+            callId: 'report-1',
+            mode: 'postcompact_retained',
+            request_id: '01J00000000000000000000000',
+            objective: { text: 'Finish the parser.' },
+            decisions: [],
+            constraints: [],
+            pending_items: [],
+        };
+        const original = mcpTurn({
+            droppedReason: undefined,
+            elephaMcpResultReceipts: undefined,
+            userMessage: 'Continue the parser work.',
+            assistantText: 'Done.',
+            taskStateReport: report,
+        });
+        store.consent.grant(original.projectPath);
+        expect(
+            store.recordIngestedTurn(original, {}, false, { decisions: [], pending_items: [], status: 'not_configured' })?.inserted,
+        ).toBe(true);
+        const replacement: ParsedTurn = {
+            ...original,
+            taskStateReport: { ...report, objective: { text: 'Finish the changed parser.' } },
+        };
+        expect(sourceTurnDigest(replacement)).not.toBe(sourceTurnDigest(original));
+
+        const reconciliation = new SourceReconciliation(store, original.tool, original.sessionId, original.projectPath, () => true);
+        reconciliation.observe(replacement);
+        expect(reconciliation.commit()).toBe(1);
+        expect(store.database.prepare('SELECT COUNT(*) AS count FROM memories').get()).toEqual({ count: 0 });
     });
 });

@@ -742,7 +742,7 @@ function expectedSQLiteFileError(pinned: AuthorizedDescriptor, expected: SQLiteF
 // open that exact object. Keep the file and ancestor descriptors pinned so
 // the caller can validate database_list before admitting any key, read, or
 // write through the SQLite handle.
-export function pinSQLitePathForOpen(databasePath: string, expected: SQLiteFileIdentitySeal): SQLitePathOpenSeal {
+function pinExpectedSQLiteDescriptor(databasePath: string, expected: SQLiteFileIdentitySeal): AuthorizedDescriptor {
     const lifecycleIdentity: DatabaseFileIdentity = {
         exists: true,
         dev: String(expected.dev),
@@ -766,6 +766,11 @@ export function pinSQLitePathForOpen(databasePath: string, expected: SQLiteFileI
         }
         throw expectedError;
     }
+    return pinned;
+}
+
+export function pinSQLitePathForOpen(databasePath: string, expected: SQLiteFileIdentitySeal): SQLitePathOpenSeal {
+    const pinned = pinExpectedSQLiteDescriptor(databasePath, expected);
     const descriptor = pinned.descriptor;
     assertLifecycle(descriptor !== undefined, DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite open mutation seal is incomplete for ${databasePath}`);
     return {
@@ -791,6 +796,90 @@ export function pinSQLitePathForOpen(databasePath: string, expected: SQLiteFileI
             assertNoCleanupFailures(failures, `SQLite identity seal cleanup failed for ${databasePath}`);
         },
     };
+}
+
+interface SealedSQLiteOpen<Result> {
+    databasePath: string;
+    retryExisting: boolean;
+    pin(): AuthorizedDescriptor;
+    open(databasePath: string): Database.Database;
+    admit(database: Database.Database, pinned: AuthorizedDescriptor): Result;
+    onUnprovenClose(database: Database.Database): () => void;
+}
+
+// Only an unadmitted construction proof may obtain a fresh attempt. Authority
+// belongs to pin(), and is checked again against the same original baseline.
+function openWithSQLiteSeal<Result>(options: SealedSQLiteOpen<Result>): Result {
+    const { databasePath } = options;
+    for (let attempt = 0; attempt < DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS; attempt++) {
+        const pinned = options.pin();
+        let database: Database.Database | undefined;
+        let confirmed = false;
+        try {
+            database = options.open(pinned.sqlitePath);
+            assertSQLiteOpenSealed(pinned, databasePath);
+            // database_list does not read database content or need
+            // a key. After the platform-specific traversal seal,
+            // it proves that later journal/WAL companion suffixes
+            // use the authorized physical filename.
+            assertSQLiteCanonicalFilename(database, pinned, databasePath);
+            confirmed = true;
+            return options.admit(database, pinned);
+        } catch (error) {
+            const databaseCloseFailures = closeProofDatabases(database === undefined ? [] : [database]);
+            if (databaseCloseFailures.length > 0 && database !== undefined) {
+                const onRecovered = options.onUnprovenClose(database);
+                retainUnprovenDatabaseProof(database, pinned, onRecovered);
+                throw new AggregateError(
+                    [error, ...databaseCloseFailures],
+                    `SQLite identity proof and cleanup both failed for ${databasePath}`,
+                );
+            }
+            const descriptorFailures = closeAuthorizedDescriptor(pinned);
+            if (descriptorFailures.length > 0) {
+                throw new AggregateError(
+                    [error, ...descriptorFailures],
+                    `SQLite identity proof and cleanup both failed for ${databasePath}`,
+                );
+            }
+            if (
+                !confirmed &&
+                error instanceof DatabasePathMutationError &&
+                options.retryExisting &&
+                attempt + 1 < DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS
+            ) {
+                // No key, read, or write has reached this closed handle.
+                continue;
+            }
+            throw error;
+        }
+    }
+    throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite identity proof exhausted for ${databasePath}`);
+}
+
+// Backup candidates use the same pre-admission seal without acquiring an
+// installation lease or registering an unmanaged file as a managed database.
+export function openSQLitePathWithSeal(
+    databasePath: string,
+    expected: SQLiteFileIdentitySeal,
+    open: (databasePath: string) => Database.Database,
+    assertOriginalAuthority: () => void,
+): Database.Database {
+    return openWithSQLiteSeal({
+        databasePath,
+        retryExisting: true,
+        pin: () => {
+            assertOriginalAuthority();
+            return pinExpectedSQLiteDescriptor(databasePath, expected);
+        },
+        open,
+        onUnprovenClose: () => () => undefined,
+        admit: (database, pinned) => {
+            const failures = closeAuthorizedDescriptor(pinned);
+            assertNoCleanupFailures(failures, `SQLite identity seal cleanup failed for ${databasePath}`);
+            return database;
+        },
+    });
 }
 
 function databaseIdentityGuard(
@@ -819,71 +908,43 @@ function databaseIdentityGuard(
         exists: expected.exists,
         assertCurrent,
         openDatabase: (open) => {
-            for (let attempt = 0; attempt < DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS; attempt++) {
-                assertHeld();
-                assertOpenAllowed();
-                const beforeIdentity = inspectDatabaseIdentity(databasePath);
-                if (!sameDatabaseIdentity(expected, beforeIdentity)) {
-                    throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `managed database identity changed while opening ${databasePath}`);
-                }
-                assertAcceptable(beforeIdentity);
-                const pinned = openAuthorizedDescriptor(databasePath, expected, assertAcceptable, recordCreated);
-                let database: Database.Database | undefined;
-                try {
-                    database = open(pinned.sqlitePath);
-                    assertSQLiteOpenSealed(pinned, databasePath);
-                    // database_list does not read database content or need
-                    // a key. After the platform-specific traversal seal,
-                    // it proves that later journal/WAL companion suffixes
-                    // use the authorized physical filename.
-                    assertSQLiteCanonicalFilename(database, pinned, databasePath);
+            return openWithSQLiteSeal({
+                databasePath,
+                retryExisting: expected.exists,
+                pin: () => {
+                    assertHeld();
+                    assertOpenAllowed();
+                    const beforeIdentity = inspectDatabaseIdentity(databasePath);
+                    if (!sameDatabaseIdentity(expected, beforeIdentity)) {
+                        throw lifecycleError(
+                            DATABASE_LIFECYCLE_AMBIGUOUS,
+                            `managed database identity changed while opening ${databasePath}`,
+                        );
+                    }
+                    assertAcceptable(beforeIdentity);
+                    return openAuthorizedDescriptor(databasePath, expected, assertAcceptable, recordCreated);
+                },
+                open,
+                onUnprovenClose,
+                admit: (database, pinned) => {
                     assertHeld();
                     assertAcceptable(pinned.identity);
                     recordOpened(database, pinned.physicalPath, pinned.identity);
                     const closeFailures = closeAuthorizedDescriptor(pinned);
                     assertNoCleanupFailures(closeFailures, `SQLite identity seal cleanup failed for ${databasePath}`);
-                    return {
-                        database,
-                        identity: databaseIdentityGuard(
-                            databasePath,
-                            pinned.identity,
-                            assertHeld,
-                            onUnprovenClose,
-                            assertAcceptable,
-                            recordCreated,
-                            assertOpenAllowed,
-                            recordOpened,
-                        ),
-                    };
-                } catch (error) {
-                    const databaseCloseFailures = closeProofDatabases(database === undefined ? [] : [database]);
-                    if (databaseCloseFailures.length > 0 && database !== undefined) {
-                        const onRecovered = onUnprovenClose(database);
-                        retainUnprovenDatabaseProof(database, pinned, onRecovered);
-                        throw new AggregateError(
-                            [error, ...databaseCloseFailures],
-                            `SQLite identity proof and cleanup both failed for ${databasePath}`,
-                        );
-                    }
-                    const descriptorFailures = closeAuthorizedDescriptor(pinned);
-                    if (descriptorFailures.length > 0) {
-                        throw new AggregateError(
-                            [error, ...descriptorFailures],
-                            `SQLite identity proof and cleanup both failed for ${databasePath}`,
-                        );
-                    }
-                    if (
-                        error instanceof DatabasePathMutationError &&
-                        expected.exists &&
-                        attempt + 1 < DATABASE_LIFECYCLE_OPEN_SEAL_ATTEMPTS
-                    ) {
-                        // No key, read, or write has reached this closed handle.
-                        continue;
-                    }
-                    throw error;
-                }
-            }
-            throw lifecycleError(DATABASE_LIFECYCLE_AMBIGUOUS, `SQLite identity proof exhausted for ${databasePath}`);
+                    const identity = databaseIdentityGuard(
+                        databasePath,
+                        pinned.identity,
+                        assertHeld,
+                        onUnprovenClose,
+                        assertAcceptable,
+                        recordCreated,
+                        assertOpenAllowed,
+                        recordOpened,
+                    );
+                    return { database, identity };
+                },
+            });
         },
     };
 }

@@ -6,7 +6,7 @@ import { generateEmbeddings } from '../../embeddings/generate.js';
 import { createEmbeddingProvider, type EmbeddingProvider } from '../../embeddings/provider-config.js';
 import { openDb } from '../../storage/db.js';
 import { errorMessage } from '../../util/error.js';
-import { startCliProgress } from '../progress.js';
+import { type CliProgress, startCliProgress } from '../progress.js';
 import { confirmYesNo } from '../shared.js';
 
 export const MEMORY_PLUS_INTRO = "elepha's Memory-Plus finds past sessions by meaning, not just matching words. Works in any language.";
@@ -14,6 +14,51 @@ export const MEMORY_PLUS_LOCAL_NOTICE =
     'Downloads a small AI model once (~113MB), runs locally, uses ~1GB of memory while active. No session data leaves your machine.';
 export const MEMORY_PLUS_CONFIRM = 'Continue? [y/N] ';
 export const MEMORY_PLUS_PROBE = "elepha's Memory-Plus setup check";
+
+// Installs the local runtime and verifies the model on fixed synthetic text
+// without touching any setting, so a caller decides when the verified provider
+// becomes active. Failure leaves any pre-existing runtime in place.
+export async function prepareMemoryPlus(
+    options: {
+        createProvider?: typeof createEmbeddingProvider;
+        installDependency?: typeof installMemoryPlusDependency;
+        progress?: (message: string) => CliProgress;
+    } = {},
+): Promise<void> {
+    const progress = options.progress ?? startCliProgress;
+    let provider: EmbeddingProvider | undefined;
+    // Both setup steps block for minutes on a first run — npm resolves the
+    // runtime, then the probe downloads the model — so each gets the same
+    // loader `elepha install` uses instead of a bare line and a silent wait.
+    const runtime = progress("Installing elepha's Memory-Plus local runtime");
+    try {
+        await (options.installDependency ?? installMemoryPlusDependency)();
+        runtime.done();
+    } catch (error) {
+        runtime.fail();
+        throw error;
+    }
+    const setup = progress("Verifying elepha's Memory-Plus setup");
+    try {
+        provider = await (options.createProvider ?? createEmbeddingProvider)(true);
+        if (provider === undefined) {
+            //noinspection ExceptionCaughtLocallyJS
+            throw new Error('Embedding provider was not available.');
+        }
+        // Verification uses fixed synthetic text, never session content. The
+        // persistent flag is committed by the caller only after setup and
+        // cleanup succeed.
+        await provider.embed(MEMORY_PLUS_PROBE, () => {});
+        await provider.dispose();
+        provider = undefined;
+        setup.done();
+    } catch (error) {
+        setup.fail();
+        throw error;
+    } finally {
+        await provider?.dispose();
+    }
+}
 
 export async function enableMemoryPlus(
     options: {
@@ -34,39 +79,12 @@ export async function enableMemoryPlus(
         log("Cancelled. elepha's Memory-Plus settings were not changed.");
         return false;
     }
-    let provider: EmbeddingProvider | undefined;
-    // Both setup steps block for minutes on a first run — npm resolves the
-    // runtime, then the probe downloads the model — so each gets the same
-    // loader `elepha install` uses instead of a bare line and a silent wait.
-    const runtime = startCliProgress("Installing elepha's Memory-Plus local runtime");
     try {
-        await (options.installDependency ?? installMemoryPlusDependency)();
-        runtime.done();
-    } catch (error) {
-        runtime.fail();
-        disableAfterFailedSetup(options.configPath);
-        throw error;
-    }
-    const setup = startCliProgress("Verifying elepha's Memory-Plus setup");
-    try {
-        provider = await (options.createProvider ?? createEmbeddingProvider)(true);
-        if (provider === undefined) {
-            //noinspection ExceptionCaughtLocallyJS
-            throw new Error('Embedding provider was not available.');
-        }
-        // Verification uses fixed synthetic text, never session content. The
-        // persistent flag is committed only after setup and cleanup succeed.
-        await provider.embed(MEMORY_PLUS_PROBE, () => {});
-        await provider.dispose();
-        provider = undefined;
+        await prepareMemoryPlus(options);
         setSetting('memory-plus', 'true', options.configPath);
-        setup.done();
     } catch (error) {
-        setup.fail();
         disableAfterFailedSetup(options.configPath);
         throw error;
-    } finally {
-        await provider?.dispose();
     }
     // Setup succeeded. A partial backfill keeps both the opt-in and completed
     // vectors so the next automatic pass (or an explicit retry) can resume.

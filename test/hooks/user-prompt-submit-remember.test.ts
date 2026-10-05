@@ -12,6 +12,7 @@ import {
 import { codexSessionsRoot } from '../../src/config/paths.js';
 import { getSetting, setSetting } from '../../src/config/settings.js';
 import { parseUserPromptCommand, runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
+import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { CLOSE } from '../../src/security/sentinel.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
@@ -26,7 +27,7 @@ import { openUnmanagedDb } from '../../src/storage/db.js';
 import { ProjectResolver, type ProjectSet } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import type { TestDatabase } from '../helpers/db.js';
-import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedCopyCoverage, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { testScratchRoot, withTempDir } from '../helpers/tmp.js';
 
 const NOW = Date.parse('2026-08-22T12:00:00.000Z');
@@ -116,6 +117,7 @@ function addSession(
     project: ReturnType<typeof seedProject>,
     projectPath: string,
     options: {
+        durableCapture?: boolean;
         decisions?: Array<{ what: string; why: string | null }>;
         files?: string[];
         nativeId: string;
@@ -145,6 +147,8 @@ function addSession(
             turnIndex,
             startedAt: options.timestamp,
             userMessage: options.turns[turnIndex]!.user,
+            assistantText: options.durableCapture ? options.turns[turnIndex]!.assistant : undefined,
+            durableCapture: options.durableCapture,
             decisions: turnIndex === 0 ? options.decisions : undefined,
             filesTouched: turnIndex === 0 ? options.files : undefined,
         });
@@ -182,6 +186,7 @@ function addDurableCopy(
             DURABLE_CAPTURE_FILTER_VERSION,
             new Date(NOW).toISOString(),
         );
+        seedCopyCoverage(fixture, memory.id);
     }
     if (state !== null) {
         fixture.db
@@ -471,12 +476,14 @@ describe('UserPromptSubmit lexical recall', () => {
         const remote = addProject(fixture, 'remote', 'approved');
         addSession(fixture, current.project, current.projectPath, {
             nativeId: 'first-hit',
+            durableCapture: true,
             title: 'Needle first hit',
             timestamp: '2026-08-22T11:00:00.000Z',
             turns: [{ user: 'find durable needle', assistant: 'first current-project answer' }],
         });
         addSession(fixture, remote.project, remote.projectPath, {
             nativeId: 'second-hit',
+            durableCapture: true,
             title: 'Needle second hit',
             timestamp: '2026-08-22T10:00:00.000Z',
             turns: [{ user: 'find durable needle', assistant: 'second cross-project answer' }],
@@ -516,6 +523,7 @@ describe('UserPromptSubmit lexical recall', () => {
         const newest = `newest-resume-turn-${'y'.repeat(turnChars)}`;
         addSession(fixture, current.project, current.projectPath, {
             nativeId: 'large-resume',
+            durableCapture: true,
             title: 'Large resume session',
             timestamp: '2026-08-22T11:00:00.000Z',
             turns: [
@@ -817,6 +825,69 @@ describe('UserPromptSubmit lexical recall', () => {
         expect(context).toContain('Routine cache follow-up');
         expect(context).not.toContain('the buried term is aurora');
         expect(context).not.toContain('the paired term is zephyr');
+    });
+
+    it('returns the same stored-content results from the in-chat query and MCP recall after the provider source is deleted', async () => {
+        const fixture = createTestDb('elepha-query-source-deleted-');
+        const current = addProject(fixture, 'current', 'approved');
+        const promptTurns = [
+            { user: 'ordinary opening request', assistant: 'ordinary opening response' },
+            { user: 'the obsidianlark setting moved', assistant: 'noted the move' },
+        ];
+        const promptHit = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'prompt-hit',
+            title: 'Prompt match session',
+            timestamp: '2026-08-22T10:00:00.000Z',
+            turns: promptTurns,
+        });
+        addDurableCopy(fixture, promptHit, promptTurns);
+        const toolTurns = [{ user: 'another opening request', assistant: 'another opening response' }];
+        const toolHit = addSession(fixture, current.project, current.projectPath, {
+            nativeId: 'tool-hit',
+            title: 'Tool match session',
+            timestamp: '2026-08-22T11:00:00.000Z',
+            turns: toolTurns,
+        });
+        addDurableCopy(fixture, toolHit, [
+            { ...toolTurns[0], tools: JSON.stringify([{ name: 'read_file', filePaths: ['/repo/src/obsidianlark.ts'] }]) },
+        ]);
+        const sourcePaths = [promptHit.source_path, toolHit.source_path];
+        fixture.close();
+
+        // Only per-call identifiers may differ between two identical requests.
+        const stable = (value: string) =>
+            value.replace(/[0-9A-HJKMNP-TV-Z]{26}/g, '<ulid>').replace(/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/g, '<nonce>');
+        const results = async () => {
+            const query = contextOf(
+                await runUserPromptSubmit(payload(current.projectPath, 'elepha:query obsidianlark'), 'codex', {
+                    dbPath: fixture.dbPath,
+                    now: () => NOW,
+                }),
+            );
+            const db = openUnmanagedDb(fixture.dbPath);
+            try {
+                const recalled = (await new ElephaMcpService(db).recall({ query: 'obsidianlark' })) as {
+                    content: Array<{ text: string }>;
+                };
+                return { query: stable(query), mcp: stable(recalled.content.map((part) => part.text).join('\n')) };
+            } finally {
+                db.close();
+            }
+        };
+
+        const before = await results();
+        for (const sourcePath of sourcePaths) {
+            rmSync(sourcePath);
+        }
+        const after = await results();
+
+        for (const body of [before.query, before.mcp]) {
+            expect(body).toContain('Tool match session');
+            expect(body).toContain('Prompt match session');
+        }
+        // The tool-call match is served from the stored copy, not the deleted source.
+        expect(before.mcp).toContain('/repo/src/obsidianlark.ts');
+        expect(after).toEqual(before);
     });
 
     it('surfaces a content-only match beyond the metadata recency cap', async () => {

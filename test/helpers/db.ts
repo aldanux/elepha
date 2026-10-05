@@ -5,8 +5,11 @@ import type { ConsentRoot, ConsentState } from '../../src/storage/consent-store.
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { type MemoryRow, MemoryStore, type ProjectRow, type SessionRow } from '../../src/storage/memory-store.js';
 import { type RollupDecision, type RollupState, RollupStore } from '../../src/storage/rollup-store.js';
+import { TurnSearchIndex } from '../../src/storage/turn-search-index.js';
 import type { ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName, TurnDecision } from '../../src/types/index.js';
 import { withGrantableTestDir } from './tmp.js';
+
+const seededSourceTurns = new WeakMap<TestDatabase, Map<number, ParsedTurn>>();
 
 export interface TestDatabase {
     directory: string;
@@ -128,6 +131,9 @@ export interface SeedMemoryOptions {
     hasExternalContent?: boolean;
     renderedChars?: number | null;
     renderedTurns?: number | null;
+    // Retains a filtered copy through the live capture path, which is also
+    // what makes the turn searchable.
+    durableCapture?: boolean;
 }
 
 export function seedMemory(fixture: TestDatabase, options: SeedMemoryOptions): MemoryRow {
@@ -154,7 +160,7 @@ export function seedMemory(fixture: TestDatabase, options: SeedMemoryOptions): M
         status: options.status ?? 'ok',
     };
 
-    fixture.store.recordTurn(turn, options.session.id, options.project.id, summary);
+    fixture.store.recordTurn(turn, options.session.id, options.project.id, summary, options.durableCapture ?? false);
     if (options.renderedChars !== undefined || options.renderedTurns !== undefined) {
         fixture.db
             .prepare(
@@ -169,7 +175,25 @@ export function seedMemory(fixture: TestDatabase, options: SeedMemoryOptions): M
     if (!memory) {
         throw new Error('seeded memory was not found');
     }
+    let turns = seededSourceTurns.get(fixture);
+    if (turns === undefined) {
+        turns = new Map();
+        seededSourceTurns.set(fixture, turns);
+    }
+    turns.set(memory.id, turn);
     return memory;
+}
+
+// Completes a manually constructed copy fixture using seedMemory's actual
+// source turn. Missing-coverage tests deliberately omit this helper.
+export function seedCopyCoverage(fixture: TestDatabase, memoryId: number): void {
+    const turn = seededSourceTurns.get(fixture)?.get(memoryId);
+    if (turn === undefined) {
+        throw new Error('copy fixture requires its seeded source turn');
+    }
+    if (new TurnSearchIndex(fixture.db).record(memoryId, turn, new Date().toISOString()) === undefined) {
+        throw new Error('copy fixture requires its retained copy');
+    }
 }
 
 export interface SeedRollupOptions {

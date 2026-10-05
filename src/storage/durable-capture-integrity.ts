@@ -1,5 +1,8 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
+import { LIVE_MEMORY_USAGE_TABLE, reconcileLiveMemoryUsage } from './live-memory-usage.js';
 import { applySanitize, planSanitize, verifySanitize } from './sanitize-backfill.js';
+import { TURN_EMBEDDINGS_TABLE } from './turn-embeddings.js';
+import { RETIRED_TURN_SEARCH_FTS_TABLE, RETIRED_TURN_SEARCH_STATE_TABLE, TURN_SEARCH_INDEX_TABLE } from './turn-search-index.js';
 
 export const DURABLE_CAPTURE_SCHEMA_MISMATCH = 'Backup durable-capture schema does not match the current elepha schema after migration.';
 
@@ -11,13 +14,23 @@ interface SchemaObjectRow {
     sql_length?: number;
 }
 
+// The retired turn-search postings and their marker are absent from the
+// canonical schema, so any object still using those names after migration is
+// a mismatch: migration leaves a noncanonical retired set whole.
 const DURABLE_SCHEMA_OBJECTS = `
-    name IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'session_embeddings', 'open_turns')
+    name IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'session_embeddings', 'open_turns', '${TURN_EMBEDDINGS_TABLE}', '${TURN_SEARCH_INDEX_TABLE}')
     OR lower(name) GLOB 'filtered_turns_fts*'
     OR lower(tbl_name) GLOB 'filtered_turns_fts*'
+    OR lower(name) GLOB '${RETIRED_TURN_SEARCH_FTS_TABLE}*'
+    OR lower(tbl_name) GLOB '${RETIRED_TURN_SEARCH_FTS_TABLE}*'
+    OR lower(name) = '${RETIRED_TURN_SEARCH_STATE_TABLE}'
+    OR lower(tbl_name) = '${RETIRED_TURN_SEARCH_STATE_TABLE}'
     OR lower(tbl_name) IN ('filtered_turns', 'durable_capture_status', 'durable_capture_usage', 'open_turns')
-    OR lower(tbl_name) = 'session_embeddings'
+    OR lower(tbl_name) IN ('session_embeddings', '${TURN_EMBEDDINGS_TABLE}', '${TURN_SEARCH_INDEX_TABLE}')
     OR (type IN ('trigger', 'index') AND lower(tbl_name) IN ('memories', 'session_rollups'))
+    OR lower(name) = '${LIVE_MEMORY_USAGE_TABLE}'
+    OR (type = 'trigger' AND lower(tbl_name) = '${LIVE_MEMORY_USAGE_TABLE}')
+    OR (type = 'trigger' AND lower(tbl_name) IN ('sessions', 'task_state_manifests'))
 `;
 
 function normalizeIdentifier(token: string): string {
@@ -120,6 +133,53 @@ function objectSignature(rows: readonly SchemaObjectRow[], normalizeLegacyOpenTu
             return [row.type.toLowerCase(), row.name.toLowerCase(), row.tbl_name.toLowerCase(), tokens.join(' ')];
         }),
     );
+}
+
+// Returns each table whose triggers differ from the canonical schema. A
+// candidate trigger is examined when it is attached to one of the tables or
+// reuses a canonical trigger name elsewhere, and must match a canonical
+// trigger by name, table, and parsed definition. With requireAll, a missing
+// canonical trigger is a difference too; without it, absent triggers are left
+// for the idempotent migration to create. Reads are bounded so a hostile
+// schema cannot force an unbounded scan or copy.
+export function noncanonicalTriggerTables(
+    candidate: Database,
+    canonical: Database,
+    tables: readonly string[],
+    options: { requireAll: boolean },
+): string[] {
+    const differing: string[] = [];
+    for (const table of tables.map((name) => name.toLowerCase())) {
+        const expected = canonical
+            .prepare(
+                `SELECT type, name, tbl_name, sql FROM sqlite_master
+                 WHERE type = 'trigger' AND lower(tbl_name) = ? ORDER BY lower(name)`,
+            )
+            .all(table) as SchemaObjectRow[];
+        const expectedByName = new Map(expected.map((row) => [row.name.toLowerCase(), row]));
+        const sqlCharacterLimit = expected.reduce((max, row) => Math.max(max, row.sql?.length ?? 0), 0) + 1;
+        const names = JSON.stringify([...expectedByName.keys()]);
+        const actual = candidate
+            .prepare(
+                `SELECT type, name, tbl_name, substr(sql, 1, ?) AS sql, length(COALESCE(sql, '')) AS sql_length
+                 FROM sqlite_master
+                 WHERE type = 'trigger' AND (lower(tbl_name) = ? OR lower(name) IN (SELECT value FROM json_each(?)))
+                 ORDER BY lower(name) LIMIT ?`,
+            )
+            .all(sqlCharacterLimit, table, names, expected.length + 1) as SchemaObjectRow[];
+        const matches = (row: SchemaObjectRow): boolean => {
+            const reference = expectedByName.get(row.name.toLowerCase());
+            return (
+                reference !== undefined &&
+                (row.sql_length ?? 0) < sqlCharacterLimit &&
+                objectSignature([row]) === objectSignature([reference])
+            );
+        };
+        if (actual.length > expected.length || (options.requireAll && actual.length !== expected.length) || !actual.every(matches)) {
+            differing.push(table);
+        }
+    }
+    return differing;
 }
 
 interface OpenTurnForeignKeyRow {
@@ -264,6 +324,7 @@ export function normalizeAndVerifyDurableCapture(db: Database): void {
         // A restored cache has no current provider/source/consent proof. Rebuild
         // vectors explicitly from the restored, normalized source material.
         db.exec('DELETE FROM session_embeddings');
+        db.exec(`DELETE FROM ${TURN_EMBEDDINGS_TABLE}`);
         applySanitize(db);
         db.exec("INSERT INTO filtered_turns_fts(filtered_turns_fts) VALUES ('rebuild')");
         const measured = exactUsage(db);
@@ -289,5 +350,8 @@ export function normalizeAndVerifyDurableCapture(db: Database): void {
         if (usageRows.length !== 1 || usageRows[0]?.id !== 1 || usageRows[0].total_bytes !== exactUsage(db)) {
             throw new Error('Durable capture usage does not equal the exact stored byte sum.');
         }
+        // A restored ledger total describes the backup's history, not this
+        // normalized content: measure it again after sanitize and vector removal.
+        reconcileLiveMemoryUsage(db);
     }).immediate();
 }

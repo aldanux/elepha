@@ -5,7 +5,7 @@ import { escapeShellSyntax } from '../security/sanitize.js';
 import type { ServedSession } from '../storage/session-read-model.js';
 import { dataBlockClose, dataBlockOpen, servedContextInstructions } from './instructions.js';
 import type { RecallQuery } from './lexical-recall.js';
-import type { EvidenceWindow, SessionReader } from './session-reader.js';
+import { type EvidenceWindow, type SessionReader, STORED_EVIDENCE_REASONS } from './session-reader.js';
 
 export const SESSION_EVIDENCE_SCOPE =
     'Coverage: selected historical evidence, not a complete episode. Source selection follows stored rollups or the indexed first interaction; other excerpts use lexical matching only, not multilingual matching. A miss is inconclusive.';
@@ -190,7 +190,10 @@ export async function selectSessionEvidence(
 
     const read = await reader.evidenceWindow(session, lastN, signal);
     if (read.projections === undefined) {
-        return { text: '', coverage: `Evidence unavailable: ${read.reason ?? 'transcript_missing'}. No transcript evidence returned.` };
+        return {
+            text: '',
+            coverage: `Evidence unavailable: ${read.reason ?? STORED_EVIDENCE_REASONS.missing}. No retained interaction evidence returned.`,
+        };
     }
     return windowEvidence(read, query, maxChars);
 }

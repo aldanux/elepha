@@ -4,16 +4,33 @@ import { validateOpenedProviderTranscriptIdentitySync } from '../security/provid
 import type { ParsedTurn, ToolName } from '../types/index.js';
 import { InjectionStore } from './injection-store.js';
 import type { MemoryStore } from './memory-store.js';
+
 import { sourceTurnDigest } from './source-turn-digest.js';
 
 export function sourceSnapshotValidator(tool: ToolName, filePath: string, opened: OpenedProviderTranscript): () => boolean {
-    return () => {
-        if ('reason' in validateOpenedProviderTranscriptIdentitySync(tool, filePath, opened)) {
-            return false;
-        }
+    return () => sourceSnapshotMismatch(tool, filePath, opened) === undefined;
+}
+
+export function sourceSnapshotMismatch(tool: ToolName, filePath: string, opened: OpenedProviderTranscript): string | undefined {
+    const identity = validateOpenedProviderTranscriptIdentitySync(tool, filePath, opened);
+    if ('reason' in identity) {
+        return `physical identity or access changed (${identity.reason})`;
+    }
+    try {
         const current = statSync(filePath);
-        return current.size === opened.stat.size && current.mtimeMs === opened.stat.mtimeMs;
-    };
+        if (current.dev !== opened.stat.dev || current.ino !== opened.stat.ino) {
+            return 'physical identity changed';
+        }
+        if (current.size !== opened.stat.size) {
+            return 'byte size changed';
+        }
+        if (current.mtimeMs !== opened.stat.mtimeMs) {
+            return 'modification time changed';
+        }
+    } catch (error) {
+        return `filesystem inspection failed (${(error as NodeJS.ErrnoException).code ?? 'unknown error'})`;
+    }
+    return undefined;
 }
 
 export function sourceGeneration(store: MemoryStore, tool: ToolName, nativeId: string): number {
@@ -84,42 +101,46 @@ export class SourceReconciliation {
             if (
                 !this.validate() ||
                 this.store.consent.consentState(this.projectPath) !== 'approved' ||
-                this.store.isTranscriptPurged(this.tool, this.nativeId) ||
+                this.store.isTranscriptCaptureBlocked(this.tool, this.nativeId) ||
                 this.store.isTranscriptIncognito(this.tool, this.nativeId) ||
                 sourceGeneration(this.store, this.tool, this.nativeId) !== this.generation
             ) {
                 throw new Error('Source reconciliation authorization or generation changed; retry required');
             }
-            const nextGeneration = this.generation + 1;
-            const durableReceipts = new InjectionStore(this.store.database);
-            for (const turn of this.mcpReceiptTurns) {
-                if (!durableReceipts.recordElephaMcpReceipts(turn, nextGeneration)) {
-                    throw new Error('Source reconciliation Elepha MCP receipt protection incomplete');
-                }
-            }
-            const db = this.store.database;
-            db.prepare(`INSERT INTO source_generations (tool, native_id, generation) VALUES (?, ?, ?)
-                ON CONFLICT(tool, native_id) DO UPDATE SET generation = excluded.generation`).run(this.tool, this.nativeId, nextGeneration);
-            db.prepare('DELETE FROM open_turns WHERE tool = ? AND native_session_id = ?').run(this.tool, this.nativeId);
-            const scope = 'SELECT id FROM sessions WHERE tool = ? AND native_id = ?';
-            const count = (
-                db
-                    .prepare(`SELECT COUNT(*) AS n FROM memories WHERE session_id IN (${scope}) AND turn_index >= ?`)
-                    .get(this.tool, this.nativeId, fromIndex) as { n: number }
-            ).n;
-            if (count === 0) {
-                return 0;
-            }
-            // Cascades remove durable text and its FTS postings/usage in the same transaction.
-            db.prepare(`DELETE FROM memories WHERE session_id IN (${scope}) AND turn_index >= ?`).run(this.tool, this.nativeId, fromIndex);
-            db.prepare(`DELETE FROM session_rollups WHERE session_id IN (${scope})`).run(this.tool, this.nativeId);
-            db.prepare(`DELETE FROM durable_capture_status WHERE session_id IN (${scope})`).run(this.tool, this.nativeId);
-            db.prepare(`UPDATE sessions SET cursor = NULL, rendered_chars = NULL, rendered_turns = NULL,
-                last_turn_at = NULL, trailing_branch = NULL, trailing_files = '[]',
-                title = CASE WHEN EXISTS (SELECT 1 FROM memories WHERE session_id = sessions.id) THEN title ELSE NULL END,
-                first_prompt_search = CASE WHEN EXISTS (SELECT 1 FROM memories WHERE session_id = sessions.id) THEN first_prompt_search ELSE NULL END
-                WHERE tool = ? AND native_id = ?`).run(this.tool, this.nativeId);
-            return count;
+            return this.applyRetraction(fromIndex);
         })();
+    }
+
+    private applyRetraction(fromIndex: number): number {
+        const nextGeneration = this.generation + 1;
+        const durableReceipts = new InjectionStore(this.store.database);
+        for (const turn of this.mcpReceiptTurns) {
+            if (!durableReceipts.recordElephaMcpReceipts(turn, nextGeneration)) {
+                throw new Error('Source reconciliation Elepha MCP receipt protection incomplete');
+            }
+        }
+        const db = this.store.database;
+        db.prepare(`INSERT INTO source_generations (tool, native_id, generation) VALUES (?, ?, ?)
+            ON CONFLICT(tool, native_id) DO UPDATE SET generation = excluded.generation`).run(this.tool, this.nativeId, nextGeneration);
+        db.prepare('DELETE FROM open_turns WHERE tool = ? AND native_session_id = ?').run(this.tool, this.nativeId);
+        const scope = 'SELECT id FROM sessions WHERE tool = ? AND native_id = ?';
+        const count = (
+            db
+                .prepare(`SELECT COUNT(*) AS n FROM memories WHERE session_id IN (${scope}) AND turn_index >= ?`)
+                .get(this.tool, this.nativeId, fromIndex) as { n: number }
+        ).n;
+        if (count === 0) {
+            return 0;
+        }
+        // Cascades remove durable text and its FTS postings/usage in the same transaction.
+        db.prepare(`DELETE FROM memories WHERE session_id IN (${scope}) AND turn_index >= ?`).run(this.tool, this.nativeId, fromIndex);
+        db.prepare(`DELETE FROM session_rollups WHERE session_id IN (${scope})`).run(this.tool, this.nativeId);
+        db.prepare(`DELETE FROM durable_capture_status WHERE session_id IN (${scope})`).run(this.tool, this.nativeId);
+        db.prepare(`UPDATE sessions SET cursor = NULL, cursor_context = NULL, rendered_chars = NULL, rendered_turns = NULL,
+            last_turn_at = NULL, trailing_branch = NULL, trailing_files = '[]',
+            title = CASE WHEN EXISTS (SELECT 1 FROM memories WHERE session_id = sessions.id) THEN title ELSE NULL END,
+            first_prompt_search = CASE WHEN EXISTS (SELECT 1 FROM memories WHERE session_id = sessions.id) THEN first_prompt_search ELSE NULL END
+            WHERE tool = ? AND native_id = ?`).run(this.tool, this.nativeId);
+        return count;
     }
 }

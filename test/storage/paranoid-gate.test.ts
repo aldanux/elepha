@@ -12,7 +12,6 @@ import { lexicalRecall, tokenizeRecallQuery } from '../../src/serving/lexical-re
 import { SessionReader } from '../../src/serving/session-reader.js';
 import type { DatabaseEncryptionRuntime } from '../../src/storage/database-encryption.js';
 import { openDb } from '../../src/storage/db.js';
-import { DurableCaptureBackfillStore } from '../../src/storage/durable-capture-backfill.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import {
     type AuthenticatedReadGeneration,
@@ -361,47 +360,6 @@ describe('paranoid read gate', () => {
                 true,
             ),
         ).toBe(true);
-
-        const historical = seeded.store.upsertSession(
-            'codex',
-            'backfill-session',
-            seeded.project.id,
-            path.join(seeded.directory, 'backfill.jsonl'),
-        );
-        expect(
-            seeded.store.recordTurn(
-                turn(historical.native_id, historical.source_path, seeded.projectPath, 0, 'backfill'),
-                historical.id,
-                seeded.project.id,
-                {
-                    decisions: [],
-                    pending_items: [],
-                    status: 'ok',
-                },
-            ),
-        ).toBe(true);
-        const backfill = new DurableCaptureBackfillStore(seeded.db, seeded.store.consent);
-        const candidate = backfill.listCandidates([seeded.project.id], 10).find((item) => item.id === historical.id);
-        if (candidate === undefined) {
-            throw new Error('backfill candidate was not found');
-        }
-        expect(backfill.begin(candidate, NOW)?.missingTurnIndexes).toEqual(new Set([0]));
-        expect(
-            backfill.record(
-                candidate,
-                0,
-                {
-                    filterVersion: 1,
-                    included: true,
-                    userPrompt: 'backfilled prompt',
-                    assistantResponse: 'backfilled response',
-                    toolCalls: [],
-                    omittedToolCallCount: 0,
-                },
-                NOW,
-            ),
-        ).toEqual({ state: 'recorded', sessionId: historical.id });
-        backfill.finish(candidate, new Set([historical.id]), 'success', NOW);
 
         const purged = seeded.store.upsertSession(
             'codex',
