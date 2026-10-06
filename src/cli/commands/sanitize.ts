@@ -120,6 +120,7 @@ async function runSanitize(
             }
             const result = applySanitize(db, {
                 beforeFirstMutation: () => memoryReadAuthorityMatchesGenerationInTransaction(db, token),
+                plan,
             });
             if (result.status === 'not_applied') {
                 invalidated = true;
