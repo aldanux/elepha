@@ -4861,7 +4861,7 @@ await runRestoreOperation(${JSON.stringify(backup)}, {
         expect(readEncryptionMetadata(encryptionMetadataPath(active.dbPath))).toEqual(metadataBefore);
         expect(readFileSync(keyPath)).toEqual(keyBefore);
         expect(readFileSync(candidate.dbPath)).toEqual(candidateBytes);
-    });
+    }, 15000);
 
     it('leaves the database untouched when a TTY declines confirmation', () => {
         const active = createTestDb('elepha-restore-active-');

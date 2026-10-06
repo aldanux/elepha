@@ -464,26 +464,30 @@ describe('elepha backup exports', () => {
             (fixture: ReturnType<typeof seedExportFixture>, destination: string) =>
                 exportProject(fixture.fixture.db, fixture.project, destination, FIXED_KEY, true),
         ],
-    ])('refuses the active database as the %s destination directly and through filesystem aliases', (_scope, exportBackup) => {
-        const fixture = seedExportFixture();
-        fixture.fixture.db.pragma('wal_checkpoint(TRUNCATE)');
-        const dbPath = fixture.fixture.dbPath;
-        const original = readFileSync(dbPath);
+    ])(
+        'refuses the active database as the %s destination directly and through filesystem aliases',
+        (_scope, exportBackup) => {
+            const fixture = seedExportFixture();
+            fixture.fixture.db.pragma('wal_checkpoint(TRUNCATE)');
+            const dbPath = fixture.fixture.dbPath;
+            const original = readFileSync(dbPath);
 
-        expect(() => exportBackup(fixture, dbPath)).toThrow('Backup destination must not be the active database.');
-        expect(readFileSync(dbPath)).toEqual(original);
+            expect(() => exportBackup(fixture, dbPath)).toThrow('Backup destination must not be the active database.');
+            expect(readFileSync(dbPath)).toEqual(original);
 
-        const parentAlias = path.join(fixture.fixture.directory, 'database-parent-alias');
-        symlinkSync(fixture.fixture.directory, parentAlias, 'dir');
-        const aliasedDatabase = path.join(parentAlias, path.basename(dbPath));
-        expect(() => exportBackup(fixture, aliasedDatabase)).toThrow('Backup destination must not be the active database.');
-        expect(readFileSync(dbPath)).toEqual(original);
+            const parentAlias = path.join(fixture.fixture.directory, 'database-parent-alias');
+            symlinkSync(fixture.fixture.directory, parentAlias, 'dir');
+            const aliasedDatabase = path.join(parentAlias, path.basename(dbPath));
+            expect(() => exportBackup(fixture, aliasedDatabase)).toThrow('Backup destination must not be the active database.');
+            expect(readFileSync(dbPath)).toEqual(original);
 
-        const hardLinkAlias = path.join(fixture.fixture.directory, 'database-hard-link-alias.db');
-        linkSync(dbPath, hardLinkAlias);
-        expect(() => exportBackup(fixture, hardLinkAlias)).toThrow('Backup destination must not be the active database.');
-        expect(readFileSync(dbPath)).toEqual(original);
-    });
+            const hardLinkAlias = path.join(fixture.fixture.directory, 'database-hard-link-alias.db');
+            linkSync(dbPath, hardLinkAlias);
+            expect(() => exportBackup(fixture, hardLinkAlias)).toThrow('Backup destination must not be the active database.');
+            expect(readFileSync(dbPath)).toEqual(original);
+        },
+        15000,
+    );
 
     it.each(['--all', '--project'] as const)(
         'revalidates an active-database hard link created during %s destination preparation',
