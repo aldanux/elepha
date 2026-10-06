@@ -35,7 +35,7 @@ import {
 } from './orphan-classification.js';
 
 import { ProjectResolver } from './project-resolver.js';
-import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
+import { type ProjectMovePlan, type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import type { SessionRuleRow } from './session-rules-store.js';
 import { hydrateSessionRow, type SessionMetadata, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
@@ -43,6 +43,7 @@ import { sourceTurnDigest } from './source-turn-digest.js';
 import { SqliteSourceWatermarkStore } from './sqlite-source-watermark-store.js';
 import { type StandingRuleRow, StandingRulesStore } from './standing-rules-store.js';
 import { minMedianMax, type ProjectCount, type Stats, type StatusCount, type ToolCount, type ToolZeroPaths } from './stats.js';
+import { TURN_EMBEDDINGS_TABLE } from './turn-embeddings.js';
 import { deleteTurnSearchForTranscript } from './turn-search-index.js';
 import { type MemoryRow, TurnStore } from './turn-store.js';
 
@@ -59,6 +60,18 @@ export interface ProjectMergePlan {
     gitRoot: string | null;
     merged: ProjectRow[];
 }
+
+// Move every direct owner before deleting a project, including caches with cascading foreign keys.
+const PROJECT_OWNERSHIP_REFERENCES = [
+    ['memories', 'project_id'],
+    ['sessions', 'project_id'],
+    ['session_rollups', 'project_id'],
+    ['open_turns', 'project_id'],
+    ['standing_rules', 'project_id'],
+    ['session_rules', 'owner_project_id'],
+    ['session_embeddings', 'project_id'],
+    [TURN_EMBEDDINGS_TABLE, 'project_id'],
+] as const;
 
 export interface MemoryStoreOptions {
     // Test seam; production resolves through the Rule 2 subprocess allowlist.
@@ -893,62 +906,11 @@ export class MemoryStore {
             }
             const affected = new Set(plans.flatMap((plan) => [plan.canonical.id, ...plan.merged.map((project) => project.id)]));
             for (const group of groups.filter((ids) => [...ids].some((id) => affected.has(id)))) {
-                const rules = this.standingRules.list([...group]);
-                const texts = rules.map((rule) => rule.text);
-                const reason =
-                    new Set(texts).size !== texts.length
-                        ? 'duplicate standing rule text'
-                        : rules.length > STANDING_RULES_MAX_ACTIVE
-                          ? 'standing rule count limit'
-                          : texts.reduce((sum, text) => sum + text.length, 0) > STANDING_RULES_MAX_TOTAL_CHARS
-                            ? 'standing rule character limit'
-                            : undefined;
-                if (reason !== undefined) {
-                    throw new Error(
-                        `Rekey refused: ${reason} for project ids ${[...group].join(', ')}; rule ULIDs: ${rules.map((rule) => rule.ulid).join(', ')}.`,
-                    );
-                }
-                const projectIds = [...group];
-                const sessionRules = this.db
-                    .prepare(
-                        `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
-                         FROM session_rules WHERE owner_project_id IN (${projectIds.map(() => '?').join(',')}) ORDER BY id`,
-                    )
-                    .all(...projectIds) as SessionRuleRow[];
-                const chatScopes = new Map<string, SessionRuleRow[]>();
-                for (const rule of sessionRules) {
-                    const key = JSON.stringify([rule.tool, rule.native_session_id, rule.checkout_anchor]);
-                    const scoped = chatScopes.get(key) ?? [];
-                    scoped.push(rule);
-                    chatScopes.set(key, scoped);
-                }
-                for (const scoped of chatScopes.values()) {
-                    const texts = scoped.map((rule) => rule.text);
-                    const reason =
-                        new Set(texts).size !== texts.length
-                            ? 'duplicate chat rule text'
-                            : scoped.length > STANDING_RULES_MAX_ACTIVE
-                              ? 'chat rule count limit'
-                              : texts.reduce((sum, text) => sum + text.length, 0) > STANDING_RULES_MAX_TOTAL_CHARS
-                                ? 'chat rule character limit'
-                                : undefined;
-                    if (reason !== undefined) {
-                        throw new Error(
-                            `Rekey refused: ${reason} for project ids ${projectIds.join(', ')}; rule ULIDs: ${scoped.map((rule) => rule.ulid).join(', ')}.`,
-                        );
-                    }
-                }
+                this.assertProjectRuleBudget(group, 'Rekey');
             }
             for (const plan of plans) {
                 for (const victim of plan.merged) {
-                    this.db.prepare('UPDATE memories SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
-                    this.db.prepare('UPDATE sessions SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
-                    this.db.prepare('UPDATE session_rollups SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
-                    this.db.prepare('UPDATE open_turns SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
-                    this.db.prepare('UPDATE standing_rules SET project_id = ? WHERE project_id = ?').run(plan.canonical.id, victim.id);
-                    this.db
-                        .prepare('UPDATE session_rules SET owner_project_id = ? WHERE owner_project_id = ?')
-                        .run(plan.canonical.id, victim.id);
+                    this.moveProjectOwnership(victim.id, plan.canonical.id);
                     this.db.prepare('DELETE FROM projects WHERE id = ?').run(victim.id);
                 }
                 if (plan.gitRoot !== null) {
@@ -960,6 +922,154 @@ export class MemoryStore {
         });
         apply();
         return plans;
+    }
+
+    private assertProjectRuleBudget(group: ReadonlySet<number>, operation: 'Rekey' | 'Move'): void {
+        const rules = this.standingRules.list([...group]);
+        const texts = rules.map((rule) => rule.text);
+        const reason =
+            new Set(texts).size !== texts.length
+                ? 'duplicate standing rule text'
+                : rules.length > STANDING_RULES_MAX_ACTIVE
+                  ? 'standing rule count limit'
+                  : texts.reduce((sum, text) => sum + text.length, 0) > STANDING_RULES_MAX_TOTAL_CHARS
+                    ? 'standing rule character limit'
+                    : undefined;
+        if (reason !== undefined) {
+            throw new Error(
+                operation === 'Rekey'
+                    ? `Rekey refused: ${reason} for project ids ${[...group].join(', ')}; rule ULIDs: ${rules.map((rule) => rule.ulid).join(', ')}.`
+                    : `Refusing move-project: ${reason}.`,
+            );
+        }
+        const projectIds = [...group];
+        const sessionRules = this.db
+            .prepare(
+                `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
+                         FROM session_rules WHERE owner_project_id IN (${projectIds.map(() => '?').join(',')}) ORDER BY id`,
+            )
+            .all(...projectIds) as SessionRuleRow[];
+        const chatScopes = new Map<string, SessionRuleRow[]>();
+        for (const rule of sessionRules) {
+            const key = JSON.stringify([rule.tool, rule.native_session_id, rule.checkout_anchor]);
+            const scoped = chatScopes.get(key) ?? [];
+            scoped.push(rule);
+            chatScopes.set(key, scoped);
+        }
+        for (const scoped of chatScopes.values()) {
+            const texts = scoped.map((rule) => rule.text);
+            const reason =
+                new Set(texts).size !== texts.length
+                    ? 'duplicate chat rule text'
+                    : scoped.length > STANDING_RULES_MAX_ACTIVE
+                      ? 'chat rule count limit'
+                      : texts.reduce((sum, text) => sum + text.length, 0) > STANDING_RULES_MAX_TOTAL_CHARS
+                        ? 'chat rule character limit'
+                        : undefined;
+            if (reason !== undefined) {
+                throw new Error(
+                    operation === 'Rekey'
+                        ? `Rekey refused: ${reason} for project ids ${projectIds.join(', ')}; rule ULIDs: ${scoped.map((rule) => rule.ulid).join(', ')}.`
+                        : `Refusing move-project: ${reason}.`,
+                );
+            }
+        }
+    }
+
+    private moveProjectOwnership(fromId: number, toId: number): void {
+        for (const [table, column] of PROJECT_OWNERSHIP_REFERENCES) {
+            this.db.prepare(`UPDATE ${table} SET ${column} = ? WHERE ${column} = ?`).run(toId, fromId);
+        }
+    }
+
+    planMoveProject(from: string, to: string): ProjectMovePlan {
+        return this.projects.planMoveProject(from, to, this.consent);
+    }
+
+    applyProjectMove(plan: ProjectMovePlan): void {
+        // Finish filesystem checks before taking the writer lock, then repeat decisive consent inside it.
+        this.projects.assertMoveDestination(plan, this.consent);
+        this.db
+            .transaction(() => {
+                this.projects.assertMoveAssociations(plan);
+                if (
+                    this.consent.consentStateForCanonicalPath(plan.to) !== 'approved' ||
+                    this.consent.consentStateForCanonicalPath(plan.destinationInput) === 'denied'
+                ) {
+                    throw new Error(`Refusing move-project: capture is not authorized for ${plan.to}.`);
+                }
+                // The mapping is frozen, but activity dates must come from the current transaction.
+                const source = plan.source && this.getProjectById(plan.source.id);
+                const destination = plan.destination && this.getProjectById(plan.destination.id);
+                if (!source || source.id === destination?.id) {
+                    this.verifyProjectMove(plan);
+                    return;
+                }
+                const ownerId = destination?.id ?? source.id;
+                const selectedIds = new Set([source.id, ownerId]);
+                const before = PROJECT_OWNERSHIP_REFERENCES.map(
+                    ([table, column]) =>
+                        (
+                            this.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} IN (?, ?)`).get(source.id, ownerId) as {
+                                count: number;
+                            }
+                        ).count,
+                );
+                // Checkout anchors are serving locations, unlike the immutable transcript source paths.
+                const rules = this.db
+                    .prepare('SELECT id, checkout_anchor FROM session_rules WHERE owner_project_id = ?')
+                    .all(source.id) as Array<{ id: number; checkout_anchor: string }>;
+                for (const rule of rules) {
+                    if (samePath(path.resolve(rule.checkout_anchor), plan.from)) {
+                        this.db.prepare('UPDATE session_rules SET checkout_anchor = ? WHERE id = ?').run(plan.gitRoot ?? plan.to, rule.id);
+                    }
+                }
+                this.assertProjectRuleBudget(selectedIds, 'Move');
+                if (ownerId !== source.id) {
+                    this.moveProjectOwnership(source.id, ownerId);
+                    this.db.prepare('DELETE FROM projects WHERE id = ?').run(source.id);
+                }
+                this.db
+                    .prepare(`UPDATE projects SET path = ?, display_name = ?, git_root = ?,
+                        git_remote = COALESCE(git_remote, ?), git_root_commit = COALESCE(git_root_commit, ?),
+                        first_seen_at = MIN(first_seen_at, ?), last_seen_at = MAX(last_seen_at, ?)
+                        WHERE id = ?`)
+                    .run(
+                        plan.to,
+                        destination?.display_name ?? path.basename(plan.to),
+                        plan.gitRoot,
+                        source.git_remote,
+                        source.git_root_commit,
+                        source.first_seen_at,
+                        source.last_seen_at,
+                        ownerId,
+                    );
+                for (const [index, [table, column]] of PROJECT_OWNERSHIP_REFERENCES.entries()) {
+                    const after = this.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`).get(ownerId) as {
+                        count: number;
+                    };
+                    if (after.count !== before[index]) {
+                        throw new Error(`Move-project verification failed: dependent ownership changed in ${table}.`);
+                    }
+                }
+                // Verification failures must roll back the relocation too, before capture resumes.
+                this.verifyProjectMove(plan);
+            })
+            .immediate();
+    }
+
+    verifyProjectMove(plan: ProjectMovePlan): void {
+        const ownerId = plan.destination?.id ?? plan.source?.id;
+        const destination = ownerId === undefined ? undefined : this.getProjectById(ownerId);
+        if (
+            !destination ||
+            !samePath(path.resolve(destination.path), plan.to) ||
+            destination.git_root !== plan.gitRoot ||
+            (plan.source && plan.source.id !== ownerId && this.getProjectById(plan.source.id) !== undefined) ||
+            (this.db.pragma('foreign_key_check') as unknown[]).length > 0
+        ) {
+            throw new Error('Move-project verification failed.');
+        }
     }
 
     // Project rows matching a purge query: exact path match if one exists,

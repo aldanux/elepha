@@ -1,6 +1,9 @@
+import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
+import { expandUserPath, samePath } from '../config/paths.js';
 import { gitRemoteGetUrlOrigin, gitRevParseShowToplevel, gitRootCommit } from '../security/subprocess-allowlist.js';
+import type { ConsentStore } from './consent-store.js';
 
 export interface ProjectRow {
     id: number;
@@ -23,6 +26,18 @@ export interface ResolvedProjectIdentity {
     gitRoot: string | null;
     gitRemote: string | null;
     gitRootCommit: string | null;
+}
+
+// A relocation freezes only the explicitly named associations, never remote-based groups.
+export interface ProjectMovePlan {
+    from: string;
+    to: string;
+    destinationInput: string;
+    source: ProjectRow | undefined;
+    destination: ProjectRow | undefined;
+    gitRoot: string | null;
+    device: number;
+    inode: number;
 }
 
 export class ProjectStore {
@@ -119,6 +134,88 @@ export class ProjectStore {
 
     getProjectById(id: number): ProjectRow | undefined {
         return this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as ProjectRow | undefined;
+    }
+
+    private findProjectByExactPath(projectPath: string): ProjectRow | undefined {
+        const matches = this.listProjects().filter((row) => samePath(path.resolve(row.path), projectPath));
+        if (matches.length > 1) {
+            throw new Error(`Refusing move-project: ambiguous stored folder ${projectPath}.`);
+        }
+        return matches[0];
+    }
+
+    planMoveProject(from: string, to: string, consent: ConsentStore): ProjectMovePlan {
+        if (!from.trim() || !to.trim()) {
+            throw new Error('Refusing move-project: --from and --to must not be empty.');
+        }
+        const oldFolder = path.resolve(expandUserPath(from));
+        const destinationInput = path.resolve(expandUserPath(to));
+        const newFolder = realpathSync(destinationInput);
+        const target = statSync(newFolder);
+        if (!target.isDirectory()) {
+            throw new Error(`Refusing move-project: ${newFolder} is not a directory.`);
+        }
+        this.assertMoveConsent(destinationInput, newFolder, consent);
+        const source = this.findProjectByExactPath(oldFolder);
+        const destination = this.findProjectByExactPath(newFolder);
+        if (source === undefined && destination === undefined) {
+            throw new Error(`Refusing move-project: no saved project at ${oldFolder}.`);
+        }
+        if (source && destination && source.id !== destination.id) {
+            for (const field of ['git_remote', 'git_root_commit'] as const) {
+                if (source[field] && destination[field] && source[field] !== destination[field]) {
+                    throw new Error(`Refusing move-project: conflicting repository identity for ${oldFolder} and ${newFolder}.`);
+                }
+            }
+        }
+        return {
+            from: oldFolder,
+            to: newFolder,
+            destinationInput,
+            source,
+            destination,
+            // Only the authorized command argument may reach Git, never a stored transcript path.
+            gitRoot: source && source.id !== destination?.id ? this.resolveGitRoot(newFolder) : (destination?.git_root ?? null),
+            device: target.dev,
+            inode: target.ino,
+        };
+    }
+
+    assertMoveDestination(plan: ProjectMovePlan, consent: ConsentStore): void {
+        const target = statSync(plan.destinationInput);
+        if (
+            !target.isDirectory() ||
+            target.dev !== plan.device ||
+            target.ino !== plan.inode ||
+            !samePath(realpathSync(plan.destinationInput), plan.to)
+        ) {
+            throw new Error(`Refusing move-project: destination changed at ${plan.destinationInput}.`);
+        }
+        this.assertMoveConsent(plan.destinationInput, plan.to, consent);
+    }
+
+    assertMoveAssociations(plan: ProjectMovePlan): void {
+        // Capture may touch activity before it is paused without changing the selected association.
+        const association = (row: ProjectRow | undefined): string | undefined =>
+            JSON.stringify(row, (key, value: unknown) => (key === 'last_seen_at' ? undefined : value));
+        for (const [folder, expected] of [
+            [plan.from, plan.source],
+            [plan.to, plan.destination],
+        ] as const) {
+            if (association(this.findProjectByExactPath(folder)) !== association(expected)) {
+                throw new Error(`Refusing move-project: saved project changed at ${folder}.`);
+            }
+        }
+    }
+
+    private assertMoveConsent(lexical: string, canonical: string, consent: ConsentStore): void {
+        if (
+            consent.consentStateForCanonicalPath(lexical) === 'denied' ||
+            consent.consentStateForCanonicalPath(canonical) !== 'approved' ||
+            consent.isRefusedForCapture(lexical)
+        ) {
+            throw new Error(`Refusing move-project: capture is not authorized for ${lexical}.`);
+        }
     }
 
     findProject(query: string): ProjectRow | undefined {
