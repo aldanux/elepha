@@ -2,16 +2,12 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Command } from 'commander';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { registerBackfills } from '../../src/cli/commands/backfills.js';
 import { registerRollup } from '../../src/cli/commands/rollup.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { RollupService } from '../../src/daemon/rollup-service.js';
-import { applyCustomTitleBackfill, planCustomTitleBackfill } from '../../src/storage/custom-title-backfill.js';
 import { planExternalAgentImportPurge } from '../../src/storage/external-agent-import-purge.js';
 import { applyFirstPromptSearchBackfill, planFirstPromptSearchBackfill } from '../../src/storage/first-prompt-search-backfill.js';
-import { applyRenderedCharsBackfill, planRenderedCharsBackfill } from '../../src/storage/rendered-chars-backfill.js';
 import { RollupStore } from '../../src/storage/rollup-store.js';
-import { applySessionFieldsBackfill, planSessionFieldsBackfill } from '../../src/storage/session-fields-backfill.js';
 import type {
     EmptySessionAnalysis,
     ParsedTurn,
@@ -176,69 +172,6 @@ async function runCommand(register: (program: Command) => void, args: string[]):
 }
 
 const ENTRY_POINTS: Array<{ name: string; run: () => Promise<void> }> = [
-    {
-        name: 'backfill-session-titles',
-        async run() {
-            const { fixture, sessionId } = seedOutsideSource();
-
-            const preview = await runCommand(registerBackfills, ['backfill-session-titles']);
-            const applied = await runCommand(registerBackfills, ['backfill-session-titles', '--apply']);
-
-            expect(preview).not.toContain(OUTSIDE_PROMPT);
-            expect(applied).not.toContain(OUTSIDE_PROMPT);
-            expect(fixture.db.prepare('SELECT title FROM sessions WHERE id = ?').get(sessionId)).toEqual({ title: 'Existing title' });
-        },
-    },
-    {
-        name: 'custom-title-backfill',
-        async run() {
-            const { fixture, adapter, adapters, sessionId } = seedOutsideSource();
-
-            const plan = await planCustomTitleBackfill(fixture.db, adapters);
-            await applyCustomTitleBackfill(fixture.db, adapters);
-
-            expect(plan.changes).toEqual([expect.objectContaining({ transcriptMissing: true, after: null })]);
-            expect(adapter.readCustomTitle).not.toHaveBeenCalled();
-            expect(fixture.db.prepare('SELECT custom_title FROM sessions WHERE id = ?').get(sessionId)).toEqual({ custom_title: null });
-        },
-    },
-    {
-        name: 'rendered-chars-backfill',
-        async run() {
-            const { fixture, adapter, adapters, sessionId } = seedOutsideSource();
-
-            const plan = await planRenderedCharsBackfill(fixture.db, adapters);
-            await applyRenderedCharsBackfill(fixture.db, adapters);
-
-            expect(plan.changes).toEqual([expect.objectContaining({ transcriptMissing: true, renderedChars: null })]);
-            expect(adapter.parseTurns).not.toHaveBeenCalled();
-            expect(fixture.db.prepare('SELECT rendered_chars, rendered_turns FROM sessions WHERE id = ?').get(sessionId)).toEqual({
-                rendered_chars: null,
-                rendered_turns: null,
-            });
-        },
-    },
-    {
-        name: 'session-fields-backfill',
-        async run() {
-            const { fixture, adapter, adapters, sessionId } = seedOutsideSource();
-
-            const plan = await planSessionFieldsBackfill(fixture.db, adapters);
-            await applySessionFieldsBackfill(fixture.db, adapters);
-
-            expect(plan.changes).toEqual([expect.objectContaining({ transcriptMissing: true })]);
-            expect(adapter.classifySession).not.toHaveBeenCalled();
-            expect(adapter.parseTurns).not.toHaveBeenCalled();
-            expect(fixture.db.prepare('SELECT surface, git_branch, kind FROM sessions WHERE id = ?').get(sessionId)).toEqual({
-                surface: null,
-                git_branch: null,
-                kind: null,
-            });
-            expect(fixture.db.prepare('SELECT has_external_content FROM memories WHERE session_id = ?').get(sessionId)).toEqual({
-                has_external_content: 0,
-            });
-        },
-    },
     {
         name: 'rollup command',
         async run() {

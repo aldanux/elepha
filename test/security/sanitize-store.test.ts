@@ -2,12 +2,14 @@
 // the transforms; these prove the choke points are actually wired, which is the
 // difference between a stated rule and one enforced in code.
 
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { detectShellSyntax } from '../../src/security/sanitize.js';
 import { SessionReader } from '../../src/serving/session-reader.js';
+import { listManagedBackups } from '../../src/storage/backup.js';
 import { openDb, openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { enableParanoidMode, LOCKED_MEMORY_MESSAGE, lockMemory, unlockMemory } from '../../src/storage/paranoid-gate.js';
@@ -487,13 +489,168 @@ async function runRegisteredSanitize(db: Database, ...args: string[]): Promise<{
     return { errors, logs, warnings };
 }
 
+function mutateAfterSanitizeBackup(mutate: () => void): void {
+    vi.doMock('../../src/storage/backup.js', async (importOriginal) => {
+        const actual = await importOriginal<typeof import('../../src/storage/backup.js')>();
+        return {
+            ...actual,
+            backupDatabaseAndReport: (...args: Parameters<typeof actual.backupDatabaseAndReport>) => {
+                const backup = actual.backupDatabaseAndReport(...args);
+                mutate();
+                return backup;
+            },
+        };
+    });
+}
+
 describe('sanitize paranoid read gate', () => {
     afterEach(() => {
         vi.restoreAllMocks();
         vi.resetModules();
         vi.doUnmock('../../src/storage/db.js');
+        vi.doUnmock('../../src/storage/backup.js');
         vi.doUnmock('../../src/storage/sanitize-backfill.js');
         vi.unstubAllEnvs();
+        process.exitCode = undefined;
+    });
+
+    it('applies only the displayed rows and reports additional unsafe data without modifying it', async () => {
+        const fixture = await createManagedSanitizeFixture();
+        const pending = JSON.stringify(['New unsafe $(content)']);
+        let addedId: number | undefined;
+        mutateAfterSanitizeBackup(() => {
+            const inserted = fixture.db
+                .prepare(`INSERT INTO memories
+                    (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched,
+                     pending_items, created_at, summarizer_status)
+                    SELECT project_id, session_id, turn_index + 1, tool, turn_started_at, decisions, files_touched,
+                        ?, created_at, summarizer_status FROM memories WHERE id = ?`)
+                .run(pending, fixture.memoryId);
+            addedId = Number(inserted.lastInsertRowid);
+        });
+
+        try {
+            const output = await runRegisteredSanitize(fixture.db, '--apply');
+
+            expect(addedId).toBeDefined();
+            expect(storedSanitizeSecret(fixture)).toBe('sanitize-secret-value $\\(exposed)');
+            expect(fixture.db.prepare('SELECT pending_items FROM memories WHERE id = ?').get(addedId)).toEqual({ pending_items: pending });
+            expect(verifySanitize(fixture.db)).toEqual([
+                expect.objectContaining({ table: 'memories', rowId: addedId, field: 'pending_items' }),
+            ]);
+            expect(output.errors.length).toBeGreaterThan(0);
+            expect(process.exitCode).toBe(1);
+            expect(listManagedBackups(fixture.dbPath)).toHaveLength(1);
+            expectLiveMemoryCurrent(fixture.db);
+        } finally {
+            fixture.db.close();
+        }
+    });
+
+    it.each(['field', 'identity', 'ownership', 'removed'] as const)(
+        'rejects a selected row whose %s changed after preview before writing any planned field',
+        async (change) => {
+            const fixture = await createManagedSanitizeFixture();
+            fixture.db.prepare('UPDATE memories SET decisions = ? WHERE id = ?').run(JSON.stringify(['Keep $(unsafe)']), fixture.memoryId);
+            let stateAfterChange: { memories: unknown[]; copies: unknown[]; search: unknown[] } | undefined;
+            mutateAfterSanitizeBackup(() => {
+                if (change === 'field') {
+                    fixture.db
+                        .prepare('UPDATE filtered_turns SET user_prompt = ? WHERE memory_id = ?')
+                        .run('Changed prompt', fixture.memoryId);
+                } else if (change === 'identity') {
+                    fixture.db.prepare('UPDATE memories SET turn_index = turn_index + 1 WHERE id = ?').run(fixture.memoryId);
+                } else if (change === 'ownership') {
+                    const store = new MemoryStore(fixture.db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+                    const other = store.upsertProject(path.join(fixture.directory, 'other-project'));
+                    fixture.db.prepare('UPDATE sessions SET project_id = ?').run(other.id);
+                } else {
+                    fixture.db.prepare('DELETE FROM filtered_turns WHERE memory_id = ?').run(fixture.memoryId);
+                }
+                stateAfterChange = {
+                    memories: fixture.db.prepare('SELECT * FROM memories ORDER BY id').all(),
+                    copies: fixture.db.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all(),
+                    search: fixture.db.prepare('SELECT * FROM turn_search_index ORDER BY memory_id').all(),
+                };
+            });
+
+            try {
+                await expect(runRegisteredSanitize(fixture.db, '--apply')).rejects.toThrow();
+                expect(stateAfterChange).toBeDefined();
+                expect({
+                    memories: fixture.db.prepare('SELECT * FROM memories ORDER BY id').all(),
+                    copies: fixture.db.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all(),
+                    search: fixture.db.prepare('SELECT * FROM turn_search_index ORDER BY memory_id').all(),
+                }).toEqual(stateAfterChange);
+                expect(listManagedBackups(fixture.dbPath)).toHaveLength(1);
+                expectLiveMemoryCurrent(fixture.db);
+            } finally {
+                fixture.db.close();
+            }
+        },
+    );
+
+    it.each([false, true])('backs up before applying and preserves unaffected data (injected failure: %s)', async (fail) => {
+        const fixture = await createManagedSanitizeFixture();
+        const sourcePath = path.join(fixture.directory, 'claude-home', 'projects', 'project', 'sanitize-session.jsonl');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(fixture.directory, 'claude-home'));
+        mkdirSync(path.dirname(sourcePath), { recursive: true });
+        writeFileSync(sourcePath, `${JSON.stringify({ type: 'user', message: { role: 'user', content: SANITIZE_SECRET } })}\n`);
+        const sourceBefore = readFileSync(sourcePath);
+        fixture.db.prepare('UPDATE sessions SET source_path = ?').run(sourcePath);
+        fixture.db.exec(`INSERT INTO memories
+            (project_id, session_id, turn_index, tool, turn_started_at, decisions, files_touched, pending_items, created_at, summarizer_status)
+            SELECT project_id, session_id, turn_index + 1, tool, turn_started_at,
+                '["Keep the safe memory"]', files_touched, pending_items, created_at, summarizer_status
+            FROM memories`);
+        fixture.db.prepare('UPDATE memories SET decisions = ? WHERE id = ?').run(JSON.stringify(['Keep $(unsafe)']), fixture.memoryId);
+        const memoriesBefore = fixture.db.prepare('SELECT * FROM memories ORDER BY id').all();
+        const sessionsBefore = fixture.db.prepare('SELECT * FROM sessions ORDER BY id').all();
+        const copiesBefore = fixture.db.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all();
+        const coverageBefore = fixture.db.prepare('SELECT * FROM turn_search_index ORDER BY memory_id').all();
+
+        await runRegisteredSanitize(fixture.db);
+        expect(fixture.db.prepare('SELECT * FROM memories ORDER BY id').all()).toEqual(memoriesBefore);
+        expect(fixture.db.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all()).toEqual(copiesBefore);
+        expect(listManagedBackups(fixture.dbPath)).toEqual([]);
+
+        if (fail) {
+            fixture.db.exec(`CREATE TEMP TRIGGER fail_sanitize_copy BEFORE UPDATE ON filtered_turns
+                BEGIN SELECT RAISE(ABORT, 'injected sanitize failure'); END`);
+            await expect(runRegisteredSanitize(fixture.db, '--apply')).rejects.toThrow('injected sanitize failure');
+            expect(fixture.db.prepare('SELECT * FROM memories ORDER BY id').all()).toEqual(memoriesBefore);
+            expect(fixture.db.prepare('SELECT * FROM filtered_turns ORDER BY memory_id').all()).toEqual(copiesBefore);
+            expect(fixture.db.prepare('SELECT * FROM turn_search_index ORDER BY memory_id').all()).toEqual(coverageBefore);
+        } else {
+            const output = await runRegisteredSanitize(fixture.db, '--apply');
+            expect(output.errors).toEqual([]);
+            expect(verifySanitize(fixture.db)).toEqual([]);
+            expect(storedSanitizeSecret(fixture)).toBe('sanitize-secret-value $\\(exposed)');
+            expect(fixture.db.prepare('SELECT decisions FROM memories WHERE id = ?').get(fixture.memoryId)).toEqual({
+                decisions: JSON.stringify(['Keep $\\(unsafe)']),
+            });
+            expect(fixture.db.prepare('SELECT * FROM memories ORDER BY id').all()).toEqual(
+                memoriesBefore.map((row) =>
+                    (row as { id: number }).id === fixture.memoryId
+                        ? { ...(row as object), decisions: JSON.stringify(['Keep $\\(unsafe)']) }
+                        : row,
+                ),
+            );
+            expectLiveMemoryCurrent(fixture.db);
+        }
+
+        expect(fixture.db.prepare('SELECT * FROM sessions ORDER BY id').all()).toEqual(sessionsBefore);
+        expect(readFileSync(sourcePath)).toEqual(sourceBefore);
+        const backups = listManagedBackups(fixture.dbPath);
+        expect(backups).toHaveLength(1);
+        fixture.db.prepare('ATTACH DATABASE ? AS sanitize_backup').run(backups[0]);
+        try {
+            expect(fixture.db.prepare('SELECT * FROM sanitize_backup.memories ORDER BY id').all()).toEqual(memoriesBefore);
+            expect(fixture.db.prepare('SELECT * FROM sanitize_backup.filtered_turns ORDER BY memory_id').all()).toEqual(copiesBefore);
+        } finally {
+            fixture.db.exec('DETACH DATABASE sanitize_backup');
+            fixture.db.close();
+        }
     });
 
     it('previews a cleared structure as NULL and an empty sanitized value distinctly', async () => {

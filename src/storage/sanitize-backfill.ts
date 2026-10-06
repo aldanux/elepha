@@ -25,6 +25,9 @@ import { detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../secur
 
 import { TurnSearchIndex } from './turn-search-index.js';
 
+const SANITIZE_PLAN_CHANGED_MESSAGE =
+    'Saved memory changed after the preview. Sanitize made no changes. Run elepha sanitize again to review the current changes.';
+
 export interface SanitizeChange {
     table: 'session_rollups' | 'memories' | 'filtered_turns' | 'open_turns';
     rowId: number;
@@ -35,11 +38,51 @@ export interface SanitizeChange {
 
 export interface SanitizePlan {
     changes: SanitizeChange[];
+    rows: Array<{ table: SanitizeChange['table']; rowId: number; snapshot: string }>;
     // Rows touched, as opposed to individual field edits.
     rollupRows: number;
     memoryRows: number;
     filteredTurnRows: number;
     openTurnRows: number;
+}
+
+function sanitizeRowIdColumn(table: SanitizeChange['table']): string {
+    return table === 'session_rollups' || table === 'open_turns' ? 'session_id' : table === 'filtered_turns' ? 'memory_id' : 'id';
+}
+
+// Numeric IDs can be reused; bind the selected values to their native session
+// and project as well as the owning memory for a filtered copy.
+function sanitizeRowSnapshot(db: Database, table: SanitizeChange['table'], rowId: number): string | undefined {
+    const rows = db.prepare(`SELECT * FROM ${table} WHERE ${sanitizeRowIdColumn(table)} = ?`).all(rowId) as Array<
+        Record<string, string | number | null>
+    >;
+    if (rows.length !== 1) {
+        return undefined;
+    }
+    const row = rows[0];
+    const memory =
+        table === 'filtered_turns'
+            ? (db
+                  .prepare('SELECT id, project_id, session_id, turn_index, tool, turn_started_at, created_at FROM memories WHERE id = ?')
+                  .get(rowId) as Record<string, string | number | null> | undefined)
+            : undefined;
+    const owner = table === 'filtered_turns' ? memory : row;
+    if (owner === undefined) {
+        return undefined;
+    }
+    const session = db
+        .prepare('SELECT id, tool, native_id, segment_index, project_id, source_path, source_format, started_at FROM sessions WHERE id = ?')
+        .get(owner.session_id) as Record<string, string | number | null> | undefined;
+    if (session === undefined) {
+        return undefined;
+    }
+    const projectQuery = db.prepare('SELECT id, path, first_seen_at FROM projects WHERE id = ?');
+    const project = projectQuery.get(owner.project_id);
+    const sessionProject = projectQuery.get(session.project_id);
+    if (project === undefined || sessionProject === undefined) {
+        return undefined;
+    }
+    return JSON.stringify({ row, memory, session, project, sessionProject });
 }
 
 type JsonMapper = (parsed: unknown) => unknown;
@@ -211,23 +254,41 @@ function collectOpenTurns(db: Database): SanitizeChange[] {
 }
 
 export function planSanitize(db: Database): SanitizePlan {
-    const changes = [
-        ...collect(db, 'session_rollups', 'session_id', ROLLUP_FIELDS),
-        ...collect(db, 'memories', 'id', MEMORY_FIELDS),
-        ...collect(db, 'filtered_turns', 'memory_id', FILTERED_TURN_FIELDS),
-        ...collectOpenTurns(db),
-    ];
-    return {
-        changes,
-        rollupRows: new Set(changes.filter((c) => c.table === 'session_rollups').map((c) => c.rowId)).size,
-        memoryRows: new Set(changes.filter((c) => c.table === 'memories').map((c) => c.rowId)).size,
-        filteredTurnRows: new Set(changes.filter((c) => c.table === 'filtered_turns').map((c) => c.rowId)).size,
-        openTurnRows: new Set(changes.filter((c) => c.table === 'open_turns').map((c) => c.rowId)).size,
-    };
+    // One read snapshot keeps the original fields and their ownership aligned.
+    return db.transaction(() => {
+        const changes = [
+            ...collect(db, 'session_rollups', 'session_id', ROLLUP_FIELDS),
+            ...collect(db, 'memories', 'id', MEMORY_FIELDS),
+            ...collect(db, 'filtered_turns', 'memory_id', FILTERED_TURN_FIELDS),
+            ...collectOpenTurns(db),
+        ];
+        const rows: SanitizePlan['rows'] = [];
+        const selected = new Set<string>();
+        for (const change of changes) {
+            const key = `${change.table}:${change.rowId}`;
+            if (!selected.has(key)) {
+                const snapshot = sanitizeRowSnapshot(db, change.table, change.rowId);
+                if (snapshot === undefined) {
+                    throw new Error(SANITIZE_PLAN_CHANGED_MESSAGE);
+                }
+                rows.push({ table: change.table, rowId: change.rowId, snapshot });
+                selected.add(key);
+            }
+        }
+        return {
+            changes,
+            rows,
+            rollupRows: new Set(changes.filter((c) => c.table === 'session_rollups').map((c) => c.rowId)).size,
+            memoryRows: new Set(changes.filter((c) => c.table === 'memories').map((c) => c.rowId)).size,
+            filteredTurnRows: new Set(changes.filter((c) => c.table === 'filtered_turns').map((c) => c.rowId)).size,
+            openTurnRows: new Set(changes.filter((c) => c.table === 'open_turns').map((c) => c.rowId)).size,
+        };
+    })();
 }
 
 export interface GuardedSanitizeApplyOptions {
     beforeFirstMutation(): boolean;
+    plan?: SanitizePlan;
 }
 
 export type GuardedSanitizeApplyResult = { status: 'applied'; plan: SanitizePlan } | { status: 'not_applied'; plan: SanitizePlan };
@@ -236,20 +297,22 @@ export type GuardedSanitizeApplyResult = { status: 'applied'; plan: SanitizePlan
 export function applySanitize(db: Database): SanitizePlan;
 export function applySanitize(db: Database, options: GuardedSanitizeApplyOptions): GuardedSanitizeApplyResult;
 export function applySanitize(db: Database, options?: GuardedSanitizeApplyOptions): SanitizePlan | GuardedSanitizeApplyResult {
-    const plan = planSanitize(db);
+    const plan = options?.plan ?? planSanitize(db);
 
     const apply = db.transaction(() => {
         if (options !== undefined && !options.beforeFirstMutation()) {
             return false;
         }
 
+        // Validate the whole displayed selection before the first write, rather
+        // than discovering a stale later row after earlier updates have begun.
+        for (const row of plan.rows) {
+            if (sanitizeRowSnapshot(db, row.table, row.rowId) !== row.snapshot) {
+                throw new Error(SANITIZE_PLAN_CHANGED_MESSAGE);
+            }
+        }
         for (const c of plan.changes) {
-            const idColumn =
-                c.table === 'session_rollups' || c.table === 'open_turns'
-                    ? 'session_id'
-                    : c.table === 'filtered_turns'
-                      ? 'memory_id'
-                      : 'id';
+            const idColumn = sanitizeRowIdColumn(c.table);
             db.prepare(`UPDATE ${c.table} SET ${c.field} = ? WHERE ${idColumn} = ?`).run(c.after, c.rowId);
         }
         // Search coverage must describe the text the retained copy now holds.

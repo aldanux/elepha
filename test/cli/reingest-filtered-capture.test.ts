@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Command } from 'commander';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,7 +8,7 @@ import { readMemoryConfig } from '../../src/config/memory-config.js';
 import { elephaConfigPath } from '../../src/config/paths.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import type { SessionAdapter } from '../../src/types/index.js';
+import type { SessionAdapter, SummarizationOutput } from '../../src/types/index.js';
 import { createTestDb } from '../helpers/db.js';
 import { expectLiveMemoryCurrent } from '../helpers/live-memory.js';
 
@@ -71,13 +71,23 @@ describe('elepha reingest under automatic filtered capture', () => {
             await expect(scan.scanFile(new CodexAdapter(), sourcePath, true)).resolves.toMatchObject({ ingested: 1 });
             await daemon.stop();
             const cursorBefore = fixture.store.getSessionCursor('codex', NATIVE_ID);
+            expect(fixture.db.prepare('SELECT decisions, pending_items FROM memories').get()).toEqual({
+                decisions: '[]',
+                pending_items: '[]',
+            });
             expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM filtered_turns').get()).toEqual({ count: 1 });
             fixture.close();
 
             // The source changes after capture; reingest must replace, not
             // withdraw, the retained copy and leave no superseded text searchable.
             writeFileSync(sourcePath, codexTranscript(projectPath, 'Use the newanswerneedle format.', timestamp));
-            mocks.summarize.mockResolvedValue({ decisions: [], pending_items: [], status: 'ok' });
+            const sourceBefore = readFileSync(sourcePath);
+            const regenerated: SummarizationOutput = {
+                decisions: [{ what: 'Use the new ledger format', why: 'Keep the ledger compatible' }],
+                pending_items: ['Migrate the remaining ledger'],
+                status: 'ok',
+            };
+            mocks.summarize.mockResolvedValue(regenerated);
             vi.spyOn(console, 'log').mockImplementation(() => {});
             const program = new Command();
             registerReingest(program);
@@ -85,7 +95,17 @@ describe('elepha reingest under automatic filtered capture', () => {
 
             expect(process.exitCode).toBeUndefined();
             expect(mocks.summarize).toHaveBeenCalledTimes(1);
+            expect(mocks.summarize).toHaveBeenCalledWith({
+                userMessage: 'Which ledger format?',
+                assistantText: 'Use the newanswerneedle format.',
+            });
             const db = openUnmanagedDb(fixture.dbPath);
+            expect(db.prepare('SELECT decisions, pending_items, summarizer_status FROM memories').get()).toEqual({
+                decisions: JSON.stringify(regenerated.decisions),
+                pending_items: JSON.stringify(regenerated.pending_items),
+                summarizer_status: 'ok',
+            });
+            expect(readFileSync(sourcePath)).toEqual(sourceBefore);
             const hits = (term: string) =>
                 (
                     db.prepare('SELECT COUNT(*) AS count FROM filtered_turns_fts WHERE filtered_turns_fts MATCH ?').get(term) as {

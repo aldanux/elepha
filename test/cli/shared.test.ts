@@ -1,25 +1,17 @@
-import { rmSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as cliProgress from '../../src/cli/progress.js';
 import { CAPTURE_PAUSE_DEADLINE_MS, DAEMON_HEALTH_CHECK_POLL_MS } from '../../src/config/constants.js';
 import type { ServiceBackend } from '../../src/install/service-backend.js';
-import type { openUnmanagedDb } from '../../src/storage/db.js';
-import { withTempDir } from '../helpers/tmp.js';
 
-const { backupDatabaseAndReport, daemonHealth, defaultDbPath, serviceBackend } = vi.hoisted(() => ({
-    backupDatabaseAndReport: vi.fn(),
+const { daemonHealth, serviceBackend } = vi.hoisted(() => ({
     daemonHealth: vi.fn(),
-    defaultDbPath: vi.fn(),
     serviceBackend: vi.fn(),
 }));
 
 vi.mock('../../src/install/health-checks.js', () => ({ daemonHealth }));
 vi.mock('../../src/install/service-backend.js', () => ({ serviceBackend }));
-vi.mock('../../src/storage/backup.js', () => ({ backupDatabaseAndReport }));
-vi.mock('../../src/storage/db.js', () => ({ defaultDbPath }));
 
-import { prepareDestructiveApply, withCapturePaused } from '../../src/cli/shared.js';
+import { withCapturePaused } from '../../src/cli/shared.js';
 
 function fakeService(calls: string[]): ServiceBackend {
     let loaded = true;
@@ -57,67 +49,6 @@ function fakeService(calls: string[]): ServiceBackend {
         },
     };
 }
-
-describe('prepareDestructiveApply daemon liveness gate', () => {
-    let root: string;
-    let db: ReturnType<typeof openUnmanagedDb>;
-    let error: ReturnType<typeof vi.spyOn>;
-    let log: ReturnType<typeof vi.spyOn>;
-
-    beforeEach(() => {
-        root = withTempDir('elepha-destructive-apply-');
-        const dbPath = path.join(root, 'elepha.db');
-        defaultDbPath.mockReturnValue(dbPath);
-        writeFileSync(dbPath, 'database');
-        db = { pragma: vi.fn() } as unknown as ReturnType<typeof openUnmanagedDb>;
-        error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
-        vi.clearAllMocks();
-        process.exitCode = undefined;
-    });
-
-    afterEach(() => {
-        error.mockRestore();
-        log.mockRestore();
-        vi.useRealTimers();
-        rmSync(root, { recursive: true, force: true });
-    });
-
-    it('refuses only a RUNNING daemon before checkpointing or backing up', () => {
-        const state = 'RUNNING (pid 42, heartbeat 1s ago)';
-        daemonHealth.mockReturnValue({ state, healthy: true });
-
-        expect(prepareDestructiveApply(db, 'destructive segmentation')).toBe(false);
-
-        expect(error).toHaveBeenCalledWith(
-            'Refusing destructive segmentation while the daemon is running (RUNNING (pid 42, heartbeat 1s ago)). Stop it and retry.',
-        );
-        expect(process.exitCode).toBe(1);
-        expect(db.pragma).not.toHaveBeenCalled();
-        expect(backupDatabaseAndReport).not.toHaveBeenCalled();
-    });
-
-    it('proceeds past a STUCK daemon after reporting that it is not writing', () => {
-        const state = 'STUCK (pid 42 alive, but heartbeat is 1m old - process may be hung)';
-        daemonHealth.mockReturnValue({ state, healthy: false });
-
-        expect(prepareDestructiveApply(db, 'destructive segmentation')).toBe(true);
-
-        expect(error).toHaveBeenCalledWith(`Daemon appears stuck (${state}); proceeding — it is not writing.`);
-        expect(db.pragma).not.toHaveBeenCalled();
-        expect(backupDatabaseAndReport).toHaveBeenCalledWith(db, defaultDbPath());
-    });
-
-    it('proceeds when the daemon is NOT RUNNING', () => {
-        daemonHealth.mockReturnValue({ state: 'NOT RUNNING (no heartbeat file)', healthy: false });
-
-        expect(prepareDestructiveApply(db, 'destructive segmentation')).toBe(true);
-
-        expect(error).not.toHaveBeenCalled();
-        expect(db.pragma).not.toHaveBeenCalled();
-        expect(backupDatabaseAndReport).toHaveBeenCalledWith(db, defaultDbPath());
-    });
-});
 
 describe('withCapturePaused', () => {
     let error: ReturnType<typeof vi.spyOn>;

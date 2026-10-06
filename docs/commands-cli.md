@@ -3,7 +3,7 @@
 Run these commands in a terminal. For commands typed inside Claude Code, Codex, or OpenCode chat, see [docs/commands-in-ai-chat.md](commands-in-ai-chat.md).
 
 Run `elepha <command> -h` for every flag. `purge`, `rekey-projects`, `sanitize`,
-`segment`, every `backfill-*` command, and `rollup --rebuild` preview without writing
+and `rollup --rebuild` preview without writing
 unless you pass `--apply`. `reingest` and ordinary `rollup` write immediately and may
 call the configured provider.
 
@@ -95,14 +95,7 @@ Full guide: [docs/maintenance.md](maintenance.md).
 | `elepha rollup [--rebuild]`           | **[operator]** Compute current rollups or preview a stale-version rebuild. More details in [docs/maintenance.md](maintenance.md#rollup).                           |
 | `elepha rekey-projects`               | **[operator]** Consolidate duplicate repository project rows. More details in [docs/maintenance.md](maintenance.md#rekey-projects).                                |
 | `elepha sanitize`                     | **[operator]** Neutralize shell-active syntax in legacy stored fields; unlock paranoid mode first. More details in [docs/maintenance.md](maintenance.md#sanitize). |
-| `elepha segment`                      | **[operator]** Preview re-segmentation, manual splits, or adjacent merges. More details in [docs/maintenance.md](maintenance.md#segment).                          |
 | `elepha stats`                        | **[operator]** Report read-only ingestion and summarizer instrumentation. More details in [docs/maintenance.md](maintenance.md#stats).                             |
-| `elepha backfill-rendered-chars`      | **[operator]** Derive rendered character and turn counts from raw turns. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                  |
-| `elepha backfill-first-prompt-search` | **[operator]** Derive the bounded first-prompt search document for legacy segments. More details in [docs/maintenance.md](maintenance.md#backfill-commands).       |
-| `elepha backfill-session-titles`      | **[operator]** Derive stored segment titles from transcript metadata or prompts. More details in [docs/maintenance.md](maintenance.md#backfill-commands).          |
-| `elepha backfill-custom-titles`       | **[operator]** Capture Claude Code custom-title events. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                                   |
-| `elepha backfill-session-fields`      | **[operator]** Re-derive legacy session metadata from local transcripts. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                  |
-| `elepha backfill-root-commits`        | **[operator]** Populate stable root-commit identity for legacy projects. More details in [docs/maintenance.md](maintenance.md#backfill-commands).                  |
 
 ## Status & troubleshooting
 
