@@ -3,7 +3,7 @@ import { open } from 'node:fs/promises';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
-import { titleForSegment } from '../../src/storage/session-title.js';
+import { titleForTurn } from '../../src/storage/session-title.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
@@ -101,7 +101,9 @@ describe('CodexAdapter session index titles', () => {
         );
 
         expect(turns[0]?.aiTitle).toBe('  Wire Codex AI session titles D111  ');
-        expect(titleForSegment(turns, true)).toBe('Wire Codex AI session titles D111');
+        expect(turns.reduce((currentTitle, turn) => titleForTurn(currentTitle, turn, true), null as string | null)).toBe(
+            'Wire Codex AI session titles D111',
+        );
     });
 
     it('preserves shell-like text for the shared title pipeline to render', async () => {
@@ -110,7 +112,9 @@ describe('CodexAdapter session index titles', () => {
         );
 
         expect(turns[0]?.aiTitle).toBe('  Keep $(this)  title  ');
-        expect(titleForSegment(turns, true)).toBe('Keep $(this) title');
+        expect(turns.reduce((currentTitle, turn) => titleForTurn(currentTitle, turn, true), null as string | null)).toBe(
+            'Keep $(this) title',
+        );
     });
 
     it.each([

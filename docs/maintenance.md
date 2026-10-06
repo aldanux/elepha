@@ -28,7 +28,7 @@ automatically.
 
 The commands below are tagged `[operator]`. They are runnable but hidden from the
 default `elepha -h`; use `elepha <command> -h` to see the exact flags for one command.
-`rekey-projects`, `sanitize`, `segment`, and every `backfill-*` command on this page
+`rekey-projects` and `sanitize`
 are dry-run by default; pass `--apply` after reviewing their preview. They save a
 safety backup before mutation. `rollup --rebuild` also previews and requires
 `--apply`. `self-update`, `reingest`, and ordinary `rollup` write immediately;
@@ -64,43 +64,11 @@ after neutralization, and an applied run verifies the database again afterward. 
 paranoid mode is enabled, unlock memory before running it; a lock or gate change while
 the command is in progress invalidates the operation.
 
-### `segment`
-
-`elepha segment` previews session boundary corrections. Use `--resegment` to replay
-retained native sessions through the current evaluator, `--split <id> --at <turn>` to
-split one stored session, or `--merge <a> <b>` to join adjacent segments. Applied
-changes invalidate affected rollups and verify the resulting relationships.
-
 ### `stats`
 
 `elepha stats` is read-only instrumentation for ingestion volume, memories per
 session, summarizer status and noise, pending-item accumulation, file-path misses, and
 per-project totals over a selected time window.
-
-### Backfill commands
-
-`elepha backfill-rendered-chars` derives each session's rendered character and turn
-counts from the filtered raw turns still on disk. Missing or unreadable transcripts
-remain unset and are reported.
-
-`elepha backfill-first-prompt-search` derives each segment's bounded search document
-from its first stored user prompt. It makes no provider call; unavailable transcripts
-remain body-unsearchable and are reported.
-
-`elepha backfill-session-titles` derives segment titles from an AI-provided title or
-the first real prompt. It makes no synthesis call and leaves sessions unchanged when
-their transcript is unavailable.
-
-`elepha backfill-custom-titles` reads Claude Code custom-title UI events into the
-stored `custom_title` field without changing turns or rendered counts.
-
-`elepha backfill-session-fields` re-derives older session metadata, including surface,
-Git branch, session kind, and external-content markers, from transcripts that still
-exist locally.
-
-`elepha backfill-root-commits` fills the repository root commit for legacy project
-rows so no-remote repositories can be matched by stable identity. Projects whose
-repository no longer resolves remain unchanged and are listed.
 
 System-invoked machinery also exists—`start`, `mcp serve`, `hook …`, and
 `internal launcher-probe`—but these entry points are registered for launch services,

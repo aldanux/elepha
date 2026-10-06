@@ -1,11 +1,7 @@
-import { existsSync } from 'node:fs';
 import * as readline from 'node:readline';
-import type Database from 'better-sqlite3-multiple-ciphers';
 import { CAPTURE_PAUSE_DEADLINE_MS, CAPTURE_PAUSE_POLL_MS } from '../config/constants.js';
 import { daemonHealth } from '../install/health-checks.js';
 import type { installElepha } from '../install/installer.js';
-import { backupDatabaseAndReport } from '../storage/backup.js';
-import { defaultDbPath } from '../storage/db.js';
 import type { PurgePlan } from '../storage/memory-store.js';
 import { errorMessage } from '../util/error.js';
 import { pauseCaptureService, resolveCaptureService, resumeCaptureService } from './capture-service.js';
@@ -94,17 +90,6 @@ export function refuseIfDaemonRunning(operation: string): boolean {
         console.error(`Daemon appears stuck (${state}); proceeding — it is not writing.`);
     }
     return false;
-}
-
-export function prepareDestructiveApply(db: Database.Database, operation: string): boolean {
-    if (refuseIfDaemonRunning(operation)) {
-        return false;
-    }
-    const dbPath = defaultDbPath();
-    if (existsSync(dbPath)) {
-        backupDatabaseAndReport(db, dbPath);
-    }
-    return true;
 }
 
 function sleep(ms: number): Promise<void> {

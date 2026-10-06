@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
 import { CLAUDE_COMPACT_SUMMARY_MAX_BYTES, CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES } from '../../src/config/constants.js';
 import { claudeProjectsRoot } from '../../src/config/paths.js';
-import { titleForSegment } from '../../src/storage/session-title.js';
+import { titleForTurn } from '../../src/storage/session-title.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
 
@@ -100,7 +100,9 @@ describe('ClaudeCodeAdapter.parseTurns', () => {
         expect(turns).toHaveLength(1);
         expect(turns[0]?.aiTitle).toBe('Review CSP headers for iframe components');
         expect(turns[0]?.userMessage).toBe('Review CSP headers');
-        expect(titleForSegment(turns, true)).toBe('Review CSP headers for iframe components');
+        expect(turns.reduce((currentTitle, turn) => titleForTurn(currentTitle, turn, true), null as string | null)).toBe(
+            'Review CSP headers for iframe components',
+        );
     });
 
     it('uses the truncated first prompt as the session-title fallback when the transcript has no ai-title', async () => {
@@ -120,7 +122,9 @@ describe('ClaudeCodeAdapter.parseTurns', () => {
 
         const turns = await collect(new ClaudeCodeAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
 
-        expect(titleForSegment(turns, true)).toBe('Implement the session title fallback so ticket-driven Claude sessions r…');
+        expect(turns.reduce((currentTitle, turn) => titleForTurn(currentTitle, turn, true), null as string | null)).toBe(
+            'Implement the session title fallback so ticket-driven Claude sessions r…',
+        );
     });
 });
 
