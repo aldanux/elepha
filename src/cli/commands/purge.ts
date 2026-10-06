@@ -15,7 +15,7 @@ import { MemoryStore, type PurgePlan, type PurgeScope } from '../../storage/memo
 import { verifyOrphanPurge } from '../../storage/orphan-classification.js';
 
 import { runDestructiveOp } from '../destructive-op.js';
-import { printOrphanClassification } from '../orphan-report.js';
+import { ORPHAN_PREVIEW_INSTRUCTIONS, printOrphanClassification } from '../orphan-report.js';
 import { buildPurgeScope, PurgeHereScopeError, runPurgeWizard } from '../purge-wizard.js';
 import { confirmYesNo, printPurgePlan, withCapturePaused } from '../shared.js';
 
@@ -171,7 +171,10 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
         plan: () => options.plan ?? store.planPurge(scope),
         describe: (plan) => {
             if (plan.orphanEvidence) {
-                printOrphanClassification(plan.orphanEvidence.classification, options.details, plan.orphanEvidence.identities.length);
+                printOrphanClassification(plan.orphanEvidence, options.details);
+                if (!options.details) {
+                    return;
+                }
             }
             printPurgePlan(plan);
             if (plan.orphanEvidence) {
@@ -187,9 +190,10 @@ export async function runPurgeOperation(store: MemoryStore, scope: PurgeScope, o
         },
         isEmpty: (plan) => plan.sessions.length === 0 && plan.standingRules.length === 0 && plan.sessionRules.length === 0,
         messages: {
-            dryRun:
-                "\nThis is a preview — nothing was deleted. This clears elepha's memory only — your original AI coding session history on disk is untouched. " +
-                'Re-run with --apply to delete (a backup is saved first).',
+            dryRun: scope.orphan
+                ? ORPHAN_PREVIEW_INSTRUCTIONS
+                : "\nThis is a preview — nothing was deleted. This clears elepha's memory only — your original AI coding session history on disk is untouched. " +
+                  'Re-run with --apply to delete (a backup is saved first).',
         },
         confirm: async (plan) => {
             const confirmed = options.confirm ? await options.confirm(plan) : true;

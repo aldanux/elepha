@@ -35,7 +35,13 @@ import {
 } from './orphan-classification.js';
 
 import { ProjectResolver } from './project-resolver.js';
-import { type ProjectMovePlan, type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
+import {
+    type ProjectMovePlan,
+    type ProjectRow,
+    ProjectStore,
+    projectAssociationIdentity,
+    type ResolvedProjectIdentity,
+} from './project-store.js';
 import type { SessionRuleRow } from './session-rules-store.js';
 import { hydrateSessionRow, type SessionMetadata, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
@@ -128,7 +134,7 @@ export interface PurgeSessionPreview {
     title: string | null;
     projectId: number;
     projectPath: string;
-    tool: ToolName;
+    tool: string;
     startedAt: string;
     lastIngestedAt: string;
     turnCount: number;
@@ -276,7 +282,7 @@ export class MemoryStore {
     }
 
     // A purge freezes the whole native transcript, across all its segments.
-    isTranscriptPurged(tool: ToolName, nativeId: string): boolean {
+    isTranscriptPurged(tool: string, nativeId: string): boolean {
         return this.db.prepare('SELECT 1 FROM purged_transcripts WHERE tool = ? AND native_id = ?').get(tool, nativeId) !== undefined;
     }
 
@@ -1304,13 +1310,15 @@ export class MemoryStore {
                 const current = this.getProjectById(planned.id);
                 if (
                     current !== undefined &&
-                    Object.keys(planned).some((key) => current[key as keyof ProjectRow] !== planned[key as keyof ProjectRow])
+                    (plan.orphanEvidence
+                        ? projectAssociationIdentity(current) !== projectAssociationIdentity(planned)
+                        : Object.keys(planned).some((key) => current[key as keyof ProjectRow] !== planned[key as keyof ProjectRow]))
                 ) {
                     throw new Error(`Purge plan project id ${planned.id} no longer matches the previewed project.`);
                 }
             }
             for (const s of plan.sessions) {
-                const identity = sessionIdentity.get(s.id) as { tool: ToolName; native_id: string } | undefined;
+                const identity = sessionIdentity.get(s.id) as { tool: string; native_id: string } | undefined;
                 if (!identity) {
                     continue;
                 }

@@ -481,7 +481,7 @@ export function readSessionByNaturalKey(
 
 // Maintenance enumerates complete native units, independently of serving eligibility.
 // A page cursor selects the first stable row of each unit; no transcript is opened.
-export function* nativeSessionUnits(db: Database.Database): Generator<{ tool: ToolName; nativeId: string }> {
+export function* nativeSessionUnits(db: Database.Database): Generator<{ tool: string; nativeId: string }> {
     let after = 0;
     const statement = db.prepare(`SELECT s.id, s.tool, s.native_id AS nativeId
         FROM sessions s
@@ -493,7 +493,7 @@ export function* nativeSessionUnits(db: Database.Database): Generator<{ tool: To
         const rows = statement.all({
             after,
             page: SESSION_ELIGIBILITY_BATCH_SIZE,
-        }) as Array<{ id: number; tool: ToolName; nativeId: string }>;
+        }) as Array<{ id: number; tool: string; nativeId: string }>;
         for (const row of rows) {
             after = row.id;
             yield { tool: row.tool, nativeId: row.nativeId };
@@ -506,7 +506,7 @@ export function* nativeSessionUnits(db: Database.Database): Generator<{ tool: To
 
 export function storedNativeSegments(
     db: Database.Database,
-    identity: { tool: ToolName; nativeId: string },
+    identity: { tool: string; nativeId: string },
     limit: number,
 ): Array<{ id: number; project_id: number; segment_index: number; source_path: string }> {
     return db
@@ -517,4 +517,35 @@ export function storedNativeSegments(
         segment_index: number;
         source_path: string;
     }>;
+}
+
+// Deletion needs proof of emptiness, a stronger predicate than serving eligibility.
+// Stale copies and malformed summary fields remain protected; status and index gaps
+// say nothing about whether the retained text is useful.
+function protectedArraySql(column: string): string {
+    return `CASE WHEN ${column} IS NULL OR trim(${column}) = '' THEN 0
+        WHEN NOT json_valid(${column}) THEN 1
+        WHEN json_type(${column}) <> 'array' THEN 1
+        ELSE json_array_length(${column}) > 0 END`;
+}
+
+function protectedFieldsSql(text: string[], arrays: string[]): string {
+    return [...text.map((column) => `length(trim(COALESCE(${column}, ''))) > 0`), ...arrays.map(protectedArraySql)].join(' OR ');
+}
+
+const PROTECTED_NATIVE_MEMORY_SQL = `SELECT 1 FROM sessions s WHERE s.tool = ? AND s.native_id = ? AND (
+    ${protectedFieldsSql(['s.first_prompt_search'], ['s.trailing_files'])}
+    OR EXISTS (SELECT 1 FROM memories m LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+        LEFT JOIN task_state_manifests tm ON tm.memory_id = m.id WHERE m.session_id = s.id AND (
+            ${protectedFieldsSql(['ft.user_prompt', 'ft.assistant_response', 'tm.report'], ['m.decisions', 'm.pending_items', 'm.files_touched', 'ft.tool_calls'])}))
+    OR EXISTS (SELECT 1 FROM session_rollups r WHERE r.session_id = s.id AND (
+        ${protectedFieldsSql(['r.summary'], ['r.decisions', 'r.instructions', 'r.pending_items', 'r.files_touched'])}))
+    OR EXISTS (SELECT 1 FROM open_turns ot WHERE ot.session_id = s.id AND (
+        ${protectedFieldsSql(['ot.durable_user_prompt', 'ot.durable_assistant_response'], ['ot.decisions', 'ot.pending_items', 'ot.durable_tool_calls'])}))
+    OR EXISTS (SELECT 1 FROM session_rules sr WHERE sr.tool = s.tool AND sr.native_session_id = s.native_id
+        AND length(trim(sr.text)) > 0)
+) LIMIT 1`;
+
+export function hasProtectedNativeMemory(db: Database.Database, identity: { tool: string; nativeId: string }): boolean {
+    return db.prepare(PROTECTED_NATIVE_MEMORY_SQL).get(identity.tool, identity.nativeId) !== undefined;
 }

@@ -17,15 +17,16 @@ import {
     ORPHAN_PLAN_MAX_SEGMENT_ROWS,
     ORPHAN_PROJECT_PAGE_SIZE,
 } from '../config/orphan-cleanup.js';
-import type { ToolName } from '../types/index.js';
+import { isWithin } from '../config/paths.js';
 
 import { measureLiveMemoryBytes, readLiveMemoryUsage } from './live-memory-usage.js';
 import type { MemoryStore, ProjectRow, PurgePlan, PurgeScope } from './memory-store.js';
+import { projectAssociationIdentity } from './project-store.js';
 
-import { nativeSessionUnits, storedNativeSegments } from './session-read-model.js';
+import { hasProtectedNativeMemory, nativeSessionUnits, storedNativeSegments } from './session-read-model.js';
 
 export interface NativeSessionIdentity {
-    tool: ToolName;
+    tool: string;
     nativeId: string;
 }
 export type OrphanOutcome = 'associated' | 'relocated' | 'candidate' | 'unresolved' | 'mixed';
@@ -44,13 +45,14 @@ export interface OrphanClassification {
 }
 export interface OrphanEvidence {
     identities: NativeSessionIdentity[];
+    counts: { emptyChats: number; missingProjectChats: number };
     filesystem: string;
     database: string;
     preview: string;
     classification: OrphanClassification;
 }
 export type PathObservation =
-    | { state: 'directory'; physical: string; dev: number; ino: number }
+    | { state: 'directory' | 'file'; physical: string; dev: number; ino: number }
     | { state: 'missing'; ancestor: string; physical: string; dev: number; ino: number; missing: string }
     | { state: 'unresolved'; reason: string };
 
@@ -61,6 +63,14 @@ function filesystemInspectionFailure(error: unknown): PathObservation {
 // ENOENT is evidence only after walking accessible directory ancestors. A dangling
 // link, file in the path, denied traversal or a changing identity stays unresolved.
 export function observeOrphanPath(projectPath: string): PathObservation {
+    return observeRecordedPath(projectPath, false);
+}
+
+export function observeOrphanSourcePath(sourcePath: string): PathObservation {
+    return observeRecordedPath(sourcePath, true);
+}
+
+function observeRecordedPath(projectPath: string, source: boolean): PathObservation {
     if (!path.isAbsolute(projectPath)) {
         return { state: 'unresolved', reason: 'non-absolute project path' };
     }
@@ -74,13 +84,16 @@ export function observeOrphanPath(projectPath: string): PathObservation {
     }
     let current = path.parse(absolute).root;
     try {
-        for (const component of components) {
+        for (const [index, component] of components.entries()) {
             const parent = current;
             const before = statSync(parent);
             accessSync(parent, constants.R_OK | constants.X_OK);
             current = path.join(parent, component);
             try {
-                lstatSync(current);
+                const entry = lstatSync(current);
+                if (source && index === components.length - 1 && entry.isSymbolicLink()) {
+                    return { state: 'unresolved', reason: 'noncanonical recorded path; lexical/physical identity is ambiguous' };
+                }
             } catch (error) {
                 if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
                     return filesystemInspectionFailure(error);
@@ -93,10 +106,11 @@ export function observeOrphanPath(projectPath: string): PathObservation {
                 return { state: 'missing', ancestor: parent, physical, dev: after.dev, ino: after.ino, missing: current };
             }
             const stat = statSync(current);
-            if (!stat.isDirectory()) {
+            const finalFile = source && index === components.length - 1 && stat.isFile();
+            if (!stat.isDirectory() && !finalFile) {
                 return { state: 'unresolved', reason: 'non-directory path component' };
             }
-            accessSync(current, constants.R_OK | constants.X_OK);
+            accessSync(current, finalFile ? constants.R_OK : constants.R_OK | constants.X_OK);
         }
         const physical = realpathSync(absolute);
         const before = statSync(physical);
@@ -104,7 +118,10 @@ export function observeOrphanPath(projectPath: string): PathObservation {
         if (before.dev !== after.dev || before.ino !== after.ino) {
             return { state: 'unresolved', reason: 'path identity changed' };
         }
-        return { state: 'directory', physical, dev: after.dev, ino: after.ino };
+        if (source && !after.isFile()) {
+            return { state: 'unresolved', reason: 'non-directory path component' };
+        }
+        return { state: source ? 'file' : 'directory', physical, dev: after.dev, ino: after.ino };
     } catch (error) {
         return filesystemInspectionFailure(error);
     }
@@ -114,9 +131,11 @@ export interface OrphanClassifierOptions {
     identities?: NativeSessionIdentity[];
 
     // Observe every scoped outcome before bounded display details are evicted.
+    onClassified?: (diagnostic: OrphanDiagnostic) => void;
 
     // Filesystem boundary and smaller budgets for deterministic failure regressions.
     observe?: (projectPath: string) => PathObservation;
+    observeSource?: (sourcePath: string) => PathObservation;
     maxProbes?: number;
     maxProjects?: number;
 }
@@ -143,26 +162,15 @@ function recordedProjects(db: Database, limit: number): { projects: ProjectRow[]
     }
 }
 
-function possibleMove(a: ProjectRow, b: ProjectRow): boolean {
-    return (
-        a.id !== b.id &&
-        Boolean(
-            (a.git_remote && a.git_remote === b.git_remote) ||
-                (a.git_root_commit && a.git_root_commit === b.git_root_commit) ||
-                (a.git_root && a.git_root === b.git_root) ||
-                (a.display_name && a.display_name === b.display_name),
-        )
-    );
-}
-
-// An identity match only protects memory and reports a possible relocation. It never
-// grants an association, consent, or permission to run Git under a recorded cwd.
+// Only recorded checkout paths protect ownership. Shared repository metadata
+// cannot establish a folder move or grant association, consent, or Git execution.
 export function classifyOrphanUnits(
     store: MemoryStore,
     options: OrphanClassifierOptions = {},
 ): {
     report: OrphanClassification;
     candidates: NativeSessionIdentity[];
+    missingProjectCandidates: NativeSessionIdentity[];
     observations: Map<string, PathObservation>;
 } {
     const db = store.database;
@@ -172,16 +180,19 @@ export function classifyOrphanUnits(
     const observations = new Map<string, PathObservation>();
     const started = Date.now();
     let probes = 0;
-    const observe = (p: string): PathObservation => {
-        const cached = observations.get(p);
+    const observe = (p: string, source = false): PathObservation => {
+        const key = source ? `source:${p}` : p;
+        const cached = observations.get(key);
         if (cached) {
             return cached;
         }
         const value: PathObservation =
             probes++ >= (options.maxProbes ?? ORPHAN_FILESYSTEM_MAX_PROBES) || Date.now() - started > ORPHAN_INSPECTION_MAX_MS
                 ? { state: 'unresolved', reason: 'filesystem discovery budget exhausted' }
-                : (options.observe ?? observeOrphanPath)(p);
-        observations.set(p, value);
+                : source
+                  ? (options.observeSource ?? observeOrphanSourcePath)(p)
+                  : (options.observe ?? observeOrphanPath)(p);
+        observations.set(key, value);
         return value;
     };
     const report: OrphanClassification = {
@@ -191,6 +202,7 @@ export function classifyOrphanUnits(
         incomplete: !discovery.complete,
     };
     const candidates: NativeSessionIdentity[] = [];
+    const missingProjectCandidates: NativeSessionIdentity[] = [];
     let candidateBytes = 0;
     let detailBytes = 0;
     for (const identity of options.identities ?? nativeSessionUnits(db)) {
@@ -226,23 +238,10 @@ export function classifyOrphanUnits(
                 }
             }
 
-            const matches = discovery.projects.filter((p) => possibleMove(project, p));
-            const possible = matches.filter((p) => observe(p.path).state !== 'missing');
-            if (possible.length > 0) {
-                const ambiguous = possible.length > 1 || possible.some((p) => observe(p.path).state === 'unresolved');
-                outcomes.push(ambiguous ? 'unresolved' : 'relocated');
-                reasons.push(
-                    `${label}: ${ambiguous ? 'ambiguous/unresolved relocation' : 'possible relocation'}: ${possible.map((p) => p.path).join(', ')}`,
-                );
-            } else {
-                outcomes.push('candidate');
-                reasons.push(`${label}: absent ${project.path}; complete recorded-project check`);
-            }
+            outcomes.push('candidate');
+            reasons.push(`${label}: absent ${project.path}; complete recorded-project check`);
         };
-        if (identity.tool !== 'claude-code' && identity.tool !== 'codex') {
-            outcomes.push('unresolved');
-            reasons.push('unsupported host; preserved');
-        } else if (segments.length === 0 || segments.length > ORPHAN_MAX_SEGMENTS) {
+        if (segments.length === 0 || segments.length > ORPHAN_MAX_SEGMENTS) {
             outcomes.push('unresolved');
             reasons.push('missing membership or sibling inspection budget exhausted');
         } else if (new Set(segments.map((s) => s.source_path)).size !== 1) {
@@ -253,7 +252,7 @@ export function classifyOrphanUnits(
                 inspectOwner(segment.project_id, `segment ${segment.id}`);
             }
         }
-        if (identity.tool === 'codex' || identity.tool === 'claude-code') {
+        {
             const rules = db
                 .prepare(
                     'SELECT owner_project_id, checkout_anchor FROM session_rules WHERE tool = ? AND native_session_id = ? ORDER BY id LIMIT ?',
@@ -282,7 +281,7 @@ export function classifyOrphanUnits(
                             inspectOwner(anchorOwner.id, 'native rule checkout owner');
                         }
                     }
-                    if (ownership.state === 'directory' || anchor.state === 'directory') {
+                    if (ownership.state !== 'directory' && anchor.state === 'directory') {
                         outcomes.push('relocated');
                         reasons.push(`native chat rules retain a current checkout association: ${owner.path}, ${rule.checkout_anchor}`);
                     } else if (ownership.state === 'unresolved' || anchor.state === 'unresolved') {
@@ -302,6 +301,24 @@ export function classifyOrphanUnits(
         if (outcomes.includes('candidate') && outcome !== 'candidate') {
             outcome = 'mixed';
             reasons.push('entire native unit preserved; segment cleanup requires segment-scoped no-resurrection support');
+        }
+
+        // Multiple owners preserve the whole chat unless every association is
+        // confirmed missing; a native tombstone must never suppress a valid sibling.
+        if (outcome !== 'candidate' && new Set(segments.map((segment) => segment.project_id)).size > 1) {
+            outcome = 'mixed';
+        }
+        if (outcome === 'candidate') {
+            missingProjectCandidates.push(identity);
+        } else if ((outcome === 'associated' || outcome === 'relocated') && !hasProtectedNativeMemory(db, identity)) {
+            const sourcePath = segments[0]?.source_path;
+            const source = sourcePath === undefined ? undefined : observe(sourcePath, true);
+            if (source?.state === 'missing') {
+                outcome = 'candidate';
+            } else if (source?.state === 'unresolved') {
+                outcome = 'unresolved';
+                reasons.push(source.reason);
+            }
         }
 
         report.incomplete ||= outcome === 'unresolved' || outcomes.includes('unresolved');
@@ -325,6 +342,7 @@ export function classifyOrphanUnits(
                 projectPath: projects.get(segment.project_id)?.path ?? null,
             })),
         };
+        options.onClassified?.(diagnostic);
 
         const bytes = Buffer.byteLength(JSON.stringify(diagnostic));
         if (bytes <= ORPHAN_DETAILS_MAX_BYTES) {
@@ -338,19 +356,29 @@ export function classifyOrphanUnits(
             report.omittedDetails++;
         }
     }
-    return { report, candidates, observations };
+    return { report, candidates, missingProjectCandidates, observations };
 }
 
 // This freezes complete owned rows and control state, including the sibling set,
 // without retaining conversation text in the authorization plan.
-export function orphanDatabaseFingerprint(db: Database, identities: NativeSessionIdentity[], projectIds: number[]): string {
+export function orphanDatabaseFingerprint(
+    db: Database,
+    identities: NativeSessionIdentity[],
+    projectIds: number[],
+    projectDeletionIds = projectIds,
+): string {
     const hash = createHash('sha256');
     let bytes = 0;
     let rows = 0;
-    const feed = (query: string, args: unknown[] = []) => {
+    const feed = (query: string, args: unknown[] = [], include: (row: Record<string, unknown>) => boolean = () => true) => {
         hash.update(query);
-        for (const row of db.prepare(query).iterate(...args)) {
-            const serialized = JSON.stringify(row);
+        for (const row of db.prepare(query).iterate(...args) as Iterable<Record<string, unknown>>) {
+            if (!include(row)) {
+                continue;
+            }
+            const serialized = query.startsWith('SELECT * FROM projects')
+                ? (projectAssociationIdentity(row as unknown as ProjectRow) ?? '')
+                : JSON.stringify(row);
             bytes += Buffer.byteLength(serialized);
             if (++rows > ORPHAN_FINGERPRINT_MAX_ROWS || bytes > ORPHAN_FINGERPRINT_MAX_BYTES) {
                 throw new Error('Orphan owned-state inspection budget exhausted; deletion refused');
@@ -358,9 +386,22 @@ export function orphanDatabaseFingerprint(db: Database, identities: NativeSessio
             hash.update(serialized);
         }
     };
-    for (const table of ['projects', 'consent_roots', 'paranoid_authority']) {
+    const ids = JSON.stringify(projectIds);
+    const owners = db.prepare('SELECT * FROM projects WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id').all(ids) as ProjectRow[];
+    feed('SELECT * FROM projects WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id', [ids]);
+    for (const table of ['consent_roots', 'paranoid_authority']) {
         if (db.prepare('SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?').get('table', table)) {
-            feed(`SELECT * FROM ${table} ORDER BY rowid`);
+            feed(
+                `SELECT * FROM ${table} ORDER BY rowid`,
+                [],
+                (row) =>
+                    table !== 'consent_roots' ||
+                    owners.some(
+                        (owner) =>
+                            isWithin(String(row.path), owner.path) ||
+                            (owner.git_root !== null && isWithin(String(row.path), owner.git_root)),
+                    ),
+            );
         }
     }
     const sessionScope = 'SELECT id FROM sessions WHERE tool = ? AND native_id = ?';
@@ -401,15 +442,20 @@ export function orphanDatabaseFingerprint(db: Database, identities: NativeSessio
             feed(`SELECT * FROM ${table} WHERE tool = ? AND native_session_id = ? ORDER BY rowid`, args);
         }
     }
-    const ids = JSON.stringify(projectIds);
-
     for (const [table, column] of [
         ['sessions', 'project_id'],
         ['memories', 'project_id'],
         ['standing_rules', 'project_id'],
         ['session_rules', 'owner_project_id'],
     ]) {
-        feed(`SELECT * FROM ${table} WHERE ${column} IN (SELECT value FROM json_each(?)) ORDER BY rowid`, [ids]);
+        const projection =
+            table === 'sessions' ? 'id, project_id, tool, native_id' : table === 'memories' ? 'id, project_id, session_id' : '*';
+        // Other chat activity matters only when it can invalidate deletion of
+        // the owner or its project rules; the selected native rows are frozen above.
+        const membership = table === 'sessions' || table === 'memories';
+        feed(`SELECT ${projection} FROM ${table} WHERE ${column} IN (SELECT value FROM json_each(?)) ORDER BY rowid`, [
+            membership ? JSON.stringify(projectDeletionIds) : ids,
+        ]);
     }
     return hash.digest('hex');
 }
@@ -475,9 +521,19 @@ export function planOrphanPurge(store: MemoryStore, scope: PurgeScope): PurgePla
     ];
     const nativeRuleScope = JSON.stringify(candidates);
     const associationOwnerIds = orphanAssociationOwnerIds(store.database, candidates, ownerIds);
+    // An empty chat does not authorize deleting a current owner's project policy.
+    const selectedUnits = new Set(candidates.map((identity) => JSON.stringify(identity)));
+    const missingProjectUnits = classified.missingProjectCandidates.filter((identity) => selectedUnits.has(JSON.stringify(identity)));
+    const missingProjectOwners = orphanAssociationOwnerIds(
+        store.database,
+        missingProjectUnits,
+        missingProjectUnits.flatMap((identity) =>
+            storedNativeSegments(store.database, identity, ORPHAN_MAX_SEGMENTS).map((segment) => segment.project_id),
+        ),
+    );
     // A rule-only chat still needs its owner and project policy. Preserve every
     // unconfirmed chat association, regardless of whether it has captured rows.
-    const ruleProjects = associationOwnerIds.filter(
+    const ruleProjects = missingProjectOwners.filter(
         (id) =>
             store.database
                 .prepare('SELECT 1 FROM sessions WHERE project_id = ? AND id NOT IN (SELECT value FROM json_each(?)) LIMIT 1')
@@ -521,10 +577,17 @@ export function planOrphanPurge(store: MemoryStore, scope: PurgeScope): PurgePla
     }
     plan.orphanEvidence = {
         identities: candidates,
+        counts: { emptyChats: candidates.length - missingProjectUnits.length, missingProjectChats: missingProjectUnits.length },
 
         preview: orphanPreviewFingerprint(plan),
         filesystem: filesystemFingerprint(selected.observations),
-        database: candidates.length === 0 ? '' : orphanDatabaseFingerprint(store.database, candidates, associationOwnerIds),
+        database:
+            candidates.length === 0
+                ? ''
+                : orphanDatabaseFingerprint(store.database, candidates, associationOwnerIds, [
+                      ...plan.emptiedProjects.map((project) => project.id),
+                      ...plan.standingRules.map((rule) => rule.project_id),
+                  ]),
         classification: classified.report,
     };
     return plan;
@@ -560,7 +623,11 @@ export function assertOrphanPlanDatabase(store: MemoryStore, plan: PurgePlan): v
     );
     if (
         orphanPreviewFingerprint(plan) !== evidence.preview ||
-        (evidence.identities.length > 0 && orphanDatabaseFingerprint(store.database, evidence.identities, ownerIds) !== evidence.database)
+        (evidence.identities.length > 0 &&
+            orphanDatabaseFingerprint(store.database, evidence.identities, ownerIds, [
+                ...plan.emptiedProjects.map((project) => project.id),
+                ...plan.standingRules.map((rule) => rule.project_id),
+            ]) !== evidence.database)
     ) {
         throw new Error('Orphan ownership, sibling membership or control state changed after preview; deletion aborted');
     }
