@@ -16,6 +16,11 @@ export interface ProjectRow {
     last_seen_at: string;
 }
 
+// Activity does not change which saved checkout owns memory.
+export function projectAssociationIdentity(row: ProjectRow | undefined): string | undefined {
+    return JSON.stringify(row, (key, value: unknown) => (key === 'last_seen_at' ? undefined : value));
+}
+
 export interface ProjectStoreOptions {
     resolveGitRoot?: (projectPath: string) => string | null;
     resolveGitRemote?: (gitRoot: string) => string | null;
@@ -196,13 +201,11 @@ export class ProjectStore {
 
     assertMoveAssociations(plan: ProjectMovePlan): void {
         // Capture may touch activity before it is paused without changing the selected association.
-        const association = (row: ProjectRow | undefined): string | undefined =>
-            JSON.stringify(row, (key, value: unknown) => (key === 'last_seen_at' ? undefined : value));
         for (const [folder, expected] of [
             [plan.from, plan.source],
             [plan.to, plan.destination],
         ] as const) {
-            if (association(this.findProjectByExactPath(folder)) !== association(expected)) {
+            if (projectAssociationIdentity(this.findProjectByExactPath(folder)) !== projectAssociationIdentity(expected)) {
                 throw new Error(`Refusing move-project: saved project changed at ${folder}.`);
             }
         }

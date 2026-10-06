@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -9,6 +9,7 @@ import { consentedProject } from '../../src/hooks/common.js';
 import { listManagedBackups } from '../../src/storage/backup.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
+import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 import { expectLiveMemoryCurrent } from '../helpers/live-memory.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
 
@@ -85,6 +86,96 @@ function databaseRows(dbPath: string): Record<string, unknown[]> {
 }
 
 describe('elepha purge orphan project scope', () => {
+    it('previews read-only, deletes exactly orphaned and empty unrecoverable chats, cleans derived state and repeats harmlessly', () => {
+        const f = createTestDb('purge-orphan-command-');
+        const gone = seedProject(f, { path: path.join(f.directory, 'gone') });
+        const orphan = seedSession(f, { project: gone, nativeId: 'orphan' });
+        const memory = seedMemory(f, { project: gone, session: orphan, durableCapture: true, userMessage: 'deletedsearchneedle' });
+        seedRollup(f, { project: gone, session: orphan });
+        f.db
+            .prepare(`INSERT INTO session_embeddings(session_id, project_id, source_hash, model, model_revision, dimensions, vector, computed_at)
+            VALUES (?, ?, 'hash', 'fixture', '1', 1, ?, '2026-10-01')`)
+            .run(orphan.id, gone.id, Buffer.alloc(4));
+        f.db
+            .prepare(`INSERT INTO turn_embeddings(memory_id, project_id, source_digest, text_hash, model, model_revision, dimensions, vector, computed_at)
+            VALUES (?, ?, ?, 'hash', 'fixture', '1', 1, ?, '2026-10-01')`)
+            .run(memory.id, gone.id, 'a'.repeat(64), Buffer.alloc(4));
+
+        const current = seedProject(f, { path: path.join(f.directory, 'current') });
+        mkdirSync(current.path);
+        const empty = seedSession(f, { project: current, nativeId: 'empty-unrecoverable' });
+        seedMemory(f, { project: current, session: empty, userMessage: '', assistantText: '', durableCapture: true });
+        seedRollup(f, { project: current, session: empty });
+        const recoverable = seedSession(f, {
+            project: current,
+            nativeId: 'recoverable',
+            sourcePath: path.join(f.directory, 'provider.jsonl'),
+        });
+        writeFileSync(recoverable.source_path, 'original provider history');
+        const retained = seedSession(f, { project: current, nativeId: 'useful-retained' });
+        seedMemory(f, { project: current, session: retained, durableCapture: true, userMessage: 'preservedsearchneedle' });
+        f.db
+            .prepare('INSERT INTO standing_rules(ulid, project_id, text, created_at) VALUES (?, ?, ?, ?)')
+            .run('current-policy', current.id, 'preserved policy', '2026-10-01');
+
+        const old = seedProject(f, { path: path.join(f.directory, 'old-folder') });
+        const destination = path.join(f.directory, 'new-folder');
+        mkdirSync(destination);
+        f.db.prepare('UPDATE projects SET git_root = ? WHERE id = ?').run(destination, old.id);
+        const relocated = seedSession(f, { project: old, nativeId: 'relocated' });
+        seedMemory(f, { project: old, session: relocated, durableCapture: true });
+        const mixed = seedSession(f, { project: current, nativeId: 'mixed' });
+        f.db
+            .prepare(`INSERT INTO sessions(tool, native_id, project_id, source_path, started_at, last_ingested_at, segment_index)
+            VALUES ('codex', ?, ?, ?, ?, ?, 1)`)
+            .run(mixed.native_id, gone.id, mixed.source_path, mixed.started_at, mixed.last_ingested_at);
+        f.close();
+
+        const before = readFileSync(f.dbPath);
+        const preview = runPurgeCli(f.dbPath, '--orphan');
+        expect(preview.status).toBe(0);
+        expect(readFileSync(f.dbPath)).toEqual(before);
+        expect(listManagedBackups(f.dbPath)).toEqual([]);
+        const applied = runPurgeCli(f.dbPath, '--orphan', '--apply', '--skip-confirmation');
+        expect(applied.status).toBe(0);
+        const db = openUnmanagedDb(f.dbPath);
+        try {
+            const store = new MemoryStore(db);
+            expect(store.findSession('codex', orphan.native_id)).toBeUndefined();
+            expect(store.findSession('codex', empty.native_id)).toBeUndefined();
+            for (const session of [recoverable, retained, relocated, mixed]) {
+                expect(store.findSession('codex', session.native_id)).toBeDefined();
+                expect(store.isTranscriptPurged('codex', session.native_id)).toBe(false);
+            }
+            expect(db.prepare('SELECT id FROM sessions WHERE native_id = ?').all(mixed.native_id)).toHaveLength(2);
+            expect(store.isTranscriptCaptureBlocked('codex', orphan.native_id)).toBe(true);
+            expect(store.isTranscriptCaptureBlocked('codex', empty.native_id)).toBe(true);
+            expect(store.standingRules.list([current.id])).toHaveLength(1);
+            for (const table of ['session_rollups', 'session_embeddings']) {
+                expect(db.prepare(`SELECT 1 FROM ${table} WHERE session_id IN (?, ?)`).get(orphan.id, empty.id)).toBeUndefined();
+            }
+            for (const table of ['filtered_turns', 'turn_search_index', 'turn_embeddings']) {
+                expect(db.prepare(`SELECT 1 FROM ${table} WHERE memory_id = ?`).get(memory.id)).toBeUndefined();
+            }
+            expect(db.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'deletedsearchneedle'").all()).toEqual(
+                [],
+            );
+            expect(
+                db.prepare("SELECT rowid FROM filtered_turns_fts WHERE filtered_turns_fts MATCH 'preservedsearchneedle'").all(),
+            ).toHaveLength(1);
+            expectLiveMemoryCurrent(db);
+        } finally {
+            db.close();
+        }
+        expect(readFileSync(recoverable.source_path, 'utf8')).toBe('original provider history');
+        const after = databaseRows(f.dbPath);
+        const backups = listManagedBackups(f.dbPath);
+        expect(backups).toHaveLength(1);
+        expect(runPurgeCli(f.dbPath, '--orphan', '--apply', '--skip-confirmation').status).toBe(0);
+        expect(databaseRows(f.dbPath)).toEqual(after);
+        expect(listManagedBackups(f.dbPath)).toEqual(backups);
+    }, 15000);
+
     it('previews, confirms, backs up and deletes a rule-only project through the CLI', () => {
         const directory = withGrantableTestDir('purge-rule-only-cli-');
         const dbPath = path.join(directory, 'elepha.db');
@@ -212,23 +303,23 @@ describe('elepha purge orphan project scope', () => {
         const tempSession = store.upsertSession('codex', 'temp-session', temp.id, path.join(directory, 'temp.jsonl'));
         const missingSession = store.upsertSession('codex', 'missing-session', missing.id, path.join(directory, 'missing.jsonl'));
         const liveSession = store.upsertSession('codex', 'live-session', live.id, path.join(directory, 'live.jsonl'));
+        // These empty sessions remain recoverable from their provider files.
+        writeFileSync(tempSession.source_path, 'provider history');
+        writeFileSync(liveSession.source_path, 'provider history');
         db.close();
 
         try {
-            const orphanDryRun = runPurgeCli(dbPath, '--orphan');
+            const orphanDryRun = runPurgeCli(dbPath, '--orphan', '--details');
             expect(orphanDryRun.status).toBe(0);
             expect(orphanDryRun.stdout).toContain('elepha memory in these projects:');
             expect(orphanDryRun.stdout).not.toContain(`  ${tempPath}  (project entry will be removed — no sessions left)`);
             expect(orphanDryRun.stdout).toContain(`  ${missingPath}  (project entry will be removed — no sessions left)`);
-            expect(orphanDryRun.stdout).not.toContain(`[${tempSession.id}]`);
-            expect(orphanDryRun.stdout).toContain(`[${missingSession.id}]`);
+            expect(orphanDryRun.stdout).not.toContain(`  [${tempSession.id}] project [${temp.id}]`);
+            expect(orphanDryRun.stdout).toContain(`  [${missingSession.id}] project [${missing.id}]`);
             expect(orphanDryRun.stdout).toContain('segment 0');
-            expect(orphanDryRun.stdout).not.toContain(`[${liveSession.id}]`);
+            expect(orphanDryRun.stdout).not.toContain(`  [${liveSession.id}] project [${live.id}]`);
             expect(orphanDryRun.stdout).not.toContain('last ingested');
             expect(orphanDryRun.stdout).toContain('In total: 1 session(s), 0 turn(s).');
-            expect(orphanDryRun.stdout).toContain(
-                "This is a preview — nothing was deleted. This clears elepha's memory only — your original AI coding session history on disk is untouched. Re-run with --apply to delete (a backup is saved first).",
-            );
             let verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).getProjectById(temp.id)).toBeDefined();
             verified.close();
