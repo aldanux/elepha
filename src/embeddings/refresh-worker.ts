@@ -1,8 +1,11 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { getSetting } from '../config/settings.js';
 import { openManagedDatabase } from '../storage/db.js';
+
+import { errorMessage } from '../util/error.js';
 import { type GenerationResult, generateEmbeddings } from './generate.js';
 import { createEmbeddingProvider } from './provider-config.js';
+import { refreshTurnEmbeddings } from './refresh-turns.js';
 
 const { databasePath, cancellation: buffer } = workerData as { databasePath: string; cancellation: SharedArrayBuffer };
 const cancellation = new Int32Array(buffer);
@@ -23,29 +26,46 @@ async function refresh(): Promise<GenerationResult | undefined> {
     const db = await openManagedDatabase(databasePath, { fileMustExist: true });
     try {
         checkRunning();
+        const createCheckedProvider: typeof createEmbeddingProvider = async (...args) => {
+            checkRunning();
+            const provider = await createEmbeddingProvider(...args);
+            if (!provider) {
+                return;
+            }
+            return {
+                configuration: provider.configuration,
+                embed: (text, beforeUse, purpose) =>
+                    provider.embed(
+                        text,
+                        () => {
+                            checkRunning();
+                            beforeUse();
+                        },
+                        purpose,
+                    ),
+                dispose: () => provider.dispose(),
+            };
+        };
+        try {
+            await refreshTurnEmbeddings(db, {
+                progress: checkRunning,
+                report: (diagnostic) => parentPort?.postMessage({ diagnostic }),
+                createProvider: createCheckedProvider,
+            });
+        } catch (error) {
+            if (error === cancelled || (error instanceof Error && error.cause === cancelled)) {
+                return;
+            }
+            checkRunning();
+            parentPort?.postMessage({
+                diagnostic: `Turn indexing failed; will retry next pass: ${errorMessage(error)}`,
+            });
+        }
+        checkRunning();
         return await generateEmbeddings(db, {
             progress: checkRunning,
             report: (diagnostic) => parentPort?.postMessage({ diagnostic }),
-            createProvider: async (...args) => {
-                checkRunning();
-                const provider = await createEmbeddingProvider(...args);
-                if (!provider) {
-                    return;
-                }
-                return {
-                    configuration: provider.configuration,
-                    embed: (text, beforeUse, purpose) =>
-                        provider.embed(
-                            text,
-                            () => {
-                                checkRunning();
-                                beforeUse();
-                            },
-                            purpose,
-                        ),
-                    dispose: () => provider.dispose(),
-                };
-            },
+            createProvider: createCheckedProvider,
         });
     } catch (error) {
         if (error !== cancelled && !(error instanceof Error && error.cause === cancelled)) {

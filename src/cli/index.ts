@@ -26,8 +26,6 @@ import { registerProjects } from './commands/projects.js';
 import { registerPurge } from './commands/purge.js';
 import { registerReingest } from './commands/reingest.js';
 import { registerRekey } from './commands/rekey.js';
-import { registerRepairClaudeCompact } from './commands/repair-claude-compact.js';
-import { registerRepairMcp } from './commands/repair-mcp.js';
 import { registerRestore } from './commands/restore.js';
 import { registerRollup } from './commands/rollup.js';
 import { registerSanitize } from './commands/sanitize.js';
@@ -84,8 +82,6 @@ registerDoctor(program);
 
 registerStats(program);
 registerReingest(program);
-registerRepairMcp(program);
-registerRepairClaudeCompact(program);
 registerRollup(program);
 registerBackfills(program);
 registerRekey(program);

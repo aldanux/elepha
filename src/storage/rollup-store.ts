@@ -24,6 +24,8 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { dedupePaths } from '../config/paths.js';
 import { escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
+import { runSessionLiveMemoryWrite } from './live-memory-retention.js';
+
 import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 
 // Every rollup from the old schema is stale, for three independent reasons
@@ -306,18 +308,19 @@ export class RollupStore {
                     return false;
                 }
             }
+
             if (expectedThroughTurnIndex === undefined) {
                 this.stmts.insert.run(params);
                 return true;
             }
             return this.stmts.updateIfWatermark.run({ ...params, expected: expectedThroughTurnIndex }).changes > 0;
         });
-        return run();
+        return runSessionLiveMemoryWrite(this.db, w.sessionId, () => run());
     }
 
     // Reopened session: a final rollup returns to live so the next close recomputes it incrementally.
     markLive(sessionId: number): void {
-        this.stmts.markLive.run(sessionId);
+        this.db.transaction(() => this.stmts.markLive.run(sessionId))();
     }
 
     listByProject(projectId: number): SessionRollupRow[] {

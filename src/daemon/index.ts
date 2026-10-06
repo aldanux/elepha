@@ -15,6 +15,7 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import { stat as fsStat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { setImmediate as yieldImmediate } from 'node:timers/promises';
@@ -23,25 +24,34 @@ import { OversizedTranscriptRecordError } from '../adapters/base.js';
 import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import { CodexAdapter } from '../adapters/codex.js';
 import { sessionSurface, toSessionRowKind } from '../adapters/discriminators.js';
-import { sessionAdapterFor } from '../adapters/index.js';
-import { OpencodeAdapter, opencodeSessionAiTitle, openOpencodeDbReadonly } from '../adapters/opencode.js';
+import {
+    OpencodeAdapter,
+    type OpencodeV2HandoffBoundary,
+    type OpencodeV2OverlapSession,
+    type OpencodeV2ParseProgress,
+    opencodeSessionAiTitle,
+    opencodeV2OverlapKey,
+    opencodeV2WatermarkKey,
+    openOpencodeDbReadonly,
+} from '../adapters/opencode.js';
 import {
     DAEMON_MISSING_PACKAGE_CHECK_LIMIT,
     DAEMON_PACKAGE_REPLACED_EXIT_CODE,
     DEFAULT_IDLE_DEBOUNCE_MS,
     DEFAULT_MAX_CONCURRENT,
-    DURABLE_CAPTURE_BACKFILL_BATCH_SIZE,
-    DURABLE_CAPTURE_MAX_BYTES,
     EMBEDDING_REFRESH_INTERVAL_MS,
     FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE,
     HEARTBEAT_INTERVAL_MS,
     MAX_DAEMON_UNKNOWN_LINE_WARNINGS,
     OPEN_TURN_SUMMARY_GRACE_MS,
+    OPENCODE_V2_OVERLAP_PAGE_SIZE,
+    OPENCODE_V2_PENDING_SCAN_LIMIT,
     PACKAGE_VERSION,
     readInstalledPackageVersion,
     SWEEP_INTERVAL_MS,
     UPDATE_CHECK_LOOP_INTERVAL_MS,
 } from '../config/constants.js';
+import { retainsFilteredCopy } from '../config/filtered-capture-policy.js';
 import { readMemoryConfig } from '../config/memory-config.js';
 import {
     canonicalizeExisting,
@@ -57,6 +67,8 @@ import {
     updateAvailablePath,
     updateCheckStatePath,
 } from '../config/paths.js';
+
+import { RESUME_CONTEXT_STEP_BYTES, RESUME_CONTEXT_STEP_MS } from '../config/resume-context.js';
 import { getSetting } from '../config/settings.js';
 import { readSessionMetadata } from '../discovery/session-projects.js';
 import { type EmbeddingRefresh, startEmbeddingRefresh } from '../embeddings/refresh.js';
@@ -64,13 +76,14 @@ import { installedAndLatestElephaVersionAsync } from '../install/self-update.js'
 import { filterTurn } from '../rendering/filtered-turn.js';
 import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
 import type { ConsentState } from '../storage/consent-store.js';
-import { DurableCaptureBackfillStore } from '../storage/durable-capture-backfill.js';
-import { type DurableEvictionPlan, withValidatedDurableEvictionSources } from '../storage/durable-capture-store.js';
+import { DurableCaptureStore } from '../storage/durable-capture-store.js';
 import { applyFirstPromptSearchBackfill } from '../storage/first-prompt-search-backfill.js';
-import { InjectionStore } from '../storage/injection-store.js';
-import type { IngestedTurnWritePreparation, MemoryStore } from '../storage/memory-store.js';
+import { isLiveMemoryCapacityGuardError, LiveMemoryCapacityError } from '../storage/live-memory-capacity-guard.js';
+import { LiveMemoryCaptureDeferredError, LiveMemoryRetentionVerificationError } from '../storage/live-memory-retention.js';
+import type { MemoryStore } from '../storage/memory-store.js';
 import type { OpenTurnSourceSnapshot } from '../storage/open-turn-store.js';
 import { isMemoryLocked } from '../storage/paranoid-gate.js';
+
 import { ProjectResolver } from '../storage/project-resolver.js';
 import type { RollupStore } from '../storage/rollup-store.js';
 import { evaluateSegmentBoundary } from '../storage/segmentation.js';
@@ -85,6 +98,8 @@ import type {
     EmptySessionKind,
     OpenTailObservation,
     ParsedTurn,
+    ResumeContext,
+    ResumeContextDerivationResult,
     SessionAdapter,
     SessionAdapterMap,
     SessionClassification,
@@ -93,19 +108,51 @@ import type {
     SummarizerStatus,
     ToolName,
 } from '../types/index.js';
+import { errorMessage } from '../util/error.js';
 import { FailureWindow } from './failure-window.js';
 import { clearHeartbeat, defaultHeartbeatPath, writeHeartbeat } from './heartbeat.js';
 import { type DaemonLogPaths, rotateDaemonLogs } from './log-rotation.js';
 import { type FileSkip, type FileSkipCategory, ReadabilityGuard } from './readability-guard.js';
 import type { RollupService } from './rollup-service.js';
+import { TaskStateManifestPublisher, type TaskStateManifestRecoveryBudget } from './task-state-manifests.js';
 import { runUpdateCheck, updateCheckEnabled } from './update-check.js';
 import { WorkQueue } from './work-queue.js';
+
+type OpencodeV2HandoffPlan = Extract<OpencodeV2HandoffBoundary, { status: 'ready' }>;
 
 interface ScanResult {
     ingested: number;
     skipped?: FileSkip;
+    // Complete records the adapter could not parse and skipped in this scan.
+    malformedRecords?: number;
+    // Complete records of an unrecognized shape the adapter skipped.
+    unrecognizedRecords?: number;
     emptySession?: EmptySessionKind;
+    v2HasMore?: boolean;
+    v2NextCursor?: { watermark: number; cursorId: string };
+    v2PendingRoundsRemaining?: number;
 }
+
+export interface BackfillIncomplete {
+    source: string;
+    category: FileSkipCategory | 'listing failed' | 'malformed records';
+    reason: string;
+}
+
+export interface BackfillReport {
+    ingested: number;
+    incomplete: BackfillIncomplete[];
+}
+
+// Skips that leave eligible history uncaptured and can succeed on a retry once
+// the file is readable, smaller or capacity is freed. Every other category is
+// an intentional exclusion or an empty session, not missing work.
+const BACKFILL_INCOMPLETE_SKIP_CATEGORIES = new Set<FileSkipCategory>([
+    'unreadable content',
+    'oversized record',
+    'unexpected error',
+    'capacity deferred',
+]);
 
 interface SweepSummary {
     files: number;
@@ -119,10 +166,10 @@ const NOTABLE_FILE_SKIP_CATEGORIES = new Set<FileSkipCategory>([
     'oversized record',
     'unexpected error',
     'outside watched store',
+    'capacity deferred',
 ]);
 
 export const FIRST_PROMPT_SEARCH_BACKFILL_LOG_PREFIX = '[elepha] first-prompt search backfill:';
-export const DURABLE_CAPTURE_BACKFILL_LOG_PREFIX = '[elepha] durable capture backfill:';
 
 // How often to look for sessions that have gone quiet. Well under the idle
 // threshold so a closed session rolls up promptly rather than up to a full
@@ -217,8 +264,10 @@ export interface DaemonOptions {
     openTranscript?: ProviderTranscriptOpener;
     // Test seam; production uses FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE.
     firstPromptSearchBackfillBatchSize?: number;
-    // Test seam; production uses DURABLE_CAPTURE_BACKFILL_BATCH_SIZE.
-    durableCaptureBackfillBatchSize?: number;
+    // Test seam; production uses the task-state manifest recovery bounds.
+    taskStateManifestRecoveryBudget?: Partial<TaskStateManifestRecoveryBudget>;
+    // Test seam; production uses RESUME_CONTEXT_STEP_BYTES and RESUME_CONTEXT_STEP_MS.
+    resumeContextStep?: { bytes?: number; elapsedMs?: number };
     // Deterministic budget exhaustion without timing-dependent fixture sleeps.
     sessionKindReconciliationNow?: () => number;
     // Fake-clock seam for the failed-EOF synthesis grace.
@@ -268,12 +317,12 @@ export class IngestionDaemon {
     private readonly captureClaudeCode: boolean;
     private readonly captureCodex: boolean;
     private readonly captureOpencode: boolean;
-    private readonly durableCapture: boolean;
-    private readonly durableCaptureMaxBytes: number;
+    // The legacy `durable-capture` key controls OpenCode copies.
+    // Claude Code and Codex copies follow retainsFilteredCopy().
+    private readonly legacyDurableCapture: boolean;
     private readonly readCorpus: (watchRoot: string) => Promise<string[]>;
     private readonly openTranscript: ProviderTranscriptOpener;
     private readonly firstPromptSearchBackfillBatchSize: number;
-    private readonly durableCaptureBackfillBatchSize: number;
     private readonly now: () => number;
     private sweepTimer: NodeJS.Timeout | undefined;
     private initialUpdateCheckTimer: NodeJS.Timeout | undefined;
@@ -281,10 +330,23 @@ export class IngestionDaemon {
     private firstPromptSearchBackfillTimer: NodeJS.Timeout | undefined;
     private firstPromptSearchBackfillPromise: Promise<void> | undefined;
     private startupSweepPromise: Promise<void> | undefined;
-    private durableCaptureBackfillTimer: NodeJS.Timeout | undefined;
-    private durableCaptureBackfillPromise: Promise<void> | undefined;
+    private readonly taskStateManifests: TaskStateManifestPublisher;
+
+    // Per OpenCode database: the in-memory discovery position used while its
+    // persisted V2 watermark is held behind a deferred chat. Later pages keep
+    // capturing disjoint chats from here; a restart or the deferral's resume
+    // replays from the persisted watermark, so nothing is omitted.
+    private readonly opencodeHeldDiscovery = new Map<string, { watermark: number; cursorId: string }>();
+
     private missingPackageChecks = 0;
     private stopping = false;
+    // Reconstruction of a resume context for a stored cursor recorded without
+    // one, by session: its progress, or the completed context until the next
+    // cursor advance records it.
+    private readonly resumeReconstructions = new Map<string, { cursor: string; result: ResumeContextDerivationResult }>();
+    // Cancels reconstruction reads when the daemon stops.
+    private readonly stopController = new AbortController();
+    private readonly resumeContextStep: { bytes: number; elapsedMs: number };
     private readonly startedAt = new Date().toISOString();
 
     private watcher: FSWatcher | undefined;
@@ -294,7 +356,7 @@ export class IngestionDaemon {
     private readonly openTurnValidationEpochs = new Map<string, number>();
     private readonly processing = new Set<string>();
     private readonly workQueue: WorkQueue;
-    private readonly opencodeAdapter: SqliteSourceAdapter;
+    private readonly opencodeAdapter: OpencodeAdapter;
     private stopPromise: Promise<void> | undefined;
     private signalHandlersInstalled = false;
     private readonly shutdownOnSignal = () => {
@@ -317,15 +379,15 @@ export class IngestionDaemon {
     constructor(options: DaemonOptions) {
         this.log = options.log ?? (() => {});
         this.logError = options.logError ?? console.error;
-        const configResult = (options.readConfig ?? readMemoryConfig)();
+        const readConfig = options.readConfig ?? readMemoryConfig;
+        const configResult = readConfig();
         if ('error' in configResult) {
             throw new Error(`cannot start daemon: ${configResult.error}`);
         }
         this.captureClaudeCode = configResult.config.captureClaudeCode ?? true;
         this.captureCodex = configResult.config.captureCodex ?? true;
         this.captureOpencode = configResult.config.captureOpencode ?? true;
-        this.durableCapture = configResult.config.durableCapture ?? false;
-        this.durableCaptureMaxBytes = configResult.config.durableCaptureMaxBytes ?? DURABLE_CAPTURE_MAX_BYTES;
+        this.legacyDurableCapture = configResult.config.durableCapture ?? false;
         this.store = options.store;
         this.openTranscript = options.openTranscript ?? openProviderTranscript;
         this.summarizer = options.summarizer;
@@ -359,14 +421,32 @@ export class IngestionDaemon {
         this.watcherPollIntervalMs = options.watcherPollIntervalMs ?? 50;
         this.readCorpus = options.readCorpus ?? ((watchRoot) => readdir(watchRoot, { recursive: true }));
         this.firstPromptSearchBackfillBatchSize = options.firstPromptSearchBackfillBatchSize ?? FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE;
-        this.durableCaptureBackfillBatchSize = options.durableCaptureBackfillBatchSize ?? DURABLE_CAPTURE_BACKFILL_BATCH_SIZE;
         this.sessionKindReconciliationNow = options.sessionKindReconciliationNow;
         this.now = options.now ?? Date.now;
+        this.resumeContextStep = {
+            bytes: options.resumeContextStep?.bytes ?? RESUME_CONTEXT_STEP_BYTES,
+            elapsedMs: options.resumeContextStep?.elapsedMs ?? RESUME_CONTEXT_STEP_MS,
+        };
+
+        this.taskStateManifests = new TaskStateManifestPublisher({
+            store: this.store,
+            adapters: Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as SessionAdapterMap,
+            openTranscript: this.openTranscript,
+            log: this.log,
+            logError: this.logError,
+
+            enqueue: (job) => this.workQueue.enqueue(job),
+            stopped: () => this.stopping,
+            budget: options.taskStateManifestRecoveryBudget,
+        });
     }
 
     start(): void {
         this.installSignalHandlers();
         rotateDaemonLogs(this.daemonLogPaths);
+        // Before any startup writer: the expiry observer and acknowledgement
+        // state are ready, so the first heartbeat may already advertise them.
+
         // followSymlinks left at chokidar's default (true) deliberately:
         // false also blocks traversal through a symlinked ANCESTOR of the
         // watch root, not just symlinks inside it - macOS's /tmp -> /private/tmp
@@ -424,22 +504,7 @@ export class IngestionDaemon {
             if (this.startupSweepPromise === startupSweep) {
                 this.startupSweepPromise = undefined;
             }
-            if (!this.durableCapture || this.stopping) {
-                return;
-            }
-            this.durableCaptureBackfillTimer = setTimeout(() => {
-                this.durableCaptureBackfillTimer = undefined;
-                const task = this.backfillDurableCapture().catch((error: unknown) => {
-                    this.logError(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} failed: ${(error as Error).message}`);
-                });
-                this.durableCaptureBackfillPromise = task;
-                void task.then(() => {
-                    if (this.durableCaptureBackfillPromise === task) {
-                        this.durableCaptureBackfillPromise = undefined;
-                    }
-                });
-            }, 0);
-            this.durableCaptureBackfillTimer.unref();
+            this.workQueue.enqueue(() => this.taskStateManifests.recover());
         });
         this.firstPromptSearchBackfillTimer = setTimeout(() => {
             this.firstPromptSearchBackfillTimer = undefined;
@@ -497,11 +562,43 @@ export class IngestionDaemon {
 
     async stop(): Promise<void> {
         this.stopping = true;
+        this.stopController.abort();
         if (this.stopPromise) {
             return this.stopPromise;
         }
         this.stopPromise = this.stopInternal();
         return this.stopPromise;
+    }
+
+    // One bounded, cancellable step of reconstructing a stored cursor's resume
+    // context from the source. Undefined while unfinished; the completed
+    // context is kept until a cursor advance records its successor.
+    private async reconstructResumeContext(
+        adapter: SessionAdapter,
+        handle: FileHandle,
+        cursor: string,
+        key: string,
+        logContext: { tool?: string; sessionId?: string },
+    ): Promise<ResumeContext | undefined> {
+        const known = this.resumeReconstructions.get(key);
+        if (known?.cursor === cursor && known.result.state === 'complete') {
+            return known.result.context;
+        }
+        const endOffset = adapter.cursorPosition?.(cursor).byteOffset;
+        if (endOffset === undefined || adapter.deriveResumeContext === undefined) {
+            return undefined;
+        }
+        const from = known?.cursor === cursor && known.result.state === 'partial' ? known.result.progress : undefined;
+        if (from === undefined) {
+            this.log(formatDaemonLog('[elepha] reconstructing the resume context of a stored cursor from its source', logContext));
+        }
+        const result = await adapter.deriveResumeContext(handle, endOffset, {
+            from,
+            readBudget: { remaining: this.resumeContextStep.bytes },
+            signal: AbortSignal.any([this.stopController.signal, AbortSignal.timeout(this.resumeContextStep.elapsedMs)]),
+        });
+        this.resumeReconstructions.set(key, { cursor, result });
+        return result.state === 'complete' ? result.context : undefined;
     }
 
     private refreshEmbeddings(): void {
@@ -599,6 +696,8 @@ export class IngestionDaemon {
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
         }
+
+        this.opencodeHeldDiscovery.clear();
         if (this.sweepTimer) {
             clearInterval(this.sweepTimer);
         }
@@ -615,9 +714,6 @@ export class IngestionDaemon {
         if (this.firstPromptSearchBackfillTimer) {
             clearTimeout(this.firstPromptSearchBackfillTimer);
         }
-        if (this.durableCaptureBackfillTimer) {
-            clearTimeout(this.durableCaptureBackfillTimer);
-        }
         clearHeartbeat(this.heartbeatPath);
         for (const timer of this.idleTimers.values()) {
             clearTimeout(timer);
@@ -631,231 +727,12 @@ export class IngestionDaemon {
         await this.startupSweepPromise;
         await this.kindReconciliationPromise;
         await this.firstPromptSearchBackfillPromise;
-        await this.durableCaptureBackfillPromise;
         await this.embeddingRefreshPromise;
-    }
-
-    private async backfillDurableCapture(): Promise<void> {
-        const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as SessionAdapterMap;
-        const backfill = new DurableCaptureBackfillStore(this.store.database, this.store.consent, this.durableCaptureMaxBytes);
-        while (!this.stopping) {
-            const consentedProjectIds = new ProjectResolver(this.store.database)
-                .listConsentedStored(this.store.consent)
-                .flatMap((project) => project.projectIds);
-            const candidates = backfill.listCandidates(consentedProjectIds, this.durableCaptureBackfillBatchSize);
-            if (candidates.length === 0) {
-                return;
-            }
-
-            for (const session of candidates) {
-                if (this.stopping) {
-                    return;
-                }
-                const work = backfill.begin(session, new Date().toISOString());
-                if (work === undefined) {
-                    continue;
-                }
-                const affectedSessionIds = new Set([session.id]);
-                if (work.missingTurnIndexes.size === 0) {
-                    backfill.finish(session, affectedSessionIds, 'success', new Date().toISOString());
-                    continue;
-                }
-
-                const adapter = sessionAdapterFor(adapters, session.tool);
-                if (!adapter) {
-                    backfill.finish(session, affectedSessionIds, 'source_unavailable', new Date().toISOString());
-                    this.log(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} source type has no JSONL adapter`);
-                    continue;
-                }
-
-                const opened = await this.openTranscript(session.tool, session.sourcePath);
-                if ('reason' in opened) {
-                    backfill.finish(session, affectedSessionIds, 'source_unavailable', new Date().toISOString());
-                    this.log(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} source unavailable (${opened.reason})`);
-                    continue;
-                }
-
-                let parseFailed = false;
-                let writeUnauthorized = false;
-                let writeEvicted = false;
-                const validateSource = sourceSnapshotValidator(session.tool, session.sourcePath, opened);
-                const expectedSourceGeneration = sourceGeneration(this.store, session.tool, session.nativeId);
-                const sourceReplayInjections = new InjectionStore(this.store.database, { includePersistedMcp: false });
-                const receiptPreflight = new InjectionStore(this.store.database);
-                const mcpReceiptTurns: ParsedTurn[] = [];
-                try {
-                    if (!isSessionKindEligible(this.store.database, session.id)) {
-                        continue;
-                    }
-                    // Complete Rule 4 and receipt-identity preflight before any
-                    // filtered turn is written. A conflict near EOF must not
-                    // leave an earlier durable row behind.
-                    for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
-                        closeTrailingOnIdle: true,
-                        handle: opened.handle,
-                    })) {
-                        turn.validateSource = validateSource;
-                        // Eligibility may change while the iterator reads.
-                        // Check before skipped turns can request another read.
-                        if (!isSessionKindEligible(this.store.database, session.id)) {
-                            writeUnauthorized = true;
-                            break;
-                        }
-                        if (this.stopping) {
-                            break;
-                        }
-                        if (turn.tool !== session.tool || turn.sessionId !== session.nativeId) {
-                            parseFailed = true;
-                            break;
-                        }
-                        if (turn.droppedReason !== undefined) {
-                            if (turn.droppedReason === 'elepha-mcp') {
-                                if (
-                                    !sourceReplayInjections.rememberElephaMcpReceipts(turn) ||
-                                    !receiptPreflight.rememberElephaMcpReceipts(turn, expectedSourceGeneration)
-                                ) {
-                                    parseFailed = true;
-                                    this.log(
-                                        formatDaemonLog(
-                                            `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} stopped at turn ${turn.turnIndex}: MCP receipt protection incomplete`,
-                                            turn,
-                                        ),
-                                    );
-                                    break;
-                                }
-                                mcpReceiptTurns.push(turn);
-                            }
-                            continue;
-                        }
-                        const quoteBackStatus = sourceReplayInjections.quoteBackStatus(turn);
-                        if (quoteBackStatus === 'incomplete') {
-                            parseFailed = true;
-                            this.log(
-                                formatDaemonLog(
-                                    `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} stopped at turn ${turn.turnIndex}: quote-back protection incomplete`,
-                                    turn,
-                                ),
-                            );
-                            break;
-                        }
-                    }
-                    if (
-                        this.stopping ||
-                        writeUnauthorized ||
-                        parseFailed ||
-                        !validateSource() ||
-                        !receiptPreflight.validateCompleteMcpReceiptLedger(session.tool, session.nativeId, expectedSourceGeneration) ||
-                        !this.store.publishElephaMcpReceiptBatch(
-                            mcpReceiptTurns,
-                            session.id,
-                            session.tool,
-                            session.nativeId,
-                            expectedSourceGeneration,
-                        )
-                    ) {
-                        parseFailed = true;
-                    }
-
-                    const replayInjections = new InjectionStore(this.store.database, { includePersistedMcp: false });
-                    if (!parseFailed && !writeUnauthorized && !this.stopping) {
-                        for await (const turn of adapter.parseTurns(opened.resolvedPath, undefined, {
-                            closeTrailingOnIdle: true,
-                            handle: opened.handle,
-                        })) {
-                            turn.validateSource = validateSource;
-                            if (!isSessionKindEligible(this.store.database, session.id)) {
-                                writeUnauthorized = true;
-                                break;
-                            }
-                            if (this.stopping) {
-                                break;
-                            }
-                            if (turn.tool !== session.tool || turn.sessionId !== session.nativeId) {
-                                parseFailed = true;
-                                break;
-                            }
-                            if (turn.droppedReason !== undefined) {
-                                if (turn.droppedReason === 'elepha-mcp' && !replayInjections.rememberElephaMcpReceipts(turn)) {
-                                    parseFailed = true;
-                                    break;
-                                }
-                                continue;
-                            }
-                            const quoteBackStatus = replayInjections.quoteBackStatus(turn);
-                            if (quoteBackStatus === 'incomplete') {
-                                parseFailed = true;
-                                break;
-                            }
-                            if (quoteBackStatus === 'match') {
-                                this.log(
-                                    formatDaemonLog(
-                                        `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} suppressed turn ${turn.turnIndex}: self-injected content (quote-back)`,
-                                        turn,
-                                    ),
-                                );
-                                continue;
-                            }
-                            if (!work.missingTurnIndexes.has(turn.turnIndex)) {
-                                continue;
-                            }
-                            const projection = filterTurn(turn);
-                            const result = await withValidatedDurableEvictionSources(
-                                this.store.database,
-                                projection,
-                                this.durableCaptureMaxBytes,
-                                { sessionId: session.id, tool: session.tool, sourcePath: session.sourcePath },
-                                (evictionPlan) =>
-                                    backfill.record(session, turn.turnIndex, projection, new Date().toISOString(), evictionPlan),
-                                { openTranscript: this.openTranscript },
-                            );
-                            if (result.state === 'unauthorized') {
-                                writeUnauthorized = true;
-                                break;
-                            }
-                            if (result.state === 'evicted') {
-                                writeEvicted = true;
-                                break;
-                            }
-                            if (result.state === 'memory_missing') {
-                                parseFailed = true;
-                                break;
-                            }
-                            work.missingTurnIndexes.delete(turn.turnIndex);
-                            affectedSessionIds.add(result.sessionId);
-                        }
-                    }
-                    if (!validateSource()) {
-                        parseFailed = true;
-                    }
-                } catch (error) {
-                    parseFailed = true;
-                    this.logError(`${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} parse failed: ${(error as Error).message}`);
-                } finally {
-                    await opened.handle.close();
-                }
-
-                // Shutdown may arrive after the last row commits but before
-                // iterator/handle cleanup finishes. Finalize covered work;
-                // leave interrupted work resumable without reading more turns.
-                if (this.stopping && work.missingTurnIndexes.size > 0) {
-                    return;
-                }
-                if (writeUnauthorized || writeEvicted) {
-                    continue;
-                }
-                backfill.finish(session, affectedSessionIds, parseFailed ? 'parse_error' : 'success', new Date().toISOString());
-                this.log(
-                    `${DURABLE_CAPTURE_BACKFILL_LOG_PREFIX} session ${session.id} processed; ` +
-                        `${work.missingTurnIndexes.size} turn(s) remained uncovered`,
-                );
-            }
-
-            await new Promise<void>((resolve) => setImmediate(resolve));
-        }
     }
 
     private async backfillFirstPromptSearch(): Promise<void> {
         const adapters = Object.fromEntries(this.adapters.map((adapter) => [adapter.tool, adapter])) as SessionAdapterMap;
+        let afterSessionId = 0;
         while (!this.stopping) {
             const consentedProjectIds = new ProjectResolver(this.store.database)
                 .listConsentedStored(this.store.consent)
@@ -870,22 +747,25 @@ export class IngestionDaemon {
                      FROM sessions s
                      LEFT JOIN first_prompt_search_backfill_skips AS skips ON skips.session_id = s.id
                      WHERE s.project_id IN (${projectPlaceholders})
+                       AND s.id > ?
                        AND s.first_prompt_search IS NULL
                        AND ${SERVED_SESSION_KIND_ELIGIBILITY}
                        AND skips.session_id IS NULL
                      ORDER BY id
                      LIMIT ?`,
                 )
-                .all(...consentedProjectIds, this.firstPromptSearchBackfillBatchSize) as Array<{ id: number }>;
+                .all(...consentedProjectIds, afterSessionId, this.firstPromptSearchBackfillBatchSize) as Array<{ id: number }>;
             if (candidates.length === 0) {
                 return;
             }
 
             const sessionIds = candidates.map((candidate) => candidate.id);
             let writeAuthorizedProjectIds: Set<number> | undefined;
+
             const plan = await applyFirstPromptSearchBackfill(this.store.database, adapters, {
                 sessionIds,
                 onlyNull: true,
+
                 authorizeWrite: (db, sessionId) => {
                     writeAuthorizedProjectIds ??= new Set(
                         new ProjectResolver(db).listConsentedStored(this.store.consent).flatMap((project) => project.projectIds),
@@ -901,6 +781,7 @@ export class IngestionDaemon {
                 return;
             }
             const lastSessionId = lastCandidate.id;
+            afterSessionId = lastSessionId;
 
             const placeholders = sessionIds.map(() => '?').join(', ');
             const leftNullRows = this.store.database
@@ -923,13 +804,16 @@ export class IngestionDaemon {
                 const skippedAt = new Date().toISOString();
                 for (const row of rows) {
                     const session = sessionProject.get(row.id) as { project_id: number } | undefined;
-                    if (session !== undefined && currentlyConsented.has(session.project_id)) {
-                        insert.run(row.id, skippedAt);
+                    if (session === undefined || !currentlyConsented.has(session.project_id)) {
+                        continue;
                     }
+
+                    insert.run(row.id, skippedAt);
                 }
             });
             const readableChanges = new Set(plan.changes.filter((change) => !change.transcriptMissing).map((change) => change.sessionId));
             recordSkips(leftNullRows.filter((row) => !readableChanges.has(row.id)));
+
             const remaining = (
                 this.store.database
                     .prepare(
@@ -1066,7 +950,7 @@ export class IngestionDaemon {
         return canonicalizeExisting(databasePath);
     }
 
-    private scheduleOpencodeScan(databasePath: string): void {
+    private scheduleOpencodeScan(databasePath: string, pendingRoundsRemaining?: number): void {
         const canonicalPath = canonicalizeExisting(databasePath);
         const existing = this.idleTimers.get(canonicalPath);
         if (existing) {
@@ -1076,14 +960,18 @@ export class IngestionDaemon {
             canonicalPath,
             setTimeout(() => {
                 this.idleTimers.delete(canonicalPath);
-                this.enqueueOpencodeScan(canonicalPath);
+                if (pendingRoundsRemaining === undefined) {
+                    this.enqueueOpencodeScan(canonicalPath);
+                } else {
+                    this.enqueueOpencodeScan(canonicalPath, pendingRoundsRemaining);
+                }
             }, this.idleDebounceMs),
         );
     }
 
-    private enqueueOpencodeScan(databasePath: string): void {
+    private enqueueOpencodeScan(databasePath: string, pendingRoundsRemaining?: number): void {
         this.workQueue.enqueue(async () => {
-            await this.scanOpencodeDb(databasePath);
+            await this.scanOpencodeDb(databasePath, undefined, undefined, pendingRoundsRemaining);
         });
     }
 
@@ -1097,29 +985,87 @@ export class IngestionDaemon {
 
     // Replays the provider corpus once for every newly-approved root in the set.
     async backfillApprovedRoots(roots: string[]): Promise<number> {
+        return (await this.backfillApprovedRootsReport(roots)).ingested;
+    }
+
+    // The same replay, also naming every source it could not finish. A missing
+    // provider store is legitimately empty history and exclusions such as
+    // consent, incognito or purge are intentional, so neither is incomplete.
+    async backfillApprovedRootsReport(roots: string[]): Promise<BackfillReport> {
         const canonicalRoots = [...new Set(roots.map((root) => canonicalizeExisting(root)))];
+        const report: BackfillReport = { ingested: 0, incomplete: [] };
         if (canonicalRoots.length === 0) {
-            return 0;
+            return report;
         }
-        let ingested = 0;
+        const noteSkip = (source: string, skipped: FileSkip | undefined): void => {
+            if (skipped !== undefined && BACKFILL_INCOMPLETE_SKIP_CATEGORIES.has(skipped.category)) {
+                report.incomplete.push({ source, category: skipped.category, reason: skipped.reason });
+            }
+        };
         const scannedOpencodeDatabases = new Set<string>();
         for (const watchRoot of this.watchRoots) {
-            const files = await this.readCorpus(watchRoot).catch(() => [] as string[]);
+            let files: string[];
+            try {
+                files = await this.readCorpus(watchRoot);
+            } catch (error: unknown) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                    report.incomplete.push({ source: watchRoot, category: 'listing failed', reason: errorMessage(error) });
+                }
+                continue;
+            }
             for (const relativePath of files.sort()) {
                 const filePath = path.join(watchRoot, relativePath);
                 const opencodeDatabase = this.opencodeDatabaseForEvent(filePath);
                 if (opencodeDatabase && !scannedOpencodeDatabases.has(opencodeDatabase)) {
                     scannedOpencodeDatabases.add(opencodeDatabase);
-                    ingested += (await this.scanOpencodeDb(opencodeDatabase, canonicalRoots)).ingested;
+                    const result = await this.backfillOpencodeDb(opencodeDatabase, canonicalRoots);
+                    report.ingested += result.ingested;
+                    for (const skipped of result.skipped) {
+                        noteSkip(opencodeDatabase, skipped);
+                    }
                     continue;
                 }
                 const adapter = this.adapterFor(filePath);
                 if (adapter) {
-                    ingested += (await this.scanFile(adapter, filePath, true, canonicalRoots)).ingested;
+                    const result = await this.scanFile(adapter, filePath, true, canonicalRoots);
+                    report.ingested += result.ingested;
+                    noteSkip(filePath, result.skipped);
+                    // Valid turns from this file stay stored; the unparseable
+                    // or unrecognized records beside them are the incomplete part.
+                    const skippedRecords = [
+                        (result.malformedRecords ?? 0) > 0
+                            ? `${result.malformedRecords} complete record(s) could not be parsed`
+                            : undefined,
+                        (result.unrecognizedRecords ?? 0) > 0
+                            ? `${result.unrecognizedRecords} record(s) had an unrecognized shape`
+                            : undefined,
+                    ].filter((part) => part !== undefined);
+                    if (skippedRecords.length > 0) {
+                        report.incomplete.push({
+                            source: filePath,
+                            category: 'malformed records',
+                            reason: `${skippedRecords.join(' and ')} and were skipped`,
+                        });
+                    }
                 }
             }
         }
-        return ingested;
+        return report;
+    }
+
+    // Pages one OpenCode database for the approved roots until it is drained.
+    private async backfillOpencodeDb(
+        databasePath: string,
+        canonicalRoots: readonly string[],
+    ): Promise<{ ingested: number; skipped: Array<FileSkip | undefined> }> {
+        let result = await this.scanOpencodeDb(databasePath, canonicalRoots);
+        const outcome = { ingested: result.ingested, skipped: [result.skipped] };
+        while (result.v2HasMore && result.v2NextCursor !== undefined) {
+            result = await this.scanOpencodeDb(databasePath, canonicalRoots, result.v2NextCursor, result.v2PendingRoundsRemaining);
+            outcome.ingested += result.ingested;
+            outcome.skipped.push(result.skipped);
+        }
+        return outcome;
     }
 
     // Cold-start work is intentionally an ordered, awaited sweep rather than
@@ -1174,7 +1120,6 @@ export class IngestionDaemon {
                 if (result.skipped) {
                     summary.skipped.set(result.skipped.category, (summary.skipped.get(result.skipped.category) ?? 0) + 1);
                 }
-                this.scheduleIdleScan(adapter, filePath);
             }
         }
         const skipped = [...summary.skipped.entries()];
@@ -1201,6 +1146,33 @@ export class IngestionDaemon {
             this.log(formatDaemonLog(`[elepha] skipped ${filePath}: ${skipped.reason}`, context));
         }
         return skipped;
+    }
+
+    // A purge is permanent; an automatic retention removal lasts until a
+    // pre-cleanup backup is restored. Both keep the transcript out of capture.
+    private blockedTranscriptSkip(tool: ToolName, nativeId: string): FileSkip {
+        return this.store.isTranscriptPurged(tool, nativeId)
+            ? { category: 'purged', reason: `transcript ${nativeId} was purged and is permanently excluded from ingestion` }
+            : {
+                  category: 'retention removed',
+                  reason: `transcript ${nativeId} was removed at live-memory capacity and is excluded from ingestion`,
+              };
+    }
+
+    // A capacity deferral is an explicit coverage gap, already recorded in the
+    // database; the file is retried from its unadvanced cursor on the next scan.
+    private fileSkipForError(error: unknown): FileSkip {
+        if (
+            error instanceof LiveMemoryCaptureDeferredError ||
+            error instanceof LiveMemoryCapacityError ||
+            isLiveMemoryCapacityGuardError(error)
+        ) {
+            return { category: 'capacity deferred', reason: (error as Error).message };
+        }
+        if (error instanceof LiveMemoryRetentionVerificationError) {
+            this.logError(`[elepha] ${error.message}`);
+        }
+        return { category: 'unexpected error', reason: `unexpected error: ${(error as Error).message}` };
     }
 
     private quarantineOversizedTranscript(
@@ -1230,7 +1202,12 @@ export class IngestionDaemon {
         return skipped;
     }
 
-    private async scanOpencodeDb(databasePath: string, onlyProjectRoots?: string | readonly string[]): Promise<ScanResult> {
+    private async scanOpencodeDb(
+        databasePath: string,
+        onlyProjectRoots?: string | readonly string[],
+        backfillV2Cursor?: { watermark: number; cursorId: string },
+        pendingRoundsRemaining?: number,
+    ): Promise<ScanResult> {
         const canonicalPath = canonicalizeExisting(databasePath);
         if (!this.captureOpencode) {
             return {
@@ -1252,11 +1229,29 @@ export class IngestionDaemon {
         try {
             const db = openOpencodeDbReadonly(canonicalPath);
             try {
-                const watermark =
+                const v2WatermarkKey = opencodeV2WatermarkKey(canonicalPath);
+                const heldDiscovery = onlyProjectRoots === undefined ? this.opencodeHeldDiscovery.get(canonicalPath) : undefined;
+                const v2Cursor =
                     onlyProjectRoots === undefined
-                        ? this.store.getSqliteSourceWatermark(this.opencodeAdapter.tool, canonicalPath)
-                        : undefined;
-                const sessions = this.opencodeAdapter.dirtySessions(db, watermark);
+                        ? (heldDiscovery ?? this.store.getSqliteSourceCursor(this.opencodeAdapter.tool, v2WatermarkKey))
+                        : backfillV2Cursor;
+                const v2Page = this.opencodeAdapter.dirtySessionsV2(db, v2Cursor);
+                // V1 remains readable as history, but only V2 creates new memories.
+                const discoveredIds = new Set(v2Page.sessions.map((session) => session.sessionId));
+                const pendingRows = this.store.listOpencodeV2Pending(canonicalPath, OPENCODE_V2_PENDING_SCAN_LIMIT + 1);
+                const pendingRoundsLeft =
+                    pendingRoundsRemaining ??
+                    (pendingRows.length > OPENCODE_V2_PENDING_SCAN_LIMIT
+                        ? Math.ceil(this.store.countOpencodeV2Pending(canonicalPath) / OPENCODE_V2_PENDING_SCAN_LIMIT) - 1
+                        : 0);
+                const pendingById = new Map(pendingRows.slice(0, OPENCODE_V2_PENDING_SCAN_LIMIT).map((row) => [row.native_id, row]));
+                const sessions = [
+                    ...v2Page.sessions,
+                    ...[...pendingById.keys()]
+                        .filter((nativeId) => !discoveredIds.has(nativeId))
+                        .map((nativeId) => this.opencodeAdapter.v2SessionById(db, nativeId))
+                        .filter((session) => session !== undefined),
+                ];
                 const selectedRoots =
                     onlyProjectRoots === undefined
                         ? undefined
@@ -1264,7 +1259,25 @@ export class IngestionDaemon {
                               canonicalizeExisting(root),
                           );
                 let ingested = 0;
-                let consumedWatermark: number | undefined;
+                let pendingHasContinuation = false;
+                let v2NextCursor: { watermark: number; cursorId: string } | undefined;
+
+                const markConsumed = (session: (typeof sessions)[number]): void => {
+                    if (
+                        pendingRows.length > OPENCODE_V2_PENDING_SCAN_LIMIT &&
+                        pendingById.has(session.sessionId) &&
+                        this.store.consent.consentState(canonicalizeExisting(session.directory)) === 'approved'
+                    ) {
+                        this.store.touchOpencodeV2Pending(canonicalPath, session.sessionId, session.directory);
+                    }
+                    if (!discoveredIds.has(session.sessionId) || heldDiscovery !== undefined) {
+                        return;
+                    }
+                    v2NextCursor = { watermark: session.timeUpdated, cursorId: session.sessionId };
+                    if (onlyProjectRoots === undefined) {
+                        this.store.setSqliteSourceCursor(this.opencodeAdapter.tool, v2WatermarkKey, v2NextCursor);
+                    }
+                };
 
                 for (const session of sessions) {
                     const logContext = { tool: this.opencodeAdapter.tool, sessionId: session.sessionId };
@@ -1280,7 +1293,7 @@ export class IngestionDaemon {
                                 },
                                 logContext,
                             );
-                            consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                            markConsumed(session);
                             continue;
                         }
                     } else {
@@ -1293,13 +1306,14 @@ export class IngestionDaemon {
                                 },
                                 logContext,
                             );
-                            consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                            markConsumed(session);
                             continue;
                         }
                         const consentState = this.store.consent.consentState(canonicalDirectory);
                         if (consentState !== 'approved') {
                             if (consentState === 'denied') {
                                 this.store.recordIncognitoTranscript(this.opencodeAdapter.tool, session.sessionId);
+                                this.store.deleteOpencodeV2Pending(canonicalPath, session.sessionId);
                             }
                             const physicalDirectory = await realpath(session.directory).catch(() => undefined);
                             const directoryStat =
@@ -1313,7 +1327,7 @@ export class IngestionDaemon {
                                     },
                                     logContext,
                                 );
-                                consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                                markConsumed(session);
                                 continue;
                             }
                             const root = this.store.consent.recordPending(physicalDirectory);
@@ -1325,24 +1339,23 @@ export class IngestionDaemon {
                                 },
                                 logContext,
                             );
-                            consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                            markConsumed(session);
                             continue;
                         }
                     }
 
-                    if (this.store.isTranscriptPurged(this.opencodeAdapter.tool, session.sessionId)) {
+                    if (this.store.isTranscriptCaptureBlocked(this.opencodeAdapter.tool, session.sessionId)) {
+                        this.store.deleteOpencodeV2Pending(canonicalPath, session.sessionId);
                         this.recordSkippedFile(
                             canonicalPath,
-                            {
-                                category: 'purged',
-                                reason: `transcript ${session.sessionId} was purged and is permanently excluded from ingestion`,
-                            },
+                            this.blockedTranscriptSkip(this.opencodeAdapter.tool, session.sessionId),
                             logContext,
                         );
-                        consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                        markConsumed(session);
                         continue;
                     }
                     if (this.store.isTranscriptIncognito(this.opencodeAdapter.tool, session.sessionId)) {
+                        this.store.deleteOpencodeV2Pending(canonicalPath, session.sessionId);
                         this.recordSkippedFile(
                             canonicalPath,
                             {
@@ -1351,7 +1364,7 @@ export class IngestionDaemon {
                             },
                             logContext,
                         );
-                        consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                        markConsumed(session);
                         continue;
                     }
 
@@ -1368,15 +1381,48 @@ export class IngestionDaemon {
                             },
                             logContext,
                         );
-                        consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                        markConsumed(session);
                         continue;
                     }
 
-                    const cursor = this.store.getSessionCursor(this.opencodeAdapter.tool, session.sessionId);
+                    const storedFormat = this.store.findSession(this.opencodeAdapter.tool, session.sessionId)?.source_format;
+                    // A handed-off session carries a V1 turn-index offset that
+                    // only the overlap path applies; its V1 row disappearing
+                    // must not silently switch it to unshifted indexes.
+                    if (
+                        (storedFormat !== undefined && storedFormat !== 'opencode-v2') ||
+                        this.store.getOpencodeV2Handoff(session.sessionId) !== undefined
+                    ) {
+                        this.recordSkippedFile(
+                            canonicalPath,
+                            {
+                                category: 'excluded session',
+                                reason: `OpenCode V2 session ${session.sessionId} overlaps historical V1 memory; V2 handoff is not verified`,
+                            },
+                            logContext,
+                        );
+                        markConsumed(session);
+                        continue;
+                    }
+
+                    const pending = pendingById.get(session.sessionId);
+                    const revision = this.opencodeAdapter.v2TailRevision(db, session.sessionId);
+                    if (
+                        pending !== undefined &&
+                        pending.needs_continuation === 0 &&
+                        pending.observed_seq === (revision?.seq ?? -1) &&
+                        pending.observed_updated === (revision?.updated ?? -1)
+                    ) {
+                        markConsumed(session);
+                        continue;
+                    }
+                    const storedCursorBefore = this.store.getSessionCursor(this.opencodeAdapter.tool, session.sessionId);
+                    const cursor = pending?.resume_cursor ?? storedCursorBefore ?? undefined;
                     let sessionIngested = 0;
-                    for await (const turn of this.opencodeAdapter.parseSessionTurns(db, session, cursor, {
-                        closeTrailingOnIdle: true,
-                    })) {
+                    const progress: OpencodeV2ParseProgress = { hasMore: false, pending: false, omittedPrefix: false };
+
+                    const turns = this.opencodeAdapter.parseSessionTurnsV2(db, session, cursor, progress);
+                    for await (const turn of turns) {
                         const consentState = this.consentStateForTurn(turn);
                         if (consentState === 'denied') {
                             this.store.recordIncognitoTranscript(turn.tool, turn.sessionId);
@@ -1407,31 +1453,399 @@ export class IngestionDaemon {
                     if (sessionIngested > 0) {
                         await this.refreshRollup(this.opencodeAdapter, canonicalPath, session.sessionId, 'live', classification);
                     }
-                    consumedWatermark = Math.max(consumedWatermark ?? session.timeUpdated, session.timeUpdated);
+                    if (progress.skippedClosedCursor !== undefined) {
+                        this.recordSkippedFile(
+                            canonicalPath,
+                            {
+                                category: 'excluded session',
+                                reason: `OpenCode V2 session ${session.sessionId} omitted an oversized old turn through ${progress.skippedClosedCursor}`,
+                            },
+                            logContext,
+                        );
+                    }
+                    const storedCursorAfter = this.store.getSessionCursor(this.opencodeAdapter.tool, session.sessionId);
+                    const resumeCursor =
+                        storedCursorAfter !== storedCursorBefore
+                            ? undefined
+                            : (progress.skippedClosedCursor ?? pending?.resume_cursor ?? undefined);
+                    if (this.store.isTranscriptIncognito(this.opencodeAdapter.tool, session.sessionId)) {
+                        this.store.deleteOpencodeV2Pending(canonicalPath, session.sessionId);
+                    } else if (revision !== undefined && (progress.pending || progress.hasMore || resumeCursor !== undefined)) {
+                        this.store.upsertOpencodeV2Pending(
+                            canonicalPath,
+                            session.sessionId,
+                            canonicalDirectory,
+                            revision,
+                            progress.hasMore,
+                            resumeCursor,
+                        );
+                        pendingHasContinuation ||= progress.hasMore && storedCursorAfter !== storedCursorBefore;
+                    } else {
+                        this.store.deleteOpencodeV2Pending(canonicalPath, session.sessionId);
+                    }
+                    markConsumed(session);
                 }
 
-                if (onlyProjectRoots === undefined && consumedWatermark !== undefined) {
-                    this.store.setSqliteSourceWatermark(this.opencodeAdapter.tool, canonicalPath, consumedWatermark);
+                // Approved-root backfill leaves same-ID sessions to the live
+                // overlap cycle, which owns the persisted handoff state.
+                let overlapContinuation = false;
+                if (onlyProjectRoots === undefined) {
+                    const overlap = await this.scanOpencodeV2Overlaps(db, canonicalPath);
+                    ingested += overlap.ingested;
+                    overlapContinuation = overlap.continuation;
                 }
+                if (heldDiscovery !== undefined) {
+                    const roots = onlyProjectRoots;
+
+                    // Discovery continues past the listed page in memory only.
+                    const last = v2Page.sessions.at(-1);
+                    const listed = last === undefined ? undefined : { watermark: last.timeUpdated, cursorId: last.sessionId };
+                    if (roots === undefined && listed !== undefined) {
+                        // Kept after the last page too, so later events read only
+                        // new chats instead of re-walking every page while held.
+                        this.opencodeHeldDiscovery.set(canonicalPath, listed);
+                        if (v2Page.hasMore) {
+                            this.scheduleOpencodeScan(canonicalPath);
+                        }
+                    }
+                    return {
+                        ingested,
+                        skipped: ingested === 0 ? this.skippedFiles.get(canonicalPath) : undefined,
+                        v2HasMore: v2Page.hasMore,
+                        v2NextCursor: listed ?? backfillV2Cursor,
+                    };
+                }
+
                 if (ingested > 0) {
                     this.skippedFiles.delete(canonicalPath);
                 }
-                return { ingested, skipped: ingested === 0 ? this.skippedFiles.get(canonicalPath) : undefined };
+                if ((pendingHasContinuation || pendingRoundsLeft > 0) && v2NextCursor === undefined && backfillV2Cursor !== undefined) {
+                    v2NextCursor = backfillV2Cursor;
+                }
+                if (
+                    onlyProjectRoots === undefined &&
+                    this.watcher !== undefined &&
+                    (v2Page.hasMore || pendingHasContinuation || pendingRoundsLeft > 0 || overlapContinuation)
+                ) {
+                    this.scheduleOpencodeScan(canonicalPath, pendingRoundsLeft > 0 ? pendingRoundsLeft - 1 : undefined);
+                }
+                return {
+                    ingested,
+                    skipped: ingested === 0 ? this.skippedFiles.get(canonicalPath) : undefined,
+                    v2HasMore: v2Page.hasMore || pendingHasContinuation || pendingRoundsLeft > 0 || overlapContinuation,
+                    v2NextCursor,
+                    v2PendingRoundsRemaining: pendingRoundsLeft > 0 ? pendingRoundsLeft - 1 : undefined,
+                };
             } finally {
                 db.close();
             }
         } catch (error) {
             return {
                 ingested: 0,
-                skipped: this.recordSkippedFile(
-                    canonicalPath,
-                    { category: 'unexpected error', reason: `unexpected error: ${(error as Error).message}` },
-                    { tool: this.opencodeAdapter.tool },
-                ),
+                skipped: this.recordSkippedFile(canonicalPath, this.fileSkipForError(error), { tool: this.opencodeAdapter.tool }),
             };
         } finally {
             this.processing.delete(canonicalPath);
         }
+    }
+
+    // One bounded id-keyset page of same-ID V1/V2 sessions per scan, plus any
+    // handed-off session whose previous pass stopped at a row budget. Unchanged
+    // sessions are recognized by their persisted revision and cost no reparse
+    // and no repeated log line.
+    private async scanOpencodeV2Overlaps(
+        db: ReturnType<typeof openOpencodeDbReadonly>,
+        canonicalPath: string,
+    ): Promise<{ ingested: number; continuation: boolean }> {
+        const cursorKey = opencodeV2OverlapKey(canonicalPath);
+        const afterId = this.store.getSqliteSourceCursor(this.opencodeAdapter.tool, cursorKey)?.cursorId || undefined;
+        const page = this.opencodeAdapter.overlappingSessionsV2(db, afterId, OPENCODE_V2_OVERLAP_PAGE_SIZE);
+        const pageIds = new Set(page.sessions.map((session) => session.sessionId));
+        const continuing = this.store
+            .listOpencodeV2HandoffContinuations(canonicalPath, OPENCODE_V2_OVERLAP_PAGE_SIZE)
+            .filter((nativeId) => !pageIds.has(nativeId))
+            .map((nativeId) => this.opencodeAdapter.overlappingSessionV2ById(db, nativeId))
+            .filter((session) => session !== undefined);
+        let ingested = 0;
+        let continuation = false;
+
+        for (const session of [...continuing, ...page.sessions]) {
+            try {
+                const result = await this.ingestOpencodeV2Overlap(db, canonicalPath, session);
+                ingested += result.ingested;
+                continuation ||= result.continuation;
+            } catch (error) {
+                // The handoff row keeps its previous revision, so this session
+                // is retried when the cycle returns instead of blocking it.
+                this.recordSkippedFile(
+                    canonicalPath,
+                    error instanceof LiveMemoryCaptureDeferredError
+                        ? this.fileSkipForError(error)
+                        : {
+                              category: 'unexpected error',
+                              reason: `unexpected error in OpenCode V2 handoff for ${session.sessionId}: ${(error as Error).message}`,
+                          },
+                    { tool: this.opencodeAdapter.tool, sessionId: session.sessionId },
+                );
+            }
+        }
+
+        // An empty cursor restarts the cycle, so an id inserted behind the last
+        // visited key is reached on the next pass.
+        this.store.setSqliteSourceCursor(this.opencodeAdapter.tool, cursorKey, {
+            watermark: 0,
+            cursorId: page.hasMore ? (page.lastId ?? '') : '',
+        });
+        return { ingested, continuation };
+    }
+
+    // Stored V1 memories stay frozen. V2 capture of the same native session
+    // starts only at a verified migration boundary, in a new segment, with a
+    // persisted turn-index offset; every unverifiable case abstains explicitly.
+    private async ingestOpencodeV2Overlap(
+        db: ReturnType<typeof openOpencodeDbReadonly>,
+        canonicalPath: string,
+        session: OpencodeV2OverlapSession,
+    ): Promise<{ ingested: number; continuation: boolean }> {
+        const none = { ingested: 0, continuation: false };
+        const tool = this.opencodeAdapter.tool;
+        const logContext = { tool, sessionId: session.sessionId };
+        if (this.store.consent.isRefusedForCapture(session.directory)) {
+            this.recordSkippedFile(
+                canonicalPath,
+                { category: 'refused root', reason: `refusing to ingest from "${session.directory}" - not a permitted project root` },
+                logContext,
+            );
+            return none;
+        }
+        const canonicalDirectory = canonicalizeExisting(session.directory);
+        const consentState = this.store.consent.consentState(canonicalDirectory);
+        if (consentState !== 'approved') {
+            if (consentState === 'denied') {
+                this.store.recordIncognitoTranscript(tool, session.sessionId);
+            }
+            this.recordSkippedFile(
+                canonicalPath,
+                {
+                    category: 'unapproved root',
+                    reason: `${session.directory} is not an approved memory root; same-ID V1/V2 session skipped before parsing transcript content`,
+                },
+                logContext,
+            );
+            return none;
+        }
+        if (this.store.isTranscriptCaptureBlocked(tool, session.sessionId)) {
+            this.recordSkippedFile(canonicalPath, this.blockedTranscriptSkip(tool, session.sessionId), logContext);
+            return none;
+        }
+        if (this.store.isTranscriptIncognito(tool, session.sessionId)) {
+            this.recordSkippedFile(
+                canonicalPath,
+                {
+                    category: 'incognito',
+                    reason: `transcript ${session.sessionId} was observed while capture was denied and is permanently excluded from ingestion`,
+                },
+                logContext,
+            );
+            return none;
+        }
+
+        const tail = this.opencodeAdapter.v2TailRevision(db, session.sessionId);
+        if (tail === undefined) {
+            return none;
+        }
+        const revision = { seq: tail.seq, updated: tail.updated, v1Updated: session.v1TimeUpdated };
+        const prior = this.store.getOpencodeV2Handoff(session.sessionId);
+        // The persisted V1 cursor and offset were verified against one source
+        // database; another source path carrying the same native id never
+        // inherits or rebinds that authority.
+        if (prior !== undefined && prior.source_path !== canonicalPath) {
+            this.recordSkippedFile(
+                canonicalPath,
+                {
+                    category: 'excluded session',
+                    reason: `OpenCode V2 handoff for ${session.sessionId} is bound to a different source database`,
+                },
+                logContext,
+            );
+            this.log(
+                formatDaemonLog(
+                    `[elepha] OpenCode V2 handoff refused for ${session.sessionId}: handoff is bound to a different source database`,
+                    logContext,
+                ),
+            );
+            return none;
+        }
+        if (
+            prior !== undefined &&
+            prior.needs_continuation === 0 &&
+            prior.observed_seq === revision.seq &&
+            prior.observed_updated === revision.updated &&
+            prior.observed_v1_updated === revision.v1Updated
+        ) {
+            return none;
+        }
+        const stored = this.store.findSession(tool, session.sessionId);
+        const abstain = (reason: string): { ingested: number; continuation: boolean } => {
+            this.store.recordOpencodeV2Handoff(canonicalPath, session.sessionId, canonicalDirectory, {
+                status: 'abstained',
+                v1Cursor: stored?.source_format === 'native' ? (stored.cursor ?? undefined) : undefined,
+                revision,
+                needsContinuation: false,
+                reason,
+            });
+            this.recordSkippedFile(
+                canonicalPath,
+                { category: 'excluded session', reason: `OpenCode V2 handoff abstained: ${reason}` },
+                logContext,
+            );
+            this.log(formatDaemonLog(`[elepha] OpenCode V2 handoff abstained for ${session.sessionId}: ${reason}`, logContext));
+            return none;
+        };
+        if (!session.sameParent) {
+            return abstain('V1 and V2 rows disagree on the parent session');
+        }
+
+        let cursor: string;
+        let turnIndexOffset: number;
+        let handoff: { v1SessionId: number; v1Cursor: string | null; boundary: OpencodeV2HandoffPlan } | undefined;
+        if (stored === undefined) {
+            return abstain('no stored V1 history anchors the handoff');
+        }
+        if (stored.source_format === 'opencode-v2') {
+            // The offset is persisted before the first V2 write, so a crash
+            // between that write and the final status update still resumes.
+            if (prior === undefined || prior.turn_index_offset === null || stored.cursor === null || !stored.cursor.startsWith('v2:')) {
+                return abstain('stored V2 segment has no verified handoff offset');
+            }
+            cursor = stored.cursor;
+            turnIndexOffset = prior.turn_index_offset;
+        } else {
+            const boundary = this.opencodeAdapter.v2HandoffBoundary(db, session.sessionId, stored.cursor);
+            if (boundary.status === 'abstain') {
+                return abstain(boundary.reason);
+            }
+            if (boundary.status === 'awaiting-user') {
+                // Legitimately empty: no V2-native user exists yet after the
+                // migrated prefix, so there is nothing new to capture.
+                this.store.recordOpencodeV2Handoff(canonicalPath, session.sessionId, canonicalDirectory, {
+                    status: 'waiting',
+                    v1Cursor: stored.cursor ?? undefined,
+                    revision,
+                    needsContinuation: false,
+                });
+                return none;
+            }
+            turnIndexOffset = prior?.turn_index_offset ?? this.store.opencodeV1TurnIndexOffset(session.sessionId);
+            cursor = boundary.startCursor;
+            handoff = { v1SessionId: stored.id, v1Cursor: stored.cursor, boundary };
+            // The offset is persisted before any V2 turn can be written. The
+            // unmatched revision keeps a failed pass retryable.
+            if (
+                !this.store.recordOpencodeV2Handoff(canonicalPath, session.sessionId, canonicalDirectory, {
+                    status: 'waiting',
+                    v1Cursor: stored.cursor ?? undefined,
+                    turnIndexOffset,
+                    revision: { seq: -1, updated: -1, v1Updated: -1 },
+                    needsContinuation: false,
+                })
+            ) {
+                return none;
+            }
+        }
+
+        const classification = this.opencodeAdapter.classifySession(session);
+        const progress: OpencodeV2ParseProgress = { hasMore: false, pending: false, omittedPrefix: false };
+        const storedCursorBefore = this.store.getSessionCursor(tool, session.sessionId);
+        let ingested = 0;
+        for await (const parsed of this.opencodeAdapter.parseSessionTurnsV2(db, session, cursor, progress)) {
+            const handingOff = handoff !== undefined && this.store.findSession(tool, session.sessionId)?.source_format !== 'opencode-v2';
+            const turn: ParsedTurn = { ...parsed, turnIndex: parsed.turnIndex + turnIndexOffset };
+            if (handingOff && handoff !== undefined) {
+                const plan = handoff;
+                // Re-read inside the write transaction, after the summarizer
+                // await: the V1 segment and its source anchor, and the V2
+                // boundary, must still be exactly what this pass verified.
+                turn.validateSource = () => {
+                    const latest = this.store.findSession(tool, session.sessionId);
+                    const again =
+                        latest?.id === plan.v1SessionId && latest.source_format === 'native' && latest.cursor === plan.v1Cursor
+                            ? this.opencodeAdapter.v2HandoffBoundary(db, session.sessionId, plan.v1Cursor)
+                            : undefined;
+                    const unchanged =
+                        again?.status === 'ready' &&
+                        again.startCursor === plan.boundary.startCursor &&
+                        again.boundarySeq === plan.boundary.boundarySeq &&
+                        again.boundaryId === plan.boundary.boundaryId;
+                    if (!unchanged) {
+                        this.log(
+                            formatDaemonLog(
+                                `[elepha] OpenCode V2 handoff write refused for ${session.sessionId}: V1 history or the V2 boundary changed before the write`,
+                                logContext,
+                            ),
+                        );
+                    }
+                    return unchanged;
+                };
+            }
+            const turnConsent = this.consentStateForTurn(turn);
+            if (turnConsent === 'denied') {
+                this.store.recordIncognitoTranscript(turn.tool, turn.sessionId);
+                break;
+            }
+            if (turn.droppedReason !== undefined) {
+                // Before the V2 segment exists the only stored cursor belongs
+                // to V1 history, so a dropped turn must not move it.
+                if (!handingOff) {
+                    await this.advanceDroppedTurn(turn, undefined, classification);
+                }
+                if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
+                    break;
+                }
+                continue;
+            }
+            if (await this.persistTurn(this.opencodeAdapter, turn, undefined, classification, handingOff)) {
+                ingested++;
+            }
+            if (this.store.isTranscriptIncognito(turn.tool, turn.sessionId)) {
+                break;
+            }
+        }
+        const latest = this.store.findSession(tool, session.sessionId);
+        const active = latest?.source_format === 'opencode-v2';
+        if (active) {
+            this.store.updateSessionTitle(latest.id, { aiTitle: opencodeSessionAiTitle(session.title), userMessage: '' });
+        }
+        if (ingested > 0) {
+            await this.refreshRollup(this.opencodeAdapter, canonicalPath, session.sessionId, 'live', classification);
+        }
+        if (progress.skippedClosedCursor !== undefined) {
+            this.recordSkippedFile(
+                canonicalPath,
+                {
+                    category: 'excluded session',
+                    reason: `OpenCode V2 session ${session.sessionId} omitted an oversized old turn through ${progress.skippedClosedCursor}`,
+                },
+                logContext,
+            );
+        }
+        if (this.store.isTranscriptIncognito(tool, session.sessionId)) {
+            return { ingested, continuation: false };
+        }
+        // A page of dropped or quote-back turns still advances the cursor
+        // without ingesting anything. Continuation follows cursor progress,
+        // not ingestion; otherwise the unchanged revision is recorded as fully
+        // observed and the rows past the page are never read. A pass that
+        // cannot move the cursor stops rather than rereading the same page.
+        const needsContinuation = progress.hasMore && this.store.getSessionCursor(tool, session.sessionId) !== storedCursorBefore;
+        this.store.recordOpencodeV2Handoff(canonicalPath, session.sessionId, canonicalDirectory, {
+            status: active ? 'active' : 'waiting',
+            v1Cursor: stored.source_format === 'native' ? (stored.cursor ?? undefined) : undefined,
+            turnIndexOffset,
+            revision,
+            needsContinuation,
+        });
+        return { ingested, continuation: needsContinuation };
     }
 
     private async scanFile(
@@ -1465,7 +1879,9 @@ export class IngestionDaemon {
         const nativeId = adapter.nativeSessionId(real);
         const openTurnSource = openTurnSourceSnapshot(opened);
         const openTurnGeneration = sourceGeneration(this.store, adapter.tool, nativeId);
-        const openTurnValidationEpoch = this.beginOpenTurnValidation(adapter.tool, nativeId);
+        let openTurnValidationEpoch: number;
+
+        openTurnValidationEpoch = this.beginOpenTurnValidation(adapter.tool, nativeId);
 
         // A second scan could read a cursor the first has not advanced yet and
         // re-emit a turn already in flight. Retry after the idle debounce so
@@ -1588,17 +2004,10 @@ export class IngestionDaemon {
                 }
             }
 
-            if (this.store.isTranscriptPurged(adapter.tool, nativeId)) {
+            if (this.store.isTranscriptCaptureBlocked(adapter.tool, nativeId)) {
                 return {
                     ingested: 0,
-                    skipped: this.recordSkippedFile(
-                        real,
-                        {
-                            category: 'purged',
-                            reason: `transcript ${nativeId} was purged and is permanently excluded from ingestion`,
-                        },
-                        logContext,
-                    ),
+                    skipped: this.recordSkippedFile(real, this.blockedTranscriptSkip(adapter.tool, nativeId), logContext),
                 };
             }
             if (this.store.isTranscriptIncognito(adapter.tool, nativeId)) {
@@ -1641,7 +2050,8 @@ export class IngestionDaemon {
             let validateSource: (() => boolean) | undefined;
             const validateOpenTurnSource = sourceSnapshotValidator(adapter.tool, filePath, opened);
             let retracted = 0;
-            const storedCursor = this.store.getSessionCursor(adapter.tool, nativeId);
+            const storedResume = this.store.getSessionResume(adapter.tool, nativeId);
+            const storedCursor = storedResume?.cursor;
             let reconcile = false;
             if (adapter.retractable) {
                 const validateWire = sourceSnapshotValidator(adapter.tool, filePath, opened);
@@ -1661,14 +2071,45 @@ export class IngestionDaemon {
                 }
             }
             const cursor = reconcile ? undefined : storedCursor;
+            let resumeContext: ResumeContext | undefined;
+            if (cursor !== undefined) {
+                const stored = storedResume?.context;
+                const resumeKey = `${adapter.tool}:${nativeId}`;
+                if (!adapter.carriesContextAcrossTurns || (stored !== undefined && adapter.resumeContextComplete?.(stored) === true)) {
+                    resumeContext = stored;
+                    this.resumeReconstructions.delete(resumeKey);
+                } else {
+                    // A cursor stored without a complete context. It stays where
+                    // it is until a bounded reconstruction from the source
+                    // completes; each unfinished step queues the next.
+                    resumeContext = await this.reconstructResumeContext(adapter, handle, cursor, resumeKey, logContext);
+                    if (resumeContext === undefined) {
+                        if (!this.stopping) {
+                            this.workQueue.enqueue(async () => {
+                                await this.scanFile(adapter, filePath, closeTrailingOnIdle, onlyProjectRoots);
+                            });
+                        }
+                        return { ingested: 0 };
+                    }
+                }
+            }
             let ingested = 0;
             let parsedTurns = 0;
             let openTail: OpenTailObservation | undefined;
+            let malformedRecords: number | undefined;
+            let unrecognizedRecords: number | undefined;
             for await (const turn of adapter.parseTurns(real, cursor, {
                 closeTrailingOnIdle,
                 handle,
+                resumeContext,
                 onOpenTail: (observation) => {
                     openTail = observation;
+                },
+                onMalformedRecords: (count) => {
+                    malformedRecords = count;
+                },
+                onUnrecognizedRecords: (count) => {
+                    unrecognizedRecords = count;
                 },
             })) {
                 parsedTurns++;
@@ -1692,6 +2133,11 @@ export class IngestionDaemon {
                     break;
                 }
             }
+
+            // Valid turns beside a skipped record stay stored, but the source
+            // is no longer completely captured. Only a stored session has
+            // coverage to withdraw; a transcript that is not captured has none.
+            this.recordLiveParseGap(adapter.tool, nativeId, { malformed: malformedRecords ?? 0, unrecognized: unrecognizedRecords ?? 0 });
 
             if (openTail !== undefined) {
                 await this.handleOpenTail(
@@ -1732,10 +2178,12 @@ export class IngestionDaemon {
             if (cursor === undefined && parsedTurns === 0 && openTail === undefined && (await handle.stat()).size > 0) {
                 const emptySession = await adapter.classifyEmptySession(real);
                 if (emptySession) {
-                    return { ingested: 0, emptySession: emptySession.kind };
+                    return { ingested: 0, emptySession: emptySession.kind, malformedRecords, unrecognizedRecords };
                 }
                 return {
                     ingested: 0,
+                    malformedRecords,
+                    unrecognizedRecords,
                     skipped: this.recordSkippedFile(
                         real,
                         {
@@ -1748,7 +2196,12 @@ export class IngestionDaemon {
                     ),
                 };
             }
-            return { ingested, skipped: ingested === 0 ? this.skippedFiles.get(real) : undefined };
+            return {
+                ingested,
+                skipped: ingested === 0 ? this.skippedFiles.get(real) : undefined,
+                malformedRecords,
+                unrecognizedRecords,
+            };
         } catch (err) {
             if (err instanceof OversizedTranscriptRecordError) {
                 const skipped = this.quarantineOversizedTranscript(real, err, logContext, fileStat);
@@ -1757,21 +2210,29 @@ export class IngestionDaemon {
                     skipped,
                 };
             }
+
             return {
                 ingested: 0,
-                skipped: this.recordSkippedFile(
-                    filePath,
-                    {
-                        category: 'unexpected error',
-                        reason: `unexpected error: ${(err as Error).message}`,
-                    },
-                    logContext,
-                ),
+                skipped: this.recordSkippedFile(filePath, this.fileSkipForError(err), logContext),
             };
         } finally {
             this.processing.delete(real);
             await handle.close();
         }
+    }
+
+    private recordLiveParseGap(tool: ToolName, nativeId: string, records: { malformed: number; unrecognized: number }): void {
+        if (records.malformed + records.unrecognized === 0 || !this.store.findSession(tool, nativeId)) {
+            return;
+        }
+        this.store.database.transaction(() => {
+            const capture = new DurableCaptureStore(this.store.database);
+            for (const row of this.store.database
+                .prepare('SELECT id FROM sessions WHERE tool = ? AND native_id = ?')
+                .all(tool, nativeId) as Array<{ id: number }>) {
+                capture.setStatus(row.id, 'parse_error', new Date(this.now()).toISOString());
+            }
+        })();
     }
 
     private async readCustomTitle(adapter: SessionAdapter, filePath: string): Promise<string | undefined> {
@@ -1857,32 +2318,19 @@ export class IngestionDaemon {
             return;
         }
         const stagedAt = new Date(this.now()).toISOString();
-        const projection = this.durableCapture ? filterTurn(turn) : undefined;
-        const stage = (evictionPlan?: DurableEvictionPlan) =>
-            this.store.stageOpenTurnSummary(
-                turn.tool,
-                turn.sessionId,
-                source.revision,
-                staged.source_digest,
-                summary,
-                stagedAt,
-                projection,
-                turn.projectPath,
-                validateSource,
-                this.durableCaptureMaxBytes,
-                validationEpoch,
-                evictionPlan,
-            );
-        const inserted = projection
-            ? await withValidatedDurableEvictionSources(
-                  this.store.database,
-                  projection,
-                  this.durableCaptureMaxBytes,
-                  { kind: 'open-turn', sessionId: staged.session_id, tool: turn.tool, sourcePath: turn.sourcePath },
-                  stage,
-                  { openTranscript: this.openTranscript },
-              )
-            : stage(undefined);
+        const projection = retainsFilteredCopy(turn.tool, this.legacyDurableCapture) ? filterTurn(turn) : undefined;
+        const inserted = this.store.stageOpenTurnSummary(
+            turn.tool,
+            turn.sessionId,
+            source.revision,
+            staged.source_digest,
+            summary,
+            stagedAt,
+            projection,
+            turn.projectPath,
+            validateSource,
+            validationEpoch,
+        );
         if (inserted) {
             this.log(formatDaemonLog(`[elepha] staged incomplete failed-EOF turn ${turn.turnIndex}`, turn));
         }
@@ -1893,6 +2341,9 @@ export class IngestionDaemon {
         turn: ParsedTurn,
         customTitle?: string,
         explicitClassification?: SessionClassification,
+        // A verified source-format handoff opens its own segment regardless
+        // of the gap/branch/file boundary heuristics.
+        forceSegment = false,
     ): Promise<boolean> {
         // Refused roots ($HOME itself, document dumps) never become projects.
         // Enforced here rather than downstream because a project row created
@@ -1928,7 +2379,9 @@ export class IngestionDaemon {
             return false;
         }
         if (quoteBackStatus === 'match') {
-            if (!this.store.recordQuoteBackTurn(turn)) {
+            // Before a forced handoff segment exists, the only stored cursor
+            // belongs to another source format and must not move.
+            if (!forceSegment && !this.store.recordQuoteBackTurn(turn)) {
                 return false;
             }
             this.log(
@@ -1947,6 +2400,7 @@ export class IngestionDaemon {
             gitBranch: turn.gitBranch ?? null,
             kind: classification ? toSessionRowKind(classification.kind) : null,
             customTitle,
+            sourceFormat: turn.tool === 'opencode' && turn.cursor.startsWith('v2:') ? ('opencode-v2' as const) : ('native' as const),
         };
         const session = this.store.findSession(turn.tool, turn.sessionId);
 
@@ -1961,14 +2415,15 @@ export class IngestionDaemon {
                 : 0;
         const cut =
             session !== undefined &&
-            evaluateSegmentBoundary({
-                gapHours,
-                trailingBranch: session.trailing_branch,
-                resumingBranch: turn.gitBranch ?? null,
-                trailingFiles: session.trailing_files,
-                resumingFiles: turn.toolCalls.flatMap((call) => call.filePaths),
-                resumeMarkerBefore: turn.resumeMarkerBefore,
-            });
+            (forceSegment ||
+                evaluateSegmentBoundary({
+                    gapHours,
+                    trailingBranch: session.trailing_branch,
+                    resumingBranch: turn.gitBranch ?? null,
+                    trailingFiles: session.trailing_files,
+                    resumingFiles: turn.toolCalls.flatMap((call) => call.filePaths),
+                    resumeMarkerBefore: turn.resumeMarkerBefore,
+                }));
 
         // Overlapping watch events (prompt scan + idle scan, or two rapid
         // 'add' events on cold start) can re-present an already-recorded
@@ -1992,39 +2447,24 @@ export class IngestionDaemon {
             await this.refreshStoredSessionRollup(adapter, turn.sourcePath, session, classification, 'final');
         }
 
-        const summary = this.summarizer
-            ? await this.summarizer.summarize({ userMessage: turn.userMessage, assistantText: turn.assistantText })
-            : { decisions: [], pending_items: [], status: 'not_configured' as const };
-        if (this.summarizer) {
+        const reportOnly = turn.taskStateReport !== undefined && !turn.userMessage && !turn.assistantText && turn.toolCalls.length === 0;
+        const summary =
+            this.summarizer && !reportOnly
+                ? await this.summarizer.summarize({ userMessage: turn.userMessage, assistantText: turn.assistantText })
+                : { decisions: [], pending_items: [], status: 'not_configured' as const };
+        if (this.summarizer && !reportOnly) {
             this.trackOutcome(summary.status);
         }
-        let preparation: IngestedTurnWritePreparation | undefined;
-        const record = (evictionPlan?: DurableEvictionPlan) =>
-            this.store.recordIngestedTurn(
-                turn,
-                meta,
-                cut,
-                summary,
-                this.durableCapture,
-                this.durableCaptureMaxBytes,
-                evictionPlan,
-                preparation,
-            );
-        const persisted = this.durableCapture
-            ? await withValidatedDurableEvictionSources(
-                  this.store.database,
-                  filterTurn(turn),
-                  this.durableCaptureMaxBytes,
-                  { sessionId: cut ? undefined : session?.id, tool: turn.tool, sourcePath: turn.sourcePath },
-                  record,
-                  {
-                      openTranscript: this.openTranscript,
-                      beforeFinalIdentityCheck: () => {
-                          preparation = this.store.prepareIngestedTurnWrite(turn, cut);
-                      },
-                  },
-              )
-            : record(undefined);
+        // A capacity deferral throws out of the file loop so no later turn can
+        // move the cursor past this one; the next scan retries from here.
+        const persisted = this.store.recordIngestedTurn(
+            turn,
+            meta,
+            cut,
+            summary,
+            retainsFilteredCopy(turn.tool, this.legacyDurableCapture),
+            undefined,
+        );
         if (!persisted) {
             return false;
         }
@@ -2045,6 +2485,9 @@ export class IngestionDaemon {
                 this.rollups.markLive(storedSession.id);
             } else {
                 this.rollupService?.noteActivity(storedSession.id);
+            }
+            if (turn.taskStateReport?.mode === 'precompact_manifest') {
+                await this.taskStateManifests.publish(turn, storedSession.id);
             }
         }
         return inserted;
@@ -2087,6 +2530,7 @@ export class IngestionDaemon {
             gitBranch: turn.gitBranch ?? null,
             kind: classification ? toSessionRowKind(classification.kind) : null,
             customTitle,
+            sourceFormat: turn.tool === 'opencode' && turn.cursor.startsWith('v2:') ? ('opencode-v2' as const) : ('native' as const),
         };
         if (!this.store.recordDroppedTurn(turn, meta)) {
             return;
@@ -2181,6 +2625,17 @@ export class IngestionDaemon {
         }
         let closed = 0;
         for (const session of this.store.listOpenSessions()) {
+            // Capture-only history has no synthesis output to aggregate.
+            // An idle sweep must not turn discovery into a provider call.
+            // A later summarized live turn makes this session eligible again.
+            if (
+                (session.tool === 'claude-code' || session.tool === 'codex') &&
+                this.store.database
+                    .prepare("SELECT 1 FROM memories WHERE session_id = ? AND summarizer_status <> 'not_configured' LIMIT 1")
+                    .get(session.id) === undefined
+            ) {
+                continue;
+            }
             const adapter = this.adapters.find((a) => a.tool === session.tool);
             if (!adapter) {
                 continue;

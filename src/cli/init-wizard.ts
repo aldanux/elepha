@@ -3,8 +3,6 @@ import path from 'node:path';
 import { isRefusedProjectRoot, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import type { DiscoveredProject } from '../discovery/session-projects.js';
 
-export type InitMode = 'folder' | 'individual';
-
 export type EffectiveSessionCount = (root: string, onDiskSessionCount: number) => number;
 
 const onDiskSessionCount: EffectiveSessionCount = (_root, sessionCount) => sessionCount;

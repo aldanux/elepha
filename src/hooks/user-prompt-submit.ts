@@ -3,13 +3,16 @@
 
 import { randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 import type Database from 'better-sqlite3-multiple-ciphers';
+import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import {
     AUTOMATIC_RECALL_MAX_CANDIDATES,
     AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
     AUTOMATIC_RECALL_MAX_PER_CHAT,
     AUTOMATIC_RECALL_MAX_PROMPT_CHARS,
     AUTOMATIC_RECALL_MIN_SIMILARITY,
+    CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
     ELEPHA_LIST_DEFAULT_LIMIT,
     ELEPHA_LIST_MAX_LIMIT,
     HOOK_WATCHDOG_TIMEOUT_MS,
@@ -19,6 +22,7 @@ import { getSetting } from '../config/settings.js';
 import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
+import { openProviderTranscript, validateOpenedProviderTranscriptIdentitySync } from '../security/provider-transcript.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { buildInjectionId, wrap } from '../security/sentinel.js';
 import { AUTOMATIC_RECALL_BODY_PREFIX, automaticRecallBody, automaticRecallCandidate } from '../serving/automatic-recall.js';
@@ -30,6 +34,7 @@ import {
     RESUME_RECAP_INSTRUCTIONS,
     SELECT_HINT,
     servedContextInstructions,
+    TASK_STATE_REQUEST_INSTRUCTIONS,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
 import { currentRecallHits, renderSemanticUnion, semanticRecall, semanticRecallNotices } from '../serving/semantic-recall.js';
@@ -48,6 +53,7 @@ import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
 import { LOCKED_MEMORY_MESSAGE, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
+import { newTaskStateRequestId, TaskStateRequestStore, taskStateRequestMarker } from '../storage/task-state-request-store.js';
 import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookTool, parsePayload, readStdin, type UserPromptSubmitPayload } from './common.js';
@@ -322,6 +328,106 @@ export async function runUserPromptSubmit(
             }
             return { output: envelope(output) };
         };
+        const addClaudeTaskRequest = async (result: UserPromptSubmitResult): Promise<UserPromptSubmitResult> => {
+            if (
+                tool !== 'claude-code' ||
+                !getSetting('memory-plus', {}, dependencies.configPath).value ||
+                payload.agent_type !== undefined ||
+                !payload.transcript_path ||
+                Buffer.byteLength(payload.transcript_path) > CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES
+            ) {
+                return result;
+            }
+            const transcriptPath = payload.transcript_path;
+            const session = store.findSession('claude-code', payload.session_id);
+            if (
+                session?.kind !== 'main' ||
+                session.source_format !== 'native' ||
+                path.basename(transcriptPath) !== `${payload.session_id}.jsonl` ||
+                (await new ClaudeCodeAdapter().classifySession(transcriptPath)).kind !== 'primary'
+            ) {
+                return result;
+            }
+            const requests = new TaskStateRequestStore(db);
+            const opened = await openProviderTranscript('claude-code', transcriptPath);
+            if ('reason' in opened) {
+                return result;
+            }
+            try {
+                const classification = await new ClaudeCodeAdapter().classifySession(opened.resolvedPath);
+                const identity = validateOpenedProviderTranscriptIdentitySync('claude-code', transcriptPath, opened);
+                if (
+                    'reason' in identity ||
+                    realpathSync(session.source_path) !== identity.resolvedPath ||
+                    classification.kind !== 'primary'
+                ) {
+                    return result;
+                }
+                if (!getSetting('memory-plus', {}, dependencies.configPath).value) {
+                    return result;
+                }
+                const pending = requests.currentPendingOutput({
+                    tool,
+                    nativeSessionId: payload.session_id,
+                    cwd: payload.cwd,
+                    mode: 'precompact_manifest',
+                });
+                if (pending !== undefined) {
+                    if ('output' in result) {
+                        const hook = result.output.hookSpecificOutput as { additionalContext: string };
+                        return { output: envelope(`${hook.additionalContext}\n\n${pending.output}`) };
+                    }
+                    return { output: envelope(pending.output) };
+                }
+                const requestId = newTaskStateRequestId();
+                const body = `${taskStateRequestMarker('precompact_manifest', requestId)}\n${TASK_STATE_REQUEST_INSTRUCTIONS}`;
+                const prepared = requests.prepareIssue({
+                    tool,
+                    nativeSessionId: payload.session_id,
+                    cwd: payload.cwd,
+                    mode: 'precompact_manifest',
+                    requestId,
+                });
+                if (prepared === undefined) {
+                    return result;
+                }
+                let requestOutput: string;
+                try {
+                    requestOutput = db.transaction(() => {
+                        const output = recordHookOutput({
+                            store,
+                            tool,
+                            nativeSessionId: payload.session_id,
+                            injectedAt: new Date(clock()).toISOString(),
+                            body,
+                            kind: 'brief',
+                            writeInjection: (memory, injection) => {
+                                const written = (dependencies.writeInjection ?? ((target, value) => target.recordInjection(value)))(
+                                    memory,
+                                    injection,
+                                );
+                                return written && requests.issuePrepared(prepared, injection.injectionId);
+                            },
+                        });
+                        if (output === undefined) {
+                            throw new Error('Task-state request injection failed.');
+                        }
+                        return output;
+                    })();
+                } catch {
+                    return result;
+                }
+                if ('output' in result) {
+                    const hook = result.output.hookSpecificOutput as Record<string, unknown>;
+                    return { output: envelope(`${hook.additionalContext}\n\n${requestOutput}`) };
+                }
+                return { output: envelope(requestOutput) };
+            } catch {
+                return result;
+            } finally {
+                await opened.handle.close().catch(() => undefined);
+            }
+        };
         let completedRuleCommand = false;
         const locked = (): UserPromptSubmitResult => {
             if (automatic) {
@@ -349,7 +455,7 @@ export async function runUserPromptSubmit(
                 if (
                     store.countInjectionBodyPrefix(tool, payload.session_id, AUTOMATIC_RECALL_BODY_PREFIX) >= AUTOMATIC_RECALL_MAX_PER_CHAT
                 ) {
-                    return { reason: 'not_command' };
+                    return addClaudeTaskRequest({ reason: 'not_command' });
                 }
                 const deadline = Date.now() + HOOK_WATCHDOG_TIMEOUT_MS;
                 const semantic = await semanticRecall(db, project.projectIds, payload.prompt, {
@@ -370,7 +476,7 @@ export async function runUserPromptSubmit(
                 // never bypass abstention or the candidate's deduplication gate.
                 const notice = semanticRecallNotices(semantic);
                 if (candidates.length === 0) {
-                    return { reason: 'not_command' };
+                    return addClaudeTaskRequest({ reason: 'not_command' });
                 }
                 // Resolve current projects and consent once for the bounded shortlist.
                 const hits = new Map(
@@ -432,7 +538,7 @@ export async function runUserPromptSubmit(
                     selected.push({ sessionId: candidate.sessionId, prefix, body });
                 }
                 if (selected.length === 0) {
-                    return { reason: 'not_command' };
+                    return addClaudeTaskRequest({ reason: 'not_command' });
                 }
                 if (
                     !getSetting('memory-plus', {}, dependencies.configPath).value ||
@@ -492,7 +598,7 @@ export async function runUserPromptSubmit(
                 if ('output' in result) {
                     log(promptLogLine(tool, payload, 'served automatic_candidate'));
                 }
-                return result;
+                return addClaudeTaskRequest(result);
             }
             const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
             let commandOutput: string;

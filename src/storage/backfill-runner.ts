@@ -1,5 +1,7 @@
 import type { Database } from 'better-sqlite3-multiple-ciphers';
 import type { SessionAdapterMap } from '../types/index.js';
+import { liveMemoryRetentionFor } from './live-memory-retention.js';
+import { assertLiveMemoryBulkWrite, readLiveMemoryUsage } from './live-memory-usage.js';
 
 export interface BackfillChange {
     transcriptMissing: boolean;
@@ -55,7 +57,10 @@ export async function applyBackfill<Session, Change extends BackfillChange, Stat
     deriver: BackfillDeriver<Session, Change, State>,
 ): Promise<BackfillPlan<Change>> {
     const plan = await planBackfill(db, adapters, deriver);
+    // One transaction spans every session, so a backfill cannot run automatic
+    // cleanup; a batch that would reach capacity is refused whole.
     const apply = db.transaction((changes: Change[]) => {
+        const liveMemoryBefore = readLiveMemoryUsage(db);
         let sessionsSkippedConcurrent = 0;
         for (const change of changes) {
             if (!deriver.shouldWrite(change)) {
@@ -63,6 +68,7 @@ export async function applyBackfill<Session, Change extends BackfillChange, Stat
             }
             sessionsSkippedConcurrent += deriver.write(db, change)?.sessionsSkippedConcurrent ?? 0;
         }
+        assertLiveMemoryBulkWrite(db, liveMemoryBefore, liveMemoryRetentionFor(db).policy.capacityBytes);
         return sessionsSkippedConcurrent;
     });
     const sessionsSkippedConcurrent = apply(plan.changes);

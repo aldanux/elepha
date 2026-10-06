@@ -23,15 +23,19 @@ import { defaultBackupPath, exportAll, exportProject, listFullBackups } from '..
 import { isSupportedPlatform } from '../../src/install/platform.js';
 import { openKeyedDatabase, rekeyDatabaseConnection } from '../../src/storage/db.js';
 import { BACKUP_DESTINATION_COMPANION_ERROR } from '../../src/storage/encrypted-database-export.js';
+import { LIVE_MEMORY_TRIGGER_NAMES, LIVE_MEMORY_USAGE_TABLE } from '../../src/storage/live-memory-usage.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { ProjectResolver } from '../../src/storage/project-resolver.js';
+import { TURN_EMBEDDINGS_TABLE } from '../../src/storage/turn-embeddings.js';
+import { TURN_SEARCH_CLEANUP_TRIGGER, TURN_SEARCH_INDEX_TABLE } from '../../src/storage/turn-search-index.js';
 import { createTestDb, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 const repositoryRoot = path.resolve(import.meta.dirname, '..', '..');
 const FIXED_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
 const SQLITE_COMPANION_SUFFIXES = ['-journal', '-shm', '-wal'] as const;
 
-function seedExportFixture() {
+// Turn vectors can only reference turns whose filtered copy was retained.
+function seedExportFixture(durableCapture = false) {
     const fixture = createTestDb('elepha-backup-');
     const store = fixture.store;
     const primary = seedProject(fixture, { path: repositoryRoot });
@@ -62,9 +66,9 @@ function seedExportFixture() {
     const primarySession = seedSession(fixture, { project: primary, nativeId: 'primary-session' });
     const fragmentSession = seedSession(fixture, { project: fragment, nativeId: 'fragment-session' });
     const otherSession = seedSession(fixture, { project: other, nativeId: 'other-session' });
-    seedMemory(fixture, { project: primary, session: primarySession });
-    seedMemory(fixture, { project: fragment, session: fragmentSession });
-    seedMemory(fixture, { project: other, session: otherSession });
+    seedMemory(fixture, { project: primary, session: primarySession, durableCapture });
+    seedMemory(fixture, { project: fragment, session: fragmentSession, durableCapture });
+    seedMemory(fixture, { project: other, session: otherSession, durableCapture });
     seedRollup(fixture, { project: primary, session: primarySession });
     seedRollup(fixture, { project: fragment, session: fragmentSession });
     seedRollup(fixture, { project: other, session: otherSession });
@@ -97,6 +101,18 @@ function allTableCounts(db: Database.Database): Record<string, number> {
     );
 }
 
+// Stores one derived vector per indexed memory; returns how many were stored.
+function seedTurnVectors(db: Database.Database): number {
+    return db
+        .prepare(
+            `INSERT INTO ${TURN_EMBEDDINGS_TABLE}
+               (memory_id, project_id, source_digest, text_hash, model, model_revision, dimensions, vector, computed_at)
+             SELECT t.memory_id, m.project_id, t.source_digest, 'text-hash', 'model', 'revision', 2, ?, '2026-09-27T00:00:00.000Z'
+             FROM ${TURN_SEARCH_INDEX_TABLE} t JOIN memories m ON m.id = t.memory_id`,
+        )
+        .run(Buffer.alloc(8)).changes;
+}
+
 function schemaRows(db: Database.Database): Array<Record<string, unknown>> {
     return db.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all() as Array<Record<string, unknown>>;
 }
@@ -119,16 +135,19 @@ function shadowTableRows(db: Database.Database): Record<string, Array<Record<str
     );
 }
 
+// The derived turn search index and the live-memory ledger stay out of
+// portable exports, including their triggers on exported tables.
 function portableSchemaRows(db: Database.Database): Array<Record<string, unknown>> {
     return db
         .prepare(
             `SELECT type, name, tbl_name, sql
              FROM sqlite_master
-             WHERE (type = 'table' AND name IN ('projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'))
-                OR (type IN ('index', 'trigger') AND tbl_name IN ('projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'))
+             WHERE ((type = 'table' AND name IN ('projects', 'sessions', 'memories', 'session_rollups', 'standing_rules'))
+                OR (type IN ('index', 'trigger') AND tbl_name IN ('projects', 'sessions', 'memories', 'session_rollups', 'standing_rules')))
+               AND NOT (type = 'trigger' AND (name = ? OR name IN (SELECT value FROM json_each(?))))
              ORDER BY type, name`,
         )
-        .all() as Array<Record<string, unknown>>;
+        .all(TURN_SEARCH_CLEANUP_TRIGGER, JSON.stringify(LIVE_MEMORY_TRIGGER_NAMES)) as Array<Record<string, unknown>>;
 }
 
 function temporaryFilesFor(destination: string): string[] {
@@ -569,7 +588,7 @@ describe('elepha backup exports', () => {
     );
 
     it('writes a standalone database with both fragment rows and no other project data through --project', () => {
-        const { fixture, project, other } = seedExportFixture();
+        const { fixture, project, other } = seedExportFixture(true);
         const output = path.join(fixture.directory, 'project-export.db');
         const blobTitle = Buffer.from([0, 1, 2, 3, 254, 255]);
         fixture.db.exec(`
@@ -580,6 +599,7 @@ describe('elepha backup exports', () => {
             END
         `);
         fixture.db.prepare('UPDATE sessions SET title = ? WHERE native_id = ?').run(blobTitle, 'primary-session');
+        expect(seedTurnVectors(fixture.db)).toBe(3);
         fixture.db.pragma('wal_checkpoint(TRUNCATE)');
         const sourceBytes = readFileSync(fixture.dbPath);
         const sourceSchema = portableSchemaRows(fixture.db);
@@ -641,6 +661,26 @@ describe('elepha backup exports', () => {
                     .all(),
             );
             expect(portableSchemaRows(exported)).toEqual(sourceSchema);
+            expect(sourceSchema).toContainEqual(expect.objectContaining({ type: 'trigger', name: 'export_sessions_title_audit' }));
+            expect(
+                fixture.db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?").get(TURN_SEARCH_CLEANUP_TRIGGER),
+            ).toEqual({
+                name: TURN_SEARCH_CLEANUP_TRIGGER,
+            });
+            expect(
+                exported
+                    .prepare("SELECT name FROM sqlite_master WHERE name GLOB 'turn_search_*' OR name = ?")
+                    .all(TURN_SEARCH_CLEANUP_TRIGGER),
+            ).toEqual([]);
+            // The live-memory ledger describes the source database, so neither
+            // its table nor its triggers on exported tables are carried along.
+            const ledgerSchema = `SELECT name FROM sqlite_master WHERE name = '${LIVE_MEMORY_USAGE_TABLE}' OR name IN (SELECT value FROM json_each(?))`;
+            expect(fixture.db.prepare(ledgerSchema).all(JSON.stringify(LIVE_MEMORY_TRIGGER_NAMES))).not.toEqual([]);
+            expect(exported.prepare(ledgerSchema).all(JSON.stringify(LIVE_MEMORY_TRIGGER_NAMES))).toEqual([]);
+            // Derived per-turn vectors stay out of portable exports with their index.
+            const turnVectorSchema = 'SELECT name FROM sqlite_master WHERE name = ? OR tbl_name = ?';
+            expect(fixture.db.prepare(turnVectorSchema).all(TURN_EMBEDDINGS_TABLE, TURN_EMBEDDINGS_TABLE)).not.toEqual([]);
+            expect(exported.prepare(turnVectorSchema).all(TURN_EMBEDDINGS_TABLE, TURN_EMBEDDINGS_TABLE)).toEqual([]);
             expect(
                 exported
                     .prepare(
@@ -735,7 +775,7 @@ describe('elepha backup exports', () => {
     }, 15000);
 
     it('writes a full database copy with matching portable-table row counts through --all', () => {
-        const { fixture } = seedExportFixture();
+        const { fixture } = seedExportFixture(true);
         const output = path.join(fixture.directory, 'full-export.db');
         const blob = Buffer.from([255, 0, 128, 64, 32]);
         fixture.db.exec(`
@@ -758,6 +798,7 @@ describe('elepha backup exports', () => {
         fixture.db.prepare('INSERT INTO backup_rowid_probe (rowid, payload) VALUES (?, ?)').run(5, Buffer.from([5]));
         fixture.db.prepare('INSERT INTO backup_rowid_probe (rowid, payload) VALUES (?, ?)').run(17, Buffer.from([17]));
         fixture.db.prepare('DELETE FROM backup_rowid_probe WHERE rowid = ?').run(5);
+        expect(seedTurnVectors(fixture.db)).toBe(3);
         const largeRowid = 9_007_199_254_740_993n;
         fixture.db.prepare('INSERT INTO backup_rowid_probe (rowid, payload) VALUES (?, ?)').run(largeRowid, Buffer.from([9, 0, 7]));
         fixture.db.pragma('wal_checkpoint(TRUNCATE)');
@@ -779,6 +820,8 @@ describe('elepha backup exports', () => {
         try {
             expect(allTableCounts(exported)).toEqual(allTableCounts(source));
             expect(schemaRows(exported)).toEqual(schemaRows(source));
+            const turnVectors = `SELECT * FROM ${TURN_EMBEDDINGS_TABLE} ORDER BY memory_id`;
+            expect(exported.prepare(turnVectors).all()).toEqual(source.prepare(turnVectors).all());
             expect(
                 exported
                     .prepare(
@@ -1301,7 +1344,7 @@ describe('elepha backup exports', () => {
         const beginVacuum = path.join(fixture.directory, 'concurrent-export.begin');
         const exportState = path.join(fixture.directory, 'concurrent-export.state');
         const writerSource = `
-            import { existsSync, writeFileSync } from 'node:fs';
+            import { existsSync, renameSync, writeFileSync } from 'node:fs';
 
             const [sourcePath, heartbeatPath, resumePath, advancedPath, stopPath, keyHex, rows] = process.argv.slice(1);
             const { openKeyedDatabase } = await import(${JSON.stringify(new URL('../../src/storage/db.ts', import.meta.url).href)});
@@ -1310,16 +1353,22 @@ describe('elepha backup exports', () => {
             const updateAll = writer.prepare('UPDATE full_snapshot_probe SET generation = ?');
             const sleeper = new Int32Array(new SharedArrayBuffer(4));
             let generation = 1;
+            const publishGeneration = () => {
+                // Readers open either complete publication; they never see a truncated overwrite.
+                const temporaryPath = heartbeatPath + '.tmp';
+                writeFileSync(temporaryPath, String(generation), { mode: 0o600 });
+                renameSync(temporaryPath, heartbeatPath);
+            };
             updateAll.run('g' + String(generation).padStart(8, '0'));
             writer.pragma('wal_checkpoint(TRUNCATE)');
-            writeFileSync(heartbeatPath, String(generation), { mode: 0o600 });
+            publishGeneration();
             while (!existsSync(resumePath)) Atomics.wait(sleeper, 0, 0, 10);
             while (!existsSync(stopPath)) {
                 generation += 1;
                 const label = 'g' + String(generation).padStart(8, '0');
                 updateAll.run(label);
                 writer.pragma('wal_checkpoint(TRUNCATE)');
-                writeFileSync(heartbeatPath, String(generation), { mode: 0o600 });
+                publishGeneration();
                 if (generation === 2) writeFileSync(advancedPath, 'ready', { mode: 0o600 });
                 Atomics.wait(sleeper, 0, 0, 5);
             }
@@ -1368,10 +1417,18 @@ describe('elepha backup exports', () => {
             };
             syncBuiltinESMExports();
             const { exportAll } = await import(${JSON.stringify(new URL('../../src/cli/commands/backup.ts', import.meta.url).href)});
+            const readGeneration = () => {
+                const value = fs.readFileSync(heartbeatPath, 'utf8');
+                const generation = Number(value);
+                if (!Number.isSafeInteger(generation) || generation <= 0 || String(generation) !== value) {
+                    throw new Error('Invalid writer progress: ' + JSON.stringify(value));
+                }
+                return generation;
+            };
             try {
-                const before = Number(fs.readFileSync(heartbeatPath, 'utf8'));
+                const before = readGeneration();
                 exportAll(sourceDb, destination, Buffer.from(keyHex, 'hex'));
-                const after = Number(fs.readFileSync(heartbeatPath, 'utf8'));
+                const after = readGeneration();
                 fs.writeFileSync(statePath, JSON.stringify({ before, after, targetCreationReached }), { mode: 0o600 });
             } finally {
                 sourceDb.close();
@@ -4049,7 +4106,10 @@ describe('elepha backup exports', () => {
         const { fixture } = seedExportFixture();
         const output = path.join(fixture.directory, 'busy-full.db');
         const original = Buffer.from('keep the previous full backup');
-        vi.spyOn(fixture.db, 'pragma').mockReturnValue([{ busy: 1 }] as never);
+        const pragma = fixture.db.pragma.bind(fixture.db);
+        vi.spyOn(fixture.db, 'pragma').mockImplementation((source, options) =>
+            source === 'wal_checkpoint(TRUNCATE)' ? [{ busy: 1 }] : pragma(source, options),
+        );
 
         expect(() => exportAll(fixture.db, output, FIXED_KEY)).toThrow(
             "Backup aborted: WAL checkpoint did not complete (the daemon may be writing) — run 'elepha pause' or retry.",

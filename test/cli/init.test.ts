@@ -3,14 +3,12 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { type InitPrompts, runInit } from '../../src/cli/init.js';
-import type { DiscoveryResult } from '../../src/discovery/session-projects.js';
+import { runInit } from '../../src/cli/init.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { ParsedTurn } from '../../src/types/index.js';
+import { CANCELLED, discovery, fakePrompts, ttyStream } from '../helpers/init-prompts.js';
 import { withGrantableTestDir, withTempDir } from '../helpers/tmp.js';
-
-const CANCELLED = Symbol('cancelled');
 
 beforeEach(() => {
     vi.stubEnv('ELEPHA_HOME', withGrantableTestDir('elepha-init-config-'));
@@ -19,46 +17,6 @@ beforeEach(() => {
 afterEach(() => {
     vi.unstubAllEnvs();
 });
-
-function ttyStream(): PassThrough {
-    const stream = new PassThrough();
-    Object.defineProperty(stream, 'isTTY', { value: true });
-    return stream;
-}
-
-function fakePrompts(
-    mode: 'folder' | 'individual' | typeof CANCELLED,
-    selection: string[] | typeof CANCELLED,
-    captureSelections: Array<string[] | typeof CANCELLED> = [],
-) {
-    const events: string[] = [];
-    const output = new PassThrough();
-    const prompts: InitPrompts = {
-        intro: (title) => events.push(`intro:${title}`),
-        note: (message) => events.push(`note:${message}`),
-        spinner: () => ({ start: (message) => events.push(`start:${message}`), stop: () => events.push('stop') }),
-        select: vi.fn(async () => mode),
-        multiselect: vi.fn(async ({ message, initialValues }) =>
-            message === 'Which tools should elepha capture?' ? (captureSelections.shift() ?? initialValues) : selection,
-        ),
-        isCancel: (value) => value === CANCELLED,
-        cancel: (message) => events.push(`cancel:${message}`),
-        outro: (message) => events.push(`outro:${message}`),
-    };
-    return { prompts, events, output };
-}
-
-function discovery(projects: Array<{ root: string; displayName: string; sessionCount: number }>): DiscoveryResult {
-    return {
-        detectedTools: ['claude-code', 'codex'],
-        projects: projects.map((project) => ({
-            ...project,
-            tools: ['codex'],
-            earliestSessionAt: '2026-08-01T00:00:00.000Z',
-            latestSessionAt: '2026-08-02T00:00:00.000Z',
-        })),
-    };
-}
 
 function storedTurn(sessionId: string, projectPath: string, sourcePath: string, turnIndex = 0): ParsedTurn {
     return {
@@ -133,11 +91,11 @@ describe('elepha init', () => {
         }
     });
 
-    it('defaults every detected capture tool on and writes unchecked tools off', async () => {
+    it('defaults every detected capture tool on and writes unchecked tools off once confirmed', async () => {
         const directory = withGrantableTestDir('elepha-init-tool-capture-');
         const db = openUnmanagedDb(path.join(directory, 'elepha.db'));
         const configPath = path.join(directory, 'config.json');
-        const { prompts, output } = fakePrompts(CANCELLED, [], [['claude-code', 'opencode']]);
+        const { prompts, output } = fakePrompts('individual', [], [['claude-code', 'opencode']]);
 
         try {
             await expect(
@@ -146,6 +104,7 @@ describe('elepha init', () => {
                     output,
                     store: new MemoryStore(db),
                     configPath,
+                    reconcile: vi.fn(),
                     prompts,
                     detectTools: async () => ['claude-code', 'codex', 'opencode'],
                     discover: async () => discovery([{ root: directory, displayName: path.basename(directory), sessionCount: 1 }]),
@@ -165,6 +124,7 @@ describe('elepha init', () => {
                 'capture-claude-code': true,
                 'capture-opencode': true,
                 'capture-codex': false,
+                'memory-plus': false,
             });
         } finally {
             db.close();
@@ -246,7 +206,7 @@ describe('elepha init', () => {
         const phpstormProjects = path.join(home, 'PhpstormProjects');
         const orphan = path.join(phpstormProjects, 'elepha-init-fixture-orphan');
         const { prompts, output } = fakePrompts('folder', [sites, phpstormProjects]);
-        const backfillApprovedRoots = vi.fn(async (roots: string[]) => roots.length * 3);
+        const backfillApprovedRoots = vi.fn(async (roots: string[]) => ({ ingested: roots.length * 3, incomplete: [] }));
         const reconcile = vi.fn();
 
         try {
@@ -256,7 +216,7 @@ describe('elepha init', () => {
                     output,
                     store,
                     prompts,
-                    daemon: { backfillApprovedRoots },
+                    daemon: { backfillApprovedRootsReport: backfillApprovedRoots },
                     reconcile,
                     detectTools: async () => ['claude-code', 'codex'],
                     discover: async () =>
@@ -310,7 +270,7 @@ describe('elepha init', () => {
         const folder = path.join(homedir(), 'Sites');
         const project = path.join(folder, `elepha-init-${path.basename(directory)}`, 'secret');
         const { prompts, output } = fakePrompts('folder', [folder]);
-        const backfillApprovedRoots = vi.fn(async () => 1);
+        const backfillApprovedRoots = vi.fn(async () => ({ ingested: 1, incomplete: [] }));
         store.consent.grant(folder);
         store.consent.revoke(project);
         const originalDecidedAt = '2026-08-01T00:00:00.000Z';
@@ -324,7 +284,7 @@ describe('elepha init', () => {
                     output,
                     store,
                     prompts,
-                    daemon: { backfillApprovedRoots },
+                    daemon: { backfillApprovedRootsReport: backfillApprovedRoots },
                     reconcile: vi.fn(),
                     discover: async () => discovery([{ root: project, displayName: 'project', sessionCount: 5 }]),
                 }),
@@ -352,7 +312,7 @@ describe('elepha init', () => {
         store.consent.grant(folder);
         store.consent.revoke(project);
         const { prompts, output } = fakePrompts('individual', [project]);
-        const backfillApprovedRoots = vi.fn(async () => 0);
+        const backfillApprovedRoots = vi.fn(async () => ({ ingested: 0, incomplete: [] }));
         const grant = vi.spyOn(store.consent, 'grant');
 
         try {
@@ -362,7 +322,7 @@ describe('elepha init', () => {
                     output,
                     store,
                     prompts,
-                    daemon: { backfillApprovedRoots },
+                    daemon: { backfillApprovedRootsReport: backfillApprovedRoots },
                     reconcile: vi.fn(),
                     discover: async () => discovery([{ root: project, displayName: 'secret', sessionCount: 1 }]),
                 }),
@@ -537,7 +497,7 @@ describe('elepha init', () => {
                     store,
                     prompts,
                     reconcile: vi.fn(),
-                    daemon: { backfillApprovedRoots: vi.fn(async () => 0) },
+                    daemon: { backfillApprovedRootsReport: vi.fn(async () => ({ ingested: 0, incomplete: [] })) },
                     discover: async () =>
                         discovery([
                             { root: selectedProject, displayName: 'selected', sessionCount: 1 },
@@ -568,7 +528,7 @@ describe('elepha init', () => {
                     store,
                     prompts: folder.prompts,
                     reconcile: vi.fn(),
-                    daemon: { backfillApprovedRoots: vi.fn(async () => 0) },
+                    daemon: { backfillApprovedRootsReport: vi.fn(async () => ({ ingested: 0, incomplete: [] })) },
                     discover: async () =>
                         discovery([
                             { root: selectedProject, displayName: 'selected', sessionCount: 1 },

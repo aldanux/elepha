@@ -2,6 +2,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { CONSENT_CONTRACT_DISCLOSURE } from '../../src/cli/consent-disclosure.js';
+import { INIT_APPLY_PENDING_ERROR, initApplyJournalPath } from '../../src/config/init-apply-journal.js';
 import { isRefusedProjectRoot } from '../../src/config/paths.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
@@ -202,11 +204,40 @@ describe('elepha consent grant/revoke', () => {
 
             expect(result.status).toBe(0);
             expect(result.stdout).toContain(`Granted ${canonicalRoot}; backfilled 1 turn(s) without synthesis.`);
+            // The same filtered-capture and retention contract is disclosed before the grant, with no extra prompt.
+            expect(result.stdout.indexOf(CONSENT_CONTRACT_DISCLOSURE)).toBeGreaterThanOrEqual(0);
+            expect(result.stdout.indexOf(CONSENT_CONTRACT_DISCLOSURE)).toBeLessThan(result.stdout.indexOf(`Granted ${canonicalRoot}`));
             const verified = openUnmanagedDb(dbPath);
             const store = new MemoryStore(verified);
             expect(store.consent.list()).toEqual([expect.objectContaining({ path: canonicalRoot, state: 'approved', source: 'cli' })]);
             expect(store.findSession('claude-code', sessionId)).toBeDefined();
             expect((verified.prepare('SELECT COUNT(*) AS count FROM memories').get() as { count: number }).count).toBe(1);
+            verified.close();
+        } finally {
+            removeDirectory(directory);
+            removeDirectory(projectDirectory);
+        }
+    }, 15000);
+
+    it('refuses a direct grant while an interrupted init apply is unresolved', () => {
+        const directory = withTempDir('elepha-consent-grant-pending-init-');
+        const projectDirectory = withGrantableTestDir('consent-grant-pending-init-');
+        const dbPath = path.join(directory, 'elepha.db');
+        const root = path.join(projectDirectory, 'project');
+        mkdirSync(root);
+        openUnmanagedDb(dbPath).close();
+        // The journal an interrupted `elepha init` leaves beside config.json.
+        const elephaHome = path.join(directory, 'elepha-home');
+        mkdirSync(elephaHome, { recursive: true });
+        writeFileSync(initApplyJournalPath(path.join(elephaHome, 'config.json')), '{}\n', { mode: 0o600 });
+
+        try {
+            const result = runConsentCli(dbPath, 'grant', { root });
+
+            expect(result.status).toBe(1);
+            expect(result.stderr).toContain(INIT_APPLY_PENDING_ERROR);
+            const verified = openUnmanagedDb(dbPath);
+            expect(new MemoryStore(verified).consent.list()).toEqual([]);
             verified.close();
         } finally {
             removeDirectory(directory);

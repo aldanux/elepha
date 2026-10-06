@@ -1,20 +1,24 @@
-// Tool-neutral read path for historical episodes. It owns transcript reparse
-// and the 20k newest-first budget; callers own their transport/envelopes.
+// Tool-neutral retained evidence reader with a newest-first serving budget.
+// Only legacy OpenCode rendering may replay a source; callers own envelopes.
 
 import { randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { TranscriptReadBudgetError } from '../adapters/base.js';
-import { defaultAdapters, sessionAdapterFor } from '../adapters/index.js';
 import { OpencodeAdapter, openOpencodeDbReadonly } from '../adapters/opencode.js';
 import {
+    CURRENT_CHAT_EVIDENCE_DEADLINE_MS,
+    CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+    CURRENT_CHAT_OPENCODE_MAX_SOURCE_ROWS,
     DURABLE_CAPTURE_FILTER_VERSION,
     MAX_GET_SESSION_LAST_N,
     RECENT_SESSION_WINDOW_MS,
     SESSION_CHAR_BUDGET,
     SESSION_EVIDENCE_SOURCE_MAX_BYTES,
 } from '../config/constants.js';
+import { canonicalizeExisting, samePath } from '../config/paths.js';
 import { type AssistantStructure, decodeAssistantStructure } from '../rendering/assistant-structure.js';
-import { type FilterableToolCall, type FilteredTurnProjection, filterTurn } from '../rendering/filtered-turn.js';
+import type { FilterableToolCall, FilteredTurnProjection } from '../rendering/filtered-turn.js';
 import {
     omissionMarker,
     RAW_TURN_SEPARATOR,
@@ -23,10 +27,12 @@ import {
     renderFilteredTurn,
     renderRawTurn,
 } from '../rendering/raw-turn-renderer.js';
-import { openProviderTranscript, type ProviderTranscriptOpener } from '../security/provider-transcript.js';
-import { escapeShellSyntax } from '../security/sanitize.js';
+import { containsSentinel } from '../security/sentinel.js';
+import { ConsentStore } from '../storage/consent-store.js';
+import { NOT_CURRENT_COPY_SQL, SUPERSEDED_COPY_SQL } from '../storage/durable-capture-store.js';
 import { matchesFirstPromptSearch } from '../storage/first-prompt-search.js';
 import { InjectionStore } from '../storage/injection-store.js';
+import { retentionRemovedSql } from '../storage/live-memory-retention-schema.js';
 import {
     type AuthenticatedReadGeneration,
     isMemoryLocked,
@@ -36,9 +42,11 @@ import {
     withMemoryReadGeneration,
     withMemoryReadGenerationAsync,
 } from '../storage/paranoid-gate.js';
+
 import type { ProjectSet } from '../storage/project-resolver.js';
 import {
     type ProjectSessionAggregate,
+    readIndexedTurnLocator,
     readProjectSessionAggregates,
     readProjectSessions,
     readSessionById,
@@ -50,8 +58,8 @@ import {
 import { UNTITLED_EPISODE } from '../storage/session-title.js';
 import { hydrateTurnDecisions } from '../storage/turn-store.js';
 import {
+    type OpenedSessionRow,
     type ParsedTurn,
-    type SessionAdapterMap,
     SUPPORTED_TOOLS,
     TOOL_METADATA,
     type ToolName,
@@ -60,6 +68,16 @@ import {
 import { dataBlockClose, dataBlockOpen } from './instructions.js';
 
 export type { ServedSession } from '../storage/session-read-model.js';
+
+export const STORED_EVIDENCE_REASONS = {
+    missing: 'durable_capture_missing',
+    incomplete: 'durable_capture_incomplete',
+    evicted: 'durable_capture_evicted',
+    filterVersionMismatch: 'durable_capture_filter_version_mismatch',
+    stale: 'durable_turn_stale_after_reingest',
+    unreadable: 'durable_turn_unreadable',
+    selfInjected: 'durable_turn_self_injected',
+} as const;
 
 export interface BoundedEpisode {
     text: string;
@@ -73,7 +91,7 @@ export interface BoundedEpisode {
 export interface FirstInteraction {
     projection?: FilteredTurnProjection;
     turnIndex?: number;
-    source?: 'durable stored interaction' | 'provider transcript interaction';
+    source?: 'durable stored interaction';
     reason?: string;
 }
 
@@ -84,6 +102,14 @@ export interface EvidenceWindow {
     total: number;
     reason?: string;
 }
+
+export interface IndexedEvidenceWindow extends EvidenceWindow {
+    turnIndexes?: number[];
+}
+
+export type IndexedTurnEvidence =
+    | { state: 'available'; turnIndex: number; projection: FilteredTurnProjection; source: 'durable' | 'transcript' }
+    | { state: 'unavailable'; reason: string };
 
 export interface IncompleteLastObservedSnapshot {
     complete: false;
@@ -147,10 +173,10 @@ interface RetainedFilteredTurn {
 interface StoredFilteredTurnRow {
     turn_index: number;
     included: number;
-    user_prompt: string;
-    assistant_response: string;
+    user_prompt: string | null;
+    assistant_response: string | null;
     assistant_structure: string | null;
-    tool_calls: string;
+    tool_calls: string | null;
     omitted_tool_call_count: number;
     filter_version: number;
 }
@@ -180,7 +206,12 @@ interface SourceTurnCollection extends TurnCollection {
 interface OpenedSourceTurns {
     turns: AsyncIterable<ParsedTurn> | Iterable<ParsedTurn>;
     close(): Promise<void> | void;
+    coverage?: { omittedBefore: number };
 }
+
+type IndexedSourceSession = Pick<ServedSession, 'id' | 'tool' | 'native_id' | 'source_path' | 'source_format'> & {
+    expectedProjectPath?: string;
+};
 
 function leafStrings(value: unknown): string[] {
     if (typeof value === 'string') {
@@ -268,19 +299,14 @@ export function newestActivity(
     return newest;
 }
 
+const SUPERSEDED_COPY = SUPERSEDED_COPY_SQL;
+
 export class SessionReader {
-    private readonly adapters: SessionAdapterMap;
     private readonly opencodeAdapter = new OpencodeAdapter();
     private readonly sessionsMemo = new Map<string, ServedSession[]>();
     private readonly consentedSessionsMemo = new Map<string, ServedSession[]>();
 
-    constructor(
-        private readonly db: Database.Database,
-        adapters: SessionAdapterMap = defaultAdapters(),
-        private readonly openTranscript: ProviderTranscriptOpener = openProviderTranscript,
-    ) {
-        this.adapters = adapters;
-    }
+    constructor(private readonly db: Database.Database) {}
 
     serveState(): 'locked' | 'unlocked' {
         return memoryServeState(this.db);
@@ -355,7 +381,7 @@ export class SessionReader {
                             SELECT 1 FROM memories m
                             LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
                             WHERE m.session_id = s.id
-                              AND (ft.memory_id IS NULL OR ft.filter_version <> ?)
+                              AND ${NOT_CURRENT_COPY_SQL}
                         ) AS has_uncovered
                  FROM requested
                  JOIN sessions s ON s.id = requested.id
@@ -364,13 +390,14 @@ export class SessionReader {
                            SELECT 1 FROM purged_transcripts p
                            WHERE p.tool = s.tool AND p.native_id = s.native_id
                        )
+                   AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
                    AND NOT EXISTS (
                            SELECT 1 FROM incognito_transcripts i
                            WHERE i.tool = s.tool AND i.native_id = s.native_id
                        )
                  ORDER BY s.id`,
                 )
-                .all(JSON.stringify(requestedIds), DURABLE_CAPTURE_FILTER_VERSION) as Array<{
+                .all(JSON.stringify(requestedIds)) as Array<{
                 filter_version: number | null;
                 has_filtered: number;
                 has_uncovered: number;
@@ -412,7 +439,8 @@ export class SessionReader {
              FROM eligible
              JOIN memories m ON m.session_id = eligible.id
              JOIN filtered_turns_fts ON filtered_turns_fts.rowid = m.id
-             WHERE filtered_turns_fts MATCH ?
+             JOIN filtered_turns ft ON ft.memory_id = m.id
+             WHERE filtered_turns_fts MATCH ? AND NOT ${SUPERSEDED_COPY}
              ORDER BY score, m.session_id, memory_id
              LIMIT ?`,
             );
@@ -448,6 +476,7 @@ export class SessionReader {
                      FROM filtered_turns ft
                      JOIN memories m ON m.id = ft.memory_id
                      WHERE m.session_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))
+                       AND NOT ${SUPERSEDED_COPY}
                      ORDER BY m.session_id, m.turn_index`,
                     )
                     .iterate(JSON.stringify([...matchedSessionIds])) as Iterable<{
@@ -562,7 +591,7 @@ export class SessionReader {
                                 durable_assistant_structure, durable_tool_calls,
                                 durable_omitted_tool_call_count, durable_filter_version
                          FROM open_turns
-                         WHERE session_id = ? AND staged_at IS NOT NULL AND validated_epoch = validation_epoch
+                         WHERE session_id = ? AND open_turns.staged_at IS NOT NULL AND open_turns.validated_epoch = open_turns.validation_epoch
                            AND receipt_coverage = 'complete'`,
                     )
                     .get(session.id) as
@@ -588,7 +617,11 @@ export class SessionReader {
                 }
                 const toolCalls = row.durable_tool_calls === null ? undefined : decodedToolCalls(row.durable_tool_calls);
                 const durableProjection =
-                    row.durable_included === null || row.durable_filter_version === null || toolCalls === undefined
+                    row.durable_included !== 1 ||
+                    row.durable_filter_version !== DURABLE_CAPTURE_FILTER_VERSION ||
+                    toolCalls === undefined ||
+                    containsSentinel(row.durable_user_prompt ?? '') ||
+                    containsSentinel(row.durable_assistant_response ?? '')
                         ? undefined
                         : {
                               included: row.durable_included === 1,
@@ -678,6 +711,9 @@ export class SessionReader {
         return this.withReadGenerationAsync(
             () => ({ reason: 'locked' }),
             async () => {
+                if (signal?.aborted) {
+                    return { reason: 'deadline' };
+                }
                 const first = this.db
                     .prepare('SELECT MIN(turn_index) AS turn_index FROM memories WHERE session_id = ?')
                     .get(session.id) as { turn_index: number | null };
@@ -685,16 +721,17 @@ export class SessionReader {
                     return { reason: 'no_stored_turn_indexes' };
                 }
                 const row = this.db
-                    .prepare(`SELECT ft.included, ft.filter_version, ft.omitted_before_chars,
+                    .prepare(`SELECT ft.included, ft.filter_version, ft.omitted_before_chars, d.state,
                 CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB)) + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0) <= ?
                     THEN ft.user_prompt END AS user_prompt,
                 CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB)) + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0) <= ?
                     THEN ft.assistant_response END AS assistant_response,
                 CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB)) + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0) <= ?
-                    THEN ft.assistant_structure END AS assistant_structure
-                FROM memories m JOIN filtered_turns ft ON ft.memory_id = m.id
+                    THEN ft.assistant_structure END AS assistant_structure,
+                ${NOT_CURRENT_COPY_SQL} AS not_current
+                FROM memories m LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
                 LEFT JOIN durable_capture_status d ON d.session_id = m.session_id
-                WHERE m.session_id = ? AND m.turn_index = ? AND COALESCE(d.state, '') <> 'evicted'`)
+                WHERE m.session_id = ? AND m.turn_index = ?`)
                     .get(
                         SESSION_EVIDENCE_SOURCE_MAX_BYTES,
                         SESSION_EVIDENCE_SOURCE_MAX_BYTES,
@@ -703,64 +740,60 @@ export class SessionReader {
                         first.turn_index,
                     ) as
                     | {
-                          included: number;
-                          filter_version: number;
-                          omitted_before_chars: number;
+                          included: number | null;
+                          filter_version: number | null;
+                          omitted_before_chars: number | null;
+                          state: string | null;
                           user_prompt: string | null;
                           assistant_response: string | null;
                           assistant_structure: string | null;
+                          not_current: number;
                       }
                     | undefined;
-                let projection: FilteredTurnProjection | undefined;
-                let source: FirstInteraction['source'] = 'durable stored interaction';
                 if (
-                    row?.filter_version === DURABLE_CAPTURE_FILTER_VERSION &&
-                    row.omitted_before_chars === 0 &&
-                    row.user_prompt !== null &&
-                    row.assistant_response !== null
+                    session.tool === 'opencode' &&
+                    (row?.state === 'evicted' ||
+                        row?.filter_version !== DURABLE_CAPTURE_FILTER_VERSION ||
+                        row.not_current !== 0 ||
+                        row.omitted_before_chars !== 0 ||
+                        row.user_prompt === null ||
+                        row.assistant_response === null)
                 ) {
-                    projection = {
-                        included: row.included === 1,
-                        filterVersion: row.filter_version,
-                        userPrompt: row.user_prompt,
-                        assistantResponse: row.assistant_response,
-                        assistantStructure: this.readAssistantStructure(session.id, row.assistant_structure, row.assistant_response.length),
-                        toolCalls: [],
-                        omittedToolCallCount: 0,
-                    };
-                    if (session.tool === 'codex' && projection.assistantStructure === undefined) {
-                        const parsed = await this.sourceTurns(
-                            session,
-                            signal,
-                            new Set([first.turn_index]),
-                            undefined,
-                            SESSION_EVIDENCE_SOURCE_MAX_BYTES,
-                        );
-                        projection = this.enrichAssistantStructure(projection, parsed.turns?.[0]);
-                    }
-                } else {
-                    // OpenCode's DB adapter has no byte-bounded directed read yet.
-                    // Do not silently replace an incomplete first interaction.
-                    if (session.tool === 'opencode') {
-                        return { reason: 'first_interaction_requires_durable_capture' };
-                    }
-                    const parsed = await this.sourceTurns(
-                        session,
-                        signal,
-                        new Set([first.turn_index]),
-                        undefined,
-                        SESSION_EVIDENCE_SOURCE_MAX_BYTES,
-                    );
-                    const turn = parsed.turns?.[0];
-                    if (turn === undefined) {
-                        return { reason: parsed.reason };
-                    }
-                    if (turn.droppedReason !== undefined) {
-                        return { reason: 'first_interaction_filtered' };
-                    }
-                    projection = filterTurn(turn);
-                    source = 'provider transcript interaction';
+                    return { reason: 'first_interaction_requires_durable_capture' };
                 }
+                if (row?.state === 'evicted') {
+                    return { reason: STORED_EVIDENCE_REASONS.evicted };
+                }
+                if (row?.filter_version == null) {
+                    return { reason: STORED_EVIDENCE_REASONS.missing };
+                }
+                if (row.filter_version !== DURABLE_CAPTURE_FILTER_VERSION) {
+                    return { reason: STORED_EVIDENCE_REASONS.filterVersionMismatch };
+                }
+                // Individually current evidence does not certify whole-session
+                // coverage. A superseded copy can never supply this interaction.
+                if (row.not_current !== 0) {
+                    return { reason: STORED_EVIDENCE_REASONS.stale };
+                }
+                if (row.omitted_before_chars !== 0) {
+                    return { reason: 'first_interaction_requires_durable_capture' };
+                }
+                if (row.user_prompt === null || row.assistant_response === null) {
+                    return { reason: 'evidence_source_byte_budget' };
+                }
+                if (row.included === 1 && (containsSentinel(row.user_prompt) || containsSentinel(row.assistant_response))) {
+                    return { reason: STORED_EVIDENCE_REASONS.selfInjected };
+                }
+                const projection: FilteredTurnProjection = {
+                    included: row.included === 1,
+                    filterVersion: row.filter_version,
+                    userPrompt: row.user_prompt,
+                    assistantResponse: row.assistant_response,
+                    assistantStructure: this.readAssistantStructure(session.id, row.assistant_structure, row.assistant_response.length),
+                    toolCalls: [],
+                    omittedToolCallCount: 0,
+                };
+                const source: FirstInteraction['source'] = 'durable stored interaction';
                 if (signal?.aborted) {
                     return { reason: 'deadline' };
                 }
@@ -769,7 +802,7 @@ export class SessionReader {
                 }
                 if (
                     session.first_prompt_search === null ||
-                    !matchesFirstPromptSearch(projection.userPrompt, session.first_prompt_search, source === 'durable stored interaction')
+                    !matchesFirstPromptSearch(projection.userPrompt, session.first_prompt_search, true)
                 ) {
                     return { reason: 'first_prompt_source_changed' };
                 }
@@ -781,56 +814,191 @@ export class SessionReader {
     // Preserve roles from the adapters/storage. Rendered Markdown is content,
     // so its headings can never establish a user/assistant boundary.
     async evidenceWindow(session: ServedSession, lastN?: number, signal?: AbortSignal): Promise<EvidenceWindow> {
-        const unavailable = (reason?: string): EvidenceWindow => ({ returned: 0, omitted: 0, total: 0, reason });
+        const { turnIndexes: _, ...window } = await this.indexedEvidenceWindow(session, lastN, signal);
+        return window;
+    }
+
+    // Resolves one indexed interaction from the complete, current-version
+    // filtered copy stored in elepha's database. The provider transcript is
+    // never reopened here, so evidence survives the source being removed and
+    // a missing copy stays an explicit unavailable state.
+    async indexedTurnEvidence(
+        session: IndexedSourceSession & { expectedProjectPath: string },
+        turnIndex: number,
+        signal?: AbortSignal,
+    ): Promise<IndexedTurnEvidence> {
+        const unavailable = (reason: string): IndexedTurnEvidence => ({ state: 'unavailable', reason });
+        return this.withReadGenerationAsync(
+            () => unavailable('locked'),
+            async () => {
+                if (!Number.isSafeInteger(turnIndex) || turnIndex < 0) {
+                    return unavailable('invalid_turn_index');
+                }
+                const deadline = AbortSignal.timeout(CURRENT_CHAT_EVIDENCE_DEADLINE_MS);
+                const readSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
+                const consent = new ConsentStore(this.db);
+                const authorizedCheckout = (): string | undefined => {
+                    if (Buffer.byteLength(session.expectedProjectPath, 'utf8') > CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES) {
+                        return undefined;
+                    }
+                    try {
+                        if (!statSync(session.expectedProjectPath).isDirectory()) {
+                            return undefined;
+                        }
+                    } catch {
+                        return undefined;
+                    }
+                    if (
+                        consent.consentState(session.expectedProjectPath) !== 'approved' ||
+                        consent.isRefusedForCapture(session.expectedProjectPath)
+                    ) {
+                        return undefined;
+                    }
+                    return canonicalizeExisting(session.expectedProjectPath);
+                };
+                const physicalCheckout = authorizedCheckout();
+                if (physicalCheckout === undefined) {
+                    return unavailable('checkout_not_consented');
+                }
+                const checkoutAuthorizationFailure = (): string | undefined => {
+                    const currentCheckout = authorizedCheckout();
+                    if (currentCheckout === undefined) {
+                        return 'checkout_not_consented';
+                    }
+                    return samePath(currentCheckout, physicalCheckout) ? undefined : 'checkout_identity_changed';
+                };
+                const locator = readIndexedTurnLocator(
+                    this.db,
+                    session,
+                    session.expectedProjectPath,
+                    turnIndex,
+                    CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+                    SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                );
+                if (readSignal.aborted) {
+                    return unavailable('deadline');
+                }
+                if (locator === undefined) {
+                    return unavailable('indexed_turn_unavailable');
+                }
+                // A stored turn without a coverage row has no retained current
+                // copy; the durable checks below name that gap.
+                const indexed = locator.coverage !== null;
+                if (indexed && locator.filterVersion !== DURABLE_CAPTURE_FILTER_VERSION) {
+                    return unavailable('indexed_turn_filter_version_mismatch');
+                }
+                if (indexed && (!locator.sourceDigest || !/^[a-f0-9]{64}$/.test(locator.sourceDigest))) {
+                    return unavailable('indexed_turn_digest_unavailable');
+                }
+                if (locator.coverage === 'excluded') {
+                    return unavailable('indexed_turn_filtered');
+                }
+                // Only the filtered copy in elepha's own database is evidence here.
+                // A missing or untrustworthy copy is a coverage gap, never a
+                // reason to reopen the provider transcript.
+                if (locator.durableState === null) {
+                    return unavailable('indexed_turn_evidence_missing');
+                }
+                if (locator.durableState !== 'complete') {
+                    return unavailable(`indexed_turn_evidence_${locator.durableState}`);
+                }
+                if (locator.durableFilterVersion === null) {
+                    return unavailable('indexed_turn_evidence_missing');
+                }
+                if (
+                    locator.durableVersion !== DURABLE_CAPTURE_FILTER_VERSION ||
+                    locator.durableFilterVersion !== DURABLE_CAPTURE_FILTER_VERSION
+                ) {
+                    return unavailable('indexed_turn_evidence_filter_version_mismatch');
+                }
+                // A reingest that retains a replacement writes the copy and its
+                // coverage row in one transaction, stamped with the reingest time.
+                // A reingested turn whose copy is older, or has no coverage row,
+                // still holds superseded text; the coverage test does not depend
+                // on the two timestamps differing.
+                if (
+                    locator.memoryReingestedAt !== null &&
+                    (!indexed || locator.durableCapturedAt === null || locator.durableCapturedAt < locator.memoryReingestedAt)
+                ) {
+                    return unavailable('indexed_turn_evidence_stale');
+                }
+                if (locator.durableIncluded !== 1) {
+                    return unavailable('indexed_turn_filtered');
+                }
+                if (locator.durableOmittedBeforeChars !== 0) {
+                    return unavailable('indexed_turn_evidence_truncated');
+                }
+                if (!indexed) {
+                    return unavailable('indexed_turn_evidence_missing');
+                }
+                const inconsistent = this.db
+                    .prepare(`SELECT 1 FROM memories m LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+                              WHERE m.session_id = ? AND m.turn_index = ? AND ${NOT_CURRENT_COPY_SQL}`)
+                    .get(session.id, turnIndex);
+                if (inconsistent !== undefined) {
+                    return unavailable('indexed_turn_evidence_stale');
+                }
+                const toolCalls = locator.durableToolCalls === null ? undefined : decodedToolCalls(locator.durableToolCalls);
+                if (locator.durableUserPrompt === null || locator.durableAssistantResponse === null || toolCalls === undefined) {
+                    return unavailable('indexed_turn_evidence_unreadable');
+                }
+                if (containsSentinel(locator.durableUserPrompt) || containsSentinel(locator.durableAssistantResponse)) {
+                    return unavailable('indexed_turn_evidence_self_injected');
+                }
+                const projection: FilteredTurnProjection = {
+                    included: true,
+                    filterVersion: locator.durableFilterVersion,
+                    userPrompt: locator.durableUserPrompt,
+                    assistantResponse: locator.durableAssistantResponse,
+                    assistantStructure: this.readAssistantStructure(
+                        session.id,
+                        locator.durableAssistantStructure,
+                        locator.durableAssistantResponse.length,
+                    ),
+                    toolCalls,
+                    omittedToolCallCount: locator.durableOmittedToolCallCount ?? 0,
+                };
+                const authorizationFailure = checkoutAuthorizationFailure();
+                if (authorizationFailure !== undefined) {
+                    return unavailable(authorizationFailure);
+                }
+                return { state: 'available', turnIndex, projection, source: 'durable' };
+            },
+        );
+    }
+
+    async indexedEvidenceWindow(session: IndexedSourceSession, lastN?: number, signal?: AbortSignal): Promise<IndexedEvidenceWindow> {
+        const unavailable = (reason?: string): IndexedEvidenceWindow => ({ returned: 0, omitted: 0, total: 0, reason });
         return this.withReadGenerationAsync(
             () => unavailable('locked'),
             async () => {
                 const boundedLastN = lastN === undefined ? undefined : Math.min(Math.max(1, Math.trunc(lastN)), MAX_GET_SESSION_LAST_N);
                 const bounds = { lastN: boundedLastN, charBudget: SESSION_CHAR_BUDGET, nonce: randomUUID() };
                 const durable = this.durableTurns(session, bounds, signal);
-                let projections: FilteredTurnProjection[];
-                let omitted: number;
-                if (durable.complete) {
-                    if (durable.projections === undefined) {
-                        return unavailable(durable.reason);
-                    }
-                    projections = durable.projections;
-                    omitted = durable.omittedBefore ?? 0;
-                    if (session.tool === 'codex' && projections.some((projection) => projection.assistantStructure === undefined)) {
-                        const parsed = await this.sourceTurns(
-                            session,
-                            signal,
-                            new Set(durable.turnIndexes),
-                            bounds,
-                            SESSION_EVIDENCE_SOURCE_MAX_BYTES,
-                        );
-                        const sourceByIndex = new Map(parsed.turns?.map((turn) => [turn.turnIndex, turn]));
-                        projections = projections.map((projection, index) =>
-                            projection.assistantStructure === undefined
-                                ? this.enrichAssistantStructure(projection, sourceByIndex.get(durable.turnIndexes?.[index] ?? -1))
-                                : projection,
+                if (!durable.complete || durable.projections === undefined) {
+                    if (!durable.complete && session.tool === 'opencode') {
+                        // Legacy SQLite cannot authenticate current-chat source
+                        // evidence by opened-file identity.
+                        return unavailable(
+                            session.expectedProjectPath === undefined
+                                ? 'evidence_source_requires_durable_capture'
+                                : 'opencode_source_identity_unverified',
                         );
                     }
-                } else {
-                    if (session.tool === 'opencode') {
-                        return unavailable('evidence_source_requires_durable_capture');
-                    }
-                    const parsed = await this.sourceTurns(session, signal, undefined, bounds, SESSION_EVIDENCE_SOURCE_MAX_BYTES);
-                    if (parsed.turns === undefined) {
-                        return unavailable(parsed.reason);
-                    }
-                    if (parsed.turns.some((turn) => turn.droppedReason !== undefined)) {
-                        return unavailable('evidence_source_turn_filtered');
-                    }
-                    projections = parsed.turns.map(filterTurn).filter((projection) => projection.included);
-                    omitted = parsed.omittedBefore ?? 0;
+                    return unavailable(durable.reason);
                 }
-                return { projections, returned: projections.length, omitted, total: projections.length + omitted };
+                const projections = durable.projections;
+                const turnIndexes = durable.turnIndexes ?? [];
+                const omitted = durable.omittedBefore ?? 0;
+                return { projections, turnIndexes, returned: projections.length, omitted, total: projections.length + omitted };
             },
         );
     }
 
     private durableTurns(session: Pick<ServedSession, 'id'>, bounds: TurnCollectionBounds, signal?: AbortSignal): DurableTurnCollection {
+        if (signal?.aborted) {
+            return { complete: false, present: false, reason: 'deadline' };
+        }
         const status = this.db
             .prepare(
                 `SELECT state, filter_version
@@ -848,43 +1016,78 @@ export class SessionReader {
                      LIMIT 1`,
                 )
                 .get(session.id);
-            return { complete: false, present: capturedRow !== undefined };
+            return {
+                complete: false,
+                present: capturedRow !== undefined,
+                reason: capturedRow === undefined ? STORED_EVIDENCE_REASONS.missing : STORED_EVIDENCE_REASONS.incomplete,
+            };
         }
         if (status.state === 'evicted') {
-            return { complete: false, present: false };
+            return { complete: false, present: false, reason: STORED_EVIDENCE_REASONS.evicted };
         }
-        if (
-            (status.state !== 'complete' && status.state !== 'complete_truncated') ||
-            status.filter_version !== DURABLE_CAPTURE_FILTER_VERSION
-        ) {
-            return { complete: false, present: true };
+        if (status.filter_version !== DURABLE_CAPTURE_FILTER_VERSION) {
+            return { complete: false, present: true, reason: STORED_EVIDENCE_REASONS.filterVersionMismatch };
+        }
+        if (status.state !== 'complete' && status.state !== 'complete_truncated') {
+            return { complete: false, present: true, reason: `durable_capture_${status.state}` };
+        }
+        const stale = this.db
+            .prepare(
+                `SELECT 1 FROM memories m JOIN filtered_turns ft ON ft.memory_id = m.id
+                 WHERE m.session_id = ? AND ${SUPERSEDED_COPY}
+                 LIMIT 1`,
+            )
+            .get(session.id);
+        if (stale !== undefined) {
+            // Reingest invalidated this copy; only retained current evidence
+            // may supply the session, never the superseded text.
+            return { complete: true, present: true, reason: STORED_EVIDENCE_REASONS.stale };
         }
         const uncovered = this.db
             .prepare(
-                `SELECT 1
+                `SELECT ft.filter_version
                  FROM memories m
                  LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
                  WHERE m.session_id = ?
-                   AND (ft.memory_id IS NULL OR ft.filter_version <> ?)
+                   AND ${NOT_CURRENT_COPY_SQL}
                  LIMIT 1`,
             )
-            .get(session.id, DURABLE_CAPTURE_FILTER_VERSION);
+            .get(session.id) as { filter_version: number | null } | undefined;
         if (uncovered !== undefined) {
-            return { complete: false, present: true };
+            return {
+                complete: false,
+                present: true,
+                reason:
+                    uncovered.filter_version !== null && uncovered.filter_version !== DURABLE_CAPTURE_FILTER_VERSION
+                        ? STORED_EVIDENCE_REASONS.filterVersionMismatch
+                        : STORED_EVIDENCE_REASONS.incomplete,
+            };
         }
 
         const rows = this.db
             .prepare(
-                `SELECT m.turn_index, ft.included, ft.user_prompt, ft.assistant_response,
+                `SELECT m.turn_index, ft.included,
+                        CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB))
+                            + length(CAST(ft.tool_calls AS BLOB)) <= ? THEN ft.user_prompt END AS user_prompt,
+                        CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB))
+                            + length(CAST(ft.tool_calls AS BLOB)) <= ? THEN ft.assistant_response END AS assistant_response,
                         CASE WHEN length(CAST(ft.assistant_structure AS BLOB)) <= ? THEN ft.assistant_structure
-                             WHEN ft.assistant_structure IS NOT NULL THEN '{}' END AS assistant_structure, ft.tool_calls,
+                             WHEN ft.assistant_structure IS NOT NULL THEN '{}' END AS assistant_structure,
+                        CASE WHEN length(CAST(ft.user_prompt AS BLOB)) + length(CAST(ft.assistant_response AS BLOB))
+                            + length(CAST(ft.tool_calls AS BLOB)) <= ? THEN ft.tool_calls END AS tool_calls,
                         ft.omitted_tool_call_count, ft.filter_version
                  FROM memories m
                  JOIN filtered_turns ft ON ft.memory_id = m.id
                  WHERE m.session_id = ?
                  ORDER BY m.turn_index`,
             )
-            .iterate(SESSION_EVIDENCE_SOURCE_MAX_BYTES, session.id) as Iterable<StoredFilteredTurnRow>;
+            .iterate(
+                SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                session.id,
+            ) as Iterable<StoredFilteredTurnRow>;
         const retained = new Map<number, RetainedFilteredTurn>();
         let renderedTurns = 0;
         let omittedBefore = 0;
@@ -894,9 +1097,15 @@ export class SessionReader {
                 if (signal?.aborted) {
                     return { complete: true, present: true, reason: 'deadline' };
                 }
+                if (row.user_prompt === null || row.assistant_response === null || row.tool_calls === null) {
+                    return { complete: true, present: true, reason: 'evidence_source_byte_budget' };
+                }
                 const toolCalls = decodedToolCalls(row.tool_calls);
                 if (toolCalls === undefined) {
-                    return { complete: false, present: true };
+                    return { complete: false, present: true, reason: STORED_EVIDENCE_REASONS.unreadable };
+                }
+                if (row.included === 1 && (containsSentinel(row.user_prompt) || containsSentinel(row.assistant_response))) {
+                    return { complete: false, present: true, reason: STORED_EVIDENCE_REASONS.selfInjected };
                 }
                 const projection: FilteredTurnProjection = {
                     filterVersion: row.filter_version,
@@ -928,7 +1137,7 @@ export class SessionReader {
                 }
             }
         } catch {
-            return { complete: false, present: true };
+            return { complete: false, present: true, reason: STORED_EVIDENCE_REASONS.unreadable };
         }
         return {
             complete: true,
@@ -948,77 +1157,49 @@ export class SessionReader {
         }
     }
 
-    // Historical rows remain untouched. Borrow phase only from a safely read
-    // source whose complete filtered response still matches the stored value.
-    private enrichAssistantStructure(stored: FilteredTurnProjection, turn: ParsedTurn | undefined): FilteredTurnProjection {
-        if (turn === undefined || turn.droppedReason !== undefined) {
-            return stored;
-        }
-        const current = filterTurn(turn);
-        return current.included &&
-            escapeShellSyntax(current.userPrompt) === stored.userPrompt &&
-            escapeShellSyntax(current.assistantResponse) === stored.assistantResponse
-            ? { ...current, toolCalls: stored.toolCalls, omittedToolCallCount: stored.omittedToolCallCount }
-            : stored;
-    }
-
-    async turns(
-        session: ServedSession,
-        signal?: AbortSignal,
-        storedIndexes?: ReadonlySet<number>,
-        bounds?: TurnCollectionBounds,
-    ): Promise<TurnCollection> {
-        const locked = (): TurnCollection => ({ state: 'locked', reason: 'locked', content_coverage: LOCKED_CONTENT_COVERAGE });
-        return this.withReadGenerationAsync(locked, async () => {
-            const { sourceUnavailable: _, ...result } = await this.sourceTurns(session, signal, storedIndexes, bounds);
-            return result;
-        });
-    }
-
-    private async sourceTurns(
-        session: ServedSession,
+    private async opencodeSourceTurns(
+        session: IndexedSourceSession & { tool: 'opencode' },
         signal?: AbortSignal,
         storedIndexes?: ReadonlySet<number>,
         bounds?: TurnCollectionBounds,
         maxReadBytes?: number,
     ): Promise<SourceTurnCollection> {
+        if (session.source_format === 'opencode-v2') {
+            // V2 SQLite is not bound to the opened inode here; only the verified
+            // filtered copy may serve this segment.
+            return { reason: 'opencode_v2_requires_durable_capture', sourceUnavailable: true };
+        }
         let opened: OpenedSourceTurns | undefined;
         try {
-            if (session.tool === 'opencode') {
-                const sourceDb = openOpencodeDbReadonly(session.source_path);
-                const sourceSession = this.opencodeAdapter
-                    .dirtySessions(sourceDb)
-                    .find((candidate) => candidate.sessionId === session.native_id);
-                if (!sourceSession) {
+            const sourceDb = openOpencodeDbReadonly(session.source_path);
+            const currentChatRead = session.expectedProjectPath !== undefined;
+            const coverage = { omittedBefore: 0 };
+            opened = {
+                turns: [],
+                close: () => {
                     sourceDb.close();
-                    return { reason: 'transcript_unreadable', sourceUnavailable: true };
-                }
-                opened = {
-                    turns: this.opencodeAdapter.parseSessionTurns(sourceDb, sourceSession, undefined, { closeTrailingOnIdle: true }),
-                    close: () => {
-                        sourceDb.close();
-                    },
-                };
-            } else {
-                const transcript = await this.openTranscript(session.tool, session.source_path);
-                if ('reason' in transcript) {
-                    return { reason: transcript.reason, sourceUnavailable: true };
-                }
-                const adapter = sessionAdapterFor(this.adapters, session.tool);
-                if (!adapter) {
-                    await transcript.handle.close();
-                    return { reason: 'transcript_unreadable', sourceUnavailable: true };
-                }
-                opened = {
-                    turns: adapter.parseTurns(session.source_path, undefined, {
-                        closeTrailingOnIdle: true,
-                        handle: transcript.handle,
-                        signal,
-                        maxReadBytes,
-                    }),
-                    close: () => transcript.handle.close(),
-                };
+                },
+            };
+            if (currentChatRead) {
+                sourceDb.exec('BEGIN');
             }
+            const sourceSession: OpenedSessionRow | undefined = currentChatRead
+                ? this.opencodeAdapter.boundedSessionById(sourceDb, session.native_id, CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES)
+                : this.opencodeAdapter.dirtySessions(sourceDb).find((candidate) => candidate.sessionId === session.native_id);
+            if (!sourceSession) {
+                return { reason: 'transcript_unreadable', sourceUnavailable: true };
+            }
+            opened.turns = currentChatRead
+                ? this.opencodeAdapter.parseSessionTurnsBounded(
+                      sourceDb,
+                      sourceSession,
+                      maxReadBytes ?? SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+                      CURRENT_CHAT_OPENCODE_MAX_SOURCE_ROWS,
+                      coverage,
+                      signal,
+                  )
+                : this.opencodeAdapter.parseSessionTurns(sourceDb, sourceSession, undefined, { closeTrailingOnIdle: true });
+            opened.coverage = currentChatRead ? coverage : undefined;
             if (!opened) {
                 return { reason: 'transcript_unreadable', sourceUnavailable: true };
             }
@@ -1035,7 +1216,7 @@ export class SessionReader {
             let retainedRenderedChars = 0;
             let highWaterTurns = 0;
             let highWaterRenderedChars = 0;
-            const replayInjections = new InjectionStore(this.db, { includePersistedMcp: false });
+            const replayInjections = new InjectionStore(this.db, { includePersistedMcp: session.expectedProjectPath !== undefined });
             for await (const turn of opened.turns) {
                 if (isMemoryLocked(this.db)) {
                     return { reason: 'locked' };
@@ -1057,6 +1238,14 @@ export class SessionReader {
                     continue;
                 }
                 if (indexes.has(turn.turnIndex)) {
+                    if (
+                        session.expectedProjectPath !== undefined &&
+                        (turn.tool !== session.tool ||
+                            turn.sessionId !== session.native_id ||
+                            !samePath(canonicalizeExisting(turn.projectPath), canonicalizeExisting(session.expectedProjectPath)))
+                    ) {
+                        return { reason: 'transcript_identity_mismatch' };
+                    }
                     matchedTurns += 1;
                     if (bounds === undefined) {
                         turns.push(turn);
@@ -1103,11 +1292,17 @@ export class SessionReader {
             }
             return {
                 turns: [...retained.values()].map((entry) => entry.turn),
-                omittedBefore,
+                omittedBefore: omittedBefore + (opened.coverage?.omittedBefore ?? 0),
                 retentionHighWater: { turns: highWaterTurns, renderedChars: highWaterRenderedChars },
             };
         } catch (error) {
-            return { reason: error instanceof TranscriptReadBudgetError ? 'evidence_source_byte_budget' : 'transcript_unreadable' };
+            return {
+                reason: signal?.aborted
+                    ? 'deadline'
+                    : error instanceof TranscriptReadBudgetError
+                      ? 'evidence_source_byte_budget'
+                      : 'transcript_unreadable',
+            };
         } finally {
             await opened?.close();
         }
@@ -1137,7 +1332,17 @@ export class SessionReader {
                     episode: boundedFilteredRender(durable.projections, boundedLastN, charBudget, nonce, durable.omittedBefore),
                 };
             }
-            const parsed = await this.sourceTurns(session, signal, undefined, { lastN: boundedLastN, charBudget, nonce });
+            if (session.tool !== 'opencode') {
+                return { reason: durable.reason };
+            }
+            if (session.source_format === 'opencode-v2') {
+                return { reason: 'opencode_v2_requires_durable_capture' };
+            }
+            const parsed = await this.opencodeSourceTurns({ ...session, tool: 'opencode' }, signal, undefined, {
+                lastN: boundedLastN,
+                charBudget,
+                nonce,
+            });
             return parsed.turns === undefined
                 ? { reason: parsed.sourceUnavailable && durable.present ? 'durable_capture_incomplete' : parsed.reason }
                 : { episode: boundedRender(parsed.turns, boundedLastN, charBudget, nonce, parsed.omittedBefore) };

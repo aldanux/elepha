@@ -11,6 +11,7 @@ import {
     STANDING_RULES_MAX_TOTAL_CHARS,
 } from '../config/constants.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
+
 import { newUlid } from './ulid.js';
 
 export interface StandingRuleRow {
@@ -166,6 +167,7 @@ export class StandingRulesStore {
                 throw new Error('Standing rule import target is no longer consented.');
             }
             const plan = this.planImport(scope.projectIds, incoming);
+
             for (const rule of plan.added) {
                 this.insertRule.run(rule.ulid, scope.ownerProjectId, rule.text, rule.created_at);
             }

@@ -3,11 +3,10 @@
 
 import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
-import { DURABLE_CAPTURE_MAX_BYTES, STANDING_RULES_MAX_ACTIVE, STANDING_RULES_MAX_TOTAL_CHARS } from '../config/constants.js';
+import { STANDING_RULES_MAX_ACTIVE, STANDING_RULES_MAX_TOTAL_CHARS } from '../config/constants.js';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
 import type { OpenTailObservation, ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
-import { DurableCaptureStore, type DurableEvictionPlan } from './durable-capture-store.js';
 import {
     InjectionQuoteBackIncompleteError,
     type InjectionQuoteBackResult,
@@ -16,16 +15,35 @@ import {
     type McpReceiptRow,
     type RecordInjectionInput,
 } from './injection-store.js';
+import {
+    type LiveMemoryRetention,
+    type LiveMemoryRetentionPolicy,
+    liveMemoryRetentionFor,
+    useLiveMemoryRetentionPolicy,
+} from './live-memory-retention.js';
+import { isRetentionRemoved } from './live-memory-retention-schema.js';
 import { type OpenTurnRow, type OpenTurnSourceSnapshot, OpenTurnStore } from './open-turn-store.js';
+import { type OpencodeV2HandoffObservation, type OpencodeV2HandoffRow, OpencodeV2HandoffStore } from './opencode-v2-handoff.js';
+import { type OpencodeV2PendingRow, OpencodeV2PendingStore } from './opencode-v2-pending.js';
+import {
+    assertOrphanPlanDatabase,
+    assertOrphanPlanFilesystem,
+    type NativeSessionIdentity,
+    type OrphanEvidence,
+    planOrphanPurge,
+    verifyOrphanPurge,
+} from './orphan-classification.js';
+
 import { ProjectResolver } from './project-resolver.js';
 import { type ProjectRow, ProjectStore, type ResolvedProjectIdentity } from './project-store.js';
 import type { SessionRuleRow } from './session-rules-store.js';
-import { hydrateSessionRow, type SessionRow, SessionStore } from './session-store.js';
+import { hydrateSessionRow, type SessionMetadata, type SessionRow, SessionStore } from './session-store.js';
 import { ShownSessionListStore } from './shown-session-list-store.js';
 import { sourceTurnDigest } from './source-turn-digest.js';
 import { SqliteSourceWatermarkStore } from './sqlite-source-watermark-store.js';
 import { type StandingRuleRow, StandingRulesStore } from './standing-rules-store.js';
 import { minMedianMax, type ProjectCount, type Stats, type StatusCount, type ToolCount, type ToolZeroPaths } from './stats.js';
+import { deleteTurnSearchForTranscript } from './turn-search-index.js';
 import { type MemoryRow, TurnStore } from './turn-store.js';
 
 export type { InjectionRow, RecordInjectionInput } from './injection-store.js';
@@ -51,6 +69,8 @@ export interface MemoryStoreOptions {
     resolveGitRootCommit?: (gitRoot: string) => string | null;
     // Test seam for the session/segment baseline captured from the same resolved project identity.
     resolveGitCommitCount?: (projectPath: string) => number | null;
+    // Test seam for small capacity thresholds and failing backups; production uses the fixed policy.
+    liveMemoryRetention?: LiveMemoryRetentionPolicy;
 }
 
 export interface IngestedTurnWritePreparation {
@@ -59,8 +79,20 @@ export interface IngestedTurnWritePreparation {
 }
 
 // What to purge: at most one project scope, optionally narrowed by time.
+// The part of an Elepha MCP receipt turn that publishing its receipts reads.
+// A full-source replay keeps only this, never the whole parsed turn.
+export type McpReceiptEvidence = Pick<
+    ParsedTurn,
+    'tool' | 'sessionId' | 'projectPath' | 'turnIndex' | 'droppedReason' | 'elephaMcpResultReceipts' | 'validateSource'
+>;
+
 export interface PurgeScope {
-    // Only explicit whole-project deletion includes durable project and chat rules. Time filters override this intention.
+    orphan?: boolean;
+    nativeUnits?: NativeSessionIdentity[];
+    sessionIds?: number[];
+    // Orphan planning narrows chat rules to these classified identities, across all rule owners.
+    sessionRuleNativeUnits?: NativeSessionIdentity[];
+    // Include durable rules for the selected scope. Time filters override this intention.
     deleteStandingRules?: boolean;
     // Purge every session belonging to project rows matching this path or display name.
     projectPath?: string;
@@ -78,6 +110,7 @@ export interface PurgeScope {
 
 export interface PurgeSessionPreview {
     id: number;
+    segmentIndex: number;
     nativeId: string;
     title: string | null;
     projectId: number;
@@ -96,6 +129,7 @@ export interface PurgeSessionPreview {
 // A purge preview includes the actual sessions because counts hide
 // misclassification.
 export interface PurgePlan {
+    orphanEvidence?: OrphanEvidence;
     scope: PurgeScope;
     sessions: PurgeSessionPreview[];
     standingRules: Array<StandingRuleRow & { projectPath: string }>;
@@ -103,6 +137,9 @@ export interface PurgePlan {
     // Project rows that will have neither sessions nor retained rules left.
     emptiedProjects: ProjectRow[];
 }
+
+// Every capture write of a parsed turn touches its whole native session and
+// may create or touch the project its cwd names.
 
 export class MemoryStore {
     private readonly db: Database;
@@ -113,6 +150,8 @@ export class MemoryStore {
     private readonly injections: InjectionStore;
     private readonly openTurns: OpenTurnStore;
     private readonly sqliteSourceWatermarks: SqliteSourceWatermarkStore;
+    private readonly opencodeV2Pending: OpencodeV2PendingStore;
+    private readonly opencodeV2Handoffs: OpencodeV2HandoffStore;
     readonly shownSessionLists: ShownSessionListStore;
     readonly standingRules: StandingRulesStore;
 
@@ -125,12 +164,23 @@ export class MemoryStore {
         this.injections = new InjectionStore(db);
         this.openTurns = new OpenTurnStore(db);
         this.sqliteSourceWatermarks = new SqliteSourceWatermarkStore(db);
+        this.opencodeV2Pending = new OpencodeV2PendingStore(db);
+        this.opencodeV2Handoffs = new OpencodeV2HandoffStore(db);
         this.shownSessionLists = new ShownSessionListStore(db);
         this.standingRules = new StandingRulesStore(db);
+        if (options.liveMemoryRetention !== undefined) {
+            useLiveMemoryRetentionPolicy(db, options.liveMemoryRetention);
+        }
     }
 
     get database(): Database {
         return this.db;
+    }
+
+    // Every capture write that adds live memory runs through the connection's
+    // shared policy, so no caller can bypass the capacity check or its cleanup.
+    get liveMemoryRetention(): LiveMemoryRetention {
+        return liveMemoryRetentionFor(this.db);
     }
 
     recordInjection(input: RecordInjectionInput): boolean {
@@ -181,14 +231,8 @@ export class MemoryStore {
         return this.projects.listProjects();
     }
 
-    upsertSession(
-        tool: ToolName,
-        nativeId: string,
-        projectId: number,
-        sourcePath: string,
-        meta?: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
-    ): SessionRow {
-        return this.sessions.upsertSession(tool, nativeId, projectId, sourcePath, meta);
+    upsertSession(tool: ToolName, nativeId: string, projectId: number, sourcePath: string, meta?: SessionMetadata): SessionRow {
+        return this.db.transaction(() => this.sessions.upsertSession(tool, nativeId, projectId, sourcePath, meta))();
     }
 
     findSession(tool: ToolName, nativeId: string): SessionRow | undefined {
@@ -196,7 +240,26 @@ export class MemoryStore {
     }
 
     updateSessionTitle(sessionDbId: number, turn: Pick<ParsedTurn, 'aiTitle' | 'userMessage'>): void {
-        this.sessions.updateSessionTitle(sessionDbId, turn);
+        const identity = this.db.prepare('SELECT tool, native_id FROM sessions WHERE id = ?').get(sessionDbId) as
+            | { tool: ToolName; native_id: string }
+            | undefined;
+        if (identity === undefined) {
+            return;
+        }
+        this.liveMemoryRetention.run({ tool: identity.tool, nativeId: identity.native_id }, () =>
+            this.db.transaction(() => this.sessions.updateSessionTitle(sessionDbId, turn))(),
+        );
+    }
+
+    // Automatic retention removed this native session. Unlike a purge, a
+    // restored pre-cleanup backup brings it back.
+    isTranscriptRetentionRemoved(tool: ToolName, nativeId: string): boolean {
+        return isRetentionRemoved(this.db, tool, nativeId);
+    }
+
+    // Capture never writes a purged or retention-removed native session.
+    isTranscriptCaptureBlocked(tool: ToolName, nativeId: string): boolean {
+        return this.isTranscriptPurged(tool, nativeId) || this.isTranscriptRetentionRemoved(tool, nativeId);
     }
 
     // A purge freezes the whole native transcript, across all its segments.
@@ -229,6 +292,15 @@ export class MemoryStore {
                      )`,
                 )
                 .run(tool, nativeId);
+            // Memory rows survive incognito, so their delete trigger cannot
+            // withdraw the derived search coverage.
+            deleteTurnSearchForTranscript(this.db, tool, nativeId);
+            this.db
+                .prepare(`DELETE FROM task_state_manifests WHERE memory_id IN (
+                SELECT m.id FROM memories m JOIN sessions s ON s.id = m.session_id
+                WHERE s.tool = ? AND s.native_id = ?
+            )`)
+                .run(tool, nativeId);
             this.db
                 .prepare(
                     `DELETE FROM durable_capture_status
@@ -251,7 +323,7 @@ export class MemoryStore {
         sourcePath: string,
         meta?: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
     ): SessionRow {
-        return this.sessions.startNextSegment(previous, projectId, sourcePath, meta);
+        return this.db.transaction(() => this.sessions.startNextSegment(previous, projectId, sourcePath, meta))();
     }
 
     listSessionsForRollupRebuild(currentVersion: number): SessionRow[] {
@@ -266,21 +338,25 @@ export class MemoryStore {
         return this.sessions.getSessionCursor(tool, nativeId);
     }
 
+    getSessionResume(tool: ToolName, nativeId: string): ReturnType<SessionStore['getSessionResume']> {
+        return this.sessions.getSessionResume(tool, nativeId);
+    }
+
     findOpenTurn(tool: ToolName, nativeId: string): OpenTurnRow | undefined {
         return this.openTurns.find(tool, nativeId);
     }
 
     beginOpenTurnValidation(tool: ToolName, nativeId: string, minimumEpoch: number): number {
-        return this.openTurns.beginValidation(tool, nativeId, minimumEpoch);
+        return this.db.transaction(() => this.openTurns.beginValidation(tool, nativeId, minimumEpoch))();
     }
 
     invalidateOpenTurnIfSourceChanged(tool: ToolName, nativeId: string, sourceGeneration: number, source: OpenTurnSourceSnapshot): boolean {
-        return this.openTurns.invalidateChangedSource(tool, nativeId, sourceGeneration, source);
+        return this.db.transaction(() => this.openTurns.invalidateChangedSource(tool, nativeId, sourceGeneration, source))();
     }
 
     observeOpenTurn(
         observation: OpenTailObservation,
-        meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
+        meta: SessionMetadata,
         sourceGeneration: number,
         source: OpenTurnSourceSnapshot,
         observedAt: string,
@@ -288,7 +364,7 @@ export class MemoryStore {
     ): OpenTurnRow | undefined {
         const turn = observation.receiptCoverage.turn;
         const resolved = this.resolveTurnGitValues(turn, false);
-        return this.db.transaction(() => {
+        const observe = this.db.transaction(() => {
             if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
                 return undefined;
             }
@@ -299,6 +375,7 @@ export class MemoryStore {
             if (quoteBackStatus === 'match') {
                 return undefined;
             }
+
             const project = this.projects.upsertProject(turn.projectPath, resolved.projectIdentity);
             const session = this.sessions.upsertSession(
                 turn.tool,
@@ -316,7 +393,8 @@ export class MemoryStore {
                 throw new Error('failed to persist open-turn Elepha MCP result receipt');
             }
             return this.openTurns.observe(observation, session.id, project.id, sourceGeneration, source, observedAt, validationEpoch);
-        })();
+        });
+        return this.liveMemoryRetention.run({ tool: turn.tool, nativeId: turn.sessionId }, () => observe());
     }
 
     stageOpenTurnSummary(
@@ -329,16 +407,14 @@ export class MemoryStore {
         projection?: Parameters<OpenTurnStore['stageSummary']>[7],
         projectPath?: string,
         validateSource?: () => boolean,
-        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
         validationEpoch?: number,
-        evictionPlan?: DurableEvictionPlan,
     ): boolean {
-        return this.db.transaction(() => {
+        const stage = this.db.transaction(() => {
             const row = this.openTurns.find(tool, nativeId);
             if (
                 row === undefined ||
                 row.source_revision !== sourceRevision ||
-                this.isTranscriptPurged(tool, nativeId) ||
+                this.isTranscriptCaptureBlocked(tool, nativeId) ||
                 this.isTranscriptIncognito(tool, nativeId) ||
                 validateSource?.() === false
             ) {
@@ -349,7 +425,7 @@ export class MemoryStore {
                 return false;
             }
             const expectedValidationEpoch = validationEpoch ?? row.validation_epoch;
-            const staged = this.openTurns.stageSummary(
+            return this.openTurns.stageSummary(
                 tool,
                 nativeId,
                 sourceRevision,
@@ -359,36 +435,110 @@ export class MemoryStore {
                 stagedAt,
                 projection,
             );
-            if (!staged || projection === undefined) {
-                return staged;
+        });
+        return this.liveMemoryRetention.run({ tool, nativeId }, () => stage());
+    }
+
+    getSqliteSourceCursor(tool: ToolName, sourcePath: string): { watermark: number; cursorId?: string } | undefined {
+        return this.sqliteSourceWatermarks.getCursor(tool, sourcePath);
+    }
+
+    setSqliteSourceCursor(tool: ToolName, sourcePath: string, cursor: { watermark: number; cursorId: string }): void {
+        this.sqliteSourceWatermarks.setCursor(tool, sourcePath, cursor);
+    }
+
+    listOpencodeV2Pending(sourcePath: string, limit: number): OpencodeV2PendingRow[] {
+        return this.opencodeV2Pending.list(sourcePath, limit);
+    }
+
+    countOpencodeV2Pending(sourcePath: string): number {
+        return this.opencodeV2Pending.count(sourcePath);
+    }
+
+    upsertOpencodeV2Pending(
+        sourcePath: string,
+        nativeId: string,
+        projectPath: string,
+        revision: { seq: number; updated: number },
+        needsContinuation: boolean,
+        resumeCursor?: string,
+    ): boolean {
+        return this.db.transaction(() => {
+            if (
+                this.consent.isRefusedForCapture(projectPath) ||
+                this.consent.consentState(projectPath) !== 'approved' ||
+                this.isTranscriptCaptureBlocked('opencode', nativeId) ||
+                this.isTranscriptIncognito('opencode', nativeId)
+            ) {
+                return false;
             }
-            new DurableCaptureStore(this.db).enforceOpenTurnMaxBytes(row.session_id, durableCaptureMaxBytes, stagedAt, evictionPlan);
+            this.opencodeV2Pending.upsert(sourcePath, nativeId, revision, needsContinuation, resumeCursor);
             return true;
         })();
     }
 
-    getSqliteSourceWatermark(tool: ToolName, sourcePath: string): number | undefined {
-        return this.sqliteSourceWatermarks.get(tool, sourcePath);
+    touchOpencodeV2Pending(sourcePath: string, nativeId: string, projectPath: string): void {
+        this.db.transaction(() => {
+            if (
+                this.consent.isRefusedForCapture(projectPath) ||
+                this.consent.consentState(projectPath) !== 'approved' ||
+                this.isTranscriptCaptureBlocked('opencode', nativeId) ||
+                this.isTranscriptIncognito('opencode', nativeId)
+            ) {
+                return;
+            }
+            this.opencodeV2Pending.touch(sourcePath, nativeId);
+        })();
     }
 
-    setSqliteSourceWatermark(tool: ToolName, sourcePath: string, watermark: number): void {
-        this.sqliteSourceWatermarks.set(tool, sourcePath, watermark);
+    deleteOpencodeV2Pending(sourcePath: string, nativeId: string): void {
+        this.opencodeV2Pending.delete(sourcePath, nativeId);
+    }
+
+    getOpencodeV2Handoff(nativeId: string): OpencodeV2HandoffRow | undefined {
+        return this.opencodeV2Handoffs.get(nativeId);
+    }
+
+    listOpencodeV2HandoffContinuations(sourcePath: string, limit: number): string[] {
+        return this.opencodeV2Handoffs.listNeedingContinuation(sourcePath, limit);
+    }
+
+    // Handoff state is identity-only, but it is still capture bookkeeping, so
+    // the consent and tombstone decision shares the write transaction. False
+    // also when the native id is bound to a different source path.
+    recordOpencodeV2Handoff(sourcePath: string, nativeId: string, projectPath: string, observation: OpencodeV2HandoffObservation): boolean {
+        return this.db.transaction(() => {
+            if (
+                this.consent.isRefusedForCapture(projectPath) ||
+                this.consent.consentState(projectPath) !== 'approved' ||
+                this.isTranscriptCaptureBlocked('opencode', nativeId) ||
+                this.isTranscriptIncognito('opencode', nativeId)
+            ) {
+                return false;
+            }
+            return this.opencodeV2Handoffs.upsert(nativeId, sourcePath, observation);
+        })();
+    }
+
+    // V1 turn indexes count V1 user messages while V2 indexes are provider
+    // sequence numbers, so the two ranges can collide within one native
+    // session. V2 indexes start strictly above every stored V1 index.
+    opencodeV1TurnIndexOffset(nativeId: string): number {
+        const row = this.db
+            .prepare(`SELECT MAX(m.turn_index) AS max_index FROM memories m JOIN sessions s ON s.id = m.session_id
+                WHERE s.tool = 'opencode' AND s.native_id = ? AND s.source_format = 'native'`)
+            .get(nativeId) as { max_index: number | null };
+        return (row.max_index ?? -1) + 1;
     }
 
     getLastIngestedAt(): string | undefined {
         return this.turns.getLastIngestedAt();
     }
 
-    recordTurn(
-        turn: ParsedTurn,
-        sessionDbId: number,
-        projectId: number,
-        summary: SummarizationOutput,
-        durableCapture = false,
-        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
-        evictionPlan?: DurableEvictionPlan,
-    ): boolean {
-        return this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture, durableCaptureMaxBytes, evictionPlan);
+    recordTurn(turn: ParsedTurn, sessionDbId: number, projectId: number, summary: SummarizationOutput, durableCapture = false): boolean {
+        return this.liveMemoryRetention.run({ tool: turn.tool, nativeId: turn.sessionId }, () =>
+            this.db.transaction(() => this.turns.recordTurn(turn, sessionDbId, projectId, summary, durableCapture))(),
+        );
     }
 
     // Creates the project/session and records one live turn as one SQLite
@@ -397,12 +547,10 @@ export class MemoryStore {
     // persistence decision across concurrent writers.
     recordIngestedTurn(
         turn: ParsedTurn,
-        meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
+        meta: SessionMetadata,
         startNextSegment: boolean,
         summary: SummarizationOutput,
         durableCapture = false,
-        durableCaptureMaxBytes = DURABLE_CAPTURE_MAX_BYTES,
-        evictionPlan?: DurableEvictionPlan,
         preparation?: IngestedTurnWritePreparation,
     ): { project: ProjectRow; session: SessionRow; inserted: boolean } | undefined {
         const resolved = preparation ?? this.resolveTurnGitValues(turn, startNextSegment);
@@ -423,6 +571,7 @@ export class MemoryStore {
             if (this.turns.hasMemoryForNativeTurn(turn.tool, turn.sessionId, turn.turnIndex)) {
                 return undefined;
             }
+
             const project = this.projects.upsertProject(turn.projectPath, resolved.projectIdentity);
             let session = this.sessions.upsertSession(
                 turn.tool,
@@ -436,24 +585,16 @@ export class MemoryStore {
                 session = this.sessions.startNextSegment(session, project.id, turn.sourcePath, meta, resolved.gitCommitCount);
             }
             // The staged projection describes this same logical turn. Remove it
-            // inside the final-write transaction before durable accounting so it
-            // cannot make the canonical replacement evict an unrelated row.
+            // inside the final-write transaction so the canonical replacement is
+            // measured without its staged copy.
             this.openTurns.delete(turn.tool, turn.sessionId);
             return {
                 project,
                 session,
-                inserted: this.turns.recordTurnInTransaction(
-                    turn,
-                    session.id,
-                    project.id,
-                    summary,
-                    durableCapture,
-                    durableCaptureMaxBytes,
-                    evictionPlan,
-                ),
+                inserted: this.turns.recordTurnInTransaction(turn, session.id, project.id, summary, durableCapture),
             };
         });
-        return write();
+        return this.liveMemoryRetention.run({ tool: turn.tool, nativeId: turn.sessionId }, () => write());
     }
 
     // Refresh a verified logical prefix after atomic source replacement without creating memories.
@@ -469,20 +610,14 @@ export class MemoryStore {
             if (memory?.source_digest !== sourceTurnDigest(turn)) {
                 return;
             }
-            this.sessions.advanceSessionCursor(memory.session_id, turn.cursor);
+
+            this.sessions.advanceSessionCursor(memory.session_id, turn);
             this.sessions.updateTrailingState(memory.session_id, turn);
             this.openTurns.delete(turn.tool, turn.sessionId);
         })();
     }
 
-    prepareIngestedTurnWrite(turn: ParsedTurn, startNextSegment: boolean): IngestedTurnWritePreparation {
-        return this.resolveTurnGitValues(turn, startNextSegment);
-    }
-
-    recordDroppedTurn(
-        turn: ParsedTurn,
-        meta: { surface?: SessionRowSurface | null; gitBranch?: string | null; kind?: SessionRowKind | null; customTitle?: string },
-    ): boolean {
+    recordDroppedTurn(turn: ParsedTurn, meta: SessionMetadata): boolean {
         if (turn.droppedReason === 'elepha-mcp' && (turn.elephaMcpResultReceipts?.length ?? 0) === 0) {
             return false;
         }
@@ -491,6 +626,7 @@ export class MemoryStore {
             if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false) {
                 return false;
             }
+
             const project = this.projects.upsertProject(turn.projectPath, resolved.projectIdentity);
             const session = this.sessions.upsertSession(
                 turn.tool,
@@ -503,12 +639,12 @@ export class MemoryStore {
             if (!this.injections.recordElephaMcpReceipts(turn)) {
                 throw new Error('failed to persist Elepha MCP result receipt');
             }
-            this.sessions.advanceSessionCursor(session.id, turn.cursor);
+            this.sessions.advanceSessionCursor(session.id, turn);
             this.openTurns.delete(turn.tool, turn.sessionId);
             return true;
         });
         try {
-            return write();
+            return this.liveMemoryRetention.run({ tool: turn.tool, nativeId: turn.sessionId }, () => write());
         } catch (error) {
             if ((error as Error).message === 'failed to persist Elepha MCP result receipt') {
                 return false;
@@ -534,6 +670,7 @@ export class MemoryStore {
                         return false;
                     }
                 }
+
                 if (!this.injections.recordElephaMcpReceipts(turn)) {
                     throw new Error('failed to persist Elepha MCP result receipt');
                 }
@@ -548,18 +685,24 @@ export class MemoryStore {
     }
 
     publishElephaMcpReceiptBatch(
-        turns: ParsedTurn[],
-        expectedSessionId: number,
+        turns: readonly McpReceiptEvidence[],
+        expectedSessionId: number | undefined,
         tool: ToolName,
         nativeSessionId: string,
         expectedSourceGeneration: number,
     ): boolean {
         try {
-            return this.db.transaction(() => {
-                const session = this.db
-                    .prepare('SELECT id FROM sessions WHERE id = ? AND tool = ? AND native_id = ?')
-                    .get(expectedSessionId, tool, nativeSessionId) as { id: number } | undefined;
-                if (session === undefined || this.injections.currentSourceGeneration(tool, nativeSessionId) !== expectedSourceGeneration) {
+            const write = () => {
+                const session =
+                    expectedSessionId === undefined
+                        ? undefined
+                        : (this.db
+                              .prepare('SELECT id FROM sessions WHERE id = ? AND tool = ? AND native_id = ?')
+                              .get(expectedSessionId, tool, nativeSessionId) as { id: number } | undefined);
+                if (
+                    (expectedSessionId !== undefined && session === undefined) ||
+                    this.injections.currentSourceGeneration(tool, nativeSessionId) !== expectedSourceGeneration
+                ) {
                     throw new Error('failed to persist Elepha MCP result receipt batch');
                 }
                 for (const turn of turns) {
@@ -574,6 +717,7 @@ export class MemoryStore {
                         throw new Error('failed to persist Elepha MCP result receipt batch');
                     }
                 }
+
                 for (const turn of turns) {
                     if (!this.injections.recordElephaMcpReceipts(turn, expectedSourceGeneration)) {
                         throw new Error('failed to persist Elepha MCP result receipt batch');
@@ -583,7 +727,8 @@ export class MemoryStore {
                     throw new Error('failed to persist Elepha MCP result receipt batch');
                 }
                 return true;
-            })();
+            };
+            return this.db.transaction(write)();
         } catch (error) {
             if ((error as Error).message === 'failed to persist Elepha MCP result receipt batch') {
                 return false;
@@ -601,8 +746,9 @@ export class MemoryStore {
                 return false;
             }
             const session = this.sessions.findSession(turn.tool, turn.sessionId);
+
             if (session) {
-                this.sessions.advanceSessionCursor(session.id, turn.cursor);
+                this.sessions.advanceSessionCursor(session.id, turn);
             }
             this.openTurns.delete(turn.tool, turn.sessionId);
             return true;
@@ -622,7 +768,12 @@ export class MemoryStore {
     }
 
     // The final consent and tombstone decision must share the transaction that would mutate capture rows.
-    private recordIncognitoIfWriteBlocked(turn: ParsedTurn): boolean {
+    private recordIncognitoIfWriteBlocked(turn: Pick<ParsedTurn, 'tool' | 'sessionId' | 'projectPath'>): boolean {
+        // A retention removal is not a privacy decision, so it blocks the write
+        // without recording an incognito tombstone a restore would carry.
+        if (this.isTranscriptRetentionRemoved(turn.tool, turn.sessionId)) {
+            return true;
+        }
         const consentState = this.consent.consentState(turn.projectPath);
         const mustRecordIncognito =
             consentState === 'denied' ||
@@ -640,8 +791,9 @@ export class MemoryStore {
         projectId: number,
         summary: SummarizationOutput,
         quoteBackPrevalidated = false,
+        durableCapture = false,
     ): boolean {
-        return this.db.transaction(() => {
+        const reingest = this.db.transaction(() => {
             if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false || turn.droppedReason !== undefined) {
                 return false;
             }
@@ -654,9 +806,14 @@ export class MemoryStore {
                     return false;
                 }
             }
-            this.turns.reingestTurn(turn, sessionDbId, projectId, summary);
+            this.turns.reingestTurn(turn, sessionDbId, projectId, summary, durableCapture);
+            const reportingMemory = this.db
+                .prepare('SELECT id FROM memories WHERE session_id = ? AND turn_index = ?')
+                .get(sessionDbId, turn.turnIndex) as { id: number };
+            this.db.prepare('DELETE FROM task_state_manifests WHERE memory_id = ?').run(reportingMemory.id);
             return true;
-        })();
+        });
+        return this.liveMemoryRetention.run({ tool: turn.tool, nativeId: turn.sessionId }, () => reingest());
     }
 
     listSessionsWithMemoriesSince(sinceIso: string): SessionRow[] {
@@ -716,6 +873,7 @@ export class MemoryStore {
     // Applies and returns the same plan in one transaction for reporting.
     rekeyProjectsByIdentity(resolveGitRoot: (path: string) => string | null): ProjectMergePlan[] {
         const plans = this.planRekeyProjectsByIdentity(resolveGitRoot);
+
         const apply = this.db.transaction(() => {
             // A merge can join formerly independent rule budgets. Include existing
             // logical membership, then validate all resulting groups before writing.
@@ -825,10 +983,19 @@ export class MemoryStore {
     // Computes what a purge would delete, without deleting anything. The
     // actual session list, not just a count: aggregates hide misclassification.
     planPurge(scope: PurgeScope): PurgePlan {
+        if (scope.orphan) {
+            return planOrphanPurge(this, scope);
+        }
         const projects = this.listProjects();
         let selectedProjectIds: number[] = [];
         let sessionRows: SessionRow[];
-        if (scope.projectRoot !== undefined) {
+        if (scope.sessionIds !== undefined) {
+            sessionRows = this.db
+                .prepare('SELECT * FROM sessions WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id')
+                .all(JSON.stringify(scope.sessionIds))
+                .map((row) => hydrateSessionRow(row as Record<string, unknown>));
+            selectedProjectIds = scope.projectIds ?? [];
+        } else if (scope.projectRoot !== undefined) {
             const root = canonicalizeExisting(scope.projectRoot);
             const projectIds = projects.filter((p) => isWithin(root, canonicalizeExisting(p.path))).map((p) => p.id);
             sessionRows = this.sessionsForProjectIds(projectIds);
@@ -865,15 +1032,21 @@ export class MemoryStore {
                       projectPath: projectById.get(rule.project_id)?.path ?? '(unknown project)',
                   }))
                 : [];
+        const chatRuleScope =
+            scope.sessionRuleNativeUnits !== undefined
+                ? `EXISTS (SELECT 1 FROM json_each(?) AS unit
+                    WHERE json_extract(unit.value, '$.tool') = tool
+                      AND json_extract(unit.value, '$.nativeId') = native_session_id)`
+                : 'owner_project_id IN (SELECT value FROM json_each(?))';
         const sessionRules =
-            scope.deleteStandingRules === true && newerThan === undefined && olderThan === undefined && selectedProjectIds.length > 0
+            scope.deleteStandingRules === true && newerThan === undefined && olderThan === undefined
                 ? (
                       this.db
                           .prepare(
                               `SELECT id, ulid, tool, native_session_id, checkout_anchor, owner_project_id, text, created_at
-                               FROM session_rules WHERE owner_project_id IN (${selectedProjectIds.map(() => '?').join(',')}) ORDER BY id`,
+                               FROM session_rules WHERE ${chatRuleScope} ORDER BY id`,
                           )
-                          .all(...selectedProjectIds) as SessionRuleRow[]
+                          .all(JSON.stringify(scope.sessionRuleNativeUnits ?? selectedProjectIds)) as SessionRuleRow[]
                   ).map((rule) => ({ ...rule, projectPath: projectById.get(rule.owner_project_id)?.path ?? '(unknown project)' }))
                 : [];
         const countTurns = this.db.prepare('SELECT COUNT(*) as c FROM memories WHERE session_id = ?');
@@ -901,6 +1074,7 @@ export class MemoryStore {
             const staged = stagedFiltered.get(s.id) as { count: number; bytes: number } | undefined;
             return {
                 id: s.id,
+                segmentIndex: s.segment_index,
                 nativeId: s.native_id,
                 title: s.title,
                 projectId: s.project_id,
@@ -951,6 +1125,7 @@ export class MemoryStore {
 
     // Applies exactly the still-present sessions and unchanged rules in a previewed plan, in one transaction.
     applyPurgePlan(plan: PurgePlan, purgedAt = new Date().toISOString()): PurgePlan {
+        assertOrphanPlanFilesystem(this, plan);
         const sessionIdentity = this.db.prepare('SELECT tool, native_id FROM sessions WHERE id = ?');
         const tombstone = this.db.prepare('INSERT OR IGNORE INTO purged_transcripts (tool, native_id, purged_at) VALUES (?, ?, ?)');
         const deleteRollup = this.db.prepare('DELETE FROM session_rollups WHERE session_id = ?');
@@ -980,7 +1155,10 @@ export class MemoryStore {
         const deleteProject = this.db.prepare('DELETE FROM projects WHERE id = ?');
         const appliedSessions: PurgeSessionPreview[] = [];
         const emptiedProjects: ProjectRow[] = [];
-        const apply = this.db.transaction(() => {
+
+        const write = () => {
+            assertOrphanPlanDatabase(this, plan);
+
             for (const planned of plan.standingRules) {
                 const current = ruleIdentity.get(planned.id) as StandingRuleRow | undefined;
                 const project = this.getProjectById(planned.project_id);
@@ -1032,6 +1210,21 @@ export class MemoryStore {
                 tombstone.run(identity.tool, identity.native_id, purgedAt);
                 deleteMcpReceipts.run(identity.tool, identity.native_id);
                 deleteSourceGeneration.run(identity.tool, identity.native_id);
+                if (plan.orphanEvidence) {
+                    for (const table of ['injections', 'shown_session_lists']) {
+                        this.db
+                            .prepare(`DELETE FROM ${table} WHERE tool = ? AND native_session_id = ?`)
+                            .run(identity.tool, identity.native_id);
+                    }
+                    this.db
+                        .prepare('DELETE FROM live_memory_capture_deferrals WHERE tool = ? AND native_id = ?')
+                        .run(identity.tool, identity.native_id);
+                    if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'segment_corrections'").get()) {
+                        this.db
+                            .prepare('DELETE FROM segment_corrections WHERE tool = ? AND native_id = ?')
+                            .run(identity.tool, identity.native_id);
+                    }
+                }
                 deleteRollup.run(s.id);
                 deleteFilteredTurns.run(s.id);
                 deleteDurableCaptureStatus.run(s.id);
@@ -1073,8 +1266,11 @@ export class MemoryStore {
                     emptiedProjects.push(p);
                 }
             }
-        });
-        apply();
+            if (plan.orphanEvidence) {
+                verifyOrphanPurge(this, plan);
+            }
+        };
+        this.db.transaction(write)();
         // "Revocation = deletion" isn't true of the file on disk until the
         // WAL is reclaimed too - a deleted row's page can sit in
         // elepha.db-wal, readable to anything with filesystem access, until a

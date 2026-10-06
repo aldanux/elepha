@@ -33,7 +33,7 @@ import {
 import * as semantic from '../../src/serving/semantic-recall.js';
 import { selectSessionEvidence } from '../../src/serving/session-evidence.js';
 import { publicSessionId } from '../../src/serving/session-id.js';
-import { SessionReader } from '../../src/serving/session-reader.js';
+import { SessionReader, STORED_EVIDENCE_REASONS } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { DurableCaptureStore } from '../../src/storage/durable-capture-store.js';
 import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
@@ -41,7 +41,7 @@ import { firstPromptSearch } from '../../src/storage/first-prompt-search.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import { withMemoryReadGeneration } from '../../src/storage/paranoid-gate.js';
 import * as readModel from '../../src/storage/session-read-model.js';
-import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedCopyCoverage, seedMemory, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 const configuration: providers.EmbeddingConfiguration = { provider: 'local', model: 'fixture', revision: 'v1', dimensions: 2 };
 const NOW = Date.parse('2026-09-14T12:00:00Z');
@@ -101,6 +101,7 @@ function fixture(similarity = 1) {
         tool: HookTool = 'codex',
         chat = 'current',
         extra: UserPromptSubmitDependencies = {},
+        transcriptPath?: string,
     ) =>
         runUserPromptSubmit(
             JSON.stringify({
@@ -110,6 +111,7 @@ function fixture(similarity = 1) {
                 prompt,
                 model: 'fixture',
                 permission_mode: 'default',
+                ...(transcriptPath === undefined ? {} : { transcript_path: transcriptPath }),
             }),
             tool,
             { dbPath: f.dbPath, configPath, openDatabase, now: () => NOW, log, ...extra },
@@ -145,6 +147,26 @@ afterEach(() => {
 });
 
 describe('automatic Memory-Plus candidates', () => {
+    it('keeps historical recall and a Claude task-state request in separate injections', async () => {
+        const f = fixture();
+        vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(f.directory, '.claude'));
+        const sourcePath = path.join(f.directory, '.claude', 'projects', 'fixture', 'current.jsonl');
+        mkdirSync(path.dirname(sourcePath), { recursive: true });
+        writeFileSync(sourcePath, '');
+        seedSession(f, { project: f.project, tool: 'claude-code', nativeId: 'current', sourcePath, kind: 'main' });
+        const body = context(await f.run(undefined, 'claude-code', 'current', {}, sourcePath));
+        expect(body).toContain('Payment recovery');
+        expect(body).toContain('elepha task-state request mode=precompact_manifest request_id=');
+        const rows = f.db
+            .prepare("SELECT body FROM injections WHERE tool = 'claude-code' AND native_session_id = 'current'")
+            .all() as Array<{
+            body: string;
+        }>;
+        expect(rows.some((row) => row.body.startsWith(automatic.AUTOMATIC_RECALL_BODY_PREFIX))).toBe(true);
+        expect(rows.some((row) => row.body.startsWith('elepha task-state request'))).toBe(true);
+        expect((f.db.prepare('SELECT COUNT(*) AS count FROM task_state_requests').get() as { count: number }).count).toBe(1);
+        expect(f.store.countInjectionBodyPrefix('claude-code', 'current', automatic.AUTOMATIC_RECALL_BODY_PREFIX)).toBe(1);
+    });
     it.each([false, true])('injects production-sized finals completely or abstains above the cap; oversized=%s', async (oversized) => {
         const f = fixture(0.929);
         const question =
@@ -177,6 +199,7 @@ describe('automatic Memory-Plus candidates', () => {
             }),
             '2026-09-15',
         );
+        seedCopyCoverage(f, first.id);
         f.writeVector();
         if (oversized) {
             expect(question.length + final.length + followup.length).toBeGreaterThan(AUTOMATIC_RECALL_MAX_CONTEXT_CHARS);
@@ -245,6 +268,7 @@ describe('automatic Memory-Plus candidates', () => {
             omitted_tool_call_count, dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
             VALUES (?, 1, ?, ?, '[]', 0, 0, 0, ?, '2026-09-15')`)
             .run(first.id, question, answer, DURABLE_CAPTURE_FILTER_VERSION);
+        seedCopyCoverage(f, first.id);
         f.writeVector();
         const output = context(await f.run('Which option did we choose for payment receipts?'));
         expect(output).toContain(question);
@@ -284,6 +308,7 @@ describe('automatic Memory-Plus candidates', () => {
                     omitted_tool_call_count, dropped_tool_ref_count, omitted_before_chars, filter_version, captured_at)
                     VALUES (?, 1, ?, ?, '[]', 0, 0, 0, ?, '2026-09-15')`)
                     .run(first.id, question, answer, DURABLE_CAPTURE_FILTER_VERSION);
+                seedCopyCoverage(f, first.id);
             } else {
                 vi.stubEnv('CODEX_HOME', path.join(f.directory, 'codex'));
                 const root = path.join(f.directory, 'codex', 'sessions');
@@ -323,6 +348,16 @@ describe('automatic Memory-Plus candidates', () => {
             // The mocked vector fixes already-tested semantic ranking. This
             // proves selection is language-independent, not embedding quality.
             const prompt = 'Explain the rejected confidence heuristic and its measured failure.';
+            if (source === 'provider') {
+                // Source-only content can no longer supply automatic response
+                // evidence; expansion names the retained gap instead.
+                expect(await f.run(prompt)).toEqual({ reason: 'not_command' });
+                const expanded = await new ElephaMcpService(f.db).getSession({ id: publicSessionId(f.session), query: prompt });
+                expect(JSON.stringify(expanded.content)).toContain(STORED_EVIDENCE_REASONS.missing);
+                expect(JSON.stringify(expanded.content)).not.toContain(decision);
+                expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
+                return;
+            }
             const output = context(await f.run(prompt));
             expect(output).toContain(decision);
             expect(output).not.toContain('Late margin mention');
@@ -338,7 +373,7 @@ describe('automatic Memory-Plus candidates', () => {
         },
     );
 
-    it('reads the first paired interaction of a nonzero native Codex segment and abstains at the streaming ceiling', async () => {
+    it('reads the retained first pair of a nonzero native Codex segment independently of the source ceiling', async () => {
         const f = fixture(0);
         const priorProject = seedProject(f, { path: path.join(f.directory, 'prior-project') });
         mkdirSync(priorProject.path, { recursive: true });
@@ -393,6 +428,7 @@ describe('automatic Memory-Plus candidates', () => {
                 { surface: 'cli' },
                 previousProject !== undefined && previousProject !== turn.projectPath,
                 { decisions: [], pending_items: [], status: 'ok' },
+                true,
             );
             expect(result?.inserted).toBe(true);
             ingested.push({ turn, session: result!.session });
@@ -418,7 +454,7 @@ describe('automatic Memory-Plus candidates', () => {
         expect(evidence.text).toContain(question);
         expect(evidence.text).toContain(answer);
         expect(evidence.text).not.toMatch(/prior|Later receipt/i);
-        expect(evidence.coverage).toContain('provider transcript interaction, stored turn index 2');
+        expect(evidence.coverage).toContain('durable stored interaction, stored turn index 2');
         const output = context(await f.run('What was our receipt choice?', 'codex', 'segmented-current'));
         expect(output).toContain(question);
         expect(output).toContain(answer);
@@ -429,12 +465,9 @@ describe('automatic Memory-Plus candidates', () => {
         // of the implementation constant. Its end must never be read/parsed.
         const oversized = JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', padding: 'x'.repeat(5 * 1024 * 1024) } });
         writeFileSync(sourcePath, `${[header, ...batches.slice(0, 2), oversized, ...batches.slice(2)].join('\n')}\n`);
-        const unavailable = await selectSessionEvidence(reader, session, undefined, 1500);
-        expect(unavailable.text).toBe('');
-        expect(unavailable.coverage).toContain('evidence_source_byte_budget');
-        expect(await f.run('What was our receipt choice?', 'codex', 'segmented-bounded')).toEqual({ reason: 'not_command' });
-        expect(f.log).toHaveBeenCalledWith(expect.stringContaining('evidence_source_byte_budget'));
-        expect(f.store.injectionsForSession('codex', 'segmented-bounded', new Date(NOW).toISOString())).toEqual([]);
+        expect(await selectSessionEvidence(reader, session, undefined, 1500)).toEqual(evidence);
+        expect(context(await f.run('What was our receipt choice?', 'codex', 'segmented-bounded'))).toContain(answer);
+        expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('evidence_source_byte_budget'));
 
         const handle = await open(sourcePath, 'r');
         const reads = vi.spyOn(handle, 'read');
@@ -456,7 +489,12 @@ describe('automatic Memory-Plus candidates', () => {
                 expect(typeof args[3]).toBe('number');
                 return (args[2] as number) + (args[3] as number);
             });
-            expect(Math.max(...readEnds)).toBe(SESSION_EVIDENCE_SOURCE_MAX_BYTES);
+            // The ceiling bounds every read the parse makes, including the
+            // adapter's user-boundary prescan: together they use it exactly,
+            // and nothing past it is read.
+            const readLengths = reads.mock.calls.map((call) => (call as unknown[])[2] as number);
+            expect(readLengths.reduce((total, length) => total + length, 0)).toBe(SESSION_EVIDENCE_SOURCE_MAX_BYTES);
+            expect(Math.max(...readEnds)).toBeLessThanOrEqual(SESSION_EVIDENCE_SOURCE_MAX_BYTES);
         } finally {
             await handle.close();
         }

@@ -3,7 +3,7 @@ import { DURABLE_CAPTURE_FILTER_VERSION } from '../../src/config/constants.js';
 import { type HookTool, isHookTool, parsePayload } from '../../src/hooks/common.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedCopyCoverage, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
 const NOW = Date.parse('2026-09-09T00:00:00.000Z');
 
@@ -58,6 +58,7 @@ function seedStoredSession(
              VALUES (?, 1, ?, ?, '[]', 0, 0, 0, ?, ?)`,
         )
         .run(memory.id, `Request for ${title}`, `Response for ${title}`, DURABLE_CAPTURE_FILTER_VERSION, timestamp);
+    seedCopyCoverage(fixture, memory.id);
     fixture.db
         .prepare(
             `INSERT INTO durable_capture_status (session_id, state, filter_version, updated_at)

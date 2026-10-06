@@ -110,7 +110,7 @@ Full guide: [docs/troubleshooting.md](troubleshooting.md).
 
 | Command                    | Description                                                                                                                                                 |
 |----------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `elepha status`            | Print the quick daemon health and recent-ingestion summary. More details in [docs/troubleshooting.md](troubleshooting.md#quick-health-check).               |
+| `elepha status`            | Print daemon health and recent ingestion. See [docs/troubleshooting.md](troubleshooting.md#quick-health-check).                                             |
 | `elepha doctor`            | Run deep checks and repair a down managed daemon when possible. More details in [docs/troubleshooting.md](troubleshooting.md#deep-health-check-and-repair). |
 | `elepha inspect <project>` | Print recent stored memory for one project. More details in [docs/troubleshooting.md](troubleshooting.md#inspect-recently-captured-memory).                 |
 

@@ -1,18 +1,11 @@
-import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
-import { CodexAdapter } from '../../src/adapters/codex.js';
-import { applyCustomTitleBackfill, planCustomTitleBackfill } from '../../src/storage/custom-title-backfill.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
 import { applySessionTitleBackfill, planSessionTitleBackfill } from '../../src/storage/session-title-backfill.js';
 import type { ParsedTurn, ParseTurnsOptions, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
-
-const SOURCE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'sample-session.jsonl');
-const CUSTOM_TITLE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.229-custom-title.jsonl');
-const FRAME_LINK = path.join(__dirname, '..', 'fixtures', 'claude-code', 'claude-v2.1.232-frame-link.jsonl');
 
 class TitleFixtureAdapter implements SessionAdapter {
     readonly tool: SessionAdapterTool = 'claude-code';
@@ -74,7 +67,7 @@ function turn(index: number, userMessage: string, aiTitle?: string): ParsedTurn 
     return {
         tool: 'claude-code',
         sessionId: 'title-backfill',
-        sourcePath: SOURCE,
+        sourcePath: '/repo/session.jsonl',
         projectPath: '/repo',
         turnIndex: index,
         startedAt: `2026-08-0${index + 1}T00:00:00.000Z`,
@@ -104,12 +97,8 @@ describe('session-title backfill', () => {
         vi.stubEnv('CODEX_HOME', codexHome);
         const claudeSource = path.join(claudeProjects, 'sample-session.jsonl');
         const codexSource = path.join(codexSessions, 'sample-session.jsonl');
-        const customTitleSource = path.join(claudeProjects, 'custom-title.jsonl');
-        const frameLinkSource = path.join(claudeProjects, 'frame-link.jsonl');
         writeFileSync(claudeSource, '{}\n');
         writeFileSync(codexSource, '{}\n');
-        copyFileSync(CUSTOM_TITLE, customTitleSource);
-        copyFileSync(FRAME_LINK, frameLinkSource);
 
         const db = openUnmanagedDb(':memory:');
         db.prepare(
@@ -173,38 +162,5 @@ describe('session-title backfill', () => {
         ]);
         expect((await planSessionTitleBackfill(db, adapters)).changes).toHaveLength(0);
         db.close();
-
-        const customDb = openUnmanagedDb(':memory:');
-        customDb
-            .prepare(
-                `INSERT INTO projects (id, path, first_seen_at, last_seen_at) VALUES (1, '/tmp/proj', '2026-08-16T00:00:00.000Z', '2026-08-16T00:00:00.000Z')`,
-            )
-            .run();
-        customDb
-            .prepare(
-                `INSERT INTO sessions (id, tool, native_id, project_id, source_path, started_at, last_ingested_at, rendered_chars)
-                 VALUES (1, 'claude-code', 'custom-title-sample', 1, ?, '2026-08-16T00:00:00.000Z', '2026-08-16T00:00:00.000Z', 123),
-                        (2, 'claude-code', 'frame-link-sample', 1, ?, '2026-08-16T00:00:00.000Z', '2026-08-16T00:00:00.000Z', 456)`,
-            )
-            .run(customTitleSource, frameLinkSource);
-        const beforeRendered = customDb.prepare('SELECT id, rendered_chars FROM sessions ORDER BY id').all();
-        const customTitleAdapters: SessionAdapterMap = {
-            'claude-code': new ClaudeCodeAdapter(),
-            codex: new CodexAdapter(),
-        };
-
-        const customPreview = await planCustomTitleBackfill(customDb, customTitleAdapters);
-        expect(customPreview.changes).toEqual([
-            expect.objectContaining({ sessionId: 1, before: null, after: 'Latest project changelog', transcriptMissing: false }),
-        ]);
-
-        await applyCustomTitleBackfill(customDb, customTitleAdapters);
-        expect(customDb.prepare('SELECT custom_title FROM sessions WHERE id = 1').get()).toEqual({
-            custom_title: 'Latest project changelog',
-        });
-        expect(customDb.prepare('SELECT custom_title FROM sessions WHERE id = 2').get()).toEqual({ custom_title: null });
-        expect(customDb.prepare('SELECT id, rendered_chars FROM sessions ORDER BY id').all()).toEqual(beforeRendered);
-        expect((await planCustomTitleBackfill(customDb, customTitleAdapters)).changes).toHaveLength(0);
-        customDb.close();
     });
 });

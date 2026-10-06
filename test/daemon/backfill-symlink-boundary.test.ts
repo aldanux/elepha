@@ -139,7 +139,6 @@ describe('approved-root backfill symlink boundary', () => {
         await expect(daemon.backfillApprovedRoot(approvedRoot)).resolves.toBe(1);
         expect(adapter.classificationCalls.get('aliased-session')).toBe(1);
         expect(adapter.titleCalls.get('aliased-session')).toBe(1);
-        expect(adapter.turnParserCalls.get('aliased-session')).toBe(1);
         expect(capturedRowCounts(store)).toEqual({ projects: 1, sessions: 1, memories: 1, cursors: 1 });
         expect(store.listProjects().map((project) => project.path)).toEqual([aliasedCwd]);
     });

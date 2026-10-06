@@ -18,7 +18,7 @@ import {
     DATABASE_SCHEMA_METADATA_MAX_ROWS,
     PRIVATE_FILE_MODE,
 } from '../config/constants.js';
-import { pinSQLitePathForOpen, type SQLiteFileIdentitySeal } from './database-lifecycle.js';
+import { openSQLitePathWithSeal, pinSQLitePathForOpen, type SQLiteFileIdentitySeal } from './database-lifecycle.js';
 import { hasPlaintextDatabaseHeader, isPlaintextDatabaseHeader, keyDatabaseConnection, openKeyedDatabase } from './db.js';
 
 const ATTACHED_EXPORT_SCHEMA = 'elepha_export';
@@ -428,6 +428,7 @@ interface EncryptedDatabaseImportState {
 
 function runEncryptedDatabaseImport(
     sourceSeal: SQLitePathSeal,
+    sourceIdentity: DatabaseFileSeal,
     destinationPath: string,
     destinationIdentity: DatabaseFileSeal,
     destinationKey: Buffer,
@@ -436,7 +437,8 @@ function runEncryptedDatabaseImport(
     state: EncryptedDatabaseImportState,
 ): void {
     state.physicalSource = realpathSync(sourceSeal.sqlitePath);
-    state.sourceState = sourceSeal.captureMutationState();
+    state.sourceState = { fileCtimeNs: sourceIdentity.ctimeNs, fileNlink: sourceIdentity.nlink };
+    sourceSeal.assertCurrent(state.sourceState);
     state.sourceHash = descriptorHash(sourceSeal.descriptor);
     for (const suffix of SQLITE_COMPANION_SUFFIXES) {
         if (lstatSync(`${state.physicalSource}${suffix}`, { throwIfNoEntry: false }) !== undefined) {
@@ -445,15 +447,29 @@ function runEncryptedDatabaseImport(
     }
     state.preflightPassed = true;
     state.destinationSeal = pinSQLitePathForOpen(destinationPath, destinationIdentity);
-    state.source = new Database(sourceSeal.sqlitePath, { readonly: true, fileMustExist: true });
-    sourceSeal.confirmOpen(state.source);
+    const destinationSeal = state.destinationSeal;
+    const destinationState = { fileCtimeNs: destinationIdentity.ctimeNs, fileNlink: destinationIdentity.nlink };
+    const sourceState = state.sourceState;
+    state.source = openSQLitePathWithSeal(
+        sourceSeal.sqlitePath,
+        sourceIdentity,
+        (filename) => new Database(filename, { readonly: true, fileMustExist: true }),
+        () => sourceSeal.assertCurrent(sourceState),
+    );
     if (sourceKey !== undefined) {
         keyDatabaseConnection(state.source, sourceKey);
     }
     state.source.pragma('temp_store = MEMORY');
     validateSource?.(state.source);
-    state.destination = new Database(state.destinationSeal.sqlitePath, { fileMustExist: true });
-    state.destinationSeal.confirmOpen(state.destination);
+    // Source admission and validation may change adjacent directories. Keep
+    // the original destination authority and obtain a fresh construction proof
+    // only now; destination retries must never restart source validation.
+    state.destination = openSQLitePathWithSeal(
+        destinationSeal.sqlitePath,
+        destinationIdentity,
+        (filename) => new Database(filename, { fileMustExist: true }),
+        () => destinationSeal.assertCurrent(destinationState),
+    );
     keyDatabaseConnection(state.destination, destinationKey);
     state.destination.pragma('temp_store = MEMORY');
     state.destination.pragma('journal_mode = MEMORY');
@@ -494,7 +510,16 @@ export function writeEncryptedDatabaseImport(
     let primaryFailed = false;
     const state: EncryptedDatabaseImportState = { preflightPassed: false };
     try {
-        runEncryptedDatabaseImport(sourceSeal, destinationPath, destinationIdentity, destinationKey, sourceKey, validateSource, state);
+        runEncryptedDatabaseImport(
+            sourceSeal,
+            sourceIdentity,
+            destinationPath,
+            destinationIdentity,
+            destinationKey,
+            sourceKey,
+            validateSource,
+            state,
+        );
     } catch (error) {
         primaryFailed = true;
         primaryError = error;

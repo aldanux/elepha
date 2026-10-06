@@ -22,6 +22,7 @@ import type { Command } from 'commander';
 import { DATABASE_EXPORT_VERIFY_CHUNK_BYTES, DATABASE_HEADER_BYTES, USER_BACKUPS_DIR_NAME } from '../../config/constants.js';
 import { canonicalizeExisting, elephaHome, normalizeForCompare } from '../../config/paths.js';
 import { databaseKey } from '../../storage/database-encryption.js';
+import { resolveSQLiteMainDatabaseFilename } from '../../storage/database-lifecycle.js';
 import { defaultDbPath, isPlaintextDatabaseHeader, openDb, openKeyedDatabase } from '../../storage/db.js';
 import {
     assertDatabaseFileIdentity,
@@ -34,8 +35,10 @@ import {
     writeEncryptedAttachedDatabase,
     writeEncryptedDatabaseSnapshot,
 } from '../../storage/encrypted-database-export.js';
+import { LIVE_MEMORY_TRIGGER_NAMES } from '../../storage/live-memory-usage.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { ProjectResolver, type ProjectSet } from '../../storage/project-resolver.js';
+import { TURN_SEARCH_CLEANUP_TRIGGER } from '../../storage/turn-search-index.js';
 import { errorMessage } from '../../util/error.js';
 import { ensureCreatedDirsPrivate, listRegularFiles } from '../../util/fs.js';
 import { runBackupWizard, sessionRulesExcludedMessage } from '../backup-wizard.js';
@@ -198,12 +201,13 @@ export function resolveOutput(output: string | undefined, defaultPath: string): 
 
 // Full exports retain every source table in one SQLite snapshot after a WAL checkpoint, unlike pruned safety snapshots.
 export function exportAll(db: Database.Database, destination: string, encryptionKey: Buffer, force = false): string {
-    if (db.name === ':memory:') {
+    const dbPath = resolveSQLiteMainDatabaseFilename(db);
+    if (dbPath === undefined) {
         throw new Error('A full backup requires an on-disk database.');
     }
-    refuseActiveDatabaseDestination(db.name, destination);
+    refuseActiveDatabaseDestination(dbPath, destination);
     const destinationAuthorization = prepareDestination(destination, force);
-    refuseActiveDatabaseDestination(db.name, destination);
+    refuseActiveDatabaseDestination(dbPath, destination);
     const [checkpoint] = db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy?: unknown }>;
     if (checkpoint?.busy !== 0) {
         throw new Error("Backup aborted: WAL checkpoint did not complete (the daemon may be writing) — run 'elepha pause' or retry.");
@@ -226,9 +230,10 @@ export function exportProject(
     force = false,
     reportExcludedSessionRules?: (count: number) => void,
 ): string {
-    refuseActiveDatabaseDestination(source.name, destination);
+    const dbPath = resolveSQLiteMainDatabaseFilename(source) ?? ':memory:';
+    refuseActiveDatabaseDestination(dbPath, destination);
     const destinationAuthorization = prepareDestination(destination, force);
-    refuseActiveDatabaseDestination(source.name, destination);
+    refuseActiveDatabaseDestination(dbPath, destination);
     let excludedSessionRules = 0;
     replaceDestination(
         destination,
@@ -956,6 +961,9 @@ function replaceDestination(
     throw failure;
 }
 
+// The derived turn search index and the live-memory ledger are not exported,
+// so their triggers on exported tables are left out too; every other trigger
+// on an exported table is kept.
 function readExportSchema(source: Database.Database): SchemaRow[] {
     const placeholders = EXPORTED_TABLES.map(() => '?').join(', ');
     return source
@@ -964,9 +972,10 @@ function readExportSchema(source: Database.Database): SchemaRow[] {
              FROM sqlite_master
              WHERE sql IS NOT NULL
                AND ((type = 'table' AND name IN (${placeholders}))
-                 OR (type IN ('index', 'trigger') AND tbl_name IN (${placeholders})))`,
+                 OR (type IN ('index', 'trigger') AND tbl_name IN (${placeholders})))
+               AND NOT (type = 'trigger' AND (name = ? OR name IN (SELECT value FROM json_each(?))))`,
         )
-        .all(...EXPORTED_TABLES, ...EXPORTED_TABLES) as SchemaRow[];
+        .all(...EXPORTED_TABLES, ...EXPORTED_TABLES, TURN_SEARCH_CLEANUP_TRIGGER, JSON.stringify(LIVE_MEMORY_TRIGGER_NAMES)) as SchemaRow[];
 }
 
 function createExportTables(source: Database.Database, targetSchema: string, schema: SchemaRow[]): void {

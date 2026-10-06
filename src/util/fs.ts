@@ -54,9 +54,17 @@ export function atomicWrite(file: string, text: string, mode: number): void {
     })();
     mkdirSync(path.dirname(target), { recursive: true });
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-    writeFileSync(temporary, text, { mode });
-    renameSync(temporary, target);
-    chmodSync(target, mode);
+    // The rename is the only step after which the target has changed, so a
+    // caller can treat any thrown error as "previous file intact". The mode is
+    // fixed on the temporary file first because writeFileSync applies umask.
+    try {
+        writeFileSync(temporary, text, { mode });
+        chmodSync(temporary, mode);
+        renameSync(temporary, target);
+    } catch (error: unknown) {
+        removeFileIfExists(temporary);
+        throw error;
+    }
 }
 
 // Atomically replaces a file with a byte-for-byte private copy without treating binary data as text.

@@ -11,6 +11,7 @@ import { stripShellSyntax } from '../security/sanitize.js';
 import { errorMessage } from '../util/error.js';
 import type { MemoryStore } from './memory-store.js';
 import { isMemoryLocked } from './paranoid-gate.js';
+
 import { sourceGeneration, sourceSnapshotValidator } from './source-reconciliation.js';
 
 const SUMMARY_KEY = 'session_kind_reconciliation';
@@ -153,7 +154,7 @@ export async function reconcileSessionKinds(
                 !isMemoryLocked(db) &&
                 !store.consent.isRefusedForCapture(row.project_path) &&
                 store.consent.isConsented(row.project_path) &&
-                !store.isTranscriptPurged('codex', row.native_id) &&
+                !store.isTranscriptCaptureBlocked('codex', row.native_id) &&
                 !store.isTranscriptIncognito('codex', row.native_id) &&
                 sourceGeneration(store, 'codex', row.native_id) === generations.get(row.native_id);
             const currentRows = (): Map<number, Candidate> =>
@@ -211,6 +212,7 @@ export async function reconcileSessionKinds(
                     }
                     let reclassified = 0;
                     let checked = 0;
+
                     for (const row of eligible()) {
                         if (row.native_id !== preamble.nativeId) {
                             continue;
@@ -228,6 +230,7 @@ export async function reconcileSessionKinds(
                         }
                         checked++;
                     }
+
                     return { checked, reclassified };
                 })();
                 if (result === undefined) {

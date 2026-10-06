@@ -1,9 +1,12 @@
 import type { Command } from 'commander';
 import { defaultAdapters, sessionAdapterFor } from '../../adapters/index.js';
+import { retainsFilteredCopy } from '../../config/filtered-capture-policy.js';
+import { readMemoryConfig } from '../../config/memory-config.js';
 import { isWithinProviderStore } from '../../config/paths.js';
 import { openProviderTranscript } from '../../security/provider-transcript.js';
 import { openDb } from '../../storage/db.js';
 import { InjectionStore } from '../../storage/injection-store.js';
+import { LiveMemoryCaptureDeferredError } from '../../storage/live-memory-retention.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { sourceGeneration, sourceSnapshotValidator } from '../../storage/source-reconciliation.js';
 import { parseSince } from '../../storage/stats.js';
@@ -27,6 +30,15 @@ export function registerReingest(program: Command): void {
                 process.exitCode = 1;
                 return;
             }
+            // Reingest replaces the filtered copy under the same capture policy
+            // as live ingestion; otherwise the old copy's search coverage is withdrawn.
+            const configResult = readMemoryConfig();
+            if ('error' in configResult) {
+                console.error(`Cannot reingest: ${configResult.error}`);
+                process.exitCode = 1;
+                return;
+            }
+            const legacyDurableCapture = configResult.config.durableCapture ?? false;
             const limit = Number(opts.limit) || 0;
             const store = new MemoryStore(await openDb());
             const cutoffIso = parseSince(opts.since);
@@ -43,9 +55,10 @@ export function registerReingest(program: Command): void {
             const runStart = new Date().toISOString();
             let turnsReprocessed = 0;
             let sessionsTouched = 0;
+            let deferred: LiveMemoryCaptureDeferredError | undefined;
 
             for (const session of sessions) {
-                if (limit > 0 && turnsReprocessed >= limit) {
+                if (deferred !== undefined || (limit > 0 && turnsReprocessed >= limit)) {
                     break;
                 }
                 if (!isWithinProviderStore(session.tool, session.source_path)) {
@@ -139,13 +152,30 @@ export function registerReingest(program: Command): void {
                             break;
                         }
                         const summary = await summarizer.summarize({ userMessage: turn.userMessage, assistantText: turn.assistantText });
-                        if (!store.reingestTurn(turn, session.id, session.project_id, summary, true)) {
+                        let reingested: boolean;
+                        try {
+                            reingested = store.reingestTurn(
+                                turn,
+                                session.id,
+                                session.project_id,
+                                summary,
+                                true,
+                                retainsFilteredCopy(turn.tool, legacyDurableCapture),
+                            );
+                        } catch (error) {
+                            if (!(error instanceof LiveMemoryCaptureDeferredError)) {
+                                throw error;
+                            }
+                            deferred = error;
+                            break;
+                        }
+                        if (!reingested) {
                             throw new Error(`Turn protection changed during reingest for ${session.native_id} turn ${turn.turnIndex}`);
                         }
                         turnsReprocessed++;
                         sessionHadReingest = true;
                     }
-                    if (!validateSource()) {
+                    if (deferred === undefined && !validateSource()) {
                         throw new Error(`Elepha MCP receipt reconciliation required for ${session.native_id}`);
                     }
                 } finally {
@@ -170,5 +200,11 @@ export function registerReingest(program: Command): void {
                 `Tokens: ${inputTokens} in / ${outputTokens} out — est. cost $${estimateCostUsd(inputTokens, outputTokens).toFixed(4)}`,
             );
             console.log(`Duration: ${(durationMs / 1000).toFixed(1)}s`);
+            if (deferred !== undefined) {
+                // The remaining turns keep their previous memory rows; nothing
+                // was removed to make room for them.
+                console.error(`Reingest stopped early: ${deferred.message}. Run \`elepha status\` for the capacity report.`);
+                process.exitCode = 1;
+            }
         });
 }

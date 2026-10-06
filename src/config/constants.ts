@@ -32,6 +32,49 @@ export const ELEPHA_MCP_RESULTS_PER_TURN_MAX = 64;
 // below the quote-back scan budget so recording a valid turn cannot make its
 // own future protection permanently incomplete.
 export const ELEPHA_MCP_RESULTS_PER_TURN_MAX_BYTES = 4 * 1024 * 1024;
+// The working AI reports its own task state through this elepha MCP tool.
+// Unlike every other elepha tool it serves no memory, so its call is parsed
+// into a separate report field instead of dropping the invoking turn.
+export const TASK_STATE_REPORT_TOOL = 'report_task_state';
+// OpenCode V2 exposes direct MCP tools as <server>_<tool> when codemode is false.
+export const OPENCODE_ELEPHA_MCP_PREFIX = 'elepha_';
+// OpenCode V2 completed-compaction notifications are volatile and contain
+// untrusted host text. Keep receipts small and evict old observations.
+export const OPENCODE_COMPACTION_RECEIPT_MAX_TEXT_BYTES = 32 * 1024;
+export const OPENCODE_COMPACTION_RECEIPT_MAX_CWD_BYTES = 4096;
+export const OPENCODE_COMPACTION_RECEIPT_HOST_VERSION = '2.0.18';
+export const OPENCODE_COMPACTION_RECEIPT_CONTRACT = `opencode-v${OPENCODE_COMPACTION_RECEIPT_HOST_VERSION}-session.compaction.ended`;
+export const OPENCODE_COMPACTION_RECEIPT_ACK = 'elepha compaction receipt stored';
+export const OPENCODE_TASK_STATE_RECEIPT_CONTRACT = `opencode-v${OPENCODE_COMPACTION_RECEIPT_HOST_VERSION}-report-task-state-success`;
+export const OPENCODE_TASK_STATE_RECEIPT_ACK = 'elepha task-state call observed';
+export const OPENCODE_TASK_STATE_RECEIPT_PENDING_MAX = 128;
+export const OPENCODE_TASK_STATE_RECEIPT_PENDING_MAX_AGE_MS = 60_000;
+export const OPENCODE_TASK_STATE_RECEIPTS_PER_SESSION = 32;
+export const OPENCODE_TASK_STATE_RECEIPTS_GLOBAL_MAX = 4096;
+export const OPENCODE_COMPACTION_RECEIPTS_PER_SESSION = 16;
+export const OPENCODE_COMPACTION_RECEIPTS_GLOBAL_MAX = 4096;
+// The tool's only successful result. Anything else fails the report closed,
+// and a fixed body cannot carry served memory back into the transcript.
+export const TASK_STATE_REPORT_ACK = 'elepha received the task-state report.';
+export const TASK_STATE_REPORT_MODES = ['precompact_manifest', 'postcompact_retained'] as const;
+export const TASK_STATE_REQUEST_ID_CHARS = 26;
+export const TASK_STATE_REQUEST_ID_PATTERN = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
+// A report is bounded task evidence, not a transcript. Reject it whole when
+// a field or the complete decoded input exceeds its ceiling.
+export const TASK_STATE_REPORT_LIST_MAX_ITEMS = 8;
+export const TASK_STATE_REPORT_ITEM_MAX_CHARS = 400;
+export const TASK_STATE_REPORT_SOURCE_MAX_ITEMS = 2;
+export const TASK_STATE_REPORT_SOURCE_QUOTE_MAX_CHARS = 500;
+// Raw input ceiling, checked before a JSON-encoded argument string is
+// decoded. The decoded report is checked against this ceiling separately.
+export const TASK_STATE_REPORT_INPUT_MAX_BYTES = 32 * 1024;
+export const TASK_STATE_MANIFEST_TIMESTAMP_MAX_BYTES = 64;
+export const TASK_STATE_MANIFEST_MAX_SOURCE_TURNS = 64;
+export const TASK_STATE_HISTORICAL_MAX_TAIL_ROWS = 64;
+export const TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS = 1_200;
+// Checked before a JSON-encoded result envelope is decoded. The fixed
+// acknowledgement plus its MCP envelope fits well inside this bound.
+export const TASK_STATE_REPORT_RESULT_MAX_BYTES = 1024;
 // Quote-back checks run on the ingestion hot path. These ceilings are well
 // above ordinary per-chat injection volume while making incomplete coverage explicit.
 export const INJECTION_QUOTE_BACK_MAX_ROWS = 512;
@@ -46,8 +89,15 @@ export const INJECTION_QUOTE_BACK_BUDGET_MS = 100;
 // this is a safety ceiling for resume, not a presentation budget.
 export const RESUME_TOKEN_BUDGET = 400_000;
 export const RESUME_CHAR_BUDGET = RESUME_TOKEN_BUDGET * CHARS_PER_TOKEN;
-export const DURABLE_CAPTURE_MAX_BYTES = 1024 * 1024 * 1024;
 export const DURABLE_CAPTURE_FILTER_VERSION = 1;
+// Per-field ceiling of the bounded per-turn projection recorded in turn search
+// coverage. Text beyond it is reported as truncated coverage with its omitted
+// character count, which stored-evidence and embedding readers consume.
+export const TURN_SEARCH_INDEX_MAX_FIELD_CHARS = 64 * 1024;
+// Reconciling coverage rows against retained copies pages memory ids so an
+// upgrade of a large cache never materializes the whole index; copies load one
+// at a time.
+export const TURN_SEARCH_REBUILD_BATCH_SIZE = 1000;
 // Structural offsets retain whole final messages without duplicating their
 // text. Bound metadata independently when a turn contains many messages.
 export const ASSISTANT_STRUCTURE_MAX_FINALS = 256;
@@ -55,8 +105,6 @@ export const DURABLE_CAPTURE_STATES = [
     'complete',
     'complete_truncated',
     'disabled_gap',
-    'backfilling',
-    'source_unavailable',
     'parse_error',
     'revoked',
     'incognito',
@@ -152,7 +200,6 @@ export const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 // than the idle sweep is fine here. Only one pass runs at a time.
 export const EMBEDDING_REFRESH_INTERVAL_MS = 60 * 1000;
 export const FIRST_PROMPT_SEARCH_BACKFILL_BATCH_SIZE = 25;
-export const DURABLE_CAPTURE_BACKFILL_BATCH_SIZE = 25;
 export const UPDATE_CHECK_LOOP_INTERVAL_MS = 5 * 60 * 1000;
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const NPM_REGISTRY_LOOKUP_TIMEOUT_MS = 10_000;
@@ -205,6 +252,8 @@ export const DECISION_PROVENANCE_OVERLAP_THRESHOLD = 0.5;
 // Transcript and project capture policy
 export const FINGERPRINT_WINDOW_BYTES = 4096;
 export const MAX_TRANSCRIPT_RECORD_BYTES = 64 * 1024 * 1024;
+export const CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES = 4 * 1024 * 1024;
+export const CLAUDE_COMPACT_SUMMARY_MAX_BYTES = 64 * 1024;
 export const MAX_METADATA_SCAN_BYTES = 4 * 1024 * 1024;
 export const CODEX_WORKTREE_METADATA_MAX_BYTES = 4 * 1024;
 export const MAX_METADATA_SCAN_LINES = 2_048;
@@ -224,7 +273,7 @@ export const TEMPORARY_PROJECT_ROOTS = ['/tmp', '/private/tmp', '/var/folders', 
 export const PRIVATE_FILE_MODE = 0o600;
 export const PRIVATE_DIR_MODE = 0o700;
 export const PRIVATE_UMASK_MASK = 0o077;
-export const MINIMUM_NODE_VERSION = '22.12.0';
+export const MINIMUM_NODE_VERSION = '22.15.0';
 export const DEFAULT_ELEPHA_SERVICE_LABEL = 'com.elepha.daemon';
 export const PLIST_THROTTLE_INTERVAL_SECONDS = 30;
 export const PLIST_UMASK = 63;
@@ -235,6 +284,13 @@ export const SYSTEMD_UMASK = '0077';
 
 // Manual embedding jobs keep one source and one model input resident at a time.
 export const EMBEDDING_SESSION_PAGE_SIZE = 100;
+// Offline turn-vector passes bound both source reads and local inference work.
+export const TURN_EMBEDDING_PAGE_SIZE = 16;
+export const TURN_EMBEDDING_PASS_MAX_ROWS = 32;
+export const TURN_EMBEDDING_RECENT_PASS_ROWS = 8;
+// Keep the newest interaction text; provider input remains small even when a
+// filtered source turn reaches the directed-read byte ceiling.
+export const TURN_EMBEDDING_MAX_TEXT_CHARS = 4_000;
 // Leave room for the fixed tool and project parameters under SQLite's variable limit.
 export const SESSION_ELIGIBILITY_BATCH_SIZE = 500;
 // Retrieval was evaluated by presence among the five nearest sessions.
@@ -264,6 +320,31 @@ export const SESSION_EVIDENCE_MAX_QUERY_CHARS = 4_000;
 export const SESSION_EVIDENCE_EXCERPT_CHARS = 800;
 // A directed first-interaction read stops once found, or at this byte ceiling.
 export const SESSION_EVIDENCE_SOURCE_MAX_BYTES = 4 * 1024 * 1024;
+export const CURRENT_CHAT_EVIDENCE_MAX_CHARS = 3_000;
+export const CURRENT_CHAT_EVIDENCE_MAX_TURNS = 3;
+export const CURRENT_CHAT_EVIDENCE_MAX_CANDIDATES = 12;
+export const CURRENT_CHAT_EVIDENCE_SEGMENT_PAGE = 16;
+export const CURRENT_CHAT_EVIDENCE_MAX_SEGMENT_READS = 16;
+export const CURRENT_CHAT_EVIDENCE_MAX_QUERY_CHARS = 4_000;
+export const CURRENT_CHAT_EVIDENCE_MAX_ID_BYTES = 1_024;
+export const CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES = 4_096;
+export const CURRENT_CHAT_EVIDENCE_DEADLINE_MS = 1_200;
+export const CURRENT_CHAT_EVIDENCE_MAX_METADATA_PAGES = 4;
+export const CURRENT_CHAT_SEMANTIC_MAX_VECTOR_ROWS = 128;
+export const CURRENT_CHAT_SEMANTIC_MAX_VECTOR_BYTES = 256 * 1024;
+export const CURRENT_CHAT_SEMANTIC_DEADLINE_MS = 5_000;
+export const CURRENT_CHAT_OPENCODE_MAX_SOURCE_ROWS = 2_048;
+// Retry a bounded number of open V2 sessions per SQLite event; unchanged tails
+// are probed by their indexed last row and do not trigger another scan.
+export const OPENCODE_V2_PENDING_SCAN_LIMIT = 32;
+// Same-ID V1/V2 sessions are revisited by id keyset, independent of the V2
+// time watermark; one page per SQLite event keeps each scan bounded.
+export const OPENCODE_V2_OVERLAP_PAGE_SIZE = 32;
+// Provider message ids are short opaque keys; a longer boundary id is treated
+// as malformed rather than hydrated into a cursor.
+export const OPENCODE_V2_HANDOFF_MAX_ID_BYTES = 256;
+export const CURRENT_CHAT_OPENCODE_MAX_MESSAGE_ROWS = 512;
+export const CURRENT_CHAT_OPENCODE_MAX_INDEX_ROWS = 8_192;
 // Capsules use stored metadata only. The row ceiling applies before hydration;
 // the smaller response ceiling includes provenance, framing and omission notices.
 export const SESSION_CAPSULE_METADATA_MAX_BYTES = 65_536;

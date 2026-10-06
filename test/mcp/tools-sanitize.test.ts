@@ -5,47 +5,9 @@ import { mcpResponseShaper } from '../../src/mcp/server.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
 import { detectShellSyntax, escapeShellSyntax } from '../../src/security/sanitize.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
-import type { ParsedTurn, SessionAdapter, SessionAdapterMap, SessionAdapterTool } from '../../src/types/index.js';
+import { MemoryStore } from '../../src/storage/memory-store.js';
+import type { ParsedTurn } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
-
-class FixtureAdapter implements SessionAdapter {
-    readonly tool: SessionAdapterTool = 'codex';
-    readonly watchGlobs = ['*.jsonl'];
-
-    matches(): boolean {
-        return true;
-    }
-
-    async classifySession(): Promise<{ kind: 'primary' }> {
-        return { kind: 'primary' };
-    }
-
-    async classifyEmptySession() {
-        return undefined;
-    }
-
-    nativeSessionId(filePath: string): string {
-        return path.basename(filePath, '.jsonl');
-    }
-
-    async *parseTurns(): AsyncIterable<ParsedTurn> {
-        yield {
-            tool: 'codex',
-            sessionId: 'dirty-session',
-            sourcePath: '',
-            projectPath: '',
-            turnIndex: 0,
-            startedAt: '2026-08-24T00:00:00.000Z',
-            endedAt: '2026-08-24T00:01:00.000Z',
-            userMessage: 'inspect the file',
-            assistantText: 'done',
-            toolCalls: [{ name: 'read_file', filePaths: ['src/example.ts'] }],
-            cursor: '0|1',
-            hasExternalContent: false,
-            resumeMarkerBefore: false,
-        };
-    }
-}
 
 function text(response: { content: [{ type: 'text'; text: string }] }): string {
     return response.content[0].text;
@@ -187,11 +149,36 @@ describe('MCP response shell-syntax net', () => {
         db.prepare(`INSERT INTO consent_roots (ulid, path, state, decided_at, source) VALUES ('root', ?, 'approved', 'x', 'cli')`).run(
             realpathSync(projectPath),
         );
-        const adapters: SessionAdapterMap = {
-            codex: new FixtureAdapter(),
-            'claude-code': new FixtureAdapter(),
+        const store = new MemoryStore(db, { resolveGitRoot: () => null, resolveGitRemote: () => null });
+        // Retain the original dirty summary fields; only its content copy is
+        // needed to exercise the independent title response boundary.
+        const legacy = db.prepare('SELECT decisions, pending_items FROM memories WHERE session_id = ?').get(sessionId) as {
+            decisions: string;
+            pending_items: string;
         };
-        const service = new ElephaMcpService(db, mcpResponseShaper, adapters);
+        const parsed: ParsedTurn = {
+            tool: 'codex',
+            sessionId: 'dirty-session',
+            sourcePath,
+            projectPath,
+            turnIndex: 0,
+            startedAt: '2026-08-24T00:00:00.000Z',
+            endedAt: '2026-08-24T00:01:00.000Z',
+            userMessage: 'inspect the file',
+            assistantText: 'done',
+            toolCalls: [{ name: 'read_file', filePaths: ['src/example.ts'] }],
+            cursor: '0|1',
+            hasExternalContent: false,
+            resumeMarkerBefore: false,
+        };
+        db.prepare('DELETE FROM memories WHERE session_id = ?').run(sessionId);
+        store.recordTurn(parsed, sessionId, projectId, { decisions: [], pending_items: [], status: 'ok' }, true);
+        db.prepare('UPDATE memories SET decisions = ?, pending_items = ? WHERE session_id = ?').run(
+            legacy.decisions,
+            legacy.pending_items,
+            sessionId,
+        );
+        const service = new ElephaMcpService(db, mcpResponseShaper);
         const log = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
         try {

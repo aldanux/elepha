@@ -63,8 +63,13 @@ async function expectBoundedOversizedThrow(filePath: string, oversizedRecordStar
 
 type CodexPreReaderSeam = {
     readClassificationPreamble(filePath: string): Promise<unknown>;
-    userBoundaryFor(filePath: string): Promise<unknown>;
 };
+
+async function drain(turns: AsyncIterable<unknown>): Promise<void> {
+    for await (const _turn of turns) {
+        // The user-boundary prescan runs before the first turn is assembled.
+    }
+}
 
 describe('bounded adapter pre-readers', () => {
     it('throws while the shared empty-session classifier is still reading the oversized record', async () => {
@@ -88,9 +93,7 @@ describe('bounded adapter pre-readers', () => {
 
     it('throws while the Codex user-boundary reader is still reading the oversized record', async () => {
         const { filePath, oversizedRecordStart } = oversizedTranscript({ type: 'session_meta', payload: { cwd: '/tmp/project' } });
-        const adapter = new CodexAdapter() as unknown as CodexPreReaderSeam;
-
-        await expectBoundedOversizedThrow(filePath, oversizedRecordStart, () => adapter.userBoundaryFor(filePath));
+        await expectBoundedOversizedThrow(filePath, oversizedRecordStart, () => drain(new CodexAdapter().parseTurns(filePath)));
     });
 
     it('honours an explicitly injected maxRecordBytes in the shared reader', async () => {

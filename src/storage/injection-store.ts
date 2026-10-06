@@ -50,6 +50,11 @@ export interface RecordInjectionInput {
     attribution?: InjectionAttribution;
 }
 
+type QuoteBackTurn = Pick<
+    ParsedTurn,
+    'sessionId' | 'turnIndex' | 'endedAt' | 'userMessage' | 'assistantText' | 'toolCalls' | 'taskStateReport'
+> & { tool: ToolName };
+
 export type InjectionQuoteBackResult = 'match' | 'no-match' | 'incomplete';
 
 export class InjectionQuoteBackIncompleteError extends Error {
@@ -104,7 +109,7 @@ export class InjectionStore {
                  ORDER BY injected_at ASC, id ASC
                  LIMIT ${INJECTION_QUOTE_BACK_MAX_ROWS + 1}`,
             ),
-            injectionBodyById: db.prepare('SELECT body FROM injections WHERE id = ?'),
+            injectionBodyById: db.prepare('SELECT * FROM injections WHERE id = ?'),
             injectionsForSession: db.prepare(
                 `SELECT * FROM injections
                  WHERE tool = ? AND native_session_id = ? AND injected_at <= ?
@@ -127,7 +132,7 @@ export class InjectionStore {
                  ORDER BY source_turn_index ASC, id ASC
                  LIMIT ${INJECTION_QUOTE_BACK_MAX_ROWS + 1}`,
             ),
-            mcpReceiptBodyById: db.prepare('SELECT body FROM mcp_receipts WHERE id = ?'),
+            mcpReceiptBodyById: db.prepare('SELECT * FROM mcp_receipts WHERE id = ?'),
             mcpReceiptsForSession: db.prepare(
                 `SELECT * FROM mcp_receipts
                  WHERE tool = ? AND native_session_id = ? AND source_generation = ?
@@ -174,7 +179,10 @@ export class InjectionStore {
         return (this.stmts.sourceGeneration.get(tool, nativeSessionId) as { generation: number } | undefined)?.generation ?? 0;
     }
 
-    recordElephaMcpReceipts(turn: ParsedTurn, sourceGeneration = this.currentSourceGeneration(turn.tool, turn.sessionId)): boolean {
+    recordElephaMcpReceipts(
+        turn: Pick<ParsedTurn, 'tool' | 'sessionId' | 'turnIndex' | 'droppedReason' | 'elephaMcpResultReceipts'>,
+        sourceGeneration = this.currentSourceGeneration(turn.tool, turn.sessionId),
+    ): boolean {
         if (turn.droppedReason !== 'elepha-mcp' || (turn.elephaMcpResultReceipts?.length ?? 0) === 0) {
             return turn.droppedReason !== 'elepha-mcp';
         }
@@ -286,7 +294,11 @@ export class InjectionStore {
         if (this.currentSourceGeneration(tool, nativeSessionId) !== sourceGeneration) {
             return false;
         }
-        for (const persisted of this.mcpReceiptsForSession(tool, nativeSessionId, sourceGeneration)) {
+        for (const persisted of this.stmts.mcpReceiptsForSession.iterate(
+            tool,
+            nativeSessionId,
+            sourceGeneration,
+        ) as Iterable<McpReceiptRow>) {
             const encountered = this.encounteredMcpReceipts.get(
                 receiptIdentity(tool, nativeSessionId, sourceGeneration, persisted.call_id),
             );
@@ -320,109 +332,79 @@ export class InjectionStore {
         return row.count;
     }
 
-    quoteBackStatus(
-        turn: Pick<ParsedTurn, 'sessionId' | 'turnIndex' | 'endedAt' | 'userMessage' | 'assistantText' | 'toolCalls'> & {
-            tool: ToolName;
-        },
-    ): InjectionQuoteBackResult {
+    quoteBackStatus(turn: QuoteBackTurn): InjectionQuoteBackResult {
         let deadline: number | undefined;
-        let rows = 0;
-        let bytes = 0;
         let normalizedTurn: string | undefined;
-        const matchBody = (body: string): InjectionQuoteBackResult | undefined => {
-            deadline ??= this.now() + INJECTION_QUOTE_BACK_BUDGET_MS;
-            if (normalizedTurn === undefined && !turnSurfaceWithinBudget(turn, deadline, this.now)) {
-                return 'incomplete';
-            }
-            normalizedTurn ??= normalizeForNearVerbatim(turnText(turn));
-            if (this.now() >= deadline) {
-                return 'incomplete';
-            }
-            const result = nearVerbatimStatusNormalized(normalizedTurn, body, { deadline, now: this.now });
-            return result === 'no-match' ? undefined : result;
-        };
-        const compare = (body: string): InjectionQuoteBackResult | undefined => {
-            rows++;
-            bytes += Buffer.byteLength(body);
-            if (rows > INJECTION_QUOTE_BACK_MAX_ROWS || bytes > INJECTION_QUOTE_BACK_MAX_BYTES) {
-                return 'incomplete';
-            }
-            return matchBody(body);
-        };
         try {
-            const hookCandidateExists = this.stmts.hookCandidateExists.get(turn.tool, turn.sessionId) !== undefined;
-            if (hookCandidateExists) {
-                const endedAt = canonicalObservedAt(turn.endedAt);
-                if (endedAt === null) {
-                    return 'incomplete';
+            for (const { body } of this.quoteBackBodies(turn)) {
+                deadline ??= this.now() + INJECTION_QUOTE_BACK_BUDGET_MS;
+                if (normalizedTurn === undefined) {
+                    if (!turnSurfaceWithinBudget(turn, deadline, this.now)) {
+                        return 'incomplete';
+                    }
+                    normalizedTurn = normalizeForNearVerbatim(turnText(turn));
                 }
-                for (const candidate of this.stmts.hookBodiesForSession.iterate(turn.tool, turn.sessionId, endedAt) as Iterable<{
-                    id: number;
-                    body_bytes: number;
-                }>) {
-                    if (deadline !== undefined && this.now() >= deadline) {
-                        return 'incomplete';
-                    }
-                    rows++;
-                    bytes += candidate.body_bytes;
-                    if (rows > INJECTION_QUOTE_BACK_MAX_ROWS || bytes > INJECTION_QUOTE_BACK_MAX_BYTES) {
-                        return 'incomplete';
-                    }
-                    const row = this.stmts.injectionBodyById.get(candidate.id) as { body: string } | undefined;
-                    if (row === undefined) {
-                        return 'incomplete';
-                    }
-                    const result = matchBody(row.body);
-                    if (result !== undefined) {
-                        return result;
-                    }
-                }
-            }
-            if (this.includePersistedMcp) {
-                const generation = this.currentSourceGeneration(turn.tool, turn.sessionId);
-                for (const candidate of this.stmts.mcpBodiesForSession.iterate(
-                    turn.tool,
-                    turn.sessionId,
-                    generation,
-                    turn.turnIndex,
-                ) as Iterable<{ id: number; body_bytes: number }>) {
-                    if (deadline !== undefined && this.now() >= deadline) {
-                        return 'incomplete';
-                    }
-                    rows++;
-                    bytes += candidate.body_bytes;
-                    if (rows > INJECTION_QUOTE_BACK_MAX_ROWS || bytes > INJECTION_QUOTE_BACK_MAX_BYTES) {
-                        return 'incomplete';
-                    }
-                    const row = this.stmts.mcpReceiptBodyById.get(candidate.id) as { body: string } | undefined;
-                    if (row === undefined) {
-                        return 'incomplete';
-                    }
-                    const result = matchBody(row.body);
-                    if (result !== undefined) {
-                        return result;
-                    }
-                }
-            }
-            for (const receipt of this.transientMcpReceipts) {
-                if (deadline !== undefined && this.now() >= deadline) {
-                    return 'incomplete';
-                }
-                if (
-                    receipt.tool !== turn.tool ||
-                    receipt.native_session_id !== turn.sessionId ||
-                    receipt.source_turn_index >= turn.turnIndex
-                ) {
-                    continue;
-                }
-                const result = compare(receipt.body);
-                if (result !== undefined) {
-                    return result;
+                const status = nearVerbatimStatusNormalized(normalizedTurn, body, { deadline, now: this.now });
+                if (status !== 'no-match') {
+                    return status;
                 }
             }
             return deadline !== undefined && this.now() >= deadline ? 'incomplete' : 'no-match';
         } catch {
             return 'incomplete';
+        }
+    }
+
+    private *quoteBackBodies(turn: QuoteBackTurn): Generator<{ body: string }> {
+        let rows = 0;
+        let bytes = 0;
+        const charge = (bodyBytes: number) => {
+            rows++;
+            bytes += bodyBytes;
+            if (rows > INJECTION_QUOTE_BACK_MAX_ROWS || bytes > INJECTION_QUOTE_BACK_MAX_BYTES) {
+                throw new InjectionQuoteBackIncompleteError('Receipt bounds');
+            }
+        };
+        if (this.stmts.hookCandidateExists.get(turn.tool, turn.sessionId) !== undefined) {
+            const endedAt = canonicalObservedAt(turn.endedAt);
+            if (endedAt === null) {
+                throw new InjectionQuoteBackIncompleteError('Receipt timestamp');
+            }
+            const candidates = this.stmts.hookBodiesForSession.all(turn.tool, turn.sessionId, endedAt) as Array<{
+                id: number;
+                body_bytes: number;
+            }>;
+            for (const candidate of candidates) {
+                charge(candidate.body_bytes);
+                const row = this.stmts.injectionBodyById.get(candidate.id) as InjectionRow | undefined;
+                if (!row) {
+                    throw new InjectionQuoteBackIncompleteError('Receipt missing');
+                }
+                yield { body: row.body };
+            }
+        }
+        if (this.includePersistedMcp) {
+            const candidates = this.stmts.mcpBodiesForSession.all(
+                turn.tool,
+                turn.sessionId,
+                this.currentSourceGeneration(turn.tool, turn.sessionId),
+                turn.turnIndex,
+            ) as Array<{ id: number; body_bytes: number }>;
+            for (const candidate of candidates) {
+                charge(candidate.body_bytes);
+                const row = this.stmts.mcpReceiptBodyById.get(candidate.id) as McpReceiptRow | undefined;
+                if (!row) {
+                    throw new InjectionQuoteBackIncompleteError('Receipt missing');
+                }
+                yield { body: row.body };
+            }
+        }
+        for (const receipt of this.transientMcpReceipts) {
+            if (receipt.tool !== turn.tool || receipt.native_session_id !== turn.sessionId || receipt.source_turn_index >= turn.turnIndex) {
+                continue;
+            }
+            charge(Buffer.byteLength(receipt.body));
+            yield { body: receipt.body };
         }
     }
 
@@ -476,16 +458,19 @@ function validMcpCallId(callId: string): boolean {
 }
 
 function turnSurfaceWithinBudget(
-    turn: Pick<ParsedTurn, 'userMessage' | 'assistantText' | 'toolCalls'>,
+    turn: Pick<ParsedTurn, 'userMessage' | 'assistantText' | 'toolCalls' | 'taskStateReport'>,
     deadline: number,
     now: () => number,
 ): boolean {
     let bytes = 2;
     const add = (value: string, overhead = 1, expansion = 1): boolean => {
         bytes += Buffer.byteLength(value) * expansion + overhead;
-        return bytes <= INJECTION_QUOTE_BACK_TURN_MAX_BYTES && now() < deadline;
+        return bytes <= INJECTION_QUOTE_BACK_TURN_MAX_BYTES;
     };
     if (!add(turn.userMessage) || !add(turn.assistantText)) {
+        return false;
+    }
+    if (now() >= deadline) {
         return false;
     }
     for (const call of turn.toolCalls) {
@@ -500,6 +485,35 @@ function turnSurfaceWithinBudget(
         }
         for (const filePath of call.filePaths) {
             if (!add(filePath, 4, 6)) {
+                return false;
+            }
+            if (now() >= deadline) {
+                return false;
+            }
+        }
+        if (now() >= deadline) {
+            return false;
+        }
+    }
+    // turnText appends each report item and source quote raw, one line each.
+    const report = turn.taskStateReport;
+    if (report) {
+        for (const item of [report.objective, ...report.decisions, ...report.constraints, ...report.pending_items]) {
+            if (item === null) {
+                continue;
+            }
+            if (!add(item.text)) {
+                return false;
+            }
+            for (const source of item.sources ?? []) {
+                if (!add(source.quote)) {
+                    return false;
+                }
+                if (now() >= deadline) {
+                    return false;
+                }
+            }
+            if (now() >= deadline) {
                 return false;
             }
         }

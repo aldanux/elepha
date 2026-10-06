@@ -20,9 +20,32 @@ selected for capture by default, and at least one must remain enabled. Folder mo
 projects already inside the selected folder and discovers new projects there
 automatically. Individual mode gives you a project-by-project selection.
 
-New approvals are backfilled immediately from eligible transcripts already on disk,
-so elepha can remember earlier work as well as future sessions. The wizard is
-interactive and makes no changes if you cancel it.
+The wizard then asks how elepha should search memory. First setup preselects local
+semantic search, which finds sessions by meaning in any language; term-only search is
+the alternative. Later runs preselect the mode you already use.
+
+Every answer is only staged. One final review lists the exact roots to approve or
+pause, the capture tools and the search mode, and explains what approval means:
+filtered memory rather than raw transcripts, model reasoning or fetched tool output;
+the physical path shown, with separate worktrees needing their own approval; and the
+fixed 5,000,000,000-byte live-memory limit. Nothing is written, installed or downloaded
+before you confirm, and cancelling at any step leaves everything unchanged. Rerunning
+with the same choices changes nothing.
+
+After you confirm, a newly chosen semantic search is installed and verified before any
+choice is saved; if that fails, your previous settings and consent stay in effect.
+Choosing term-only turns Memory-Plus off but keeps its stored vectors and local runtime.
+Consent changes and settings are then saved together. If the preview went stale while
+it was open, the plan is refused and you are asked to run the wizard again. While
+choices are being saved, other settings, consent and restore commands wait for it; if a
+run was interrupted while saving, the next `elepha init` finishes or undoes it before
+accepting new choices, and never overwrites a decision you made in between.
+
+New approvals are backfilled from eligible transcripts already on disk, so elepha can
+remember earlier work as well as future sessions. If that backfill or the capture
+service fails, or some transcripts cannot be listed, read or parsed, your confirmed
+choices and already imported turns are kept and the wizard names the gap and how to
+retry it.
 
 ## Change consent later
 
@@ -32,7 +55,8 @@ For a returning user, the interactive entry point is:
 elepha consent
 ```
 
-It opens the same discovery and selection picker used during onboarding. Selecting a
+It opens the same discovery, selection and review steps used during onboarding, without
+the search-mode choice. Selecting a
 root grants it; deselecting an approved project or folder pauses consent for that
 scope. Deselecting never deletes captured memory, and selecting it again does not
 override the privacy veto for sessions written while it was explicitly paused.
@@ -45,7 +69,9 @@ elepha consent grant /path/to/workspace
 ```
 
 From inside a project, `elepha consent grant --here` grants the current directory.
-Choose either a path or `--here`, never both.
+Choose either a path or `--here`, never both. The command is itself the explicit grant:
+it prints the same filtered-capture and live-memory contract before granting, without
+asking a second time.
 
 Revoking a root stops new capture for that scope and hides its retained memory from
 search and recall while the root remains revoked. It does not delete the retained

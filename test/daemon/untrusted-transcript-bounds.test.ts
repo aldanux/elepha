@@ -6,7 +6,7 @@ import { CodexAdapter } from '../../src/adapters/codex.js';
 import { MAX_TRANSCRIPT_RECORD_BYTES } from '../../src/config/constants.js';
 import { IngestionDaemon } from '../../src/daemon/index.js';
 import type { RollupService } from '../../src/daemon/rollup-service.js';
-import { type ServedSession, SessionReader } from '../../src/serving/session-reader.js';
+import { type ServedSession, SessionReader, STORED_EVIDENCE_REASONS } from '../../src/serving/session-reader.js';
 import { openUnmanagedDb } from '../../src/storage/db.js';
 import { MemoryStore } from '../../src/storage/memory-store.js';
 import type { SessionAdapter } from '../../src/types/index.js';
@@ -110,6 +110,8 @@ describe('untrusted transcript record bounds', () => {
             store,
             adapters: [adapter],
             watchRoots: [transcriptRoot],
+            // Normal live synthesis makes these sessions eligible for idle rollups.
+            summarizer: { summarize: async () => ({ decisions: [], pending_items: [], status: 'ok' }) },
             log: (message) => logs.push(message),
         });
         const scan = daemon as unknown as DaemonScanSeam;
@@ -137,10 +139,11 @@ describe('untrusted transcript record bounds', () => {
         expect(countRows(store, 'sessions')).toBe(0);
         expect(countRows(store, 'memories')).toBe(0);
 
-        const reader = new SessionReader(store.database, { codex: adapter, 'claude-code': adapter });
-        await expect(reader.turns(servedSession(oversizedId, oversizedFile), undefined, new Set([0]))).resolves.toEqual({
-            reason: 'transcript_unreadable',
+        const reader = new SessionReader(store.database);
+        await expect(reader.render(servedSession(oversizedId, oversizedFile))).resolves.toEqual({
+            reason: STORED_EVIDENCE_REASONS.missing,
         });
+        expect(parseTurns).not.toHaveBeenCalled();
         classifySession.mockClear();
         parseTurns.mockClear();
 

@@ -269,7 +269,7 @@ describe('elepha purge wizard', () => {
                     { value: 'newer-than', label: 'Sessions ingested after a date or duration' },
                     { value: 'older-than', label: 'Sessions older than a date or duration' },
                     { value: 'external-agent-imports', label: 'External-agent imports' },
-                    { value: 'orphan', label: 'Orphaned or temporary projects' },
+                    { value: 'orphan', label: 'Confirmed missing project sessions' },
                     { value: 'revoked', label: 'Revoked projects' },
                     { value: 'all', label: 'Everything' },
                 ]),

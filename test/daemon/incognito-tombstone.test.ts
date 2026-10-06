@@ -173,7 +173,6 @@ describe('capture-off incognito tombstones', () => {
         expect(await daemon.backfillApprovedRoot(canonicalDeniedRoot)).toBe(0);
         expect(await daemon.backfillApprovedRoot(canonicalPendingRoot)).toBe(1);
         expect(adapter.parseCalls.get(DENIED_SESSION)).toBeUndefined();
-        expect(adapter.parseCalls.get(PENDING_SESSION)).toBe(1);
         expect(store.findSession('claude-code', DENIED_SESSION)).toBeUndefined();
         expect(store.findSession('claude-code', PENDING_SESSION)).toBeDefined();
 

@@ -52,6 +52,10 @@ const AUTHORIZATION_PROJECTION = AUTHORIZATION_FIELDS.map(
 interface ResolvedProjectRow {
     row: ProjectGroupingRow;
     resolvedGitRoot: string | null;
+    normalizedPath: string;
+    pathDepth: number;
+    parentPath: string;
+    parentPrefix: string;
 }
 
 interface ProjectSetBuild {
@@ -65,9 +69,7 @@ function groupingIdentity(resolvedRow: ResolvedProjectRow): string | null {
 }
 
 function shallowestFirst(a: ResolvedProjectRow, b: ResolvedProjectRow): number {
-    const aDepth = normalizeForCompare(a.row.path).split('/').length;
-    const bDepth = normalizeForCompare(b.row.path).split('/').length;
-    return aDepth - bDepth || normalizeForCompare(a.row.path).localeCompare(normalizeForCompare(b.row.path));
+    return a.pathDepth - b.pathDepth || a.normalizedPath.localeCompare(b.normalizedPath);
 }
 
 function commonRemote(members: ResolvedProjectRow[]): string | null {
@@ -89,7 +91,11 @@ function prefixGroups(rows: ResolvedProjectRow[]): ProjectSetBuild[] {
     const groups: ProjectSetBuild[] = [];
     for (const row of [...rows].sort(shallowestFirst)) {
         const containing = groups
-            .filter((group) => group.members.some((member) => isWithin(member.row.path, row.row.path)))
+            .filter((group) =>
+                group.members.some(
+                    (member) => row.normalizedPath === member.parentPath || row.normalizedPath.startsWith(member.parentPrefix),
+                ),
+            )
             .sort((a, b) => {
                 const firstA = a.members[0];
                 const firstB = b.members[0];
@@ -325,14 +331,21 @@ export class ProjectResolver {
 
     // Rebuild the current logical membership using bounded identity fields
     // only. No memoized consent, filesystem resolution or Git is used here.
-    storedProjectForAuthorization(projectId: number): ProjectSet | undefined {
+    storedProjectForAuthorization(projectId: number, rowLimit?: number): ProjectSet | undefined {
         const rows: ProjectGroupingRow[] = [];
-        for (const value of this.db.prepare(`SELECT id, ${AUTHORIZATION_PROJECTION} FROM projects ORDER BY id`).iterate()) {
+        const statement = this.db.prepare(
+            `SELECT id, ${AUTHORIZATION_PROJECTION} FROM projects ORDER BY id${rowLimit === undefined ? '' : ' LIMIT ?'}`,
+        );
+        const values = rowLimit === undefined ? statement.iterate() : statement.iterate(rowLimit + 1);
+        for (const value of values) {
             const row = value as Omit<ProjectGroupingRow, 'path'> & { path: string | null };
             if (row.path === null) {
                 return undefined;
             }
             rows.push({ ...row, path: row.path });
+            if (rowLimit !== undefined && rows.length > rowLimit) {
+                return undefined;
+            }
         }
         const storedRoots = new Map(rows.map((row) => [normalizeForCompare(row.path), row.git_root]));
         const projects = this.projectSets(
@@ -355,7 +368,20 @@ export class ProjectResolver {
             return resolved;
         },
     ): ProjectSetBuild[] {
-        const resolved = rows.map((row) => ({ row, resolvedGitRoot: resolveRoot(row.path) }));
+        // These keys belong to this grouping invocation, never to cached authority.
+        // Containment and sorting reuse them instead of normalizing each pair.
+        const resolved = rows.map((row) => {
+            const normalizedPath = normalizeForCompare(row.path);
+            const parentPath = normalizedPath.replace(/\/+$/, '');
+            return {
+                row,
+                resolvedGitRoot: resolveRoot(row.path),
+                normalizedPath,
+                pathDepth: normalizedPath.split('/').length,
+                parentPath,
+                parentPrefix: `${parentPath}/`,
+            };
+        });
         const byIdentity = new Map<string, ProjectSetBuild>();
         const rootless: ResolvedProjectRow[] = [];
         for (const resolvedRow of resolved) {
@@ -380,7 +406,8 @@ export class ProjectResolver {
     private projectSets(groups: ProjectSetBuild[]): ProjectSet[] {
         return groups
             .map((group) => this.toProjectSet(group))
-            .sort((a, b) => normalizeForCompare(a.paths[0] ?? '').localeCompare(normalizeForCompare(b.paths[0] ?? '')));
+            .sort((a, b) => a.sortPath.localeCompare(b.sortPath))
+            .map(({ project }) => project);
     }
 
     private consentedProjectSets(groups: ProjectSetBuild[], consent: ProjectConsent): ProjectSet[] {
@@ -435,7 +462,7 @@ export class ProjectResolver {
         return samePath(a, b) || isWithin(a, b) || isWithin(b, a);
     }
 
-    private toProjectSet(group: ProjectSetBuild): ProjectSet {
+    private toProjectSet(group: ProjectSetBuild): { project: ProjectSet; sortPath: string } {
         const members = [...group.members].sort(shallowestFirst);
         const [shallowest] = members;
         if (!shallowest) {
@@ -444,12 +471,15 @@ export class ProjectResolver {
         const gitRemote = commonRemote(members);
         const gitRootCommit = members.map((member) => member.row.git_root_commit).find((commit) => commit !== null && commit !== '');
         return {
-            key: gitRemote ?? gitRootCommit ?? group.gitRoot ?? shallowest.row.path,
-            displayName: shallowest.row.display_name?.trim() || path.basename(shallowest.row.path),
-            paths: members.map((member) => member.row.path),
-            projectIds: members.map((member) => member.row.id),
-            gitRoot: group.gitRoot,
-            gitRemote,
+            sortPath: shallowest.normalizedPath,
+            project: {
+                key: gitRemote ?? gitRootCommit ?? group.gitRoot ?? shallowest.row.path,
+                displayName: shallowest.row.display_name?.trim() || path.basename(shallowest.row.path),
+                paths: members.map((member) => member.row.path),
+                projectIds: members.map((member) => member.row.id),
+                gitRoot: group.gitRoot,
+                gitRemote,
+            },
         };
     }
 

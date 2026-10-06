@@ -77,8 +77,8 @@ export function createMcpServer(service: McpToolHandlers): McpServer {
     return server;
 }
 
-// Builds either the normal read surface or the same four-tool surface whose
-// calls refuse with a named schema reason. The check itself is read-only.
+// Builds either the normal read surface or one whose memory reads refuse
+// with a named schema reason. The report acknowledgement needs no schema.
 export function createMcpServerForDatabase(db: Database.Database): McpServer {
     const readiness = schemaReadiness(db);
     if (readiness.ready) {
@@ -102,6 +102,7 @@ export function createMcpServerForDatabase(db: Database.Database): McpServer {
 }
 
 function registerTools(server: McpServer, tools: ReturnType<typeof mcpToolDefinitions>): void {
+    server.registerTool(tools.reportTaskState.name, tools.reportTaskState.configuration, tools.reportTaskState.handler);
     server.registerTool(tools.listProjects.name, tools.listProjects.configuration, tools.listProjects.handler);
     server.registerTool(tools.listSessions.name, tools.listSessions.configuration, tools.listSessions.handler);
     server.registerTool(tools.getSession.name, tools.getSession.configuration, tools.getSession.handler);

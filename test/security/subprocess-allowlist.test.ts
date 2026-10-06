@@ -1,6 +1,6 @@
 // Security Rule 2: only fixed git, service-manager, Elepha npm calls, and
 // bounded read-only macOS process inspection for legacy MCP retirement, and
-// fixed OpenCode command/rules clients with JSON-only stdin are
+// fixed OpenCode command, rules, and receipt clients with JSON-only stdin are
 // permitted. This test is the allowlist half of "both required" - the
 // Biome GritQL plugin (.biome-plugins/no-raw-subprocess.grit) is the other
 // half, structurally banning child_process calls anywhere else in src/. This
@@ -11,10 +11,14 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+    OPENCODE_COMPACTION_RECEIPT_ARGS,
     OPENCODE_HOOK_ARGS,
     OPENCODE_RULES_HOOK_ARGS,
+    OPENCODE_TASK_STATE_RECEIPT_ARGS,
+    renderOpencodeCompactionReceiptClient,
     renderOpencodeHookClient,
     renderOpencodeRulesClient,
+    renderOpencodeTaskStateReceiptClient,
 } from '../../src/security/subprocess-allowlist.js';
 
 const SRC_ROOT = path.resolve(__dirname, '../../src');
@@ -34,10 +38,17 @@ function listTsFiles(dir: string): string[] {
 }
 
 describe('subprocess allowlist', () => {
-    it('renders only the two fixed OpenCode hook commands with bounded shell-free stdin clients', () => {
+    it('renders only fixed OpenCode hook commands with bounded shell-free stdin clients', () => {
         expect(OPENCODE_HOOK_ARGS).toEqual(['hook', 'user-prompt-submit', '--tool', 'opencode']);
         expect(OPENCODE_RULES_HOOK_ARGS).toEqual(['hook', 'standing-rules', '--tool', 'opencode']);
-        for (const source of [renderOpencodeHookClient('/installed/elepha'), renderOpencodeRulesClient('/installed/elepha')]) {
+        expect(OPENCODE_COMPACTION_RECEIPT_ARGS).toEqual(['hook', 'compaction-receipt', '--tool', 'opencode']);
+        expect(OPENCODE_TASK_STATE_RECEIPT_ARGS).toEqual(['hook', 'task-state-receipt', '--tool', 'opencode']);
+        for (const source of [
+            renderOpencodeHookClient('/installed/elepha'),
+            renderOpencodeRulesClient('/installed/elepha'),
+            renderOpencodeCompactionReceiptClient('/installed/elepha'),
+            renderOpencodeTaskStateReceiptClient('/installed/elepha'),
+        ]) {
             expect(source).toContain('shell: false');
             expect(source).toContain('JSON.stringify(payload)');
             expect(source).toContain('timeout:');
@@ -45,6 +56,8 @@ describe('subprocess allowlist', () => {
             expect(source).not.toMatch(/cwd\s*:/);
         }
         expect(() => renderOpencodeRulesClient('relative')).toThrow('absolute path');
+        expect(() => renderOpencodeCompactionReceiptClient('relative')).toThrow('absolute path');
+        expect(() => renderOpencodeTaskStateReceiptClient('relative')).toThrow('absolute path');
     });
     it('is the only file under src/ that imports node:child_process', () => {
         const offenders = listTsFiles(SRC_ROOT)

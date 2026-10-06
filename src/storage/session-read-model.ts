@@ -4,6 +4,7 @@
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { DURABLE_CAPTURE_FILTER_VERSION, SESSION_CAPSULE_METADATA_MAX_BYTES, SESSION_ELIGIBILITY_BATCH_SIZE } from '../config/constants.js';
 import { type SessionRowSurface, SUPPORTED_TOOLS, type ToolName } from '../types/index.js';
+import { retentionRemovedSql } from './live-memory-retention-schema.js';
 
 export interface ServedSession {
     id: number;
@@ -12,6 +13,7 @@ export interface ServedSession {
     segment_index: number;
     project_id: number;
     source_path: string;
+    source_format?: 'native' | 'opencode-v2';
     started_at: string;
     last_ingested_at: string;
     surface: SessionRowSurface | null;
@@ -118,7 +120,7 @@ export function readSessionCapsuleByNaturalKey(
         LEFT JOIN open_turns ot ON ot.session_id = s.id AND ot.staged_at IS NOT NULL AND ot.validated_epoch = ot.validation_epoch
         WHERE s.tool = ? AND s.native_id = ? AND s.segment_index = ?
         AND ${SERVED_SESSION_KIND_ELIGIBILITY}
-        AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)
+        AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id) AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
         AND NOT EXISTS (SELECT 1 FROM incognito_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)`)
         .get(DURABLE_CAPTURE_FILTER_VERSION, key.tool, key.nativeId, key.segmentIndex) as SessionCapsuleMetadata | undefined;
 }
@@ -282,6 +284,141 @@ export function readSessionById(db: Database.Database, id: number): ServedSessio
     return row === undefined ? undefined : hydrateServedSession(db, row);
 }
 
+export interface CurrentChatSegment {
+    id: number;
+    tool: ToolName;
+    native_id: string;
+    segmentIndex: number;
+    projectId: number;
+    projectPath: string | null;
+    source_path: string | null;
+    turnCount: number;
+}
+
+// The native chat key is exact; project ids can group distinct worktrees.
+// Reject oversized path fields before moving them from SQLite into JavaScript.
+const CURRENT_CHAT_SEGMENT_SELECT = `SELECT s.id, s.tool, s.native_id, s.segment_index AS segmentIndex, s.project_id AS projectId,
+            CASE WHEN length(CAST(p.path AS BLOB)) <= ? THEN p.path END AS projectPath,
+            CASE WHEN length(CAST(s.source_path AS BLOB)) <= ? THEN s.source_path END AS source_path,
+            (SELECT COUNT(*) FROM memories m WHERE m.session_id = s.id) AS turnCount
+            FROM sessions s JOIN projects p ON p.id = s.project_id
+            WHERE s.tool = ? AND s.native_id = ? AND ${SERVED_SESSION_KIND_ELIGIBILITY}
+              AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id) AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
+              AND NOT EXISTS (SELECT 1 FROM incognito_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)`;
+
+export function readCurrentChatSegmentPage(
+    db: Database.Database,
+    tool: ToolName,
+    nativeId: string,
+    maxPathBytes: number,
+    beforeSegmentIndex: number | null,
+    limit: number,
+): CurrentChatSegment[] {
+    return db
+        .prepare(`${CURRENT_CHAT_SEGMENT_SELECT} AND (? IS NULL OR s.segment_index < ?)
+            ORDER BY s.segment_index DESC LIMIT ?`)
+        .all(maxPathBytes, maxPathBytes, tool, nativeId, beforeSegmentIndex, beforeSegmentIndex, limit) as CurrentChatSegment[];
+}
+
+export function readCurrentChatSegmentById(
+    db: Database.Database,
+    tool: ToolName,
+    nativeId: string,
+    maxPathBytes: number,
+    id: number,
+): CurrentChatSegment | undefined {
+    return db.prepare(`${CURRENT_CHAT_SEGMENT_SELECT} AND s.id = ?`).get(maxPathBytes, maxPathBytes, tool, nativeId, id) as
+        | CurrentChatSegment
+        | undefined;
+}
+
+export interface IndexedTurnLocator {
+    memoryId: number;
+    turnIndex: number;
+    memoryReingestedAt: string | null;
+    // Null when the turn has no retained current copy to index; the durable
+    // fields then say why.
+    coverage: string | null;
+    locator: string | null;
+    sourceCursor: string | null;
+    sourceDigest: string | null;
+    filterVersion: number | null;
+    predecessorTurnIndex: number | null;
+    predecessorCursor: string | null;
+    durableState: string | null;
+    durableVersion: number | null;
+    durableCapturedAt: string | null;
+    durableIncluded: number | null;
+    durableFilterVersion: number | null;
+    durableOmittedBeforeChars: number | null;
+    durableUserPrompt: string | null;
+    durableAssistantResponse: string | null;
+    durableAssistantStructure: string | null;
+    durableToolCalls: string | null;
+    durableOmittedToolCallCount: number | null;
+}
+
+// A point lookup binds the index row to the exact stored segment. The prior
+// stored turn, including an unavailable locator, is returned rather than
+// silently skipping backwards to a different boundary.
+export function readIndexedTurnLocator(
+    db: Database.Database,
+    session: { id: number; tool: ToolName; native_id: string; source_path: string },
+    expectedProjectPath: string,
+    turnIndex: number,
+    maxCursorBytes: number,
+    maxDurableBytes: number,
+): IndexedTurnLocator | undefined {
+    const durableBytes = `COALESCE(length(CAST(ft.user_prompt AS BLOB)), 0)
+        + COALESCE(length(CAST(ft.assistant_response AS BLOB)), 0)
+        + COALESCE(length(CAST(ft.assistant_structure AS BLOB)), 0)
+        + COALESCE(length(CAST(ft.tool_calls AS BLOB)), 0)`;
+    return db
+        .prepare(`SELECT m.id AS memoryId, m.turn_index AS turnIndex, m.reingested_at AS memoryReingestedAt,
+        tsi.coverage, tsi.locator,
+        CASE WHEN length(CAST(tsi.source_cursor AS BLOB)) <= ? THEN tsi.source_cursor END AS sourceCursor,
+        CASE WHEN length(CAST(tsi.source_digest AS BLOB)) = 64 THEN tsi.source_digest END AS sourceDigest,
+        tsi.filter_version AS filterVersion,
+        pm.turn_index AS predecessorTurnIndex,
+        CASE WHEN length(CAST(pi.source_cursor AS BLOB)) <= ? THEN pi.source_cursor END AS predecessorCursor,
+        d.state AS durableState, d.filter_version AS durableVersion, ft.captured_at AS durableCapturedAt,
+        ft.included AS durableIncluded, ft.filter_version AS durableFilterVersion,
+        ft.omitted_before_chars AS durableOmittedBeforeChars,
+        CASE WHEN ${durableBytes} <= ? THEN ft.user_prompt END AS durableUserPrompt,
+        CASE WHEN ${durableBytes} <= ? THEN ft.assistant_response END AS durableAssistantResponse,
+        CASE WHEN ${durableBytes} <= ? THEN ft.assistant_structure END AS durableAssistantStructure,
+        CASE WHEN ${durableBytes} <= ? THEN ft.tool_calls END AS durableToolCalls,
+        ft.omitted_tool_call_count AS durableOmittedToolCallCount
+        FROM memories m JOIN sessions s ON s.id = m.session_id JOIN projects p ON p.id = s.project_id
+        LEFT JOIN turn_search_index tsi ON tsi.memory_id = m.id
+        LEFT JOIN memories pm ON pm.id = (SELECT prior.id FROM memories prior
+            JOIN sessions ps ON ps.id = prior.session_id
+            WHERE ps.tool = s.tool AND ps.native_id = s.native_id AND ps.source_path = s.source_path
+              AND (ps.segment_index < s.segment_index OR (ps.segment_index = s.segment_index AND prior.turn_index < m.turn_index))
+            ORDER BY ps.segment_index DESC, prior.turn_index DESC LIMIT 1)
+        LEFT JOIN turn_search_index pi ON pi.memory_id = pm.id
+        LEFT JOIN durable_capture_status d ON d.session_id = s.id
+        LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
+        WHERE s.id = ? AND s.tool = ? AND s.native_id = ? AND s.source_path = ? AND p.path = ? AND m.turn_index = ?
+        AND ${SERVED_SESSION_KIND_ELIGIBILITY}
+        AND NOT EXISTS (SELECT 1 FROM purged_transcripts p WHERE p.tool = s.tool AND p.native_id = s.native_id) AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
+        AND NOT EXISTS (SELECT 1 FROM incognito_transcripts i WHERE i.tool = s.tool AND i.native_id = s.native_id)`)
+        .get(
+            maxCursorBytes,
+            maxCursorBytes,
+            maxDurableBytes,
+            maxDurableBytes,
+            maxDurableBytes,
+            maxDurableBytes,
+            session.id,
+            session.tool,
+            session.native_id,
+            session.source_path,
+            expectedProjectPath,
+            turnIndex,
+        ) as IndexedTurnLocator | undefined;
+}
+
 // Manual embedding jobs page identities, then hydrate only a currently
 // authorized session. No transcript or filtered-turn body is selected.
 export function readEmbeddingSessionIds(db: Database.Database, before: number, limit: number): number[] {
@@ -293,7 +430,7 @@ export function readEmbeddingSessionIds(db: Database.Database, before: number, l
 const EMBEDDING_SESSION_ELIGIBILITY = `s.tool IN (${SUPPORTED_TOOL_PLACEHOLDERS})
           AND ${SERVED_SESSION_KIND_ELIGIBILITY}
           AND s.project_id IN (SELECT value FROM json_each(?))
-          AND NOT EXISTS (SELECT 1 FROM purged_transcripts p WHERE p.tool = s.tool AND p.native_id = s.native_id)
+          AND NOT EXISTS (SELECT 1 FROM purged_transcripts p WHERE p.tool = s.tool AND p.native_id = s.native_id) AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
           AND NOT EXISTS (SELECT 1 FROM incognito_transcripts i WHERE i.tool = s.tool AND i.native_id = s.native_id)`;
 
 export function readEmbeddingSession(db: Database.Database, id: number, projectIds: readonly number[]): ServedSession | undefined {
@@ -340,4 +477,44 @@ export function readSessionByNaturalKey(
         )
         .get(key.tool, key.nativeId, key.segmentIndex, ...SUPPORTED_TOOLS) as RawServedSession | undefined;
     return row === undefined ? undefined : hydrateServedSession(db, row);
+}
+
+// Maintenance enumerates complete native units, independently of serving eligibility.
+// A page cursor selects the first stable row of each unit; no transcript is opened.
+export function* nativeSessionUnits(db: Database.Database): Generator<{ tool: ToolName; nativeId: string }> {
+    let after = 0;
+    const statement = db.prepare(`SELECT s.id, s.tool, s.native_id AS nativeId
+        FROM sessions s
+        WHERE s.id > @after AND NOT EXISTS (
+            SELECT 1 FROM sessions ns
+            WHERE ns.tool = s.tool AND ns.native_id = s.native_id AND ns.id < s.id
+        ) ORDER BY s.id LIMIT @page`);
+    while (true) {
+        const rows = statement.all({
+            after,
+            page: SESSION_ELIGIBILITY_BATCH_SIZE,
+        }) as Array<{ id: number; tool: ToolName; nativeId: string }>;
+        for (const row of rows) {
+            after = row.id;
+            yield { tool: row.tool, nativeId: row.nativeId };
+        }
+        if (rows.length < SESSION_ELIGIBILITY_BATCH_SIZE) {
+            return;
+        }
+    }
+}
+
+export function storedNativeSegments(
+    db: Database.Database,
+    identity: { tool: ToolName; nativeId: string },
+    limit: number,
+): Array<{ id: number; project_id: number; segment_index: number; source_path: string }> {
+    return db
+        .prepare('SELECT id, project_id, segment_index, source_path FROM sessions WHERE tool = ? AND native_id = ? ORDER BY id LIMIT ?')
+        .all(identity.tool, identity.nativeId, limit) as Array<{
+        id: number;
+        project_id: number;
+        segment_index: number;
+        source_path: string;
+    }>;
 }

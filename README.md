@@ -54,19 +54,22 @@ Full walkthrough: [getting-started guide](docs/getting-started.md).
 
 All supported tools use the same local memory database.
 
-It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.12+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
+It runs on **macOS**, **Linux**, and **Windows through WSL**, on **Node.js 22.15+**. Native Windows is not supported; see the [getting-started guide](docs/getting-started.md) for exact requirements.
 
 ## How it works
 
 1. **Capture:** A background service reads supported local session sources under approved project roots.
-2. **Index:** Session metadata, summaries, and optional filtered durable copies are stored in the encrypted local database.
+2. **Index:** Session metadata, summaries, and filtered durable copies are stored in the encrypted local database.
 3. **Recall:** A read-only MCP server and `elepha:` commands surface past context in chat. Ask in plain language, or find and reopen
    sessions with `elepha:query` / `elepha:resume` / `elepha:last`.
 
 Search uses stored titles, first prompts, rollups, and the filtered local full-text
-index where durable capture is available. Session recall renders filtered content
-from a complete durable copy or the source transcript. Results are bounded and
-report when older turns were omitted.
+index where a durable copy is available. Session recall renders filtered content
+from complete retained database copies for Claude Code and Codex. Missing, stale or
+incompatible copies stay explicit gaps; ordinary reads never reopen their provider
+transcripts or trigger capture or repair. Individually current interactions and stored
+summaries may still be returned with their limited scope. OpenCode keeps its legacy
+source rendering. Results are bounded and report when older turns were omitted.
 
 ## Recall in chat: ask in plain language
 
@@ -90,12 +93,9 @@ guide: [docs/commands-in-ai-chat.md](docs/commands-in-ai-chat.md).
 
 ## Storage
 
-By default elepha stores derived memory only: session metadata and summaries. The full
-conversation is read back from the original transcript on demand, so recall of an older
-session depends on that file still being on disk.
-
-Durable capture is opt-in and off by default. When on, elepha keeps its own filtered copy
-of each turn inside the encrypted database: sanitized user prompts, assistant responses,
+elepha stores session metadata and summaries. For Claude Code and Codex it also keeps
+its own filtered copy of each newly captured turn inside the encrypted database,
+automatically and with no extra setting: sanitized user prompts, assistant responses,
 and path-bearing tool-call metadata. Raw JSONL, thinking, tool output, fetched content,
 and raw tool arguments are excluded. That copy:
 
@@ -103,8 +103,9 @@ and raw tool arguments are excluded. That copy:
 - enables local full-text search of past content with no AI provider key;
 - travels inside encrypted backups and project exports.
 
-Durable capture is capped at 1 GiB in total; when full, the oldest sessions are evicted
-first. Turn it on or off with:
+All of elepha's memory shares a fixed 5 GB capacity; at capacity the oldest whole
+sessions are removed after an encrypted backup, and `elepha status` lists them. The
+legacy `durable-capture` setting (off by default) enables new OpenCode copies:
 
 ```console
 elepha config set durable-capture true

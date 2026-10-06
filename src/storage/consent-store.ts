@@ -1,5 +1,5 @@
 // Consent roots are the ingestion boundary. They are deliberately separate
-// from project rows: a project row is historical capture, while consent is a
+// from project rows: a project row records captured work, while consent is a
 // user decision that can cover a whole ProjectSet and later be withdrawn.
 
 import path from 'node:path';
@@ -14,6 +14,7 @@ import {
     samePath,
 } from '../config/paths.js';
 import { ProjectResolver } from './project-resolver.js';
+import { TURN_EMBEDDINGS_TABLE } from './turn-embeddings.js';
 import { newUlid } from './ulid.js';
 
 export type ConsentState = 'approved' | 'denied' | 'pending';
@@ -150,18 +151,22 @@ export class ConsentStore {
         })();
     }
 
-    // Revocation keeps captured history, but the rebuildable vector cache must
+    // Revocation keeps captured history, but the rebuildable vector caches must
     // disappear immediately, including other members of a denied ProjectSet.
     private removeUnconsentedEmbeddings(): void {
-        const cached = this.db.prepare('SELECT DISTINCT project_id FROM session_embeddings').all() as Array<{ project_id: number }>;
+        const cached = this.db
+            .prepare(`SELECT project_id FROM session_embeddings UNION SELECT project_id FROM ${TURN_EMBEDDINGS_TABLE}`)
+            .all() as Array<{ project_id: number }>;
         if (cached.length === 0) {
             return;
         }
         const allowed = new Set(new ProjectResolver(this.db).listConsentedStored(this).flatMap((project) => project.projectIds));
-        const remove = this.db.prepare('DELETE FROM session_embeddings WHERE project_id = ?');
+        const removeSessionVectors = this.db.prepare('DELETE FROM session_embeddings WHERE project_id = ?');
+        const removeTurnVectors = this.db.prepare(`DELETE FROM ${TURN_EMBEDDINGS_TABLE} WHERE project_id = ?`);
         for (const { project_id } of cached) {
             if (!allowed.has(project_id)) {
-                remove.run(project_id);
+                removeSessionVectors.run(project_id);
+                removeTurnVectors.run(project_id);
             }
         }
     }
@@ -217,6 +222,13 @@ export class ConsentStore {
     // Stored project paths alone are not proof: they may still name a symlink.
     consentStateForCanonicalPath(canonicalProjectPath: string): ConsentState {
         return this.explicitConsentDecisionForCanonicalPath(canonicalProjectPath)?.state ?? 'pending';
+    }
+
+    // A request keeps the exact effective decision it was issued under.
+    // A later revoke/regrant cannot restore that old request's authority.
+    approvedDecisionForCanonicalPath(canonicalProjectPath: string): ConsentRoot | undefined {
+        const decision = this.explicitConsentDecisionForCanonicalPath(canonicalProjectPath);
+        return decision?.state === 'approved' ? decision : undefined;
     }
 
     private explicitConsentDecision(projectPath: string): ConsentRoot | undefined {
@@ -315,6 +327,11 @@ export class ConsentStore {
         return this.setState(projectPath, 'denied', 'cli');
     }
 
+    // The stored row for exactly this physical root, not the closest ancestor decision.
+    exactDecision(canonicalRoot: string): ConsentRoot | undefined {
+        return this.list().find((root) => samePath(root.path, canonicalRoot));
+    }
+
     private setState(projectPath: string, state: ConsentState, source: 'cli'): ConsentRoot {
         const canonical = canonicalPath(projectPath);
         const existing = this.list().find((root) => samePath(root.path, canonical));
@@ -322,7 +339,7 @@ export class ConsentStore {
             ulid: existing?.ulid ?? newUlid(),
             path: existing?.path ?? canonical,
             state,
-            decided_at: new Date().toISOString(),
+            decided_at: new Date(Math.max(Date.now(), (Date.parse(existing?.decided_at ?? '') || 0) + 1)).toISOString(),
             source,
         };
         this.db.transaction(() => {

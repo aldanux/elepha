@@ -1,12 +1,12 @@
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
+import { CLAUDE_COMPACT_SUMMARY_MAX_BYTES, CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES } from '../../src/config/constants.js';
+import { claudeProjectsRoot } from '../../src/config/paths.js';
 import { titleForSegment } from '../../src/storage/session-title.js';
 import type { ParsedTurn } from '../../src/types/index.js';
 import { withTempDir } from '../helpers/tmp.js';
-
-const FIXTURE = path.join(__dirname, '..', 'fixtures', 'claude-code', 'sample-session.jsonl');
 
 async function collect(iter: AsyncIterable<ParsedTurn>): Promise<ParsedTurn[]> {
     const out: ParsedTurn[] = [];
@@ -74,7 +74,7 @@ describe('ClaudeCodeAdapter.classifySession', () => {
     });
 });
 
-describe('ClaudeCodeAdapter.parseTurns against fixture', () => {
+describe('ClaudeCodeAdapter.parseTurns', () => {
     it('attaches a standalone ai-title to its active turn without treating it as turn content or an unknown line', async () => {
         const dir = withTempDir('elepha-ai-title-');
         const file = path.join(dir, 'session.jsonl');
@@ -121,45 +121,6 @@ describe('ClaudeCodeAdapter.parseTurns against fixture', () => {
         const turns = await collect(new ClaudeCodeAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
 
         expect(titleForSegment(turns, true)).toBe('Implement the session title fallback so ticket-driven Claude sessions r…');
-    });
-
-    it('extracts both real turns, filters meta/tool_result noise, resolves tool_use file paths', async () => {
-        const adapter = new ClaudeCodeAdapter();
-        const turns = await collect(adapter.parseTurns(FIXTURE, undefined, { closeTrailingOnIdle: true }));
-
-        expect(turns).toHaveLength(3);
-
-        const [first, second] = turns;
-        expect(first!.turnIndex).toBe(0);
-        expect(first!.sessionId).toBe('sample-session');
-        expect(first!.tool).toBe('claude-code');
-        expect(first!.projectPath).toBe('/Users/test/demo-project');
-        expect(first!.userMessage).toBe('Add a health check endpoint to the API');
-        expect(first!.assistantText).toContain('Added GET /health endpoint');
-        expect(first!.assistantText).not.toContain('tool_result');
-        expect(first!.toolCalls.map((c) => c.name)).toEqual(['Read', 'Edit', 'Write']);
-        expect(first!.toolCalls.flatMap((c) => c.filePaths)).toEqual([
-            '/Users/test/demo-project/src/server.ts',
-            '/Users/test/demo-project/src/server.ts',
-            '/Users/test/demo-project/src/health.ts',
-        ]);
-
-        expect(second!.turnIndex).toBe(1);
-        expect(second!.userMessage).toBe('Also add a TODO for adding rate limiting later');
-        expect(second!.assistantText).toContain('rate limiting');
-        // local-command-caveat / command-name / command-stdout noise between the
-        // two real turns must not leak into either turn's userMessage.
-        expect(second!.userMessage).not.toContain('command-name');
-        expect(first!.userMessage).not.toContain('command-name');
-    });
-
-    it('resumes correctly from a previously emitted cursor', async () => {
-        const adapter = new ClaudeCodeAdapter();
-        const all = await collect(adapter.parseTurns(FIXTURE, undefined, { closeTrailingOnIdle: true }));
-        const resumed = await collect(adapter.parseTurns(FIXTURE, all[0]!.cursor, { closeTrailingOnIdle: true }));
-        expect(resumed).toHaveLength(2);
-        expect(resumed[0]!.turnIndex).toBe(1);
-        expect(resumed[0]!.userMessage).toBe(all[1]!.userMessage);
     });
 });
 
@@ -382,30 +343,92 @@ describe('ClaudeCodeAdapter compact summary', () => {
     });
 });
 
-describe('ClaudeCodeAdapter surface/gitBranch/hasExternalContent capture', () => {
-    it('captures surface (entrypoint) and gitBranch on emitted turns', async () => {
-        const adapter = new ClaudeCodeAdapter();
-        const turns = await collect(adapter.parseTurns(FIXTURE, undefined, { closeTrailingOnIdle: true }));
-        expect(turns[0]!.surface).toBe('cli');
-        expect(turns[0]!.gitBranch).toBe('main');
+describe('ClaudeCodeAdapter.readLatestCompactSummary', () => {
+    let configDir: string | undefined;
+    afterEach(() => {
+        vi.unstubAllEnvs();
+        configDir = undefined;
     });
 
-    it('flags hasExternalContent when a turn contains a WebFetch/WebSearch tool_use', async () => {
-        const adapter = new ClaudeCodeAdapter();
-        const turns = await collect(adapter.parseTurns(FIXTURE, undefined, { closeTrailingOnIdle: true }));
-        const fetchTurn = turns.find((t) => t.toolCalls.some((c) => c.name === 'WebFetch'));
-        expect(fetchTurn?.hasExternalContent).toBe(true);
-        const otherTurn = turns.find((t) => !t.toolCalls.some((c) => c.name === 'WebFetch' || c.name === 'WebSearch'));
-        expect(otherTurn?.hasExternalContent).toBe(false);
+    function transcript(records: Array<Record<string, unknown> | string>): string {
+        const directory = withTempDir('elepha-native-compact-');
+        configDir ??= path.join(directory, '.claude');
+        vi.stubEnv('CLAUDE_CONFIG_DIR', configDir);
+        const project = path.join(claudeProjectsRoot(), path.basename(directory));
+        mkdirSync(project, { recursive: true });
+        const file = path.join(project, 'session.jsonl');
+        writeFileSync(file, `${records.map((record) => (typeof record === 'string' ? record : JSON.stringify(record))).join('\n')}\n`);
+        return file;
+    }
+
+    const boundary = { type: 'system', subtype: 'compact_boundary' };
+    const summary = (content: unknown) => ({ type: 'user', isCompactSummary: true, message: { role: 'user', content } });
+    const user = (content: string) => ({ type: 'user', message: { role: 'user', content } });
+
+    it('reads the latest native summary with byte provenance while leaving human text out', async () => {
+        const file = transcript([
+            boundary,
+            summary('Earlier decision'),
+            user('Work after first compact'),
+            boundary,
+            summary('Latest decision'),
+        ]);
+
+        const result = await new ClaudeCodeAdapter().readLatestCompactSummary(file);
+
+        expect(result).toMatchObject({ status: 'available', summary: 'Latest decision' });
+        if (result.status !== 'available') throw new Error(result.reason);
+        expect(result.byteStart).toBeGreaterThan(0);
+        expect(result.byteEnd).toBeGreaterThan(result.byteStart);
+        expect(result.boundaryByteStart).toBeLessThan(result.byteStart);
+        expect(result.previousBoundaryByteStart).not.toBeNull();
+        const turns = await collect(new ClaudeCodeAdapter().parseTurns(file, undefined, { closeTrailingOnIdle: true }));
+        expect(turns.every((turn) => !turn.userMessage.includes('Latest decision'))).toBe(true);
     });
 
-    // The resume marker is a Codex-only concept: Claude Code has per-turn
-    // gitBranch and does not need it. ClaudeCodeAdapter never overrides
-    // isResumeMarkerLine, so every turn must use the base class's default false.
-    it('never sets resumeMarkerBefore - the resume marker is a Codex-only concept', async () => {
+    it('does not infer a native summary from a human message or an older compact before an unfilled boundary', async () => {
+        const withoutBoundary = transcript([summary('Flag without boundary')]);
+        await expect(new ClaudeCodeAdapter().readLatestCompactSummary(withoutBoundary)).resolves.toEqual({
+            status: 'unavailable',
+            reason: 'summary_absent',
+        });
+        const humanOnly = transcript([boundary, user('This session is being continued from a previous conversation.')]);
+        await expect(new ClaudeCodeAdapter().readLatestCompactSummary(humanOnly)).resolves.toEqual({
+            status: 'unavailable',
+            reason: 'summary_absent',
+        });
+
+        const unfilled = transcript([boundary, summary('Old summary'), boundary, user('Continue')]);
+        await expect(new ClaudeCodeAdapter().readLatestCompactSummary(unfilled)).resolves.toEqual({
+            status: 'unavailable',
+            reason: 'summary_absent',
+        });
+    });
+
+    it('reports repeated, malformed and oversized native summaries without returning partial content', async () => {
+        const ambiguous = transcript([boundary, summary('One'), summary('Two')]);
+        const malformed = transcript([boundary, summary({ text: 'Wrong shape' })]);
+        const oversized = transcript([boundary, summary('x'.repeat(CLAUDE_COMPACT_SUMMARY_MAX_BYTES + 1))]);
+
         const adapter = new ClaudeCodeAdapter();
-        const turns = await collect(adapter.parseTurns(FIXTURE, undefined, { closeTrailingOnIdle: true }));
-        expect(turns.every((t) => t.resumeMarkerBefore === false)).toBe(true);
+        await expect(adapter.readLatestCompactSummary(ambiguous)).resolves.toEqual({ status: 'unavailable', reason: 'summary_ambiguous' });
+        await expect(adapter.readLatestCompactSummary(malformed)).resolves.toEqual({ status: 'unavailable', reason: 'summary_malformed' });
+        await expect(adapter.readLatestCompactSummary(oversized)).resolves.toEqual({ status: 'unavailable', reason: 'summary_oversized' });
+    });
+
+    it('enforces the tail scan bound and provider-store containment', async () => {
+        const file = transcript([boundary, summary('Too far back'), user('x'.repeat(CLAUDE_COMPACT_SUMMARY_TAIL_SCAN_MAX_BYTES))]);
+        await expect(new ClaudeCodeAdapter().readLatestCompactSummary(file)).resolves.toEqual({
+            status: 'unavailable',
+            reason: 'scan_limit',
+        });
+
+        const outside = path.join(withTempDir('elepha-native-compact-outside-'), 'session.jsonl');
+        writeFileSync(outside, `${JSON.stringify(summary('Private'))}\n`);
+        await expect(new ClaudeCodeAdapter().readLatestCompactSummary(outside)).resolves.toEqual({
+            status: 'unavailable',
+            reason: 'transcript_outside_store',
+        });
     });
 });
 

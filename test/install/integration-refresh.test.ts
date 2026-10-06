@@ -83,6 +83,9 @@ parentPort.postMessage({ refreshed: [render(workerData.launcher)], skipped: [], 
         );
         const result = reconcileOwnedIntegrations('/managed/elepha', paths);
         expect(result.refreshed).toEqual([paths.opencodeConfig]);
+        expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8')).mcp).toEqual({
+            servers: { elepha: { type: 'local', command: ['/managed/elepha', 'mcp', 'serve'], codemode: false } },
+        });
         expect(result.skipped).toEqual(
             expect.arrayContaining([
                 { integration: 'Claude MCP', file: paths.claudeMcp, status: 'invalid' },

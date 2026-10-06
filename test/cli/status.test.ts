@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { synthesisStatusReport } from '../../src/cli/status.js';
 import type { SummarizerCallLogEntry } from '../../src/summarizer/call-log.js';
+
+const originalExitCode = process.exitCode;
+afterEach(() => {
+    vi.restoreAllMocks();
+    process.exitCode = originalExitCode;
+});
 
 function call(status: SummarizerCallLogEntry['status'], error: string | null = null): SummarizerCallLogEntry {
     return {

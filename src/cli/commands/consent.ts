@@ -1,15 +1,18 @@
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { Command } from 'commander';
-import { canonicalizeExisting, isRefusedProjectRoot, isValidCodexWorktreeRoot } from '../../config/paths.js';
+import { assertNoPendingInitApply } from '../../config/init-apply-journal.js';
+import { canonicalizeExisting, elephaConfigPath, isRefusedProjectRoot, isValidCodexWorktreeRoot } from '../../config/paths.js';
 import { IngestionDaemon } from '../../daemon/index.js';
 import { reconcileCaptureService, serviceBackend } from '../../install/service-backend.js';
 import { type ConsentRoot, ConsentStore } from '../../storage/consent-store.js';
 import { openDb } from '../../storage/db.js';
 import { MemoryStore } from '../../storage/memory-store.js';
 import { errorMessage } from '../../util/error.js';
+import { CONSENT_CONTRACT_DISCLOSURE } from '../consent-disclosure.js';
 import { runDestructiveOp } from '../destructive-op.js';
 import { runInit } from '../init.js';
+import { backfillGap } from '../init-apply.js';
 import { confirmYesNo } from '../shared.js';
 
 interface ConsentPathOptions {
@@ -70,6 +73,20 @@ function planConsentPrune(store: ConsentStore): ConsentPruneCandidate[] {
     });
 }
 
+// Direct consent changes must not interleave with an `elepha init` apply that
+// is running or was interrupted: resolving it compares consent with its
+// journal, and a decision taken in between would read as a conflict.
+function refuseWhileInitApplyPending(): boolean {
+    try {
+        assertNoPendingInitApply(elephaConfigPath());
+        return false;
+    } catch (error) {
+        console.error(errorMessage(error));
+        process.exitCode = 1;
+        return true;
+    }
+}
+
 async function confirmConsentPrune(count: number): Promise<boolean> {
     return confirmYesNo(`Remove these ${count} stale or refused consent root(s) from consent list? Captured memory will be kept. [y/N] `);
 }
@@ -120,6 +137,9 @@ export function registerConsent(program: Command): void {
         .option('--apply', 'actually remove the listed consent roots (default is a dry run that only prints the plan)')
         .option('--skip-confirmation', 'remove without the confirmation prompt')
         .action(async (options: ConsentPruneOptions) => {
+            if (options.apply && refuseWhileInitApplyPending()) {
+                return;
+            }
             const db = await openDb();
             const store = new ConsentStore(db);
             let verificationFailed = false;
@@ -216,6 +236,7 @@ export function registerConsent(program: Command): void {
         .description('Grant consent to a root and capture its already-written transcripts without calling a synthesis provider')
         .argument('[path]', 'memory root to grant')
         .option('--here', 'use the current working directory as the memory root')
+        .addHelpText('after', `\n${CONSENT_CONTRACT_DISCLOSURE}`)
         .action(async (rootPath: string | undefined, options: ConsentPathOptions) => {
             const root = resolveConsentPath(rootPath, options);
             if (root === undefined) {
@@ -226,17 +247,29 @@ export function registerConsent(program: Command): void {
                 process.exitCode = 1;
                 return;
             }
+            if (refuseWhileInitApplyPending()) {
+                return;
+            }
             const db = await openDb();
+            // The command itself is the explicit grant: disclose what it means
+            // before granting, without a second permission prompt.
+            console.log(`${CONSENT_CONTRACT_DISCLOSURE}\n`);
             const consentStore = new ConsentStore(db);
             const store = new MemoryStore(db);
             const consentRoot = consentStore.grant(root);
             const daemon = new IngestionDaemon({ store, log: (message) => console.log(message) });
-            const ingested = await daemon.backfillApprovedRoot(consentRoot.path);
+            const report = await daemon.backfillApprovedRootsReport([consentRoot.path]);
+            const ingested = report.ingested;
             console.log(
                 ingested > 0
                     ? `Granted ${consentRoot.path}; backfilled ${ingested} turn(s) without synthesis.`
                     : `Granted ${consentRoot.path}; no new turns to backfill.`,
             );
+            const gap = backfillGap(report, [consentRoot.path]);
+            if (gap !== undefined) {
+                console.error(gap);
+                process.exitCode = 1;
+            }
             try {
                 const service = reconcileCaptureService(serviceBackend(), consentStore.list('approved').length);
                 if (service === 'not installed') {
@@ -256,6 +289,9 @@ export function registerConsent(program: Command): void {
         .action(async (rootPath: string | undefined, options: ConsentPathOptions) => {
             const root = resolveConsentPath(rootPath, options);
             if (root === undefined) {
+                return;
+            }
+            if (refuseWhileInitApplyPending()) {
                 return;
             }
             const db = await openDb();

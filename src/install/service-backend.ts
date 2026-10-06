@@ -55,7 +55,7 @@ export function serviceBackend(options: ServiceBackendOptions = {}): ServiceBack
 }
 
 // Called after consent mutations; an absent service is intentionally a no-op.
-type ReconcileStatus = 'not installed' | 'awaiting consent' | 'active';
+export type ReconcileStatus = 'not installed' | 'awaiting consent' | 'active';
 
 function prepareCaptureService(service: ServiceBackend, approvedRoots: number): ReconcileStatus {
     if (!service.isInstalled()) {

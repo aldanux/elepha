@@ -9,6 +9,7 @@ import type { SessionAdapter, SessionAdapterMap, ToolName } from '../types/index
 import { applyBackfill, type BackfillDeriver, planBackfill } from './backfill-runner.js';
 import { firstPromptSearch } from './first-prompt-search.js';
 import { InjectionQuoteBackIncompleteError, InjectionStore } from './injection-store.js';
+
 import { isSessionKindEligible, SERVED_SESSION_KIND_ELIGIBILITY } from './session-read-model.js';
 
 export interface FirstPromptSearchChange {
@@ -186,6 +187,7 @@ function daemonBatchDeriver(
             if (scope.authorizeWrite?.(db, change.sessionId) === false) {
                 return { sessionsSkippedConcurrent: 1 };
             }
+
             const nullClause = scope.onlyNull ? ' AND first_prompt_search IS NULL' : '';
             const result = db
                 .prepare(

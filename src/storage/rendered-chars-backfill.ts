@@ -126,7 +126,7 @@ const deriver: BackfillDeriver<SessionSeed, RenderedCharsChange, Map<number, Set
         const result = db
             .prepare(
                 `UPDATE sessions SET rendered_chars = ?, rendered_turns = ?
-                 WHERE id = ? AND rendered_chars IS ? AND rendered_turns IS ?`,
+                     WHERE id = ? AND rendered_chars IS ? AND rendered_turns IS ?`,
             )
             .run(change.renderedChars, change.renderedTurns, change.sessionId, change.beforeRenderedChars, change.beforeRenderedTurns);
         return { sessionsSkippedConcurrent: result.changes === 0 ? 1 : 0 };

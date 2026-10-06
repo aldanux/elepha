@@ -1,20 +1,23 @@
 import { mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { realpath as fsRealpath } from 'node:fs/promises';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
-import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CodexAdapter } from '../../src/adapters/codex.js';
 import { DURABLE_CAPTURE_FILTER_VERSION, MAX_GET_SESSION_LAST_N, SESSION_CHAR_BUDGET } from '../../src/config/constants.js';
 import { codexSessionsRoot } from '../../src/config/paths.js';
 import { omissionMarker } from '../../src/rendering/raw-turn-renderer.js';
-import { openProviderTranscript, type ProviderTranscriptOpener } from '../../src/security/provider-transcript.js';
+import * as providerTranscript from '../../src/security/provider-transcript.js';
 import { dataBlockClose, dataBlockOpen } from '../../src/serving/instructions.js';
-import { boundedRender, newestActivity, type ServedSession, SessionReader } from '../../src/serving/session-reader.js';
+import {
+    boundedRender,
+    newestActivity,
+    type ServedSession,
+    SessionReader,
+    STORED_EVIDENCE_REASONS,
+} from '../../src/serving/session-reader.js';
 import type { ProjectSet } from '../../src/storage/project-resolver.js';
 import { UNTITLED_EPISODE } from '../../src/storage/session-title.js';
-import type { ParsedTurn, ParseTurnsOptions, SessionAdapter } from '../../src/types/index.js';
-import { createTestDb, seedConsentRoot, seedMemory, seedProject, seedSession } from '../helpers/db.js';
-import { withGrantableTestDir } from '../helpers/tmp.js';
+import type { ParsedTurn } from '../../src/types/index.js';
+import { createTestDb, seedMemory, seedProject, seedSession } from '../helpers/db.js';
 
 function turn(index: number, text: string): ParsedTurn {
     return {
@@ -32,14 +35,6 @@ function turn(index: number, text: string): ParsedTurn {
         hasExternalContent: false,
         resumeMarkerBefore: false,
     };
-}
-
-async function collectTurns(turns: AsyncIterable<ParsedTurn>): Promise<ParsedTurn[]> {
-    const collected: ParsedTurn[] = [];
-    for await (const parsedTurn of turns) {
-        collected.push(parsedTurn);
-    }
-    return collected;
 }
 
 function session(nativeId: string, lastTurnAt: string, sourcePath = '/tmp/episode.jsonl'): ServedSession {
@@ -84,15 +79,6 @@ async function withCodexStore<T>(fixtureDirectory: string, run: (storeRoot: stri
     }
 }
 
-function readerWithParseTurns(
-    db: ReturnType<typeof createTestDb>['db'],
-    parseTurns: SessionAdapter['parseTurns'],
-    openTranscript?: ProviderTranscriptOpener,
-): SessionReader {
-    const adapter = { parseTurns } as SessionAdapter;
-    return new SessionReader(db, { codex: adapter, 'claude-code': adapter }, openTranscript);
-}
-
 const storedSummary = { decisions: [], pending_items: [], status: 'not_configured' as const };
 
 function captureTurns(
@@ -120,123 +106,36 @@ function captureTurns(
     }
 }
 
+afterEach(() => vi.restoreAllMocks());
+
 describe('P2.8 bounded shared episode reader', () => {
-    it('rejects an existing transcript outside the Codex store before parsing it', async () => {
-        const fixture = createTestDb('elepha-session-reader-');
-        await withCodexStore(fixture.directory, async () => {
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield turn(0, 'must not be read');
+    it.each(['outside', 'symlink', 'inside'] as const)(
+        'never opens or parses a %s provider source to fill missing retained evidence',
+        async (location) => {
+            const fixture = createTestDb('elepha-session-reader-');
+            await withCodexStore(fixture.directory, async (storeRoot) => {
+                const outside = path.join(fixture.directory, 'outside.jsonl');
+                const inside = path.join(storeRoot, 'inside.jsonl');
+                const alias = path.join(storeRoot, 'alias.jsonl');
+                writeFileSync(outside, '{}\n');
+                writeFileSync(inside, '{}\n');
+                symlinkSync(outside, alias);
+                const sourcePath = location === 'outside' ? outside : location === 'symlink' ? alias : inside;
+                const opened = vi.spyOn(providerTranscript, 'openProviderTranscript');
+                const parsed = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+                try {
+                    await expect(new SessionReader(fixture.db).render(session(location, '2026-08-17', sourcePath))).resolves.toEqual({
+                        reason: STORED_EVIDENCE_REASONS.missing,
+                    });
+                    expect(opened).not.toHaveBeenCalled();
+                    expect(parsed).not.toHaveBeenCalled();
+                } finally {
+                    opened.mockRestore();
+                    parsed.mockRestore();
+                }
             });
-
-            await expect(
-                readerWithParseTurns(fixture.db, parseTurns).turns(
-                    session('outside', '2026-08-17T00:00:00.000Z', '/etc/passwd'),
-                    undefined,
-                    new Set([0]),
-                ),
-            ).resolves.toEqual({
-                reason: 'transcript_outside_store',
-            });
-            expect(parseTurns).not.toHaveBeenCalled();
-        });
-    });
-
-    it('rejects a store-local symlink whose target is outside the Codex store', async () => {
-        const fixture = createTestDb('elepha-session-reader-');
-        await withCodexStore(fixture.directory, async (storeRoot) => {
-            const outside = `${fixture.directory}/outside.jsonl`;
-            const symlink = `${storeRoot}/escape.jsonl`;
-            writeFileSync(outside, '{}\n');
-            symlinkSync(outside, symlink);
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield turn(0, 'must not be read');
-            });
-
-            await expect(
-                readerWithParseTurns(fixture.db, parseTurns).turns(
-                    session('symlink', '2026-08-17T00:00:00.000Z', symlink),
-                    undefined,
-                    new Set([0]),
-                ),
-            ).resolves.toEqual({
-                reason: 'transcript_outside_store',
-            });
-            expect(parseTurns).not.toHaveBeenCalled();
-        });
-    });
-
-    it('rejects a parent symlink retargeted outside after the file is opened', async () => {
-        const fixture = createTestDb('elepha-session-reader-');
-        await withCodexStore(fixture.directory, async (storeRoot) => {
-            const projectPath = path.join(withGrantableTestDir('elepha-session-reader-project-'), 'project');
-            const insideDirectory = path.join(storeRoot, 'inside');
-            const outsideDirectory = path.join(fixture.directory, 'outside');
-            const alias = path.join(storeRoot, 'alias');
-            const sourcePath = path.join(alias, 'episode.jsonl');
-            mkdirSync(projectPath);
-            mkdirSync(insideDirectory);
-            mkdirSync(outsideDirectory);
-            writeFileSync(path.join(insideDirectory, 'episode.jsonl'), '{"assistantText":"inside"}\n');
-            writeFileSync(path.join(outsideDirectory, 'episode.jsonl'), '{"assistantText":"outside-derived"}\n');
-            symlinkSync(insideDirectory, alias, 'dir');
-            seedConsentRoot(fixture, { path: projectPath });
-            const project = seedProject(fixture, { path: projectPath });
-            const storedSession = seedSession(fixture, { project, nativeId: 'swapped', sourcePath });
-            seedMemory(fixture, { project, session: storedSession });
-
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield turn(0, 'must not be read');
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns, (tool, candidate) =>
-                openProviderTranscript(tool, candidate, {
-                    realpath: async (openedPath) => {
-                        unlinkSync(alias);
-                        symlinkSync(outsideDirectory, alias, 'dir');
-                        return fsRealpath(openedPath);
-                    },
-                }),
-            );
-            const servedSession = reader.sessionById(storedSession.id);
-            if (!servedSession) throw new Error('seeded session was not found');
-
-            const result = await reader.turns(servedSession);
-
-            expect(result).toEqual({ reason: 'transcript_outside_store' });
-            expect(result.turns).toBeUndefined();
-            expect(parseTurns).not.toHaveBeenCalled();
-        });
-    });
-
-    it('parses a real transcript inside the Codex store', async () => {
-        const fixture = createTestDb('elepha-session-reader-');
-        await withCodexStore(fixture.directory, async (storeRoot) => {
-            const sourcePath = `${storeRoot}/episode.jsonl`;
-            writeFileSync(sourcePath, '{}\n');
-            const parseTurns = vi.fn(async function* (
-                _filePath: string,
-                _sinceCursor?: string,
-                options?: ParseTurnsOptions,
-            ): AsyncIterable<ParsedTurn> {
-                await expect(options?.handle?.stat()).resolves.toMatchObject({ size: 3 });
-                yield turn(0, 'served');
-            });
-
-            await expect(
-                readerWithParseTurns(fixture.db, parseTurns).turns(
-                    session('inside', '2026-08-17T00:00:00.000Z', sourcePath),
-                    undefined,
-                    new Set([0]),
-                ),
-            ).resolves.toEqual({
-                turns: [turn(0, 'served')],
-            });
-            expect(parseTurns).toHaveBeenCalledWith(sourcePath, undefined, {
-                closeTrailingOnIdle: true,
-                handle: expect.anything(),
-                signal: undefined,
-            });
-        });
-    });
+        },
+    );
 
     it('counts every stored session, including non-substantive sessions', () => {
         const now = Date.parse('2026-08-20T00:00:00.000Z');
@@ -369,24 +268,9 @@ describe('P2.8 bounded shared episode reader', () => {
             const project = seedProject(fixture, { path: '/tmp/project' });
             const storedSession = seedSession(fixture, { project, nativeId: 'large', sourcePath });
             const turns = Array.from({ length: 50 }, (_, index) => turn(index, `assistant ${index}`));
-            for (const parsedTurn of turns) {
-                seedMemory(fixture, { project, session: storedSession, turnIndex: parsedTurn.turnIndex });
-            }
-            let renderedBodies = 0;
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                for (const parsedTurn of turns) {
-                    const instrumented = { ...parsedTurn };
-                    Object.defineProperty(instrumented, 'assistantText', {
-                        enumerable: true,
-                        get: () => {
-                            renderedBodies += 1;
-                            return parsedTurn.assistantText;
-                        },
-                    });
-                    yield instrumented;
-                }
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            captureTurns(fixture, project, storedSession, turns, true);
+            const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded session was not found');
 
@@ -397,92 +281,23 @@ describe('P2.8 bounded shared episode reader', () => {
             expect(result.episode?.text).toContain('assistant 49');
             expect(result.episode?.text).not.toContain('assistant 48');
             expect(result.episode?.text).toContain(omissionMarker(49, 1, 50));
-            expect(renderedBodies).toBe(turns.length + 1);
+            expect(parseTurns).not.toHaveBeenCalled();
+            parseTurns.mockRestore();
         });
     });
 
-    it('keeps the retained streaming high-water below both count and character bounds with a large last_n', async () => {
+    it('keeps newest retained content within the character bound with a large last_n', async () => {
         const fixture = createTestDb('elepha-session-reader-');
-        await withCodexStore(fixture.directory, async (storeRoot) => {
-            const sourcePath = `${storeRoot}/large-budgeted.jsonl`;
-            writeFileSync(sourcePath, '{}\n');
-            const project = seedProject(fixture, { path: '/tmp/project' });
-            const storedSession = seedSession(fixture, { project, nativeId: 'large-budgeted', sourcePath });
-            const turns = Array.from({ length: 60 }, (_, index) => turn(index, `assistant ${index} ${'x'.repeat(4_000)}`));
-            for (const parsedTurn of turns) {
-                seedMemory(fixture, { project, session: storedSession, turnIndex: parsedTurn.turnIndex });
-            }
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield* turns;
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
-            const servedSession = reader.sessionById(storedSession.id);
-            if (!servedSession) throw new Error('seeded session was not found');
-            const charBudget = 12_000;
-
-            const result = await reader.turns(servedSession, undefined, undefined, {
-                lastN: 1_000_000_000,
-                charBudget,
-                nonce: 'high-water-nonce',
-            });
-
-            expect(result.retentionHighWater?.renderedChars).toBeLessThanOrEqual(charBudget);
-            expect(result.retentionHighWater?.turns).toBe(2);
-            expect(result.turns).toHaveLength(2);
-        });
-    });
-
-    it('matches the full-parse renderer byte-for-byte on real Claude and Codex fixtures', async () => {
-        const fixtureCases = [
-            {
-                name: 'claude-code/sample-session.jsonl',
-                adapter: new ClaudeCodeAdapter(),
-                source: path.join(__dirname, '..', 'fixtures', 'claude-code', 'sample-session.jsonl'),
-            },
-            {
-                name: 'codex/rollout-2026-08-15 resume-marker.jsonl',
-                adapter: new CodexAdapter(),
-                source: path.join(
-                    __dirname,
-                    '..',
-                    'fixtures',
-                    'codex',
-                    'rollout-2026-08-15T09-00-00-019fc000-0000-7000-8000-000000000002-resume-marker.jsonl',
-                ),
-            },
-        ];
-
-        for (const fixtureCase of fixtureCases) {
-            const parsedTurns = await collectTurns(
-                fixtureCase.adapter.parseTurns(fixtureCase.source, undefined, { closeTrailingOnIdle: true }),
-            );
-            const fixture = createTestDb('elepha-session-reader-equality-');
-            await withCodexStore(fixture.directory, async (storeRoot) => {
-                const sourcePath = `${storeRoot}/${path.basename(fixtureCase.source)}`;
-                writeFileSync(sourcePath, '{}\n');
-                const project = seedProject(fixture, { path: `/tmp/${fixtureCase.adapter.tool}` });
-                const storedSession = seedSession(fixture, {
-                    project,
-                    nativeId: `equality-${fixtureCase.adapter.tool}`,
-                    sourcePath,
-                });
-                for (const parsedTurn of parsedTurns) {
-                    seedMemory(fixture, { project, session: storedSession, turnIndex: parsedTurn.turnIndex });
-                }
-                const reader = readerWithParseTurns(fixture.db, async function* (): AsyncIterable<ParsedTurn> {
-                    yield* parsedTurns;
-                });
-                const servedSession = reader.sessionById(storedSession.id);
-                if (!servedSession) throw new Error(`seeded ${fixtureCase.name} session was not found`);
-
-                for (const lastN of [undefined, 1, 2, parsedTurns.length + 10]) {
-                    const result = await reader.render(servedSession, lastN);
-                    expect(result.episode, `${fixtureCase.name}, last_n=${String(lastN)}`).toEqual(
-                        boundedRender(parsedTurns, lastN, SESSION_CHAR_BUDGET, result.episode?.nonce),
-                    );
-                }
-            });
-        }
+        const project = seedProject(fixture);
+        const storedSession = seedSession(fixture, { project });
+        const turns = Array.from({ length: 60 }, (_, index) => turn(index, `assistant ${index} ${'x'.repeat(4_000)}`));
+        captureTurns(fixture, project, storedSession, turns, true);
+        const reader = new SessionReader(fixture.db);
+        const result = await reader.render(reader.sessionById(storedSession.id)!, MAX_GET_SESSION_LAST_N, undefined, 12_000);
+        expect(result.episode?.renderedChars).toBeLessThanOrEqual(12_000);
+        expect(result.episode).toMatchObject({ returned: 2, omitted: 58, total: 60 });
+        expect(result.episode?.text).toContain('assistant 59');
+        expect(result.episode?.text).not.toContain('assistant 57');
     });
 
     it('prefers a verified complete copy and renders it byte-for-byte like the source with the same bounds', async () => {
@@ -506,28 +321,20 @@ describe('P2.8 bounded shared episode reader', () => {
                 turn(3, 'newest rendered response'),
             ];
             captureTurns(fixture, project, storedSession, turns, true);
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield* turns;
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded durable session was not found');
 
             fixture.db.prepare("UPDATE durable_capture_status SET state = 'disabled_gap' WHERE session_id = ?").run(storedSession.id);
-            const source = await reader.render(servedSession, 2, undefined, Number.MAX_SAFE_INTEGER);
-            expect(parseTurns).toHaveBeenCalledTimes(1);
+            await expect(reader.render(servedSession, 2)).resolves.toEqual({ reason: 'durable_capture_disabled_gap' });
 
             fixture.db.prepare("UPDATE durable_capture_status SET state = 'complete' WHERE session_id = ?").run(storedSession.id);
             const persisted = await reader.render(servedSession, 2, undefined, Number.MAX_SAFE_INTEGER);
 
-            expect(source.episode).toBeDefined();
-            expect(persisted.episode).toEqual({
-                ...source.episode,
-                nonce: persisted.episode?.nonce,
-                text: source.episode?.text.replaceAll(source.episode.nonce, persisted.episode?.nonce ?? ''),
-            });
+            expect(persisted.episode).toEqual(boundedRender(turns, 2, Number.MAX_SAFE_INTEGER, persisted.episode?.nonce));
             expect(persisted.episode).toMatchObject({ returned: 2, omitted: 1, total: 3 });
-            expect(parseTurns).toHaveBeenCalledTimes(1);
+            expect(parseTurns).not.toHaveBeenCalled();
         });
     });
 
@@ -540,14 +347,8 @@ describe('P2.8 bounded shared episode reader', () => {
             const storedSession = seedSession(fixture, { project, nativeId: 'durable-recovery', sourcePath });
             captureTurns(fixture, project, storedSession, [turn(0, 'recovered response')], true);
             unlinkSync(sourcePath);
-            const openTranscript: ProviderTranscriptOpener = vi.fn(openProviderTranscript);
-            const reader = readerWithParseTurns(
-                fixture.db,
-                async function* (): AsyncIterable<ParsedTurn> {
-                    yield turn(99, 'the deleted source must not be parsed');
-                },
-                openTranscript,
-            );
+            const openTranscript = vi.spyOn(providerTranscript, 'openProviderTranscript');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded durable session was not found');
 
@@ -555,10 +356,11 @@ describe('P2.8 bounded shared episode reader', () => {
 
             expect(result.episode?.text).toContain('recovered response');
             expect(openTranscript).not.toHaveBeenCalled();
+            openTranscript.mockRestore();
         });
     });
 
-    it('treats an evicted copy as pre-durable content for search and transcript serving', async () => {
+    it('reports evicted coverage without rescuing it from a source', async () => {
         const fixture = createTestDb('elepha-session-reader-evicted-');
         await withCodexStore(fixture.directory, async (storeRoot) => {
             const sourcePath = `${storeRoot}/evicted.jsonl`;
@@ -572,10 +374,8 @@ describe('P2.8 bounded shared episode reader', () => {
                     .run(storedSession.id);
                 fixture.db.prepare("UPDATE durable_capture_status SET state = 'evicted' WHERE session_id = ?").run(storedSession.id);
             })();
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield turn(0, 'source fallback response');
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded evicted session was not found');
 
@@ -590,15 +390,15 @@ describe('P2.8 bounded shared episode reader', () => {
             });
             expect(recall.matches).toEqual(new Map());
             const fromSource = await reader.render(servedSession);
-            expect(fromSource.episode?.text).toContain('source fallback response');
-            expect(parseTurns).toHaveBeenCalledTimes(1);
+            expect(fromSource).toEqual({ reason: STORED_EVIDENCE_REASONS.evicted });
+            expect(parseTurns).not.toHaveBeenCalled();
 
             unlinkSync(sourcePath);
-            await expect(reader.render(servedSession)).resolves.toEqual({ reason: 'transcript_missing' });
+            await expect(reader.render(servedSession)).resolves.toEqual({ reason: STORED_EVIDENCE_REASONS.evicted });
         });
     });
 
-    it('suppresses a source quote-back using an earlier structural MCP receipt without persisting it', async () => {
+    it('never serves a source quote-back or persists its receipt on a missing-copy read', async () => {
         const fixture = createTestDb('elepha-session-reader-rule4-source-');
         await withCodexStore(fixture.directory, async (storeRoot) => {
             const sourcePath = `${storeRoot}/rule4-source.jsonl`;
@@ -606,29 +406,11 @@ describe('P2.8 bounded shared episode reader', () => {
             const project = seedProject(fixture, { path: '/tmp/project' });
             const storedSession = seedSession(fixture, { project, nativeId: 'rule4-source', sourcePath });
             seedMemory(fixture, { project, session: storedSession, turnIndex: 1 });
-            const receiptBody = 'This verified Elepha MCP result must not be reconstructed from a later transcript quote-back.';
-            const receipt: ParsedTurn = {
-                ...turn(0, ''),
-                sessionId: storedSession.native_id,
-                sourcePath,
-                userMessage: '',
-                assistantText: '',
-                droppedReason: 'elepha-mcp',
-                elephaMcpResultReceipts: [{ callId: 'source-receipt', body: receiptBody, observedAt: '2026-08-17T00:00:00.000Z' }],
-            };
-            const quoteBack: ParsedTurn = {
-                ...turn(1, `As Elepha reported: ${receiptBody}`),
-                sessionId: storedSession.native_id,
-                sourcePath,
-            };
-            const reader = readerWithParseTurns(fixture.db, async function* (): AsyncIterable<ParsedTurn> {
-                yield receipt;
-                yield quoteBack;
-            });
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded Rule 4 session was not found');
 
-            await expect(reader.render(servedSession)).resolves.toEqual({ reason: 'transcript_reparse_empty' });
+            await expect(reader.render(servedSession)).resolves.toEqual({ reason: STORED_EVIDENCE_REASONS.missing });
             expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM injections').get()).toEqual({ count: 0 });
         });
     });
@@ -636,6 +418,7 @@ describe('P2.8 bounded shared episode reader', () => {
     it.each([
         {
             name: 'a missing filtered row',
+            reason: STORED_EVIDENCE_REASONS.incomplete,
             invalidate: (fixture: ReturnType<typeof createTestDb>, sessionId: number): void => {
                 fixture.db
                     .prepare(
@@ -649,6 +432,7 @@ describe('P2.8 bounded shared episode reader', () => {
         },
         {
             name: 'an unsupported filtered row version',
+            reason: STORED_EVIDENCE_REASONS.filterVersionMismatch,
             invalidate: (fixture: ReturnType<typeof createTestDb>, sessionId: number): void => {
                 fixture.db
                     .prepare(
@@ -661,7 +445,7 @@ describe('P2.8 bounded shared episode reader', () => {
                     .run(DURABLE_CAPTURE_FILTER_VERSION + 1, sessionId);
             },
         },
-    ])('uses only the source for $name, then reports an incomplete durable copy when the source is gone', async ({ invalidate }) => {
+    ])('reports the retained gap for $name independently of source presence', async ({ invalidate, reason }) => {
         const fixture = createTestDb('elepha-session-reader-durable-incomplete-');
         await withCodexStore(fixture.directory, async (storeRoot) => {
             const sourcePath = `${storeRoot}/durable-incomplete.jsonl`;
@@ -672,22 +456,19 @@ describe('P2.8 bounded shared episode reader', () => {
             captureTurns(fixture, project, storedSession, turns, true);
             fixture.db.prepare("UPDATE filtered_turns SET assistant_response = 'partial copy must not render'").run();
             invalidate(fixture, storedSession.id);
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield* turns;
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded durable session was not found');
 
             const fromSource = await reader.render(servedSession);
 
-            expect(fromSource.episode?.text).toContain('source newest');
-            expect(fromSource.episode?.text).not.toContain('partial copy must not render');
-            expect(parseTurns).toHaveBeenCalledTimes(1);
+            expect(fromSource).toEqual({ reason });
+            expect(parseTurns).not.toHaveBeenCalled();
 
             unlinkSync(sourcePath);
-            await expect(reader.render(servedSession)).resolves.toEqual({ reason: 'durable_capture_incomplete' });
-            expect(parseTurns).toHaveBeenCalledTimes(1);
+            await expect(reader.render(servedSession)).resolves.toEqual({ reason });
+            expect(parseTurns).not.toHaveBeenCalled();
         });
     });
 
@@ -725,10 +506,8 @@ describe('P2.8 bounded shared episode reader', () => {
                 ...turn(row.turn_index, row.assistant_response),
                 userMessage: row.user_prompt,
             }));
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield turn(99, 'a complete_truncated copy must not parse the source');
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded durable session was not found');
 
@@ -751,12 +530,8 @@ describe('P2.8 bounded shared episode reader', () => {
             const project = seedProject(fixture, { path: '/tmp/project' });
             const storedSession = seedSession(fixture, { project, nativeId: 'reader-clamp', sourcePath });
             const turns = Array.from({ length: MAX_GET_SESSION_LAST_N + 10 }, (_, index) => turn(index, `assistant ${index}`));
-            for (const parsedTurn of turns) {
-                seedMemory(fixture, { project, session: storedSession, turnIndex: parsedTurn.turnIndex });
-            }
-            const reader = readerWithParseTurns(fixture.db, async function* (): AsyncIterable<ParsedTurn> {
-                yield* turns;
-            });
+            captureTurns(fixture, project, storedSession, turns, true);
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded session was not found');
 
@@ -779,14 +554,10 @@ describe('P2.8 bounded shared episode reader', () => {
             writeFileSync(sourcePath, '{}\n');
             const project = seedProject(fixture, { path: '/tmp/project' });
             const storedSession = seedSession(fixture, { project, nativeId: 'deadline', sourcePath });
-            seedMemory(fixture, { project, session: storedSession, turnIndex: 0 });
-            seedMemory(fixture, { project, session: storedSession, turnIndex: 1 });
+            captureTurns(fixture, project, storedSession, [turn(0, 'partial content'), turn(1, 'must not render')], true);
             const controller = new AbortController();
-            const reader = readerWithParseTurns(fixture.db, async function* (): AsyncIterable<ParsedTurn> {
-                yield turn(0, 'partial content');
-                controller.abort();
-                yield turn(1, 'must not render');
-            });
+            controller.abort();
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded session was not found');
 
@@ -797,7 +568,7 @@ describe('P2.8 bounded shared episode reader', () => {
         });
     });
 
-    it('keeps a durable-capture-off session byte-identical on the source path when streaming does not evict', async () => {
+    it('renders retained content byte-identically with the standalone renderer', async () => {
         const fixture = createTestDb('elepha-session-reader-');
         await withCodexStore(fixture.directory, async (storeRoot) => {
             const sourcePath = `${storeRoot}/normal.jsonl`;
@@ -805,22 +576,18 @@ describe('P2.8 bounded shared episode reader', () => {
             const project = seedProject(fixture, { path: '/tmp/project' });
             const storedSession = seedSession(fixture, { project, nativeId: 'normal', sourcePath });
             const turns = [turn(0, 'first'), turn(1, 'second')];
-            for (const parsedTurn of turns) {
-                seedMemory(fixture, { project, session: storedSession, turnIndex: parsedTurn.turnIndex });
-            }
-            const parseTurns = vi.fn(async function* (): AsyncIterable<ParsedTurn> {
-                yield* turns;
-            });
-            const reader = readerWithParseTurns(fixture.db, parseTurns);
+            captureTurns(fixture, project, storedSession, turns, true);
+            const parseTurns = vi.spyOn(CodexAdapter.prototype, 'parseTurns');
+            const reader = new SessionReader(fixture.db);
             const servedSession = reader.sessionById(storedSession.id);
             if (!servedSession) throw new Error('seeded session was not found');
 
             const result = await reader.render(servedSession);
 
-            expect(fixture.db.prepare('SELECT COUNT(*) AS count FROM durable_capture_status').get()).toEqual({ count: 0 });
+            expect(fixture.db.prepare('SELECT state FROM durable_capture_status').get()).toEqual({ state: 'complete' });
             expect(result.episode).toBeDefined();
             expect(result.episode).toEqual(boundedRender(turns, undefined, SESSION_CHAR_BUDGET, result.episode?.nonce));
-            expect(parseTurns).toHaveBeenCalledTimes(1);
+            expect(parseTurns).not.toHaveBeenCalled();
         });
     });
 

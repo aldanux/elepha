@@ -35,6 +35,7 @@ export class ProjectStore {
         findProjectByPath: Statement;
         findProjectByGitRoot: Statement;
         insertProject: Statement;
+
         touchProject: Statement;
     };
 
@@ -67,6 +68,10 @@ export class ProjectStore {
     // historical cwd key. Resolution is cached for this store lifetime so the
     // daemon does not execute git for every turn from the same cwd.
     upsertProject(projectPath: string, identity = this.resolveProjectIdentity(projectPath)): ProjectRow {
+        return this.db.transaction(() => this.upsertResolvedProject(projectPath, identity)).immediate();
+    }
+
+    private upsertResolvedProject(projectPath: string, identity: ResolvedProjectIdentity): ProjectRow {
         const existing = identity.gitRoot
             ? ((this.stmts.findProjectByGitRoot.get(identity.gitRoot) as ProjectRow | undefined) ?? undefined)
             : (this.stmts.findProjectByPath.get(projectPath) as ProjectRow | undefined);
@@ -76,14 +81,15 @@ export class ProjectStore {
             return { ...existing, last_seen_at: now };
         }
         const projectKey = identity.gitRoot ?? projectPath;
-        const inserted = this.stmts.insertProject.get({
+        const values = {
             path: projectKey,
             display_name: path.basename(projectKey),
             git_root: identity.gitRoot,
             git_remote: identity.gitRemote,
             git_root_commit: identity.gitRootCommit,
             now,
-        }) as { id: number };
+        };
+        const inserted = this.stmts.insertProject.get(values) as { id: number };
         // biome-ignore lint/style/noNonNullAssertion: row was just inserted or updated above, lookup by its returned id can't miss
         return this.getProjectById(inserted.id)!;
     }

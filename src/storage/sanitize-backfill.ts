@@ -23,6 +23,8 @@ import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { decodeAssistantStructure, transformAssistantStructure } from '../rendering/assistant-structure.js';
 import { detectShellSyntax, escapeShellSyntax, stripShellSyntax } from '../security/sanitize.js';
 
+import { TurnSearchIndex } from './turn-search-index.js';
+
 export interface SanitizeChange {
     table: 'session_rollups' | 'memories' | 'filtered_turns' | 'open_turns';
     rowId: number;
@@ -235,10 +237,12 @@ export function applySanitize(db: Database): SanitizePlan;
 export function applySanitize(db: Database, options: GuardedSanitizeApplyOptions): GuardedSanitizeApplyResult;
 export function applySanitize(db: Database, options?: GuardedSanitizeApplyOptions): SanitizePlan | GuardedSanitizeApplyResult {
     const plan = planSanitize(db);
+
     const apply = db.transaction(() => {
         if (options !== undefined && !options.beforeFirstMutation()) {
             return false;
         }
+
         for (const c of plan.changes) {
             const idColumn =
                 c.table === 'session_rollups' || c.table === 'open_turns'
@@ -248,6 +252,16 @@ export function applySanitize(db: Database, options?: GuardedSanitizeApplyOption
                       : 'id';
             db.prepare(`UPDATE ${c.table} SET ${c.field} = ? WHERE ${idColumn} = ?`).run(c.after, c.rowId);
         }
+        // Search coverage must describe the text the retained copy now holds.
+        const rewrittenCopies = new Set(
+            plan.changes
+                .filter((c) => c.table === 'filtered_turns' && (c.field === 'user_prompt' || c.field === 'assistant_response'))
+                .map((c) => c.rowId),
+        );
+        if (rewrittenCopies.size > 0) {
+            new TurnSearchIndex(db).reindexStoredCopies(rewrittenCopies, new Date().toISOString());
+        }
+
         return true;
     });
     if (options === undefined) {

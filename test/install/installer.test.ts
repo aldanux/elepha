@@ -1147,7 +1147,13 @@ describe('installer transaction', () => {
             expect(installed.status.ready).toBe(true);
             expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
                 mcp: {
-                    [ELEPHA_MCP_SERVER_NAME]: { type: 'local', command: [bin, ...ELEPHA_MCP_ARGS], enabled: true },
+                    servers: {
+                        [ELEPHA_MCP_SERVER_NAME]: {
+                            type: 'local',
+                            command: [bin, ...ELEPHA_MCP_ARGS],
+                            codemode: false,
+                        },
+                    },
                 },
                 plugin: [opencodePluginPath(paths.opencodeConfig)],
             });

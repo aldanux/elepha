@@ -51,3 +51,18 @@ If no project matches, elepha prints the known project paths so you can retry wi
 more specific query. If the project is absent entirely, review its permission in
 [Choosing what elepha may remember](consent.md); if it exists but ingest is stale, run
 the deep health check above.
+
+## Missing project directories and orphan cleanup
+
+Use `elepha purge --orphan --details` to inspect associated, relocated,
+chats that could not be safely classified, and chats with both missing and protected
+project parts before considering deletion. A missing
+provider transcript is not proof that project
+memory is orphaned. Existing temporary directories are preserved.
+
+Filesystem errors, ambiguous recorded relocation candidates and exhausted
+inspection budgets preserve memory with an explicit diagnostic. Resolve the
+access or ownership issue and obtain a new preview; errors never turn into
+deletion authority. Mixed sessions remain intact until segment-scoped cleanup
+can prevent resurrection without blocking valid siblings.
+

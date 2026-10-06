@@ -15,11 +15,6 @@ export type OpenedProviderTranscript = {
 export type ProviderTranscriptOpenResult = OpenedProviderTranscript | { reason: ProviderTranscriptOpenReason };
 export type ProviderTranscriptOpener = (tool: ToolName, sourcePath: string) => Promise<ProviderTranscriptOpenResult>;
 export type ProviderTranscriptIdentityResult = { resolvedPath: string } | { reason: ProviderTranscriptOpenReason };
-export type ProviderTranscriptIdentitySyncValidator = (
-    tool: ToolName,
-    sourcePath: string,
-    opened: Pick<OpenedProviderTranscript, 'handle' | 'stat'>,
-) => ProviderTranscriptIdentityResult;
 
 interface ProviderTranscriptFs {
     open: (sourcePath: string, flags: number) => Promise<FileHandle>;

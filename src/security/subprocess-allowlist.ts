@@ -3,7 +3,8 @@
 // (.biome-plugins/no-raw-subprocess.grit) bans exec/execSync/spawn/spawnSync
 // calls and the shell option everywhere else, and
 // test/security/subprocess-allowlist.test.ts asserts this file's actual call
-// sites match the fixed OpenCode hooks, git, service, npm, and macOS inspection wrappers here.
+// sites match the fixed OpenCode hook clients, git, service, npm, and
+// macOS inspection wrappers here.
 //
 // Git uses fixed subcommands and a canonicalized, consent-checked project
 // cwd. Service and npm wrappers use fixed lifecycle/package-management verbs
@@ -24,7 +25,9 @@ import {
     MEMORY_PLUS_TRANSFORMERS_MIN_VERSION,
     NPM_INSTALL_TIMEOUT_MS,
     NPM_REGISTRY_LOOKUP_TIMEOUT_MS,
+    OPENCODE_COMPACTION_RECEIPT_ACK,
     OPENCODE_PLUGIN_OUTPUT_MAX_BYTES,
+    OPENCODE_TASK_STATE_RECEIPT_ACK,
     SYSTEMD_SERVICE_NAME,
 } from '../config/constants.js';
 import { daemonLaunchAgentPath, elephaPaths, elephaServiceLabel } from '../config/paths.js';
@@ -33,6 +36,8 @@ import { ensurePrivateDir } from '../util/fs.js';
 
 export const OPENCODE_HOOK_ARGS = ['hook', 'user-prompt-submit', '--tool', 'opencode'] as const;
 export const OPENCODE_RULES_HOOK_ARGS = ['hook', 'standing-rules', '--tool', 'opencode'] as const;
+export const OPENCODE_COMPACTION_RECEIPT_ARGS = ['hook', 'compaction-receipt', '--tool', 'opencode'] as const;
+export const OPENCODE_TASK_STATE_RECEIPT_ARGS = ['hook', 'task-state-receipt', '--tool', 'opencode'] as const;
 
 // This client runs inside OpenCode. Only the trusted installed launcher is
 // baked into its code; project directory, session ID, and prompt stay on stdin.
@@ -83,6 +88,88 @@ function runRulesHook(payload) {
             child.stdin.end(input);
         } catch {
             resolve('');
+        }
+    });
+}
+`;
+}
+
+// The completed-compaction event is delivered only to a live V2 plugin
+// subscription. Its bounded payload stays on stdin, never in argv or cwd.
+export function renderOpencodeCompactionReceiptClient(launcher: string): string {
+    if (!path.isAbsolute(launcher)) {
+        throw new Error('OpenCode plugin launcher must be an absolute path');
+    }
+    return `const receiptLauncher = ${JSON.stringify(launcher)};
+function runCompactionReceipt(payload) {
+    return new Promise((resolve) => {
+        try {
+            const input = JSON.stringify(payload);
+            if (input.length > ${HOOK_PAYLOAD_MAX_CHARS}) {
+                console.warn('elepha compaction receipt payload too large; coverage unavailable');
+                resolve();
+                return;
+            }
+            const child = execFile(receiptLauncher, ${JSON.stringify(OPENCODE_COMPACTION_RECEIPT_ARGS)}, {
+                shell: false,
+                encoding: 'utf8',
+                timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
+                killSignal: 'SIGKILL',
+                maxBuffer: ${OPENCODE_PLUGIN_OUTPUT_MAX_BYTES},
+            }, (error, stdout) => {
+                if (error || stdout !== ${JSON.stringify(OPENCODE_COMPACTION_RECEIPT_ACK)}) {
+                    console.warn('elepha compaction receipt delivery failed; coverage unavailable');
+                }
+                resolve();
+            });
+            child.stdin.on('error', () => {
+                console.warn('elepha compaction receipt delivery failed; coverage unavailable');
+                resolve();
+            });
+            child.stdin.end(input);
+        } catch {
+            console.warn('elepha compaction receipt delivery failed; coverage unavailable');
+            resolve();
+        }
+    });
+}
+`;
+}
+
+export function renderOpencodeTaskStateReceiptClient(launcher: string): string {
+    if (!path.isAbsolute(launcher)) {
+        throw new Error('OpenCode plugin launcher must be an absolute path');
+    }
+    return `const taskStateReceiptLauncher = ${JSON.stringify(launcher)};
+function runTaskStateReceipt(payload) {
+    return new Promise((resolve) => {
+        try {
+            const input = JSON.stringify(payload);
+            if (input.length > ${HOOK_PAYLOAD_MAX_CHARS}) {
+                console.warn('elepha task-state receipt payload too large; coverage unavailable');
+                resolve();
+                return;
+            }
+            const child = execFile(taskStateReceiptLauncher, ${JSON.stringify(OPENCODE_TASK_STATE_RECEIPT_ARGS)}, {
+                shell: false,
+                encoding: 'utf8',
+                timeout: ${INSTALLED_HOOK_TIMEOUT_SECONDS * 1000},
+                killSignal: 'SIGKILL',
+                maxBuffer: ${OPENCODE_PLUGIN_OUTPUT_MAX_BYTES},
+            }, (error, stdout) => {
+                if (error || stdout !== ${JSON.stringify(OPENCODE_TASK_STATE_RECEIPT_ACK)}) {
+                    console.warn('elepha task-state receipt delivery failed; coverage unavailable');
+                }
+                resolve();
+            });
+            child.stdin.on('error', () => {
+                console.warn('elepha task-state receipt delivery failed; coverage unavailable');
+                resolve();
+            });
+            child.stdin.end(input);
+        } catch {
+            console.warn('elepha task-state receipt delivery failed; coverage unavailable');
+            resolve();
         }
     });
 }

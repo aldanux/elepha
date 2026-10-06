@@ -30,7 +30,7 @@
     },
     "files": {
         "ignoreUnknown": true,
-        "includes": ["**", "!dist", "!node_modules", "!.doc", "!test/fixtures/biome-plugin"]
+        "includes": ["**", "!dist", "!node_modules", "!.doc"]
     },
     "assist": {
         "actions": {

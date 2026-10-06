@@ -14,6 +14,7 @@ import { enableParanoidMode, LOCKED_MEMORY_MESSAGE, lockMemory, unlockMemory } f
 import { mergeRollupContent, RollupStore, type RollupWrite } from '../../src/storage/rollup-store.js';
 import { applySanitize, planSanitize, verifySanitize } from '../../src/storage/sanitize-backfill.js';
 import type { ParsedTurn, SummarizationOutput } from '../../src/types/index.js';
+import { expectLiveMemoryCurrent } from '../helpers/live-memory.js';
 import { withGrantableTestDir } from '../helpers/tmp.js';
 
 const C1_CONTROLS = '\u0080\u0085\u0090\u009b\u009f';
@@ -380,6 +381,7 @@ describe('Rule 3 backfill', () => {
         ).total_bytes;
         expect(usage).toBeLessThan(usageBefore);
         expect(usage).toBe(measured);
+        expectLiveMemoryCurrent(db);
 
         const storedAfterFirstApply = JSON.stringify(row);
         expect(applySanitize(db).changes).toEqual([]);

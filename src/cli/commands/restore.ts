@@ -5,6 +5,9 @@ import path from 'node:path';
 import Database from 'better-sqlite3-multiple-ciphers';
 import type { Command } from 'commander';
 import { PRIVATE_FILE_MODE, SQLITE_MINIMUM_DATABASE_BYTES } from '../../config/constants.js';
+import { assertNoPendingInitApply } from '../../config/init-apply-journal.js';
+import { LIVE_MEMORY_CAPACITY_BYTES } from '../../config/live-memory-retention.js';
+import { elephaConfigPath } from '../../config/paths.js';
 import { daemonHealth as currentDaemonHealth, type DaemonHealth } from '../../install/health-checks.js';
 import { writeBackup } from '../../storage/backup.js';
 import { readCandidateStandingRules, scanCandidateSessionRules, validateCandidateSemantics } from '../../storage/candidate-validator.js';
@@ -32,6 +35,8 @@ import {
 } from '../../storage/db.js';
 import {
     assertCanonicalDurableCaptureSchema,
+    DURABLE_CAPTURE_SCHEMA_MISMATCH,
+    noncanonicalTriggerTables,
     normalizeAndVerifyDurableCapture,
     repairLegacyOpenTurnSessionForeignKey,
     tableClauseSignature,
@@ -45,10 +50,23 @@ import {
     inspectPrivateEmptyDatabaseDescriptor,
     writeEncryptedDatabaseImport,
 } from '../../storage/encrypted-database-export.js';
+
 import { type InjectionRow, injectionBodyHash, type McpReceiptRow } from '../../storage/injection-store.js';
+import {
+    assertLiveMemoryBulkWrite,
+    hasNoncanonicalLiveMemoryTrigger,
+    LIVE_MEMORY_TRIGGER_TABLES_JSON,
+} from '../../storage/live-memory-usage.js';
 import { type ParanoidControlState, readParanoidControlState } from '../../storage/paranoid-gate.js';
+
 import type { SessionRuleRow } from '../../storage/session-rules-store.js';
 import type { StandingRuleRow } from '../../storage/standing-rules-store.js';
+import { TURN_EMBEDDINGS_REINDEX_TRIGGER } from '../../storage/turn-embeddings.js';
+import {
+    RetiredTurnSearchSchemaError,
+    TURN_SEARCH_CLEANUP_TRIGGER,
+    TURN_SEARCH_COPY_CLEANUP_TRIGGER,
+} from '../../storage/turn-search-index.js';
 import { isToolName } from '../../types/index.js';
 import { errorMessage } from '../../util/error.js';
 import { atomicCopyPrivateFile } from '../../util/fs.js';
@@ -167,6 +185,8 @@ export interface RestoreRuntime {
     daemonHealth?: () => DaemonHealth;
     writeBackup?: (db: Database.Database, dbPath: string) => string;
     confirm?: () => Promise<boolean>;
+    // Test seam for the fixed live-memory capacity, so a test need not allocate gigabytes.
+    liveMemoryCapacityBytes?: number;
 }
 
 export interface RestoreResult {
@@ -302,21 +322,60 @@ function normalizedColumns(table: string, columns: TableColumn[]): TableColumn[]
     );
 }
 
+// Name and table only: trigger bodies are compared token-for-token against the
+// canonical schema after migration by assertCanonicalDurableCaptureSchema, so a
+// same-name trigger with a modified body is still rejected there. Authority
+// table triggers are left to authorityTriggerError, which compares their
+// definitions before the candidate is ever written. Live-memory ledger
+// triggers sit on many evidence tables that earlier migrations write, so their
+// definitions are compared here, before migration can fire them.
 function hasNoncanonicalTrigger(db: Database.Database): boolean {
     return (
+        hasNoncanonicalLiveMemoryTrigger(db) ||
         db
             .prepare(
                 `SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND NOT (
+                     tbl_name COLLATE NOCASE IN ('consent_roots', 'projects')
+                     OR
                      tbl_name COLLATE NOCASE = 'filtered_turns' AND name COLLATE NOCASE IN
                      ('filtered_turns_ai', 'filtered_turns_ad', 'filtered_turns_au',
                       'filtered_turns_usage_ai', 'filtered_turns_usage_ad', 'filtered_turns_usage_au',
-                      'filtered_turns_structure_au')
+                      'filtered_turns_structure_au', ?)
                      OR tbl_name COLLATE NOCASE = 'open_turns' AND name COLLATE NOCASE IN
                      ('open_turns_usage_ai', 'open_turns_usage_ad', 'open_turns_usage_au')
+                     OR tbl_name COLLATE NOCASE = 'memories' AND name COLLATE NOCASE = ?
+                     OR tbl_name COLLATE NOCASE = 'turn_search_index' AND name COLLATE NOCASE = ?
+                     OR EXISTS (
+                         SELECT 1 FROM json_each(?) ledger
+                         WHERE tbl_name COLLATE NOCASE = json_extract(ledger.value, '$[0]')
+                           AND name COLLATE NOCASE = json_extract(ledger.value, '$[1]')
+                     )
                  ) LIMIT 1`,
             )
-            .get() !== undefined
+            .get(
+                TURN_SEARCH_COPY_CLEANUP_TRIGGER,
+                TURN_SEARCH_CLEANUP_TRIGGER,
+                TURN_EMBEDDINGS_REINDEX_TRIGGER,
+                LIVE_MEMORY_TRIGGER_TABLES_JSON,
+            ) !== undefined
     );
+}
+
+// consent_roots and projects decide what may be served. Their only admissible
+// triggers are the canonical embedding-refresh epoch triggers, which make any
+// authority change, including a revoke followed by an identical grant,
+// invalidate a persisted refresh cursor. Each must match the current schema by
+// name, table, and parsed definition; any other trigger could rewrite authority
+// when migration or restore writes these tables. Before migration an absent
+// trigger is allowed because migration creates it; afterwards all must exist.
+const AUTHORITY_TRIGGER_TABLES = ['consent_roots', 'projects'] as const;
+
+function authorityTriggerError(db: Database.Database, canonical: Database.Database, requireAll: boolean): string | undefined {
+    const differing = noncanonicalTriggerTables(db, canonical, AUTHORITY_TRIGGER_TABLES, { requireAll });
+    if (differing.includes('consent_roots')) {
+        return RESTORE_CONSENT_TRIGGER_ERROR;
+    }
+    return differing.length > 0 ? RESTORE_CONTROL_TRIGGER_ERROR : undefined;
 }
 
 function schemaDifferences(candidate: Database.Database, canonical: Database.Database): string[] {
@@ -432,8 +491,21 @@ function verifyStagedSchema(stagedPath: string, encryptionKey?: Buffer): void {
     let staged: Database.Database | undefined;
     let canonical: Database.Database | undefined;
     try {
-        staged = encryptionKey === undefined ? openUnmanagedDb(stagedPath) : openInitializedKeyedDatabase(stagedPath, encryptionKey);
+        try {
+            staged = encryptionKey === undefined ? openUnmanagedDb(stagedPath) : openInitializedKeyedDatabase(stagedPath, encryptionKey);
+        } catch (error) {
+            // A substituted legacy turn-search set is a durable schema mismatch
+            // for a backup, reported like any other before confirmation.
+            if (error instanceof RetiredTurnSearchSchemaError) {
+                throw new Error(DURABLE_CAPTURE_SCHEMA_MISMATCH, { cause: error });
+            }
+            throw error;
+        }
         canonical = openDb(':memory:');
+        const stagedTriggerError = authorityTriggerError(staged, canonical, true);
+        if (stagedTriggerError !== undefined) {
+            throw new Error(stagedTriggerError);
+        }
         if (hasNoncanonicalTrigger(staged)) {
             throw new Error(RESTORE_CONTROL_TRIGGER_ERROR);
         }
@@ -499,11 +571,10 @@ function verifyDatabase(
 function validateCandidate(candidate: Database.Database, candidatePath: string): RestoreCounts {
     let counts: RestoreCounts | undefined;
     let validationError: string | undefined;
+    const canonical = openDb(':memory:');
     try {
         assertBoundedDatabaseSchemaMetadata(candidate);
-        if (candidate.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name COLLATE NOCASE = 'consent_roots'").get()) {
-            validationError = RESTORE_CONSENT_TRIGGER_ERROR;
-        }
+        validationError = authorityTriggerError(candidate, canonical, false);
         if (validationError === undefined && hasNoncanonicalTrigger(candidate)) {
             validationError = RESTORE_CONTROL_TRIGGER_ERROR;
         } else if (validationError === undefined) {
@@ -525,6 +596,8 @@ function validateCandidate(candidate: Database.Database, candidatePath: string):
             throw error;
         }
         throw new Error(`Not a valid SQLite backup at ${candidatePath}: ${errorMessage(error)}`);
+    } finally {
+        canonical.close();
     }
     if (validationError !== undefined) {
         throw new Error(validationError);
@@ -971,6 +1044,7 @@ function overlayControlState(
     controls?: RestoreControls,
     expectedRulesFingerprint?: string,
     expectedSessionRulesFingerprint?: string,
+    liveMemoryCapacityBytes: number = LIVE_MEMORY_CAPACITY_BYTES,
 ) {
     const restored = key === undefined ? openUnmanagedDb(stagedPath) : openKeyedDatabase(stagedPath, key);
     try {
@@ -980,6 +1054,7 @@ function overlayControlState(
         const evictions = logicalPlan([...currentEvictions, ...candidateEvictions.rows]).rows.filter(
             (row, index, rows) => index === 0 || JSON.stringify(row) !== JSON.stringify(rows[index - 1]),
         );
+
         restored.transaction(() => {
             restored.prepare('DELETE FROM consent_roots').run();
             const insert = restored.prepare(
@@ -1117,6 +1192,9 @@ function overlayControlState(
             }
         })();
         normalizeAndVerifyDurableCapture(restored);
+        // Restore cannot run automatic cleanup, so a backup whose memory is at
+        // or above capacity is refused before anything is installed.
+        assertLiveMemoryBulkWrite(restored, 0, liveMemoryCapacityBytes);
         if (expectedRulesFingerprint !== undefined && standingRulesPlan(restored, true).fingerprint !== expectedRulesFingerprint) {
             throw new Error(RESTORE_STANDING_RULES_STAGE_ERROR);
         }
@@ -1219,6 +1297,9 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
     if (!existsSync(candidatePath)) {
         throw new Error(`Backup file not found: ${candidatePath}`);
     }
+    // Resolving an onboarding apply compares the active consent rows with its
+    // journal; replacing the database first would make that comparison meaningless.
+    assertNoPendingInitApply(elephaConfigPath());
     const stagedDirectory = mkdtempSync(path.join(tmpdir(), 'elepha-restore-'));
     const stagedPath = path.join(stagedDirectory, 'candidate.db');
     let candidateKey: Buffer | undefined;
@@ -1335,6 +1416,7 @@ export async function runRestoreOperation(candidatePath: string, runtime: Restor
                 confirmedControls,
                 candidateRules.fingerprint,
                 candidateSessionRules.fingerprint,
+                runtime.liveMemoryCapacityBytes,
             );
             removeDatabaseCompanions([stagedPath]);
             if (retainedEncryption !== undefined) {

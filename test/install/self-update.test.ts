@@ -200,7 +200,7 @@ describe('selfUpdate', () => {
         expect(readFileSync(paths.codexConfig, 'utf8')).toBe(transformCodexMcp('model = "custom"', launcher));
         expect(JSON.parse(readFileSync(paths.opencodeConfig, 'utf8'))).toEqual({
             plugin: ['user-plugin'],
-            mcp: { elepha: { type: 'local', command: [launcher, 'mcp', 'serve'], enabled: true } },
+            mcp: { servers: { elepha: { type: 'local', command: [launcher, 'mcp', 'serve'], codemode: false } } },
         });
         for (const file of [...Object.values(paths), plugin]) {
             expect(runtime.report).toHaveBeenCalledWith(expect.stringContaining(file));

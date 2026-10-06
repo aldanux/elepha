@@ -8,6 +8,7 @@
 import { unlinkSync } from 'node:fs';
 import { PRIVATE_FILE_MODE } from '../config/constants.js';
 import { daemonHeartbeatPath } from '../config/paths.js';
+
 import { atomicWrite, readJson } from '../util/fs.js';
 
 export { HEARTBEAT_INTERVAL_MS, HEARTBEAT_STALE_MS } from '../config/constants.js';
@@ -23,7 +24,11 @@ export function defaultHeartbeatPath(): string {
 }
 
 export function writeHeartbeat(filePath: string, startedAt: string): void {
-    const heartbeat: Heartbeat = { pid: process.pid, startedAt, updatedAt: new Date().toISOString() };
+    const heartbeat: Heartbeat = {
+        pid: process.pid,
+        startedAt,
+        updatedAt: new Date().toISOString(),
+    };
     atomicWrite(filePath, JSON.stringify(heartbeat), PRIVATE_FILE_MODE);
 }
 

@@ -7,7 +7,7 @@ registering elepha with the tools you use, and choosing which projects it may re
 
 ## Requirements
 
-You need Node.js 22.12.0 or newer. elepha supports macOS and Linux, including Windows
+You need Node.js 22.15.0 or newer. elepha supports macOS and Linux, including Windows
 through WSL; native Windows is not supported. Linux requires glibc 2.35 or newer and
 systemd. The encrypted database driver ships as a prebuilt binary, so no compiler is
 needed. WSL users may need to enable systemd as described in [WSL](#wsl).
@@ -71,8 +71,8 @@ recovery requirements.
 Nothing is written into your project directories, and elepha never modifies the
 original Claude Code or Codex transcripts or the OpenCode session database. Use the [storage tools](storage.md) to
 make encrypted same-installation backups instead of treating the database as
-disposable: it holds privacy and lifecycle state and, when durable capture is enabled,
-may hold the only surviving sanitized copy of a deleted source transcript.
+disposable: it holds privacy and lifecycle state and may hold the only surviving
+sanitized copy of a deleted source transcript.
 
 ## Platform notes
 
