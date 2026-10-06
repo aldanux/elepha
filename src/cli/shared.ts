@@ -129,6 +129,7 @@ export async function withCapturePaused(
     fn: () => Promise<void>,
     output: CliOutputSink = console,
     releaseBeforeResume?: () => void | Promise<void>,
+    showProgress = true,
 ): Promise<boolean> {
     const health = daemonHealth();
     if (!health.healthy) {
@@ -147,18 +148,18 @@ export async function withCapturePaused(
     }
 
     // Keep progress confined to service transitions so previews, confirmation and backup reports stay unobscured.
-    const pauseProgress = startCliProgress('Pausing capture');
+    const pauseProgress = showProgress ? startCliProgress('Pausing capture') : undefined;
     let pausedByUs = false;
     try {
         pauseCaptureService(service);
         pausedByUs = await waitForCaptureToStop();
         if (pausedByUs) {
-            pauseProgress.done('Capture paused');
+            pauseProgress?.done('Capture paused');
         } else {
-            pauseProgress.fail('Could not pause capture');
+            pauseProgress?.fail('Could not pause capture');
         }
     } catch (error) {
-        pauseProgress.fail('Could not pause capture');
+        pauseProgress?.fail('Could not pause capture');
         output.error(errorMessage(error));
     }
 
@@ -169,13 +170,13 @@ export async function withCapturePaused(
     }
 
     const resume = async (): Promise<void> => {
-        const resumeProgress = startCliProgress('Resuming capture');
+        const resumeProgress = showProgress ? startCliProgress('Resuming capture') : undefined;
         try {
             await releaseBeforeResume?.();
             await resumeCaptureService(service);
-            resumeProgress.done('Capture resumed');
+            resumeProgress?.done('Capture resumed');
         } catch (error) {
-            resumeProgress.fail('Could not resume capture');
+            resumeProgress?.fail('Could not resume capture');
             setOutputExitCode(output, 1);
             throw error;
         }

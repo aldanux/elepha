@@ -20,6 +20,7 @@ export interface DestructiveOpOptions<Plan> {
     confirm?: (plan: Plan) => MaybePromise<boolean>;
     backupLog?: (message: string) => void;
     output?: CliOutputSink;
+    captureProgress?: boolean;
     // Default: the operation's db is closed before the daemon is resumed, so the
     // resumed daemon can migrate and open without a competing connection (D117).
     // Set true only when the caller keeps using this handle after runDestructiveOp
@@ -69,5 +70,6 @@ export async function runDestructiveOp<Plan>(opts: DestructiveOpOptions<Plan>): 
             : () => {
                   opts.db.close();
               },
+        opts.captureProgress,
     );
 }
