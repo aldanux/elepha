@@ -85,8 +85,7 @@ describe('D123 OpenCode UserPromptSubmit hook runtime', () => {
         ).toMatchObject(valid);
 
         const runtimeTool: HookTool = 'opencode';
-        expect(runtimeTool).toBe('opencode');
-        expect(isHookTool('opencode')).toBe(true);
+        expect(isHookTool(runtimeTool)).toBe(true);
     });
 
     it('matches Claude list output and keys its shown list and resume to OpenCode', async () => {

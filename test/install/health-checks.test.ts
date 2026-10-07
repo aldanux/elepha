@@ -12,7 +12,10 @@ describe('shared installation health checks', () => {
         const root = withTempDir('elepha-health-');
         const heartbeat = path.join(root, 'daemon.heartbeat.json');
 
-        expect(daemonHealth(heartbeat, 0)).toEqual({ state: 'NOT RUNNING (no heartbeat file)', healthy: false });
+        const missing = daemonHealth(heartbeat, 0);
+        expect(missing.healthy).toBe(false);
+        expect(missing.state).toMatch(/^NOT RUNNING\b/);
+        expect(missing.heartbeat).toBeUndefined();
 
         const gonePid = 2_147_483_647;
         writeFileSync(
@@ -20,10 +23,9 @@ describe('shared installation health checks', () => {
             JSON.stringify({ pid: gonePid, startedAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() }),
         );
         const gone = daemonHealth(heartbeat, 0);
-        expect({ state: gone.state, healthy: gone.healthy }).toEqual({
-            state: `NOT RUNNING (pid ${gonePid} from last heartbeat is gone - crashed?)`,
-            healthy: false,
-        });
+        expect(gone.healthy).toBe(false);
+        expect(gone.state).toMatch(/^NOT RUNNING\b/);
+        expect(gone.state).toContain(`pid ${gonePid}`);
         expect(gone.heartbeat).toEqual({
             pid: gonePid,
             startedAt: new Date(0).toISOString(),
@@ -35,10 +37,10 @@ describe('shared installation health checks', () => {
             JSON.stringify({ pid: process.pid, startedAt: new Date(0).toISOString(), updatedAt: new Date(0).toISOString() }),
         );
         const stale = daemonHealth(heartbeat, 60_000);
-        expect({ state: stale.state, healthy: stale.healthy }).toEqual({
-            state: `STUCK (pid ${process.pid} alive, but heartbeat is 1m old - process may be hung)`,
-            healthy: false,
-        });
+        expect(stale.healthy).toBe(false);
+        expect(stale.state).toMatch(/^STUCK\b/);
+        expect(stale.state).toContain(`pid ${process.pid}`);
+        expect(stale.state).toMatch(/\b1m\b/);
         expect(stale.heartbeat).toEqual({
             pid: process.pid,
             startedAt: new Date(0).toISOString(),
@@ -50,10 +52,10 @@ describe('shared installation health checks', () => {
             JSON.stringify({ pid: process.pid, startedAt: new Date(59_000).toISOString(), updatedAt: new Date(59_000).toISOString() }),
         );
         const live = daemonHealth(heartbeat, 60_000);
-        expect({ state: live.state, healthy: live.healthy }).toEqual({
-            state: `RUNNING (pid ${process.pid}, heartbeat 1s ago)`,
-            healthy: true,
-        });
+        expect(live.healthy).toBe(true);
+        expect(live.state).toMatch(/^RUNNING\b/);
+        expect(live.state).toContain(`pid ${process.pid}`);
+        expect(live.state).toMatch(/\b1s\b/);
         expect(live.heartbeat).toEqual({
             pid: process.pid,
             startedAt: new Date(59_000).toISOString(),

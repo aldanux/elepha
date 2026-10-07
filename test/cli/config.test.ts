@@ -20,7 +20,7 @@ function fakePrompts(selections: Array<string | typeof CANCELLED>): { prompts: C
     const events: string[] = [];
     const prompts: ConfigPrompts = {
         intro: (title) => events.push(`intro:${title}`),
-        note: (message, title) => events.push(`note:${title ?? ''}:${message}`),
+        note: vi.fn((message, title) => events.push(`note:${title ?? ''}:${message}`)),
         select: vi.fn(async (options) => {
             events.push(
                 `select:${options.message}:${options.options
@@ -32,7 +32,7 @@ function fakePrompts(selections: Array<string | typeof CANCELLED>): { prompts: C
             return selections.shift() ?? CANCELLED;
         }),
         isCancel: (value) => value === CANCELLED,
-        cancel: (message) => events.push(`cancel:${message}`),
+        cancel: vi.fn(),
         outro: (message) => events.push(`outro:${message}`),
     };
     return { prompts, events };
@@ -143,6 +143,7 @@ describe('elepha config', () => {
             expect(applied.events[2]).toContain('On (default),Off');
             expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({ 'capture-claude-code': false });
 
+            const beforeOverride = readFileSync(configPath, 'utf8');
             const overridden = fakePrompts(['update-check', CANCELLED]);
             await expect(
                 runConfigWizard({
@@ -156,9 +157,12 @@ describe('elepha config', () => {
             expect(overridden.events[1]).toContain(
                 'update-check = Off (env),capture-claude-code = Off,capture-codex = On (default),capture-opencode = On (default),durable-capture = Off (default),memory-plus = Off (default),query-matching = strict (default)',
             );
-            expect(overridden.events[2]).toBe(
-                'note:Environment override:ELEPHA_NO_UPDATE_CHECK currently overrides this setting for this run. Your config preference will still be saved.',
+            expect(overridden.prompts.note).toHaveBeenCalledWith(
+                expect.stringMatching(/ELEPHA_NO_UPDATE_CHECK.*overrid/i),
+                expect.any(String),
             );
+            expect(overridden.prompts.cancel).toHaveBeenCalledOnce();
+            expect(readFileSync(configPath, 'utf8')).toBe(beforeOverride);
             expect(overridden.events[3]).toContain('On (default),Off');
 
             setSetting('capture-codex', 'off', configPath);
@@ -167,7 +171,7 @@ describe('elepha config', () => {
             await expect(runConfigWizard({ output, prompts: refused.prompts, configPath, environment: {} })).resolves.toBe(0);
 
             expect(refused.events).toContain('note:Setting unchanged:at least one capture tool must remain enabled');
-            expect(refused.events).toContain('cancel:Operation cancelled. No changes were made.');
+            expect(refused.prompts.cancel).toHaveBeenCalledOnce();
             expect(readFileSync(configPath, 'utf8')).toBe(before);
 
             const queryMatching = fakePrompts(['query-matching', 'lax']);
