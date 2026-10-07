@@ -2,10 +2,12 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../../src/adapters/claude-code.js';
+import { CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES } from '../../src/config/constants.js';
 import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { TASK_STATE_REQUEST_INSTRUCTIONS } from '../../src/serving/instructions.js';
+import { openDb, type openUnmanagedDb } from '../../src/storage/db.js';
 import { TaskStateRequestStore } from '../../src/storage/task-state-request-store.js';
 import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
 
@@ -27,13 +29,28 @@ function fixture() {
     mkdirSync(path.dirname(sourcePath), { recursive: true });
     writeFileSync(sourcePath, '');
     seedSession(f, { project, tool: 'claude-code', nativeId: 'chat-1', sourcePath, kind: 'main' });
-    vi.spyOn(providers, 'createEmbeddingProvider').mockResolvedValue({
+    const provider = vi.spyOn(providers, 'createEmbeddingProvider').mockResolvedValue({
         configuration: { provider: 'local', model: 'fixture', revision: 'v1', dimensions: 2 },
         embed: async () => [1, 0],
         dispose: async () => {},
     });
+    const databaseOpen = vi.fn();
+    function openDatabase(dbPath: ':memory:'): ReturnType<typeof openUnmanagedDb>;
+    function openDatabase(dbPath?: string): ReturnType<typeof openDb>;
+    function openDatabase(dbPath?: string) {
+        databaseOpen(dbPath);
+        return dbPath === ':memory:' ? openDb(dbPath) : openDb(dbPath);
+    }
     const run = (
-        options: { prompt?: string; sourcePath?: string; agentId?: string; enabled?: boolean; writeInjection?: () => boolean } = {},
+        options: {
+            prompt?: string;
+            sourcePath?: string | null;
+            agentId?: string;
+            agentType?: string;
+            enabled?: boolean;
+            dbPath?: string;
+            writeInjection?: () => boolean;
+        } = {},
     ) => {
         if (options.enabled === false) setSetting('memory-plus', 'false', configPath);
         return runUserPromptSubmit(
@@ -42,17 +59,42 @@ function fixture() {
                 cwd: project.path,
                 hook_event_name: 'UserPromptSubmit',
                 prompt: options.prompt ?? 'Continue the active task.',
-                transcript_path: options.sourcePath ?? sourcePath,
+                transcript_path: options.sourcePath === undefined ? sourcePath : options.sourcePath,
                 ...(options.agentId ? { agent_id: options.agentId } : {}),
+                ...(options.agentType ? { agent_type: options.agentType } : {}),
             }),
             'claude-code',
-            { dbPath: f.dbPath, configPath, log: () => {}, ...(options.writeInjection ? { writeInjection: options.writeInjection } : {}) },
+            {
+                dbPath: options.dbPath ?? f.dbPath,
+                configPath,
+                openDatabase,
+                log: () => {},
+                ...(options.writeInjection ? { writeInjection: options.writeInjection } : {}),
+            },
         );
     };
     const requestCount = () => (f.db.prepare('SELECT COUNT(*) AS count FROM task_state_requests').get() as { count: number }).count;
     const injectionCount = () => (f.db.prepare('SELECT COUNT(*) AS count FROM injections').get() as { count: number }).count;
-    return { ...f, configPath, project, sourcePath, run, requestCount, injectionCount };
+    return { ...f, configPath, project, sourcePath, run, requestCount, injectionCount, provider, databaseOpen };
 }
+
+it.each([
+    { enabled: false },
+    { agentType: 'review' },
+    { sourcePath: null },
+    { sourcePath: '' },
+    { sourcePath: 'x'.repeat(CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES + 1) },
+    { sourcePath: 'other-chat.jsonl' },
+    { prompt: ' ' },
+])('does no database or receipt work for an ineligible Claude payload (case %#)', async (options) => {
+    const f = fixture();
+    expect(await f.run(options)).toEqual({ reason: 'not_command' });
+    expect(f.databaseOpen).not.toHaveBeenCalled();
+    expect(await f.run({ ...options, dbPath: path.join(f.directory, 'missing.db') })).toEqual({ reason: 'not_command' });
+    expect(f.provider).not.toHaveBeenCalled();
+    expect(f.requestCount()).toBe(0);
+    expect(f.injectionCount()).toBe(0);
+});
 
 it('asks one verified Claude main chat for a task-state report and preserves its pending request', async () => {
     const f = fixture();
@@ -63,6 +105,7 @@ it('asks one verified Claude main chat for a task-state report and preserves its
     expect(body).toContain(TASK_STATE_REQUEST_INSTRUCTIONS);
     expect(f.requestCount()).toBe(1);
     expect(f.injectionCount()).toBe(1);
+    expect(f.provider).not.toHaveBeenCalled();
     const second = await f.run();
     expect(second).toHaveProperty('output');
     expect(JSON.stringify(second)).toBe(body);

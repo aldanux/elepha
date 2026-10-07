@@ -59,9 +59,6 @@ export async function semanticRecall(
     options: {
         configPath?: string;
         createProvider?: typeof createEmbeddingProvider;
-        beforeUse?: () => void;
-        // Strict floor for automatic recall; explicit search keeps all similarities.
-        minSimilarity?: number;
     } = {},
 ): Promise<SemanticRecallResult> {
     // Keep all embedding imports, provider configuration and vector reads behind
@@ -76,7 +73,6 @@ export async function semanticRecall(
     const generation = withMemoryReadGeneration(db, lockedEmbedding, (token) => token);
     const store = new EmbeddingStore(db, options.configPath);
     const check = () => {
-        options.beforeUse?.();
         return withMemoryReadGeneration(db, lockedEmbedding, () => store.assertEnabled(), generation);
     };
     check();
@@ -107,9 +103,6 @@ export async function semanticRecall(
             }
             const dot = stored.vector.reduce((total, value, index) => total + value * queryVector[index], 0);
             const similarity = Math.max(-1, Math.min(1, dot / (queryNorm * Math.hypot(...stored.vector))));
-            if (options.minSimilarity !== undefined && similarity <= options.minSimilarity) {
-                return;
-            }
             qualifyingSessionIds.push(stored.sessionId);
             const candidate = { sessionId: stored.sessionId, similarity };
             const position = candidates.findIndex(
@@ -128,7 +121,6 @@ export async function semanticRecall(
         },
         generation,
     );
-    options.beforeUse?.();
     const selected = new Set(candidates.map((candidate) => candidate.sessionId));
     return { candidates, truncation, hitCapOmittedSessionIds: qualifyingSessionIds.filter((id) => !selected.has(id)) };
 }

@@ -206,14 +206,6 @@ export class MemoryStore {
         return this.injections.recordInjection(input);
     }
 
-    hasInjectionBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): boolean {
-        return this.injections.hasBodyPrefix(tool, nativeSessionId, prefix);
-    }
-
-    countInjectionBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): number {
-        return this.injections.countBodyPrefix(tool, nativeSessionId, prefix);
-    }
-
     injectionsForSession(tool: ToolName, nativeSessionId: string, atOrBefore: string): InjectionRow[] {
         return this.injections.injectionsForSession(tool, nativeSessionId, atOrBefore);
     }
