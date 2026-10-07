@@ -73,8 +73,6 @@ export class InjectionStore {
     private readonly stmts: {
         insertInjection: Statement;
         injectionsForSession: Statement;
-        injectionsForPrefix: Statement;
-        countForPrefix: Statement;
         hookCandidateExists: Statement;
         hookBodiesForSession: Statement;
         injectionBodyById: Statement;
@@ -92,12 +90,6 @@ export class InjectionStore {
         this.includePersistedMcp = options.includePersistedMcp ?? true;
         this.now = options.now ?? Date.now;
         this.stmts = {
-            injectionsForPrefix: db.prepare(
-                'SELECT 1 FROM injections WHERE tool = ? AND native_session_id = ? AND substr(body, 1, ?) = ? LIMIT 1',
-            ),
-            countForPrefix: db.prepare(
-                'SELECT count(*) AS count FROM injections WHERE tool = ? AND native_session_id = ? AND substr(body, 1, ?) = ?',
-            ),
             insertInjection: db.prepare(
                 `INSERT OR IGNORE INTO injections (tool, native_session_id, injected_at, injection_id, body_hash, body)
                  VALUES (@tool, @native_session_id, @injected_at, @injection_id, @body_hash, @body)`,
@@ -319,17 +311,6 @@ export class InjectionStore {
 
     mcpReceiptsForSession(tool: ToolName, nativeSessionId: string, sourceGeneration: number): McpReceiptRow[] {
         return this.stmts.mcpReceiptsForSession.all(tool, nativeSessionId, sourceGeneration) as McpReceiptRow[];
-    }
-
-    // Query the existing hook injection index without loading its historical
-    // bodies. A stable candidate prefix survives fresh DATA nonces and changed prompts.
-    hasBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): boolean {
-        return this.stmts.injectionsForPrefix.get(tool, nativeSessionId, prefix.length, prefix) !== undefined;
-    }
-
-    countBodyPrefix(tool: ToolName, nativeSessionId: string, prefix: string): number {
-        const row = this.stmts.countForPrefix.get(tool, nativeSessionId, prefix.length, prefix) as { count: number };
-        return row.count;
     }
 
     quoteBackStatus(turn: QuoteBackTurn): InjectionQuoteBackResult {

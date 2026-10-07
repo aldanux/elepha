@@ -52,6 +52,12 @@ page work in all three.
 
 ## Guided continuity over MCP
 
+Ordinary prompts do not trigger historical memory injection or embedding inference.
+The working AI decides when to retrieve history through MCP; no user-written
+`elepha:` command is required. Memory-Plus keeps multilingual semantic search
+available to `recall` and explicit `elepha:query` commands. Standing rules and
+task-state requests remain separate from historical retrieval.
+
 For a continuity request, clients first find candidates with `list_sessions` or
 `recall`, then inspect `get_session({ id, view: "capsule" })`. A capsule reads stored
 metadata only: historical summary, newest recorded decisions, historical pending

@@ -3,8 +3,6 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-    AUTOMATIC_RECALL_MAX_CONTEXT_CHARS,
-    MAX_TITLE_CHARS,
     SEMANTIC_RECALL_MAX_HITS,
     SEMANTIC_SCAN_BUDGET_MS,
     SEMANTIC_SCAN_MAX_ROWS,
@@ -15,7 +13,6 @@ import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { ElephaMcpService } from '../../src/mcp/tools.js';
-import { AUTOMATIC_RECALL_BODY_PREFIX } from '../../src/serving/automatic-recall.js';
 import * as lexicalModule from '../../src/serving/lexical-recall.js';
 import {
     hitIdentity,
@@ -148,6 +145,48 @@ afterEach(() => {
 });
 
 describe('semantic retrieval and explicit search integration', () => {
+    it('retrieves a multilingual semantic candidate through MCP and exposes its superseding agreement in a bounded tail', async () => {
+        const f = fixture();
+        const session = f.add('Dispatch agreement', [1, 0]);
+        const opening = 'Use batch_limit:17 for dispatch.json.';
+        const correction = 'Replace the previous agreement with batch_limit:43; 17 is superseded.';
+        seedMemory(f, {
+            project: f.project,
+            session,
+            userMessage: opening,
+            assistantText: 'Agreed: the initial batch limit is 17.',
+            durableCapture: true,
+        });
+        seedMemory(f, {
+            project: f.project,
+            session,
+            turnIndex: 1,
+            userMessage: correction,
+            assistantText: 'Confirmed: dispatch.json must use batch_limit:43.',
+            durableCapture: true,
+        });
+        f.embeddings.write(
+            f.embeddings.source(session.id)!,
+            configuration,
+            [1, 0],
+            withMemoryReadGeneration(f.db, lockedEmbedding, (token) => token),
+        );
+        const service = new ElephaMcpService(f.db);
+        const query = '以前の取り決めを踏まえて作業を続ける';
+        const recalled = text(await service.recall({ query }));
+        expect(f.provider.embed).toHaveBeenCalledWith(query, expect.any(Function), 'query');
+        expect(recalled).toContain(publicSessionId(session));
+        expect(recalled).toContain(SEMANTIC_DISCOVERY);
+        const capsule = text(await service.getSession({ id: publicSessionId(session), view: 'capsule' }));
+        expect(capsule).toContain(publicSessionId(session));
+        const tail = text(await service.getSession({ id: publicSessionId(session), last_n: 2 }));
+        expect(tail).toContain(opening);
+        expect(tail).toContain(correction);
+        expect(tail).toContain('Confirmed: dispatch.json must use batch_limit:43.');
+        expect(tail.indexOf(opening)).toBeLessThan(tail.indexOf(correction));
+        expect(f.provider.embed).toHaveBeenCalledOnce();
+    });
+
     it.each([false, true])('revalidates adjudicator eligibility after awaited lexical recall (Memory-Plus: %s)', async (enabled) => {
         const f = fixture();
         const session = f.add('receipt recovery', [1, 0]);
@@ -206,10 +245,6 @@ describe('semantic retrieval and explicit search integration', () => {
                 reason: 'unknown_session',
             });
         }
-        const automatic = await hookResult(f, 'Why do receipt retries preserve payment identifiers?');
-        expect('output' in automatic).toBe(true);
-        expect(JSON.stringify(automatic)).toContain(publicSessionId(valid));
-        expect(JSON.stringify(automatic)).not.toContain(publicSessionId(guardian));
         expect(stored()).toEqual(before);
     });
 
@@ -297,24 +332,6 @@ describe('semantic retrieval and explicit search integration', () => {
         expect(peak).toBe(1);
     });
 
-    it('applies an optional strict similarity floor before counting hit-cap omissions', async () => {
-        const f = fixture();
-        f.add('below floor', [-1, 0]);
-        f.add('at floor', [0, 1]);
-        f.add('first qualifying', [1, 0]);
-        const options = { minSimilarity: 0 };
-        const first = await semanticRecall(f.db, [f.project.id], 'recovery', options);
-        expect(first.candidates).toHaveLength(1);
-        expect(first.hitCapOmittedSessionIds).toHaveLength(0);
-        for (let index = 0; index < SEMANTIC_RECALL_MAX_HITS; index++) f.add(`qualifying ${index}`, [1, 0]);
-        const capped = await semanticRecall(f.db, [f.project.id], 'recovery', options);
-        expect(capped.candidates).toHaveLength(SEMANTIC_RECALL_MAX_HITS);
-        expect(capped.candidates.every((candidate) => candidate.similarity > options.minSimilarity)).toBe(true);
-        expect(capped.hitCapOmittedSessionIds).toHaveLength(1);
-        // Explicit recall still ranks the full compatible set without a floor.
-        expect((await semanticRecall(f.db, [f.project.id], 'recovery')).hitCapOmittedSessionIds).toHaveLength(3);
-    });
-
     it('reaches an older scoped vector beyond a row budget of unrelated projects', async () => {
         const f = fixture();
         const own = f.add('own older match', [1, 0]);
@@ -360,55 +377,7 @@ describe('semantic retrieval and explicit search integration', () => {
         }
     });
 
-    it('serves an eligible fallback with both coverage notices inside the automatic context budget', async () => {
-        const f = fixture();
-        const nativeId = (suffix: number) => `00000000-0000-4000-8000-${suffix.toString().padStart(12, '0')}`;
-        const receivingSessionId = nativeId(13);
-        // One remaining slot isolates the individual fallback's context budget
-        // from the aggregate budget of additional shortlist candidates.
-        for (let index = 0; index < 2; index++) {
-            f.store.recordInjection({
-                tool: 'codex',
-                nativeSessionId: receivingSessionId,
-                injectedAt: new Date(NOW).toISOString(),
-                injectionId: `previous-${index}`,
-                body: `${AUTOMATIC_RECALL_BODY_PREFIX}previous-${index}\nPreviously shown candidate ${index}`,
-            });
-        }
-        f.add('Oldest omitted match', [1, 0], configuration, nativeId(0));
-        for (let index = 1; index <= 10; index++) {
-            f.add(`Qualifying match ${index}`, [1, 0], configuration, nativeId(index));
-        }
-        const fallback = f.add('F'.repeat(MAX_TITLE_CHARS), [1, 0], configuration, nativeId(11));
-        const receiving = f.add('S'.repeat(MAX_TITLE_CHARS), [1, 0], configuration, receivingSessionId);
-        f.addEvidence(fallback, 'Retries must preserve receipts and their original payment identity. '.repeat(11));
-        vi.spyOn(performance, 'now').mockReturnValue(0);
-
-        const result = await hookResult(f, 'Find a previous recovery decision', receivingSessionId);
-
-        expect(f.log).not.toHaveBeenCalledWith(expect.stringContaining('discarded reason=automatic_context_budget'));
-        expect(result).toHaveProperty('output');
-        const injections = f.store.injectionsForSession('codex', receivingSessionId, new Date(NOW).toISOString());
-        expect(injections).toHaveLength(4);
-        const body = injections[3].body;
-        expect(body).toContain(publicSessionId(fallback));
-        expect(body).not.toContain(publicSessionId(receiving));
-        expect(body).toContain(semanticModule.semanticScanTruncation('rows'));
-        expect(body).toContain(semanticModule.semanticHitCapTruncation(7));
-        expect(body.length).toBeGreaterThan(2_000);
-        expect(body.length).toBeLessThanOrEqual(AUTOMATIC_RECALL_MAX_CONTEXT_CHARS);
-    });
-
-    it('still abstains when an automatic candidate genuinely exceeds the context budget', async () => {
-        const f = fixture();
-        f.add('O'.repeat(MAX_TITLE_CHARS), [1, 0], configuration, 'a'.repeat(AUTOMATIC_RECALL_MAX_CONTEXT_CHARS));
-
-        expect(await hookResult(f, 'Find a previous recovery decision')).toEqual({ reason: 'not_command' });
-        expect(f.log).toHaveBeenCalledWith(expect.stringContaining('discarded reason=automatic_context_budget'));
-        expect(f.store.injectionsForSession('codex', 'current', new Date(NOW).toISOString())).toEqual([]);
-    });
-
-    it('reports empty elapsed-time truncation for explicit recall but abstains automatically', async () => {
+    it('reports empty elapsed-time truncation for explicit recall', async () => {
         const f = fixture();
         f.add('older match', [1, 0]);
         f.add('new incompatible', [1, 0], { ...configuration, revision: 'old' });
@@ -422,8 +391,6 @@ describe('semantic retrieval and explicit search integration', () => {
         const output = text(await new ElephaMcpService(f.db).recall({ query: 'recovery' }));
         expect(output).not.toContain('Title: older match');
         expect(output).toContain(semanticModule.semanticScanTruncation('time'));
-        elapsed = 0;
-        expect(await hookResult(f, 'Find a previous recovery decision')).toEqual({ reason: 'not_command' });
     });
 
     it('rejects oversized stored vectors before decoding their elements', async () => {
@@ -605,7 +572,6 @@ describe('semantic retrieval and explicit search integration', () => {
             text(await new ElephaMcpService(f.db).recall({ query: 'recovery' })),
             await hook(f, 'elepha:query recovery'),
             await hook(f, 'elepha:query:here recovery'),
-            await hook(f, 'Find a previous recovery decision'),
         ]) {
             expect.soft(output).toContain(semanticModule.semanticHitCapTruncation(1));
             expect.soft(output).not.toContain(semanticModule.semanticScanTruncation('rows'));

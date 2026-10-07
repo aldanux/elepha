@@ -135,7 +135,7 @@ function finalResponseEvidence(
     return text.length + coverage.length + 1 <= maxChars ? { text, coverage } : undefined;
 }
 
-// Both automatic delivery and query-aware expansion use this source selection.
+// Query-aware expansion uses this source selection.
 // First-prompt candidates retain their paired response regardless of query
 // language; lexical matching must never move them to a later repeated mention.
 export async function selectSessionEvidence(

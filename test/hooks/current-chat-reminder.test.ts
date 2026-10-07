@@ -3,15 +3,14 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { setSetting } from '../../src/config/settings.js';
 import * as providers from '../../src/embeddings/provider-config.js';
+import type { HookTool } from '../../src/hooks/common.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import * as currentChat from '../../src/serving/current-chat-evidence.js';
 import * as semantic from '../../src/serving/semantic-recall.js';
-import { openUnmanagedDb } from '../../src/storage/db.js';
-import { createTestDb, seedConsentRoot, seedProject } from '../helpers/db.js';
-
-// Automatic natural-language recall belongs to Memory-Plus alone. Continuation
-// or "as we discussed" phrasing in any language gets no provider-free branch.
-const FORMER_CUES = ['Continue.', '¿Qué sigue?', 'As we discussed earlier in this chat, keep the receipt format.', '続けて'];
+import { openDb, type openUnmanagedDb } from '../../src/storage/db.js';
+import { EmbeddingStore, lockedEmbedding } from '../../src/storage/embedding-store.js';
+import { withMemoryReadGeneration } from '../../src/storage/paranoid-gate.js';
+import { createTestDb, seedConsentRoot, seedProject, seedRollup, seedSession } from '../helpers/db.js';
 
 function fixture(memoryPlus: boolean) {
     const f = createTestDb('current-chat-hook-');
@@ -20,15 +19,14 @@ function fixture(memoryPlus: boolean) {
     seedConsentRoot(f, { path: project.path });
     const configPath = path.join(f.directory, 'config.json');
     setSetting('memory-plus', memoryPlus ? 'true' : 'false', configPath);
-    const open = vi.fn();
+    const databaseOpen = vi.fn();
     function openDatabase(dbPath: ':memory:'): ReturnType<typeof openUnmanagedDb>;
-    function openDatabase(dbPath?: string): Promise<ReturnType<typeof openUnmanagedDb>>;
+    function openDatabase(dbPath?: string): ReturnType<typeof openDb>;
     function openDatabase(dbPath?: string) {
-        open();
-        const db = openUnmanagedDb(dbPath);
-        return dbPath === ':memory:' ? db : Promise.resolve(db);
+        databaseOpen(dbPath);
+        return dbPath === ':memory:' ? openDb(dbPath) : openDb(dbPath);
     }
-    const run = (prompt: string) =>
+    const run = (prompt: string, tool: HookTool = 'codex', dbPath = f.dbPath) =>
         runUserPromptSubmit(
             JSON.stringify({
                 session_id: 'live-chat',
@@ -38,32 +36,65 @@ function fixture(memoryPlus: boolean) {
                 model: 'test',
                 permission_mode: 'default',
             }),
-            'codex',
-            { dbPath: f.dbPath, configPath, openDatabase, log: vi.fn() },
+            tool,
+            { dbPath, configPath, openDatabase, log: vi.fn() },
         );
-    return { ...f, open, run };
+    return { ...f, project, configPath, databaseOpen, run };
 }
 
 afterEach(() => vi.restoreAllMocks());
 
-describe('no automatic current-chat branch in the prompt hook', () => {
-    it.each(FORMER_CUES)('stays inert with Memory-Plus off: %s', async (prompt) => {
-        const f = fixture(false);
-        const read = vi.spyOn(currentChat, 'currentChatEvidence');
-        const provider = vi.spyOn(providers, 'createEmbeddingProvider');
-        expect(await f.run(prompt)).toEqual({ reason: 'not_command' });
-        expect(f.open).not.toHaveBeenCalled();
-        expect(provider).not.toHaveBeenCalled();
-        expect(read).not.toHaveBeenCalled();
-    });
+describe('host-directed memory retrieval', () => {
+    it.each(['codex', 'opencode'] as const)(
+        'does no database or memory work for an ordinary %s prompt with Memory-Plus enabled',
+        async (tool) => {
+            const f = fixture(true);
+            const session = seedSession(f, { project: f.project, title: 'Dispatch agreement' });
+            seedRollup(f, {
+                project: f.project,
+                session,
+                decisions: [{ what: 'Use batch_limit:17.', why: 'Initial dispatch agreement.' }],
+            });
+            const configuration = { provider: 'local', model: 'fixture', revision: 'v1', dimensions: 2 } as const;
+            const embeddings = new EmbeddingStore(f.db, f.configPath);
+            embeddings.write(
+                embeddings.source(session.id)!,
+                configuration,
+                [1, 0],
+                withMemoryReadGeneration(f.db, lockedEmbedding, (token) => token),
+            );
+            const read = vi.spyOn(currentChat, 'currentChatEvidence');
+            const recall = vi.spyOn(semantic, 'semanticRecall');
+            const embed = vi.fn(async () => [1, 0]);
+            const provider = vi.spyOn(providers, 'createEmbeddingProvider').mockResolvedValue({
+                configuration,
+                embed,
+                dispose: async () => {},
+            });
+            const scan = vi.spyOn(EmbeddingStore.prototype, 'scan');
+            const prompt = 'Write unrelated.txt containing only the decimal result of 23 + 48 and a newline. Change no other files.';
 
-    it.each(FORMER_CUES)('routes to historical semantic recall only with Memory-Plus on: %s', async (prompt) => {
+            expect(await f.run(prompt, tool)).toEqual({ reason: 'not_command' });
+            expect(f.databaseOpen).not.toHaveBeenCalled();
+            expect(await f.run(prompt, tool, path.join(f.directory, 'missing.db'))).toEqual({ reason: 'not_command' });
+            expect(recall).not.toHaveBeenCalled();
+            expect(provider).not.toHaveBeenCalled();
+            expect(embed).not.toHaveBeenCalled();
+            expect(scan).not.toHaveBeenCalled();
+            expect(read).not.toHaveBeenCalled();
+            expect(f.store.injectionsForSession(tool, 'live-chat', new Date().toISOString())).toEqual([]);
+        },
+    );
+
+    it('does no database or memory work for a Claude prompt without a transcript path', async () => {
         const f = fixture(true);
         const read = vi.spyOn(currentChat, 'currentChatEvidence');
-        const recall = vi.spyOn(semantic, 'semanticRecall').mockRejectedValue(new Error('stop after routing'));
-        expect('output' in (await f.run(prompt))).toBe(false);
-        expect(recall).toHaveBeenCalledWith(expect.anything(), expect.anything(), prompt, expect.anything());
+        const provider = vi.spyOn(providers, 'createEmbeddingProvider');
+        expect(await f.run('続けて', 'claude-code')).toEqual({ reason: 'not_command' });
+        expect(f.databaseOpen).not.toHaveBeenCalled();
+        expect(await f.run('続けて', 'claude-code', path.join(f.directory, 'missing.db'))).toEqual({ reason: 'not_command' });
+        expect(provider).not.toHaveBeenCalled();
         expect(read).not.toHaveBeenCalled();
-        expect(f.store.injectionsForSession('codex', 'live-chat', new Date().toISOString())).toHaveLength(0);
+        expect(f.store.injectionsForSession('claude-code', 'live-chat', new Date().toISOString())).toEqual([]);
     });
 });
