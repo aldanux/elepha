@@ -109,8 +109,6 @@ it('asks one verified Claude main chat for a task-state report and preserves its
     const second = await f.run();
     expect(second).toHaveProperty('output');
     expect(JSON.stringify(second)).toBe(body);
-    const marker = /elepha task-state request mode=precompact_manifest request_id=[0-9A-Z]+/;
-    expect(JSON.stringify(second).match(marker)?.[0]).toBe(body.match(marker)?.[0]);
     expect(f.requestCount()).toBe(1);
     expect(f.injectionCount()).toBe(1);
 });

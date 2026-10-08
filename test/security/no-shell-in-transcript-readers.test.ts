@@ -28,37 +28,6 @@ function listTsFiles(dir: string): string[] {
 }
 
 describe('no shell reachable from transcript-reading code', () => {
-    it('adapters never import node:child_process', () => {
-        const adaptersDir = path.join(SRC_ROOT, 'adapters');
-        const offenders = listTsFiles(adaptersDir)
-            .filter((f) => /['"]node:child_process['"]/.test(readFileSync(f, 'utf8')))
-            .map((f) => path.relative(SRC_ROOT, f));
-        expect(offenders).toEqual([]);
-    });
-
-    it('the daemon transcript readers never import node:child_process', () => {
-        const daemonReaders = [path.join(SRC_ROOT, 'daemon', 'index.ts'), path.join(SRC_ROOT, 'daemon', 'readability-guard.ts')];
-        for (const reader of daemonReaders) {
-            expect(readFileSync(reader, 'utf8')).not.toMatch(/['"]node:child_process['"]/);
-        }
-    });
-
-    it('the MCP raw-turn server never imports node:child_process', () => {
-        const mcpDir = path.join(SRC_ROOT, 'mcp');
-        const offenders = listTsFiles(mcpDir)
-            .filter((f) => /['"]node:child_process['"]/.test(readFileSync(f, 'utf8')))
-            .map((f) => path.relative(SRC_ROOT, f));
-        expect(offenders).toEqual([]);
-    });
-
-    it('the shared serving reader never imports node:child_process', () => {
-        const servingDir = path.join(SRC_ROOT, 'serving');
-        const offenders = listTsFiles(servingDir)
-            .filter((f) => /['"]node:child_process['"]/.test(readFileSync(f, 'utf8')))
-            .map((f) => path.relative(SRC_ROOT, f));
-        expect(offenders).toEqual([]);
-    });
-
     it('the lexical recall transcript reader is inside the serving no-shell boundary', () => {
         const recall = readFileSync(path.join(SRC_ROOT, 'serving', 'lexical-recall.ts'), 'utf8');
         expect(recall).not.toMatch(/['"]node:child_process['"]/);

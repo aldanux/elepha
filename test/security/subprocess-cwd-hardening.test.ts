@@ -84,7 +84,6 @@ describe('git subprocess cwd hardening (E-1)', () => {
         for (const call of execFileSyncMock.mock.calls) {
             const argv = call[1] as string[];
             for (const key of DANGEROUS_KEYS) {
-                expect(argv.some((a) => a === '-c' || a.startsWith(`${key}=`))).toBe(true);
                 expect(argv.some((a) => a.startsWith(`${key}=`))).toBe(true);
             }
         }

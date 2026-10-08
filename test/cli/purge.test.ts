@@ -332,7 +332,7 @@ describe('elepha purge orphan project scope', () => {
             expect(orphanApply.status).toBe(0);
             expect(orphanApply.stdout).toContain('Saved a backup of your memory database (keeping the last 5).');
             expect(orphanApply.stdout).toContain("Deleted 1 session(s) across 1 project(s) from elepha's memory.");
-            expect(orphanApply.stdout).not.toContain('Delete these');
+            expect(orphanApply.stdout).not.toContain("Delete elepha's memory");
             expect(orphanApply.stdout).not.toContain('Verified: nothing matching this scope remains.');
             verified = openUnmanagedDb(dbPath);
             const verifiedStore = new MemoryStore(verified);
@@ -657,7 +657,7 @@ describe('elepha purge orphan project scope', () => {
 
             const bypassed = runTtyPurgeCli(dbPath, '', '--orphan', '--apply', '--skip-confirmation');
             expect(bypassed.status).toBe(0);
-            expect(bypassed.stdout).not.toContain('Delete these');
+            expect(bypassed.stdout).not.toContain("Delete elepha's memory");
             verified = openUnmanagedDb(dbPath);
             expect(new MemoryStore(verified).getProjectById(bypassedProject.id)).toBeUndefined();
             verified.close();

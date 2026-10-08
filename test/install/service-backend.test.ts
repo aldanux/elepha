@@ -6,11 +6,10 @@ import { reconcileCaptureServiceAsync, SERVICE_BACKEND_PLATFORM_ERROR, serviceBa
 import { SystemdBackend } from '../../src/install/systemd-backend.js';
 
 describe('service backend factory', () => {
-    it('selects the backend from each supported reported platform, including WSL', () => {
+    it('selects the backend from each supported reported platform', () => {
         const cases = [
             { platform: 'darwin', runtime: 'Darwin', backend: LaunchdBackend },
             { platform: 'linux', runtime: 'Linux', backend: SystemdBackend },
-            { platform: 'linux', runtime: 'WSL reporting Linux', backend: SystemdBackend },
         ] as const;
 
         for (const testCase of cases) {

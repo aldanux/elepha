@@ -11,7 +11,6 @@ import {
     managedPlistEnvironment,
     renderDaemonPlist,
 } from '../../src/install/launchd-backend.js';
-import { launcherHash } from '../../src/install/launcher.js';
 import { withTempDir } from '../helpers/tmp.js';
 
 const savedEnvironment = { ...process.env };
@@ -62,7 +61,7 @@ describe('daemon service ownership', () => {
             new LaunchdBackend(defaultLaunchdServicePaths('/Users/test'));
         };
 
-        expect(constructWithoutExecutor).toBeTypeOf('function');
+        void constructWithoutExecutor;
     });
 
     it('uses the canonical elepha layout for every managed artifact path', () => {
@@ -255,7 +254,6 @@ describe('daemon service ownership', () => {
         const fromShell = renderDaemonPlist(defaultLaunchdServicePaths(alias), shellEnvironment);
 
         expect(fromShell).toBe(fromPhysical);
-        expect(launcherHash(fromShell)).toBe(launcherHash(fromPhysical));
         expect(fromShell).toContain(`<key>ELEPHA_HOME</key><string>${path.join(physical, 'elepha')}</string>`);
         expect(fromShell).toContain(`<key>CLAUDE_CONFIG_DIR</key><string>${path.join(physical, 'claude')}</string>`);
         expect(fromShell).toContain(

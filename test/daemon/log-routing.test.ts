@@ -40,7 +40,7 @@ describe('daemon log routing', () => {
         });
         daemon.start();
 
-        expect(logs).toContain(`[elepha] watching:\n  ${root}`);
+        expect(logs.some((message) => message.includes('watching') && message.includes(root))).toBe(true);
 
         const adapter = { tool: 'codex' } as SessionAdapter;
         const turn: ParsedTurn = {

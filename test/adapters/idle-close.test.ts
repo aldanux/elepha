@@ -225,7 +225,6 @@ describe.each(fixtures)(
 
             const whileToolIsOpen = await collect(subject.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
             expect(whileToolIsOpen).toEqual([]);
-            expect(whileToolIsOpen.map((turn) => turn.cursor)).toEqual([]);
 
             appendFileSync(file, jsonl(completion));
             const completed = await collect(subject.parseTurns(file, undefined, { closeTrailingOnIdle: true }));
@@ -242,7 +241,6 @@ describe.each(fixtures)(
             const turns = await collect(adapter().parseTurns(transcript(), undefined, { closeTrailingOnIdle: true }));
 
             expect(turns).toEqual([]);
-            expect(turns.map((turn) => turn.cursor)).toEqual([]);
         });
 
         it('still idle-closes a completed trailing turn with assistant text', async () => {

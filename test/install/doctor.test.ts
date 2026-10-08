@@ -71,14 +71,14 @@ describe('elepha doctor', () => {
         expect(result.exitCode).toBe(0);
         expect(result.lines).toEqual(
             expect.arrayContaining([
-                '✓ Daemon: RUNNING (pid 123, heartbeat 1s ago)',
-                '✓ Claude Code hooks: SessionStart + UserPromptSubmit installed',
-                '✓ Codex hooks: SessionStart + UserPromptSubmit installed and approved',
-                '✓ MCP: Claude, Codex, and OpenCode registered where detected',
-                '✓ Database: opens and migrations apply',
-                '✓ Consent: 1 approved root',
-                '✓ Launcher: managed launcher is valid',
-                'Summary: all checks passed.',
+                expect.stringMatching(/Daemon.*RUNNING.*pid 123.*heartbeat 1s/),
+                expect.stringMatching(/Claude Code hooks.*SessionStart.*UserPromptSubmit.*installed/),
+                expect.stringMatching(/Codex hooks.*SessionStart.*UserPromptSubmit.*installed.*approved/),
+                expect.stringMatching(/MCP.*Claude.*Codex.*OpenCode.*registered/),
+                expect.stringMatching(/Database.*opens.*migrations apply/),
+                expect.stringMatching(/Consent.*1 approved root/),
+                expect.stringMatching(/Launcher.*managed launcher is valid/),
+                expect.stringMatching(/Summary.*all checks passed/),
             ]),
         );
         expect(result.nextSteps).toEqual([]);

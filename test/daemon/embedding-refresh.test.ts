@@ -30,6 +30,7 @@ vi.mock('node:worker_threads', async (importOriginal) => {
         ...actual,
         Worker: class extends actual.Worker {
             constructor(url: URL, options: WorkerOptions) {
+                expect(url.href).toBe(new URL('../../src/embeddings/refresh-worker.js', import.meta.url).href);
                 thread.created(url);
                 const symbol = 'dev.elepha.internal.database-lifecycle-test-directory';
                 const directory = (globalThis as Record<symbol, unknown>)[Symbol.for(symbol)];
@@ -117,6 +118,7 @@ function fixture(options: { durableCapture?: boolean } = {}) {
 describe('automatic daemon embedding refresh', () => {
     it('reports a turn inference failure, refreshes session vectors, and retries the turn on the next tick', async () => {
         const f = fixture();
+        const start = vi.spyOn(refresh, 'startEmbeddingRefresh');
         for (const turnIndex of [0, 1]) {
             expect(
                 f.store.recordTurn(
@@ -159,6 +161,8 @@ describe('automatic daemon embedding refresh', () => {
             expect(f.errors[0]).toContain('Turn');
             expect(f.errors[0]).toContain('turn inference failed');
             await vi.waitFor(() => expect(f.current()).toBe(true));
+            // The vector write precedes worker cleanup and exit; wait for the real pass to finish.
+            await start.mock.results[0]!.value.done;
             await vi.waitFor(() => expect(f.logs.some((line) => line.startsWith('[elepha] automatic indexing:'))).toBe(true));
             expect(f.db.prepare(`SELECT memory_id FROM ${TURN_EMBEDDINGS_TABLE}`).all()).toEqual([]);
             expect(

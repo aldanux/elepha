@@ -3,7 +3,6 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PRIVATE_DIR_MODE, PRIVATE_FILE_MODE, SYSTEMD_SERVICE_NAME } from '../../src/config/constants.js';
 import { elephaPaths } from '../../src/config/paths.js';
-import { launcherHash } from '../../src/install/launcher.js';
 import { physicalInstallPath } from '../../src/install/service-manifest.js';
 import {
     defaultSystemdServicePaths,
@@ -134,7 +133,6 @@ describe('systemd service ownership', () => {
         const second = renderDaemonUnit(paths, environment);
 
         expect(second).toBe(first);
-        expect(launcherHash(second)).toBe(launcherHash(first));
         expect(first).toContain('[Unit]\n');
         expect(first).toContain(`[Service]\nExecStart=${physicalInstallPath(paths.launcher)} start\n`);
         expect(first).toContain('Restart=on-failure\nRestartSec=30\nUMask=0077\n');
