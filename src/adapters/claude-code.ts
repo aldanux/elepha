@@ -235,7 +235,7 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
 
     // Reads only the tail of an opened, contained transcript. The flag is
     // native Claude metadata; summary wording and human turn text are ignored.
-    async readLatestCompactSummary(filePath: string): Promise<ClaudeCompactSummaryReadResult> {
+    async readLatestCompactSummary(filePath: string, signal?: AbortSignal): Promise<ClaudeCompactSummaryReadResult> {
         if (!this.matches(filePath)) {
             return { status: 'unavailable', reason: 'transcript_outside_store' };
         }
@@ -265,6 +265,7 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
                 for await (const record of readBoundedLines(filePath, {
                     handle: opened.handle,
                     start,
+                    signal,
                     maxReadBytes: opened.stat.size - start + 1,
                 })) {
                     const byteStart = offset;
@@ -372,6 +373,7 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
         filePath: string,
         afterOffset: number,
         boundaryByteStart: number,
+        signal?: AbortSignal,
     ): Promise<'clear' | 'intervening_source_record' | 'source_changed' | 'gap_unavailable'> {
         if (
             !this.matches(filePath) ||
@@ -395,6 +397,7 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
             if (afterOffset < boundaryByteStart) {
                 for await (const record of readBoundedLines(filePath, {
                     handle: opened.handle,
+                    signal,
                     start: afterOffset,
                     maxReadBytes: boundaryByteStart - afterOffset + 1,
                 })) {
@@ -493,6 +496,11 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
 
     async classifyEmptySession(filePath: string): Promise<EmptySessionAnalysis | undefined> {
         return classifyEmptyJsonlSession(filePath, (line) => emptySessionSignals(line as CCLine));
+    }
+
+    protected isCompactionBoundaryLine(line: unknown): boolean {
+        const value = line as CCLine;
+        return value.type === 'system' && value.subtype === 'compact_boundary';
     }
 
     protected cwdOf(line: unknown): string | undefined {

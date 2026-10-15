@@ -106,6 +106,12 @@ describe('subprocess allowlist', () => {
                 .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
                 .join(' '),
         );
-        expect(asyncGitCalls.sort()).toEqual(['rev-list --count HEAD', 'rev-parse --abbrev-ref HEAD']);
+        expect(asyncGitCalls.sort()).toEqual([
+            'remote get-url origin',
+            'rev-list --count HEAD',
+            'rev-list --max-parents=0 HEAD',
+            'rev-parse --abbrev-ref HEAD',
+            'rev-parse --show-toplevel',
+        ]);
     });
 });

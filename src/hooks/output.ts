@@ -5,6 +5,7 @@ import type { MemoryStore } from '../storage/memory-store.js';
 import type { HookTool } from './common.js';
 
 export interface HookOutputInput {
+    deliveryKey?: string;
     store: MemoryStore;
     tool: HookTool;
     nativeSessionId: string;
@@ -28,6 +29,7 @@ export function recordHookOutput(input: HookOutputInput): string | undefined {
         injectionId,
         body,
         attribution: input.attribution,
+        deliveryKey: input.deliveryKey,
     });
     return recorded ? output : undefined;
 }

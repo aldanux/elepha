@@ -1,14 +1,25 @@
 import { statSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
+import { CodexAdapter, readCodexKindPreamble } from '../adapters/codex.js';
+import { sameTaskStateReportInput } from '../adapters/task-state-report.js';
+import { CODEX_TASK_SOURCE_KIND } from '../config/codex.js';
 import {
     CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+    SESSION_KIND_PREAMBLE_MAX_BYTES,
     TASK_STATE_MANIFEST_MAX_SOURCE_TURNS,
     TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS,
 } from '../config/constants.js';
 import { canonicalizeExisting, samePath } from '../config/paths.js';
+import { filterTurn } from '../rendering/filtered-turn.js';
+import type { OpenedProviderTranscript } from '../security/provider-transcript.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
+import { containsSentinel } from '../security/sentinel.js';
 import { ConsentStore } from '../storage/consent-store.js';
+import { InjectionStore } from '../storage/injection-store.js';
 import { retentionRemovedSql } from '../storage/live-memory-retention-schema.js';
+import { readTaskSourcePosition } from '../storage/session-read-model.js';
+import { decodeResumeContext } from '../storage/source-resume-context.js';
+import { sourceTurnDigests } from '../storage/source-turn-digest.js';
 import type {
     TaskStateManifestCoverage,
     TaskStateManifestInput,
@@ -16,10 +27,185 @@ import type {
     TaskStateManifestSourceLocator,
 } from '../storage/task-state-manifest-store.js';
 import { TASK_STATE_MANIFEST_PROJECTION_ENCODING } from '../storage/task-state-manifest-store.js';
-import type { TaskStateReportInput, ToolName } from '../types/index.js';
+import {
+    prepareTaskStateProjectScope,
+    type TaskStateProjectScope,
+    taskStateProjectScopeCurrent,
+} from '../storage/task-state-project-scope.js';
+import type {
+    ParsedTurn,
+    SessionAdapter,
+    SourceReadBudget,
+    TaskStateNativeSourceProof,
+    TaskStateReportInput,
+    ToolName,
+} from '../types/index.js';
 import { SessionReader } from './session-reader.js';
+import { authenticateTaskStateChat } from './task-state-chat.js';
 
 type PrecompactReport = Extract<TaskStateReportInput, { mode: 'precompact_manifest' }>;
+
+// Recovery already replayed this reporting turn against retained coverage.
+// Borrow its opened source and pass allowance; the publisher owns final checks.
+export interface TaskStateReportingEvidence {
+    turn: ParsedTurn;
+    adapter: SessionAdapter;
+    opened: OpenedProviderTranscript;
+    sourcePath: string;
+    readBudget: SourceReadBudget;
+    current: () => boolean;
+}
+
+export async function readTaskStateNativeSources(
+    db: Database.Database,
+    input: { memoryId: number; nativeId: string; cwd: string; report: PrecompactReport; sourceDigest: string },
+    signal: AbortSignal,
+    onSource: (text: string, proof: TaskStateNativeSourceProof, timestampMs?: number) => void,
+    sharedChat?: NonNullable<Awaited<ReturnType<typeof authenticateTaskStateChat>>>,
+    recovered?: TaskStateReportingEvidence,
+): Promise<{ state: 'available'; assistantBeforeMs?: number } | { state: 'unavailable'; reason: string }> {
+    const unavailable = (reason: string) => ({ state: 'unavailable' as const, reason });
+    const ownedChat =
+        !sharedChat && !recovered
+            ? await authenticateTaskStateChat(db, { tool: 'codex', nativeSessionId: input.nativeId, cwd: input.cwd, signal })
+            : undefined;
+    const liveChat = sharedChat ?? ownedChat;
+    const chat =
+        recovered ??
+        (liveChat && {
+            adapter: liveChat.adapter,
+            opened: liveChat.opened,
+            sourcePath: liveChat.binding.sourcePath,
+            readBudget: liveChat.readBudget,
+            current: liveChat.current,
+        });
+    if (!chat || !(chat.adapter instanceof CodexAdapter)) {
+        return unavailable('native_chat_unavailable');
+    }
+    try {
+        const position = readTaskSourcePosition(db, 'codex', input.nativeId, input.memoryId);
+        if (!position || (position.turnIndex > 0 && !position.beforeCursor)) {
+            return unavailable('native_source_cursor_unavailable');
+        }
+        const start = position.beforeCursor ? chat.adapter.cursorPosition(position.beforeCursor).byteOffset : 0;
+        const end = chat.adapter.cursorPosition(position.cursor).byteOffset;
+        if (start === undefined || end === undefined) {
+            return unavailable('native_source_cursor_unavailable');
+        }
+        let reporting: ParsedTurn | undefined = recovered?.turn;
+        let invalid = false;
+        if (!reporting) {
+            for await (const turn of chat.adapter.parseTurns(chat.sourcePath, position.beforeCursor ?? undefined, {
+                handle: chat.opened.handle,
+                readBudget: chat.readBudget,
+                signal,
+                endByteOffset: end,
+                includeClosingBoundary: true,
+                closeTrailingOnIdle: true,
+                skipSessionTitle: true,
+                resumeContext: decodeResumeContext(position.beforeContext),
+                onDesync: () => {
+                    invalid = true;
+                },
+                onMalformedRecords: () => {
+                    invalid = true;
+                },
+                onUnrecognizedRecords: () => {
+                    invalid = true;
+                },
+            })) {
+                if (turn.turnIndex === position.turnIndex) {
+                    reporting = turn;
+                }
+            }
+        }
+        const injections = new InjectionStore(db);
+        if (
+            invalid ||
+            !reporting ||
+            reporting.tool !== 'codex' ||
+            reporting.sessionId !== input.nativeId ||
+            reporting.turnIndex !== position.turnIndex ||
+            !chat.current() ||
+            reporting.droppedReason !== undefined ||
+            !sourceTurnDigests(reporting).includes(input.sourceDigest) ||
+            chat.adapter.cursorPosition(reporting.cursor).byteOffset !== end ||
+            !samePath(canonicalizeExisting(reporting.projectPath), canonicalizeExisting(input.cwd)) ||
+            !reporting.taskStateReport ||
+            !sameTaskStateReportInput(reporting.taskStateReport, input.report) ||
+            injections.quoteBackStatus(reporting) !== 'no-match'
+        ) {
+            return unavailable('native_reporting_source_changed');
+        }
+        if (recovered) {
+            const header = await readCodexKindPreamble(
+                chat.sourcePath,
+                chat.opened.handle,
+                (cwd, nativeId) => nativeId === input.nativeId && samePath(canonicalizeExisting(cwd), canonicalizeExisting(input.cwd)),
+                { readBudget: chat.readBudget, signal },
+            );
+            if (header.malformed || header.guardian || !header.root) {
+                return unavailable('native_chat_unavailable');
+            }
+            const classification = await chat.adapter.classifySession(chat.sourcePath, {
+                handle: chat.opened.handle,
+                readBudget: chat.readBudget,
+                signal,
+                maxReadBytes: SESSION_KIND_PREAMBLE_MAX_BYTES,
+            });
+            if (classification.kind !== 'primary' || classification.exclusion !== undefined) {
+                return unavailable('native_chat_unavailable');
+            }
+        }
+        const reportCallId = reporting.taskStateReport.callId;
+        const accepted = (text: string, proof: TaskStateNativeSourceProof, timestampMs?: number) => {
+            if (
+                containsSentinel(text) ||
+                injections.quoteBackStatus({
+                    tool: 'codex',
+                    sessionId: input.nativeId,
+                    turnIndex: reporting.turnIndex,
+                    endedAt: reporting.endedAt,
+                    userMessage: proof.kind === CODEX_TASK_SOURCE_KIND.projectInstructions ? text : '',
+                    assistantText: proof.kind === CODEX_TASK_SOURCE_KIND.assistantBeforeReport ? text : '',
+                    toolCalls: [],
+                }) !== 'no-match'
+            ) {
+                return;
+            }
+            const filtered = filterTurn({ userMessage: '', assistantText: text, toolCalls: [] }).assistantResponse;
+            onSource(filtered, proof, timestampMs);
+        };
+        const options = {
+            handle: chat.opened.handle,
+            readBudget: chat.readBudget,
+            signal,
+            reportCallId,
+            authorizeCwd: (cwd: string) => samePath(canonicalizeExisting(cwd), canonicalizeExisting(input.cwd)),
+            onSource: accepted,
+        };
+        if (!(await chat.adapter.readInitialTaskContext(chat.sourcePath, options))) {
+            return unavailable('native_context_unavailable');
+        }
+        const matchedCall = await chat.adapter.readAssistantBeforeTaskReport(chat.sourcePath, {
+            ...options,
+            start,
+            end,
+            report: reporting.taskStateReport,
+        });
+        if (signal.aborted) {
+            return unavailable('deadline');
+        }
+        if (!matchedCall) {
+            return unavailable('native_report_order_unavailable');
+        }
+        return chat.current() ? { state: 'available', ...matchedCall } : unavailable('native_source_changed');
+    } catch {
+        return unavailable(signal.aborted ? 'deadline' : 'native_source_read_unavailable');
+    } finally {
+        await ownedChat?.close();
+    }
+}
 
 interface SourceRow {
     memoryId: number;
@@ -47,6 +233,7 @@ interface SourcePathCheckpoint {
 
 interface PreparationCheckpoint {
     rows: SourcePathCheckpoint[];
+    projects: TaskStateProjectScope[];
 }
 
 interface QuoteToVerify {
@@ -193,6 +380,9 @@ export function manifestSourcesStillCurrent(
     checkpoint: PreparationCheckpoint,
 ): boolean {
     const source = manifest.reportingSource;
+    if (checkpoint.projects.some((project) => !taskStateProjectScopeCurrent(db, project))) {
+        return false;
+    }
     const expectedIds = new Set([manifest.memoryId, ...manifest.sourceLocators.map((locator) => locator.sourceMemoryId)]);
     const checkpoints = new Map(checkpoint.rows.map((row) => [row.memoryId, row]));
     if (checkpoints.size !== expectedIds.size || checkpoint.rows.length !== expectedIds.size) {
@@ -233,7 +423,9 @@ export function manifestSourcesStillCurrent(
             current.nativeId !== reporting.nativeId ||
             current.segmentIndex > reporting.segmentIndex ||
             (current.segmentIndex === reporting.segmentIndex && current.turnIndex > reporting.turnIndex) ||
-            (current.memoryId === reporting.memoryId && locator.role === 'assistant')
+            (current.memoryId === reporting.memoryId &&
+                locator.role === 'assistant' &&
+                locator.nativeSource?.kind !== CODEX_TASK_SOURCE_KIND.assistantBeforeReport)
         ) {
             return false;
         }
@@ -248,6 +440,7 @@ export async function verifyTaskStateManifest(
     input: { reportingMemoryId: number; report: PrecompactReport; cwd: string; createdAt?: string },
     reader: Pick<SessionReader, 'indexedTurnEvidence'> = new SessionReader(db),
     signal?: AbortSignal,
+    reportingEvidence?: TaskStateReportingEvidence,
 ): Promise<TaskStateManifestVerification> {
     const consent = new ConsentStore(db);
     const checkout = approvedPhysicalCheckout(consent, input.cwd);
@@ -255,6 +448,25 @@ export async function verifyTaskStateManifest(
         return { state: 'unavailable', reason: 'checkout_not_consented' };
     }
     const rows = sourceRows(db, input.reportingMemoryId, TASK_STATE_MANIFEST_MAX_SOURCE_TURNS + 1);
+    const projects = new Map<number, TaskStateProjectScope>();
+    const authorizedProject = (row: SourceRow): boolean => {
+        if (row.projectPath === null) {
+            return false;
+        }
+        let project = projects.get(row.projectId);
+        if (project === undefined) {
+            project = prepareTaskStateProjectScope(db, row.projectId, row.projectPath, checkout);
+            if (project === undefined) {
+                return false;
+            }
+            projects.set(row.projectId, project);
+        }
+        return (
+            row.projectPath === project.projectPath &&
+            samePath(physicalDirectory(row.projectPath) ?? '', project.canonicalPaths.get(row.projectPath) ?? '') &&
+            taskStateProjectScopeCurrent(db, project)
+        );
+    };
     const reporting = rows[0];
     if (reporting === undefined || reporting.memoryId !== input.reportingMemoryId) {
         return { state: 'unavailable', reason: 'reporting_turn_unavailable' };
@@ -262,11 +474,7 @@ export async function verifyTaskStateManifest(
     if (!reporting.sourceDigest || !/^[a-f0-9]{64}$/.test(reporting.sourceDigest)) {
         return { state: 'unavailable', reason: 'reporting_source_digest_unavailable' };
     }
-    if (
-        reporting.projectPath === null ||
-        reporting.sourcePath === null ||
-        !samePath(physicalDirectory(reporting.projectPath) ?? '', checkout)
-    ) {
+    if (reporting.projectPath === null || reporting.sourcePath === null || !authorizedProject(reporting)) {
         return { state: 'unavailable', reason: 'reporting_checkout_mismatch' };
     }
     const quotes = quotesIn(input.report);
@@ -275,6 +483,24 @@ export async function verifyTaskStateManifest(
     let firstGap: string | undefined;
     const deadline = AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS);
     const readSignal = signal === undefined ? deadline : AbortSignal.any([signal, deadline]);
+    // An empty replacement still needs authenticated reporting evidence;
+    // absence of quotes alone never authorizes withdrawal.
+    if (quotes.length === 0) {
+        const evidence = await reader.indexedTurnEvidence(
+            {
+                id: reporting.sessionId,
+                tool: reporting.tool,
+                native_id: reporting.nativeId,
+                source_path: reporting.sourcePath,
+                expectedProjectPath: reporting.projectPath,
+            },
+            reporting.turnIndex,
+            readSignal,
+        );
+        if (evidence.state !== 'available' || readSignal.aborted) {
+            return { state: 'unavailable', reason: evidence.state === 'unavailable' ? evidence.reason : 'deadline' };
+        }
+    }
     for (const row of rows.slice(0, TASK_STATE_MANIFEST_MAX_SOURCE_TURNS)) {
         if (unresolved.size === 0) {
             break;
@@ -287,8 +513,7 @@ export async function verifyTaskStateManifest(
             firstGap ??= 'source_metadata_exceeds_budget';
             continue;
         }
-        const sourceCheckout = approvedPhysicalCheckout(consent, row.projectPath);
-        if (sourceCheckout === undefined || !samePath(sourceCheckout, checkout)) {
+        if (!authorizedProject(row)) {
             continue;
         }
         if (!row.sourceDigest || !/^[a-f0-9]{64}$/.test(row.sourceDigest)) {
@@ -338,6 +563,84 @@ export async function verifyTaskStateManifest(
             unresolved.delete(index);
         }
     }
+    if (rows.length > TASK_STATE_MANIFEST_MAX_SOURCE_TURNS) {
+        firstGap ??= 'older_sources_not_scanned';
+    }
+    if (
+        reporting.tool === 'codex' &&
+        [...unresolved].some(
+            (index) => quotes[index]?.role === 'assistant' || (quotes[index]?.section === 'constraints' && quotes[index]?.role === 'user'),
+        )
+    ) {
+        const candidates = new Map<number, { locator: TaskStateManifestSourceLocator; timestampMs?: number }>();
+        const complete = await readTaskStateNativeSources(
+            db,
+            {
+                memoryId: reporting.memoryId,
+                nativeId: reporting.nativeId,
+                cwd: input.cwd,
+                report: input.report,
+                sourceDigest: reporting.sourceDigest,
+            },
+            readSignal,
+            (text, proof, timestampMs) => {
+                for (const index of unresolved) {
+                    const source = quotes[index];
+                    if (
+                        source === undefined ||
+                        candidates.has(index) ||
+                        (proof.kind === CODEX_TASK_SOURCE_KIND.projectInstructions
+                            ? source.section !== 'constraints' || source.role !== 'user'
+                            : source.role !== 'assistant')
+                    ) {
+                        continue;
+                    }
+                    const start = quoteOffset(text, source.quote, 'transcript');
+                    if (start < 0) {
+                        continue;
+                    }
+                    candidates.set(index, {
+                        timestampMs,
+                        locator: {
+                            section: source.section,
+                            itemIndex: source.itemIndex,
+                            quoteIndex: source.quoteIndex,
+                            sourceMemoryId: reporting.memoryId,
+                            sourceSessionId: reporting.sessionId,
+                            sourceTurnIndex: reporting.turnIndex,
+                            sourceGeneration: reporting.sourceGeneration,
+                            sourceDigest: reporting.sourceDigest as string,
+                            role: source.role,
+                            projectionEncoding: TASK_STATE_MANIFEST_PROJECTION_ENCODING,
+                            evidenceSource: 'transcript',
+                            start,
+                            end: start + escapeShellSyntax(source.quote).length,
+                            nativeSource: proof,
+                        },
+                    });
+                }
+            },
+            undefined,
+            reportingEvidence,
+        );
+        if (complete.state === 'available') {
+            for (const [index, { locator, timestampMs }] of candidates) {
+                // Desktop emits the envelope at completion; only native timestamps
+                // strictly before invocation establish pre-report assistant evidence.
+                if (
+                    locator.nativeSource?.kind === CODEX_TASK_SOURCE_KIND.assistantBeforeReport &&
+                    complete.assistantBeforeMs !== undefined &&
+                    (timestampMs === undefined || !Number.isFinite(timestampMs) || timestampMs >= complete.assistantBeforeMs)
+                ) {
+                    continue;
+                }
+                locators.push(locator);
+                unresolved.delete(index);
+            }
+        } else {
+            firstGap ??= complete.reason;
+        }
+    }
     const currentCheckout = approvedPhysicalCheckout(consent, input.cwd);
     if (currentCheckout === undefined || !samePath(currentCheckout, checkout)) {
         return { state: 'unavailable', reason: 'checkout_authorization_changed' };
@@ -348,7 +651,7 @@ export async function verifyTaskStateManifest(
         if (
             row === undefined ||
             row.projectPath === null ||
-            !samePath(approvedPhysicalCheckout(consent, row.projectPath) ?? '', checkout) ||
+            !authorizedProject(row) ||
             !refreshed.some((candidate) => sameSource(candidate, row))
         ) {
             return { state: 'unavailable', reason: 'source_authorization_changed' };
@@ -363,7 +666,7 @@ export async function verifyTaskStateManifest(
         checkpoints.set(checkpoint.memoryId, checkpoint);
     }
     const coverage: TaskStateManifestCoverage =
-        unresolved.size === 0 && quotes.length > 0
+        unresolved.size === 0 && !readSignal.aborted
             ? { state: 'verified', resolvedSourceCount: locators.length, totalSourceCount: quotes.length }
             : {
                   state: 'incomplete',
@@ -379,7 +682,7 @@ export async function verifyTaskStateManifest(
               };
     return {
         state: 'prepared',
-        checkpoint: { rows: [...checkpoints.values()] },
+        checkpoint: { rows: [...checkpoints.values()], projects: [...projects.values()] },
         manifest: {
             memoryId: reporting.memoryId,
             report: input.report,

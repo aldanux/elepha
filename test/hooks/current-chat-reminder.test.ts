@@ -46,7 +46,7 @@ afterEach(() => vi.restoreAllMocks());
 
 describe('host-directed memory retrieval', () => {
     it.each(['codex', 'opencode'] as const)(
-        'does no database or memory work for an ordinary %s prompt with Memory-Plus enabled',
+        'does no historical retrieval for an ordinary %s prompt with Memory-Plus enabled',
         async (tool) => {
             const f = fixture(true);
             const session = seedSession(f, { project: f.project, title: 'Dispatch agreement' });
@@ -75,8 +75,11 @@ describe('host-directed memory retrieval', () => {
             const prompt = 'Write unrelated.txt containing only the decimal result of 23 + 48 and a newline. Change no other files.';
 
             expect(await f.run(prompt, tool)).toEqual({ reason: 'not_command' });
-            expect(f.databaseOpen).not.toHaveBeenCalled();
-            expect(await f.run(prompt, tool, path.join(f.directory, 'missing.db'))).toEqual({ reason: 'not_command' });
+            if (tool === 'opencode') expect(f.databaseOpen).not.toHaveBeenCalled();
+            else expect(f.databaseOpen).toHaveBeenCalledOnce();
+            expect(await f.run(prompt, tool, path.join(f.directory, 'missing.db'))).toEqual({
+                reason: tool === 'opencode' ? 'not_command' : 'database_unavailable',
+            });
             expect(recall).not.toHaveBeenCalled();
             expect(provider).not.toHaveBeenCalled();
             expect(embed).not.toHaveBeenCalled();

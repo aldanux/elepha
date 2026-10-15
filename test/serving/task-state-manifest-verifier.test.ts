@@ -257,7 +257,7 @@ describe('precompact task-state source verification', () => {
         });
     });
 
-    it('marks reports with no citations incomplete and rejects unclassified reporting sessions', async () => {
+    it('verifies empty replacements using reporting evidence and rejects unclassified reporting sessions', async () => {
         const f = fixture();
         const reporting = turn(f, f.session, f.project, 0, 'Report now', 'Acknowledged');
         const empty: Report = {
@@ -274,10 +274,9 @@ describe('precompact task-state source verification', () => {
             cwd: f.checkout,
         });
         expect(result.state === 'prepared' && result.manifest.coverage).toEqual({
-            state: 'incomplete',
+            state: 'verified',
             resolvedSourceCount: 0,
             totalSourceCount: 0,
-            reason: 'no_source_backed_items',
         });
         f.db.prepare('UPDATE sessions SET kind = NULL WHERE id = ?').run(f.session.id);
         expect(

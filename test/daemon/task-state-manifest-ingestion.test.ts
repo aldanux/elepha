@@ -196,12 +196,12 @@ describe('task-state manifest ingestion', () => {
         expect(f.db.prepare('SELECT COUNT(*) AS count FROM task_state_manifests').get()).toEqual({ count: 1 });
     });
 
-    it('does not create a manifest when Memory-Plus is disabled or the report is from a child session', async () => {
+    it('publishes without Memory-Plus while excluding child sessions', async () => {
         const disabled = fixture(false);
         await disabled.persist(disabled.turn(0));
+        expect(disabled.issueRequest()).toBe(true);
         await disabled.persist(disabled.turn(1, { taskStateReport: report }));
-        expect(disabled.manifest()).toBeUndefined();
-        expect(disabled.logs.some((line) => line.includes('Memory-Plus disabled'))).toBe(true);
+        expect(disabled.manifest()?.coverage.state).toBe('verified');
 
         const child = fixture();
         await child.persist(child.turn(0), 'sub-agent');

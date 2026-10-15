@@ -7,6 +7,7 @@ import {
     TASK_STATE_REPORT_MODES,
     TASK_STATE_REPORT_SOURCE_MAX_ITEMS,
     TASK_STATE_REPORT_SOURCE_QUOTE_MAX_CHARS,
+    TASK_STATE_REPORT_TOOL,
     TASK_STATE_REQUEST_ID_PATTERN,
 } from '../config/constants.js';
 import { OPEN } from '../security/sentinel.js';
@@ -27,6 +28,56 @@ export type TaskStateReportInputResult =
     | { state: 'incomplete'; reason: Extract<TaskStateReportFailureReason, 'malformed-input' | 'oversized-input'> };
 
 type Failure = 'malformed-input' | 'oversized-input';
+
+export function taskStateReportErrorText(reason: Failure): string {
+    return `task_state_report_${reason.replace('-', '_')}`;
+}
+
+// Match the SDK's explicit tool-validation failure, never a host denial.
+const REPORT_SDK_ERROR_PREFIX = `MCP error -32602: Input validation error: Invalid arguments for tool ${TASK_STATE_REPORT_TOOL}: `;
+
+export function taskStateReportValidationError(value: unknown, reason: Failure): string {
+    const identifier = taskStateReportErrorText(reason);
+    if (reason !== 'oversized-input') {
+        return identifier;
+    }
+    let input = value;
+    if (typeof input === 'string') {
+        if (Buffer.byteLength(input) > TASK_STATE_REPORT_INPUT_MAX_BYTES) {
+            return identifier;
+        }
+        try {
+            input = JSON.parse(input);
+        } catch {
+            return identifier;
+        }
+    }
+    if (!isRecord(input) || input.mode !== 'precompact_manifest') {
+        return identifier;
+    }
+    for (const section of ['objective', 'decisions', 'constraints', 'pending_items'] as const) {
+        const entries = section === 'objective' ? [input.objective] : input[section];
+        if (!Array.isArray(entries)) {
+            continue;
+        }
+        for (let index = 0; index < Math.min(entries.length, TASK_STATE_REPORT_LIST_MAX_ITEMS); index++) {
+            const entry = entries[index];
+            if (isRecord(entry) && Array.isArray(entry.sources) && entry.sources.length > TASK_STATE_REPORT_SOURCE_MAX_ITEMS) {
+                const path = section === 'objective' ? [section, 'sources'] : [section, index, 'sources'];
+                return `${identifier} ${JSON.stringify({ code: 'too_big', path, maximum: TASK_STATE_REPORT_SOURCE_MAX_ITEMS })}`;
+            }
+        }
+    }
+    return identifier;
+}
+
+export function isTaskStateReportRejection(
+    text: string | undefined,
+    reason: Failure,
+    diagnostic = taskStateReportErrorText(reason),
+): boolean {
+    return text === taskStateReportErrorText(reason) || text === `${REPORT_SDK_ERROR_PREFIX}${diagnostic}`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === 'object' && !Array.isArray(value);

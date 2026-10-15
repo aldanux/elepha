@@ -2,7 +2,13 @@
 // here so serving consumers share one shape instead of re-declaring row types.
 
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { DURABLE_CAPTURE_FILTER_VERSION, SESSION_CAPSULE_METADATA_MAX_BYTES, SESSION_ELIGIBILITY_BATCH_SIZE } from '../config/constants.js';
+import {
+    CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+    DURABLE_CAPTURE_FILTER_VERSION,
+    SESSION_CAPSULE_METADATA_MAX_BYTES,
+    SESSION_ELIGIBILITY_BATCH_SIZE,
+    SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+} from '../config/constants.js';
 import { type SessionRowSurface, SUPPORTED_TOOLS, type ToolName } from '../types/index.js';
 import { retentionRemovedSql } from './live-memory-retention-schema.js';
 
@@ -293,6 +299,88 @@ export interface CurrentChatSegment {
     projectPath: string | null;
     source_path: string | null;
     turnCount: number;
+}
+
+export interface NativeTaskBinding {
+    id: number;
+    projectId: number;
+    projectPath: string;
+    sourcePath: string;
+    sourceGeneration: number;
+}
+
+export interface NativeTaskChat extends NativeTaskBinding {
+    memoryId: number;
+    sourceDigest: string;
+}
+
+// A first reporting request needs an authenticated native session, not a
+// fabricated completed turn. Existing retained or excluded history cannot
+// fall back to this metadata-only binding when indexed evidence is missing.
+export function readUncapturedNativeTaskChat(db: Database.Database, tool: ToolName, nativeId: string): NativeTaskBinding | undefined {
+    return db
+        .prepare(`SELECT s.id, s.project_id AS projectId, p.path AS projectPath, s.source_path AS sourcePath,
+        COALESCE(g.generation, 0) AS sourceGeneration
+        FROM sessions s JOIN projects p ON p.id = s.project_id
+        LEFT JOIN source_generations g ON g.tool = s.tool AND g.native_id = s.native_id
+        WHERE s.tool = ? AND s.native_id = ? AND s.kind = 'main' AND s.source_format = 'native' AND s.cursor IS NULL
+        AND s.segment_index = 0
+        AND s.segment_index = (SELECT MAX(latest.segment_index) FROM sessions latest WHERE latest.tool = s.tool AND latest.native_id = s.native_id)
+        AND NOT EXISTS (SELECT 1 FROM sessions prior JOIN memories m ON m.session_id = prior.id
+            WHERE prior.tool = s.tool AND prior.native_id = s.native_id)
+        AND length(CAST(p.path AS BLOB)) <= ? AND length(CAST(s.source_path AS BLOB)) <= ?
+        AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)
+        AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
+        AND NOT EXISTS (SELECT 1 FROM incognito_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)
+        LIMIT 1`)
+        .get(tool, nativeId, CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES, CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES) as NativeTaskBinding | undefined;
+}
+
+// Exact stored native binding only. No provider discovery belongs in a hook.
+export function readNativeTaskChat(db: Database.Database, tool: ToolName, nativeId: string): NativeTaskChat | undefined {
+    return db
+        .prepare(`SELECT s.id, s.project_id AS projectId, p.path AS projectPath, s.source_path AS sourcePath,
+        m.id AS memoryId, tsi.source_digest AS sourceDigest,
+        COALESCE(g.generation, 0) AS sourceGeneration
+        FROM sessions s JOIN projects p ON p.id = s.project_id
+        JOIN memories m ON m.session_id = s.id
+        JOIN turn_search_index tsi ON tsi.memory_id = m.id
+        LEFT JOIN source_generations g ON g.tool = s.tool AND g.native_id = s.native_id
+        WHERE s.tool = ? AND s.native_id = ? AND s.kind = 'main' AND s.source_format = 'native'
+        AND s.segment_index = (SELECT MAX(latest.segment_index) FROM sessions latest WHERE latest.tool = s.tool AND latest.native_id = s.native_id)
+        AND length(CAST(p.path AS BLOB)) <= ? AND length(CAST(s.source_path AS BLOB)) <= ?
+        AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)
+        AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
+        AND NOT EXISTS (SELECT 1 FROM incognito_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)
+        ORDER BY s.segment_index DESC, m.turn_index DESC LIMIT 1`)
+        .get(tool, nativeId, CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES, CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES) as NativeTaskChat | undefined;
+}
+
+export function readTaskSourcePosition(db: Database.Database, tool: ToolName, nativeId: string, memoryId: number) {
+    return db
+        .prepare(`SELECT m.turn_index AS turnIndex, tsi.source_cursor AS cursor, tsi.source_context AS context,
+        (SELECT CASE WHEN length(CAST(pi.source_cursor AS BLOB)) <= ? THEN pi.source_cursor END FROM memories pm JOIN sessions ps ON ps.id = pm.session_id
+            JOIN turn_search_index pi ON pi.memory_id = pm.id
+            WHERE ps.tool = s.tool AND ps.native_id = s.native_id AND ps.source_path = s.source_path AND pm.turn_index < m.turn_index
+            ORDER BY pm.turn_index DESC LIMIT 1) AS beforeCursor,
+        (SELECT CASE WHEN length(CAST(pi.source_context AS BLOB)) <= ? THEN pi.source_context END FROM memories pm JOIN sessions ps ON ps.id = pm.session_id
+            JOIN turn_search_index pi ON pi.memory_id = pm.id
+            WHERE ps.tool = s.tool AND ps.native_id = s.native_id AND ps.source_path = s.source_path AND pm.turn_index < m.turn_index
+            ORDER BY pm.turn_index DESC LIMIT 1) AS beforeContext
+        FROM memories m JOIN sessions s ON s.id = m.session_id JOIN turn_search_index tsi ON tsi.memory_id = m.id
+        WHERE s.tool = ? AND s.native_id = ? AND m.id = ?
+        AND length(CAST(tsi.source_cursor AS BLOB)) <= ? AND COALESCE(length(CAST(tsi.source_context AS BLOB)), 0) <= ?`)
+        .get(
+            CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+            SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+            tool,
+            nativeId,
+            memoryId,
+            CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+            SESSION_EVIDENCE_SOURCE_MAX_BYTES,
+        ) as
+        | { turnIndex: number; cursor: string; context: string | null; beforeCursor: string | null; beforeContext: string | null }
+        | undefined;
 }
 
 // The native chat key is exact; project ids can group distinct worktrees.

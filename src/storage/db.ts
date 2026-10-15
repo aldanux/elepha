@@ -2,8 +2,9 @@
 
 import { closeSync, constants as fsConstants, mkdirSync, openSync, readSync, realpathSync } from 'node:fs';
 import path from 'node:path';
+import { setTimeout as wait } from 'node:timers/promises';
 import Database from 'better-sqlite3-multiple-ciphers';
-import { DATABASE_HEADER_BYTES, DURABLE_CAPTURE_STATES } from '../config/constants.js';
+import { DATABASE_HEADER_BYTES, DATABASE_LIFECYCLE_POLL_MS, DURABLE_CAPTURE_STATES } from '../config/constants.js';
 import { elephaHome, samePath } from '../config/paths.js';
 import { hardenDir, hardenFile } from '../security/file-permissions.js';
 import { SUPPORTED_TOOLS } from '../types/index.js';
@@ -1030,8 +1031,13 @@ export function isPlaintextDatabaseHeader(bytes: Uint8Array): boolean {
 export interface ManagedDatabaseOpenOptions {
     readonly?: boolean;
     fileMustExist?: boolean;
+    timeout?: number;
     encryption?: DatabaseEncryptionRuntime;
     lifecycle?: ExclusiveDatabaseLifecycleLease;
+}
+
+export interface InitializedDatabaseOpenOptions extends ManagedDatabaseOpenOptions {
+    signal?: AbortSignal;
 }
 
 function releaseLifecycleAfterFailure(lease: SharedDatabaseLifecycleLease, error: unknown): never {
@@ -1271,6 +1277,7 @@ async function openManagedDatabaseAtPinnedPath(dbPath: string, options: ManagedD
                 new Database(physicalPath, {
                     ...(options.readonly ? { readonly: true } : {}),
                     ...(options.fileMustExist ? { fileMustExist: true } : {}),
+                    ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
                 }),
         );
         db = opened.database;
@@ -1322,20 +1329,47 @@ export async function openManagedDatabase(
 }
 
 export function openDb(dbPath: ':memory:'): Database.Database;
-export function openDb(dbPath?: string, options?: ManagedDatabaseOpenOptions): Promise<Database.Database>;
+export function openDb(dbPath?: string, options?: InitializedDatabaseOpenOptions): Promise<Database.Database>;
 export function openDb(
     dbPath: string = defaultDbPath(),
-    options: ManagedDatabaseOpenOptions = {},
+    options: InitializedDatabaseOpenOptions = {},
 ): Database.Database | Promise<Database.Database> {
     if (dbPath === ':memory:') {
         return openUnmanagedDb(dbPath);
     }
     const databasePath = path.resolve(dbPath);
-    return openManagedDatabaseAtPinnedPath(databasePath, options).then((db) => {
+    return openInitializedDatabase(databasePath, options);
+}
+
+async function openInitializedDatabase(dbPath: string, options: InitializedDatabaseOpenOptions): Promise<Database.Database> {
+    // A deferred transaction can fail its read-to-write upgrade immediately,
+    // regardless of SQLite's busy timeout. Reopen only after normal cleanup,
+    // yielding between attempts so the caller's shared deadline can expire.
+    const opening = options.signal === undefined ? options : { ...options, timeout: 0 };
+    while (true) {
+        options.signal?.throwIfAborted();
         try {
-            return initializeDatabase(db, databasePath);
+            const db = await openManagedDatabaseAtPinnedPath(dbPath, opening);
+            try {
+                options.signal?.throwIfAborted();
+                return initializeDatabase(db, dbPath);
+            } catch (error) {
+                return closeDatabaseAfterFailure(db, error);
+            }
         } catch (error) {
-            return closeDatabaseAfterFailure(db, error);
+            if (
+                options.signal === undefined ||
+                options.signal.aborted ||
+                !(error instanceof Database.SqliteError) ||
+                error.code !== 'SQLITE_BUSY'
+            ) {
+                throw error;
+            }
+            try {
+                await wait(DATABASE_LIFECYCLE_POLL_MS, undefined, { signal: options.signal });
+            } catch {
+                throw error;
+            }
         }
-    });
+    }
 }

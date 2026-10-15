@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { Database } from 'better-sqlite3-multiple-ciphers';
 import { STANDING_RULES_MAX_ACTIVE, STANDING_RULES_MAX_TOTAL_CHARS } from '../config/constants.js';
 import { canonicalizeExisting, isWithin, normalizeForCompare, samePath } from '../config/paths.js';
+import { gitRevListCountHeadAsync } from '../security/subprocess-allowlist.js';
 import type { OpenTailObservation, ParsedTurn, SessionRowKind, SessionRowSurface, SummarizationOutput, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
 import {
@@ -244,6 +245,39 @@ export class MemoryStore {
 
     upsertSession(tool: ToolName, nativeId: string, projectId: number, sourcePath: string, meta?: SessionMetadata): SessionRow {
         return this.db.transaction(() => this.sessions.upsertSession(tool, nativeId, projectId, sourcePath, meta))();
+    }
+
+    // Register only metadata authenticated from an in-progress native source.
+    // No turn, cursor, digest, title or receipt exists until normal capture.
+    async registerNativeTaskChat(
+        input: { tool: ToolName; nativeId: string; cwd: string; sourcePath: string },
+        validate: () => boolean,
+        signal: AbortSignal,
+    ): Promise<SessionRow | undefined> {
+        if (signal.aborted || !validate()) {
+            return undefined;
+        }
+        const identity = await this.projects.resolveProjectIdentityAsync(input.cwd, signal);
+        if (signal.aborted || !validate()) {
+            return undefined;
+        }
+        const gitCommitCount = await gitRevListCountHeadAsync(identity.gitRoot ?? input.cwd, signal);
+        return this.db.transaction(() => {
+            if (
+                signal.aborted ||
+                !validate() ||
+                this.consent.consentState(input.cwd) !== 'approved' ||
+                this.consent.isRefusedForCapture(input.cwd) ||
+                this.isTranscriptCaptureBlocked(input.tool, input.nativeId) ||
+                this.isTranscriptIncognito(input.tool, input.nativeId) ||
+                this.sessions.findSession(input.tool, input.nativeId) !== undefined ||
+                this.db.prepare('SELECT 1 FROM sessions WHERE tool = ? AND source_path = ? LIMIT 1').get(input.tool, input.sourcePath)
+            ) {
+                return undefined;
+            }
+            const project = this.projects.upsertProject(input.cwd, identity);
+            return this.sessions.upsertSession(input.tool, input.nativeId, project.id, input.sourcePath, { kind: 'main' }, gitCommitCount);
+        })();
     }
 
     findSession(tool: ToolName, nativeId: string): SessionRow | undefined {
@@ -803,9 +837,15 @@ export class MemoryStore {
         summary: SummarizationOutput,
         quoteBackPrevalidated = false,
         durableCapture = false,
+        liveCompletion?: { previousCursor: string; current: () => boolean },
     ): boolean {
         const reingest = this.db.transaction(() => {
-            if (this.recordIncognitoIfWriteBlocked(turn) || turn.validateSource?.() === false || turn.droppedReason !== undefined) {
+            if (
+                this.recordIncognitoIfWriteBlocked(turn) ||
+                turn.validateSource?.() === false ||
+                turn.droppedReason !== undefined ||
+                liveCompletion?.current() === false
+            ) {
                 return false;
             }
             if (!quoteBackPrevalidated) {
@@ -822,6 +862,15 @@ export class MemoryStore {
                 .prepare('SELECT id FROM memories WHERE session_id = ? AND turn_index = ?')
                 .get(sessionDbId, turn.turnIndex) as { id: number };
             this.db.prepare('DELETE FROM task_state_manifests WHERE memory_id = ?').run(reportingMemory.id);
+            // An authenticated append completes the same captured turn. Move
+            // its live cursor only while it still heads the native session.
+            if (
+                liveCompletion !== undefined &&
+                this.getSessionResume(turn.tool, turn.sessionId)?.cursor === liveCompletion.previousCursor
+            ) {
+                this.sessions.advanceSessionCursor(sessionDbId, turn);
+                this.sessions.updateTrailingState(sessionDbId, turn);
+            }
             return true;
         });
         return this.liveMemoryRetention.run({ tool: turn.tool, nativeId: turn.sessionId }, () => reingest());

@@ -150,7 +150,7 @@ describe('task-state manifest store', () => {
         db.close();
     });
 
-    it('keeps a zero-claim precompact report explicitly incomplete', () => {
+    it('stores a verified empty replacement with authenticated reporting metadata', () => {
         const db = openUnmanagedDb(':memory:');
         seedMemory(db);
         const store = new TaskStateManifestStore(db);
@@ -165,9 +165,6 @@ describe('task-state manifest store', () => {
         };
         empty.sourceLocators = [];
         empty.coverage = { state: 'verified', resolvedSourceCount: 0, totalSourceCount: 0 };
-        expect(() => store.insert(empty)).toThrow('verification state');
-        expect(store.get(1)).toBeUndefined();
-        empty.coverage = { state: 'incomplete', resolvedSourceCount: 0, totalSourceCount: 0, reason: 'no claims to verify' };
         expect(store.insert(empty)).toBe('inserted');
         expect(store.get(1)?.coverage).toEqual(empty.coverage);
         db.close();

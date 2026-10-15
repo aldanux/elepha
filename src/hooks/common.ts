@@ -69,8 +69,9 @@ export function parsePayload(raw: string, tool: HookTool, event?: HookPayload['h
     ) {
         return undefined;
     }
-    // Codex explicitly allows a null transcript path. No hook tool's path is
-    // used beyond validation; it cannot become a reader or subprocess input.
+    // Codex explicitly allows a null transcript path. Continuity reads separately
+    // authenticate the stored native binding and the opened provider identity;
+    // a hook path can never become a subprocess input.
     if (payload.transcript_path !== undefined && payload.transcript_path !== null && typeof payload.transcript_path !== 'string') {
         return undefined;
     }

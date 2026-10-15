@@ -25,6 +25,7 @@ import {
     MAX_TRANSCRIPT_RECORD_BYTES,
     MAX_UNKNOWN_LINE_DISCRIMINATOR_CHARS,
     TASK_STATE_REPORT_ACK,
+    TASK_STATE_REPORT_INPUT_MAX_BYTES,
     TASK_STATE_REPORT_RESULT_MAX_BYTES,
 } from '../config/constants.js';
 import { type AssistantMessageBoundary, joinedAssistantStructure } from '../rendering/assistant-structure.js';
@@ -51,10 +52,12 @@ import type {
     TaskStateReportInput,
 } from '../types/index.js';
 import {
+    isTaskStateReportRejection,
     parseTaskStateReportInput,
     sameTaskStateReportInput,
     type TaskStateReportRawGuard,
     taskStateReportRawGuard,
+    taskStateReportValidationError,
 } from './task-state-report.js';
 
 const NEWLINE = 0x0a;
@@ -212,16 +215,21 @@ export interface BoundedLine {
 }
 
 export interface BoundedLineReadOptions {
+    signal?: AbortSignal;
     start?: number;
     maxRecordBytes?: number;
     maxReadBytes?: number;
     // Reads from this already-opened file without taking ownership or changing its position.
     handle?: FileHandle;
+    readBudget?: SourceReadBudget;
 }
 
 // Reads JSONL records without retaining a pending record beyond the per-record ceiling.
 export async function* readBoundedLines(filePath: string, options: BoundedLineReadOptions = {}): AsyncIterable<BoundedLine> {
     const start = options.start ?? 0;
+    if (options.signal?.aborted) {
+        throw new TranscriptReadBudgetError('deadline');
+    }
     const maxRecordBytes = options.maxRecordBytes ?? MAX_TRANSCRIPT_RECORD_BYTES;
     if (!Number.isSafeInteger(start) || start < 0) {
         throw new RangeError('start must be a non-negative safe integer');
@@ -239,7 +247,13 @@ export async function* readBoundedLines(filePath: string, options: BoundedLineRe
     try {
         for (;;) {
             const bytesUntilOversized = maxRecordBytes - pendingBytes + 1;
-            const remainingBytes = (options.maxReadBytes ?? Number.POSITIVE_INFINITY) - (readOffset - start);
+            if (options.signal?.aborted) {
+                throw new TranscriptReadBudgetError('deadline');
+            }
+            const remainingBytes = Math.min(
+                (options.maxReadBytes ?? Number.POSITIVE_INFINITY) - (readOffset - start),
+                options.readBudget?.remaining ?? Number.POSITIVE_INFINITY,
+            );
             if (remainingBytes <= 0) {
                 throw new TranscriptReadBudgetError('Transcript evidence byte budget reached.');
             }
@@ -247,6 +261,9 @@ export async function* readBoundedLines(filePath: string, options: BoundedLineRe
             const { bytesRead } = await handle.read(chunk, 0, chunk.length, readOffset);
             if (bytesRead === 0) {
                 break;
+            }
+            if (options.readBudget) {
+                chargeRead(options.readBudget, bytesRead);
             }
             readOffset += bytesRead;
             const data = chunk.subarray(0, bytesRead);
@@ -583,11 +600,13 @@ export interface TurnBuilderState {
     elephaMcpResultReceipts: ElephaMcpResultReceipt[];
     elephaMcpResultBytes: number;
     elephaMcpCoverageFailure?: ElephaMcpCoverageFailureReason;
-    // First report_task_state call of the turn. Tracked apart from the
+    // Candidate report_task_state call of the turn. Tracked apart from the
     // elepha MCP sets above so it never forces the Rule 4 whole-turn drop.
     taskStateReport: TaskStateReportObservation | undefined;
     // First reason the turn's report cannot be trusted; it withholds only the report.
     taskStateReportFailure: TaskStateReportFailureReason | undefined;
+    taskStateReportRetryBlocked: boolean;
+    taskStateReportRejectedCalls: Map<string, TaskStateReportObservation>;
     taskStateReportRawGuard: TaskStateReportRawGuard;
     explicitLifecycleStarted: boolean;
     explicitLifecycleId: string | undefined;
@@ -719,15 +738,22 @@ export function rememberUnmatchedElephaMcpResult(state: TurnBuilderState, callId
 export type TaskStateReportEnvelope = 'claude-code' | 'codex-cli' | 'codex-desktop' | 'opencode-v2';
 
 export interface TaskStateReportObservation {
+    inputErrorText?: string;
     callId: string;
     // Undefined once any envelope carried invalid input; a failure is recorded then.
     input: TaskStateReportInput | undefined;
+    inputFailure: 'malformed-input' | 'oversized-input' | undefined;
+    invalidInputDigest: string | undefined;
     callEnvelopes: Set<TaskStateReportEnvelope>;
     resultEnvelopes: Set<TaskStateReportEnvelope>;
+    rejectedEnvelopes: Set<TaskStateReportEnvelope>;
 }
 
 function failTaskStateReport(state: TurnBuilderState, reason: TaskStateReportFailureReason): void {
     state.taskStateReportFailure ??= reason;
+    if (reason !== 'malformed-input' && reason !== 'oversized-input') {
+        state.taskStateReportRetryBlocked = true;
+    }
 }
 
 export function reportInputDropReason(guard: TaskStateReportRawGuard): 'sentinel' | 'report-input-unscanned' | undefined {
@@ -745,50 +771,77 @@ function selfIngestionDropMessage(reason: 'sentinel' | 'report-input-unscanned')
     return reason === 'sentinel' ? 'self-injected content (sentinel)' : 'report input could not be fully scanned within bound';
 }
 
-function isTaskStateReportAck(value: unknown): boolean {
+function taskStateReportResultText(value: unknown, expectedError: boolean, transportError: boolean): string | undefined {
     let decoded = value;
+    let resultError = transportError;
     if (typeof value === 'string') {
         if (value.length > TASK_STATE_REPORT_RESULT_MAX_BYTES || Buffer.byteLength(value) > TASK_STATE_REPORT_RESULT_MAX_BYTES) {
-            return false;
-        }
-        if (value === TASK_STATE_REPORT_ACK) {
-            return true;
+            return undefined;
         }
         try {
             decoded = JSON.parse(value);
         } catch {
-            return false;
+            return expectedError === transportError ? value : undefined;
         }
     }
     // Claude and Codex Desktop carry text blocks. Codex CLI can serialize
     // the MCP result envelope into its output string. Neither shape may
-    // include extra result fields or error metadata.
+    // include extra result fields. Only a rejection carries error metadata.
     if (decoded !== null && typeof decoded === 'object' && !Array.isArray(decoded)) {
         const envelope = decoded as Record<string, unknown>;
-        if (Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'content')) {
-            return false;
+        const envelopeError = Object.hasOwn(envelope, 'isError');
+        if (
+            Object.keys(envelope).length !== (expectedError && envelopeError ? 2 : 1) ||
+            !Object.hasOwn(envelope, 'content') ||
+            (expectedError ? (envelopeError ? envelope.isError !== true : !transportError) : transportError)
+        ) {
+            return undefined;
+        }
+        if (envelopeError) {
+            resultError = envelope.isError === true;
         }
         decoded = envelope.content;
     }
     if (!Array.isArray(decoded) || decoded?.length !== 1) {
-        return false;
+        return undefined;
     }
     const block = decoded[0];
-    return (
-        block !== null &&
+    return block !== null &&
         typeof block === 'object' &&
         !Array.isArray(block) &&
         Object.keys(block).length === 2 &&
         Object.hasOwn(block, 'type') &&
         Object.hasOwn(block, 'text') &&
         block.type === 'text' &&
-        block.text === TASK_STATE_REPORT_ACK
-    );
+        typeof block.text === 'string' &&
+        expectedError === resultError
+        ? block.text
+        : undefined;
+}
+
+// Invalid duplicate envelopes must still agree. Keep only a bounded digest,
+// never the rejected arguments or the tool's error text.
+function invalidReportInputDigest(value: unknown): string | undefined {
+    if (typeof value === 'string') {
+        try {
+            value = JSON.parse(value);
+        } catch {
+            // A malformed JSON argument remains a string.
+        }
+    }
+    try {
+        const encoded = JSON.stringify(value);
+        return encoded !== undefined && Buffer.byteLength(encoded) <= TASK_STATE_REPORT_INPUT_MAX_BYTES
+            ? createHash('sha256').update(encoded).digest('hex')
+            : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 // A generic elepha call reusing the report's id makes correlation ambiguous.
 export function isTaskStateReportCallId(state: TurnBuilderState, callId: string): boolean {
-    return state.taskStateReport?.callId === callId;
+    return state.taskStateReport?.callId === callId || state.taskStateReportRejectedCalls.has(callId);
 }
 
 export function observeTaskStateReportCall(
@@ -818,13 +871,51 @@ export function observeTaskStateReportCall(
         return;
     }
     const parsed = parseTaskStateReportInput(rawInput);
+    const prior = state.taskStateReportRejectedCalls.get(callId);
+    if (prior !== undefined) {
+        if (prior.callEnvelopes.has(envelope)) {
+            failTaskStateReport(state, 'duplicate-call-id');
+        } else if (
+            prior.resultEnvelopes.has(envelope) ||
+            parsed.state !== 'incomplete' ||
+            parsed.reason !== prior.inputFailure ||
+            prior.invalidInputDigest === undefined ||
+            prior.invalidInputDigest !== invalidReportInputDigest(rawInput)
+        ) {
+            failTaskStateReport(state, 'conflicting-duplicate');
+        } else {
+            // Codex can record a matching second envelope after the correction.
+            // It must still obtain its own explicit rejection before turn close.
+            prior.callEnvelopes.add(envelope);
+        }
+        return;
+    }
     const existing = state.taskStateReport;
-    if (existing === undefined) {
+    const rejected =
+        existing !== undefined &&
+        existing.inputFailure !== undefined &&
+        !state.taskStateReportRetryBlocked &&
+        state.taskStateReportRawGuard === undefined &&
+        existing.resultEnvelopes.size === existing.callEnvelopes.size &&
+        [...existing.callEnvelopes].every((source) => existing.rejectedEnvelopes.has(source));
+    if (existing === undefined || (existing.callId !== callId && rejected)) {
+        if (existing !== undefined) {
+            if (state.taskStateReportRejectedCalls.size + 1 >= ELEPHA_MCP_RESULTS_PER_TURN_MAX) {
+                failTaskStateReport(state, 'multiple-reports');
+                return;
+            }
+            state.taskStateReportRejectedCalls.set(existing.callId, existing);
+            state.taskStateReportFailure = undefined;
+        }
         state.taskStateReport = {
             callId,
             input: parsed.state === 'complete' ? parsed.input : undefined,
+            inputErrorText: parsed.state === 'incomplete' ? taskStateReportValidationError(rawInput, parsed.reason) : undefined,
+            inputFailure: parsed.state === 'incomplete' ? parsed.reason : undefined,
+            invalidInputDigest: parsed.state === 'incomplete' && rawGuard === undefined ? invalidReportInputDigest(rawInput) : undefined,
             callEnvelopes: new Set([envelope]),
             resultEnvelopes: new Set(),
+            rejectedEnvelopes: new Set(),
         };
         if (parsed.state === 'incomplete') {
             failTaskStateReport(state, parsed.reason);
@@ -840,9 +931,20 @@ export function observeTaskStateReportCall(
         failTaskStateReport(state, 'duplicate-call-id');
         return;
     }
+    if (existing.resultEnvelopes.has(envelope)) {
+        failTaskStateReport(state, 'unexpected-result');
+        return;
+    }
     existing.callEnvelopes.add(envelope);
     if (parsed.state === 'incomplete') {
         failTaskStateReport(state, parsed.reason);
+        if (
+            existing.inputFailure !== parsed.reason ||
+            existing.invalidInputDigest === undefined ||
+            existing.invalidInputDigest !== invalidReportInputDigest(rawInput)
+        ) {
+            failTaskStateReport(state, 'conflicting-duplicate');
+        }
         return;
     }
     if (existing.input === undefined || !sameTaskStateReportInput(existing.input, parsed.input)) {
@@ -859,26 +961,44 @@ export function consumeTaskStateReportResult(
     value: unknown,
     isError: boolean,
 ): boolean {
-    const observation = state.taskStateReport;
-    if (typeof callId !== 'string' || observation?.callId !== callId) {
+    if (typeof callId !== 'string') {
         return false;
+    }
+    const prior = state.taskStateReportRejectedCalls.get(callId);
+    const observation = prior ?? (state.taskStateReport?.callId === callId ? state.taskStateReport : undefined);
+    if (observation === undefined) {
+        return false;
+    }
+    if (!observation.callEnvelopes.has(envelope)) {
+        failTaskStateReport(state, 'unexpected-result');
+        return true;
     }
     if (observation.resultEnvelopes.has(envelope)) {
         failTaskStateReport(state, 'duplicate-call-id');
         return true;
     }
     observation.resultEnvelopes.add(envelope);
-    if (isError || !isTaskStateReportAck(value)) {
+    if (
+        observation.inputFailure !== undefined &&
+        isTaskStateReportRejection(taskStateReportResultText(value, true, isError), observation.inputFailure, observation.inputErrorText)
+    ) {
+        observation.rejectedEnvelopes.add(envelope);
+    } else if (prior !== undefined || isError || taskStateReportResultText(value, false, isError) !== TASK_STATE_REPORT_ACK) {
         failTaskStateReport(state, 'unexpected-result');
     }
     return true;
 }
 
-export type TaskStateReportOutcome = { report: TaskStateReport } | { failure: TaskStateReportFailureReason };
+export type TaskStateReportOutcome = { report: TaskStateReport; rejectedRetry?: true } | { failure: TaskStateReportFailureReason };
 
 export function taskStateReportOutcome(state: TurnBuilderState): TaskStateReportOutcome | undefined {
     if (state.taskStateReportFailure !== undefined) {
         return { failure: state.taskStateReportFailure };
+    }
+    for (const rejected of state.taskStateReportRejectedCalls.values()) {
+        if ([...rejected.callEnvelopes].some((envelope) => !rejected.rejectedEnvelopes.has(envelope))) {
+            return { failure: 'missing-result' };
+        }
     }
     const observation = state.taskStateReport;
     if (observation === undefined) {
@@ -893,7 +1013,10 @@ export function taskStateReportOutcome(state: TurnBuilderState): TaskStateReport
             return { failure: 'missing-result' };
         }
     }
-    return { report: { callId: observation.callId, ...observation.input } };
+    return {
+        report: { callId: observation.callId, ...observation.input },
+        ...(state.taskStateReportRejectedCalls.size > 0 ? { rejectedRetry: true as const } : {}),
+    };
 }
 
 export function createTurnBuilderState(): TurnBuilderState {
@@ -919,6 +1042,8 @@ export function createTurnBuilderState(): TurnBuilderState {
         elephaMcpResultBytes: 0,
         taskStateReport: undefined,
         taskStateReportFailure: undefined,
+        taskStateReportRetryBlocked: false,
+        taskStateReportRejectedCalls: new Map(),
         taskStateReportRawGuard: undefined,
         explicitLifecycleStarted: false,
         explicitLifecycleId: undefined,
@@ -1037,6 +1162,10 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
     // own - it just sets a pending flag the next turn boundary picks up. Base
     // default false; Claude Code never overrides this (it has per-turn
     // gitBranch and doesn't need it).
+    protected isCompactionBoundaryLine(_line: unknown): boolean {
+        return false;
+    }
+
     protected isResumeMarkerLine(_line: unknown): boolean {
         return false;
     }
@@ -1356,7 +1485,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
             }
 
             const sessionId = this.nativeSessionId(filePath);
-            const sessionAiTitle = await this.readSessionAiTitle(filePath);
+            const sessionAiTitle = options?.skipSessionTitle ? undefined : await this.readSessionAiTitle(filePath);
             let currentCwd: string | undefined;
             let currentSurface: string | undefined;
             let currentBranch: string | undefined;
@@ -1492,7 +1621,11 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                         );
                         return { ...turn, taskStateReportFailure: report.failure };
                     }
-                    return { ...turn, taskStateReport: report.report };
+                    return {
+                        ...turn,
+                        taskStateReport: report.report,
+                        ...(report.rejectedRetry ? { taskStateReportRejectedRetry: true } : {}),
+                    };
                 }
                 if (state.elephaMcpCoverageFailure !== undefined) {
                     throw new ElephaMcpCoverageError(state.elephaMcpCoverageFailure);
@@ -1627,6 +1760,9 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                         if (aiTitle !== undefined) {
                             currentTurn.aiTitle = aiTitle;
                         }
+                    }
+                    if (this.isCompactionBoundaryLine(parsed)) {
+                        options?.onCompactionBoundary?.(line.byteStart);
                     }
                     if (this.isResumeMarkerLine(parsed)) {
                         pendingResumeMarker = true;
@@ -1769,6 +1905,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
             if (pendingBytes > 0) {
             }
 
+            let emittedTrailing = false;
             if (
                 currentTurn &&
                 lastCompleteLineEnd !== undefined &&
@@ -1781,6 +1918,7 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                     currentTurn.elephaMcpCallIds.size > 0 ||
                     currentTurn.taskStateReportRawGuard !== undefined)
             ) {
+                emittedTrailing = true;
                 const parsed = {
                     ...(await parsedTurn(currentTurn, lastCompleteLineEnd)),
                     ...(!currentTurn.explicitLifecycleStarted ? { provisionalIdle: true as const } : {}),
@@ -1805,6 +1943,70 @@ export abstract class JsonlTurnAdapter implements SessionAdapter {
                 } else {
                     yield turn;
                 }
+            }
+
+            if (
+                !emittedTrailing &&
+                options?.includeClosingBoundary &&
+                options.endByteOffset !== undefined &&
+                currentTurn &&
+                lastCompleteLineEnd === readEnd &&
+                pendingBytes === 0 &&
+                malformedCompleteRecords === 0 &&
+                unrecognizedRecords === 0 &&
+                (!isEmptyTurn(currentTurn) || currentTurn.taskStateReportRawGuard !== undefined)
+            ) {
+                // A captured cursor precedes the record that closed its turn.
+                // Observe only that boundary (plus Codex's preceding start
+                // marker), charging every byte without folding newer content.
+                for await (const line of chargedLines(handle, {
+                    start: readEnd,
+                    end: fileStat.size,
+                    budget,
+                    signal: options.signal,
+                    chunkBytes: RECORD_OVERRUN_READ_BYTES,
+                })) {
+                    let next: unknown;
+                    try {
+                        next = JSON.parse(line.text);
+                    } catch {
+                        this.warnUnknownLine(malformedCompleteRecordsDiagnostic(filePath, 1));
+                        options.onMalformedRecords?.(1);
+                        break;
+                    }
+                    if (line.byteStart === readEnd && this.turnLifecycleSignal(next)?.phase === 'started') {
+                        continue;
+                    }
+                    this.unrecognizedInClassify = 0;
+                    const classification = this.classify(next, filePath);
+                    if (this.unrecognizedInClassify > 0) {
+                        options.onUnrecognizedRecords?.(this.unrecognizedInClassify);
+                    }
+                    if (classification === 'boundary') {
+                        emittedTrailing = true;
+                        const turn = await parsedTurn(currentTurn, readEnd);
+                        const reason = selfIngestionDropReason(turn);
+                        if (reason !== undefined) {
+                            this.warnUnknownLine(
+                                `[elepha] dropped turn ${turn.turnIndex} of ${sessionId}: ${selfIngestionDropMessage(reason)}`,
+                            );
+                        }
+                        yield reason === undefined ? turn : { ...turn, droppedReason: reason };
+                    }
+                    break;
+                }
+            }
+
+            if (
+                !emittedTrailing &&
+                options?.onPendingTurn &&
+                currentTurn &&
+                lastCompleteLineEnd !== undefined &&
+                !isEmptyTurn(currentTurn)
+            ) {
+                const pending = await parsedTurn(currentTurn, lastCompleteLineEnd);
+                const reason = selfIngestionDropReason(pending);
+                options.onPendingTurn(reason === undefined ? pending : { ...pending, droppedReason: reason });
             }
 
             if (
