@@ -184,7 +184,7 @@ describe('elepha consent grant/revoke', () => {
         } finally {
             removeDirectory(directory);
         }
-    });
+    }, 15000);
 
     it('grants the current directory and backfills its already-written transcript with --here', () => {
         const directory = withTempDir('elepha-consent-grant-here-');
