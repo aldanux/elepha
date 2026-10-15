@@ -35,7 +35,7 @@ export interface EncryptionMetadata {
 
 export interface KeyringEntry {
     setSecret(secret: Uint8Array, signal?: AbortSignal | null): Promise<void>;
-    getSecret(signal?: AbortSignal | null): Promise<Uint8Array | null | undefined>;
+    getSecret(signal?: AbortSignal | null): Promise<Uint8Array | number[] | null | undefined>;
     deleteCredential(signal?: AbortSignal | null): Promise<boolean>;
 }
 
