@@ -9,14 +9,14 @@ import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { TASK_STATE_REQUEST_INSTRUCTIONS } from '../../src/serving/instructions.js';
 import { openDb, type openUnmanagedDb } from '../../src/storage/db.js';
 import { TaskStateRequestStore } from '../../src/storage/task-state-request-store.js';
-import { createTestDb, seedConsentRoot, seedProject, seedSession } from '../helpers/db.js';
+import { createTestDb, seedConsentRoot, seedProject } from '../helpers/db.js';
 
 afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
 });
 
-function fixture() {
+async function fixture() {
     const f = createTestDb('task-state-hook-');
     vi.stubEnv('ELEPHA_HOME', f.directory);
     vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(f.directory, '.claude'));
@@ -27,8 +27,26 @@ function fixture() {
     seedConsentRoot(f, { path: project.path });
     const sourcePath = path.join(f.directory, '.claude', 'projects', 'fixture', 'chat-1.jsonl');
     mkdirSync(path.dirname(sourcePath), { recursive: true });
-    writeFileSync(sourcePath, '');
-    seedSession(f, { project, tool: 'claude-code', nativeId: 'chat-1', sourcePath, kind: 'main' });
+    writeFileSync(
+        sourcePath,
+        `${[
+            { type: 'user', cwd: project.path, timestamp: '2026-10-08T12:00:00Z', message: { role: 'user', content: 'Build dispatch.' } },
+            {
+                type: 'assistant',
+                cwd: project.path,
+                timestamp: '2026-10-08T12:00:01Z',
+                message: { role: 'assistant', content: [{ type: 'text', text: 'Ready.' }] },
+            },
+        ]
+            .map((record) => JSON.stringify(record))
+            .join('\n')}\n`,
+    );
+    for await (const turn of new ClaudeCodeAdapter().parseTurns(sourcePath, undefined, {
+        closeTrailingOnIdle: true,
+        skipSessionTitle: true,
+    })) {
+        f.store.recordIngestedTurn(turn, { kind: 'main', surface: 'cli' }, false, { decisions: [], pending_items: [], status: 'ok' }, true);
+    }
     const provider = vi.spyOn(providers, 'createEmbeddingProvider').mockResolvedValue({
         configuration: { provider: 'local', model: 'fixture', revision: 'v1', dimensions: 2 },
         embed: async () => [1, 0],
@@ -48,11 +66,13 @@ function fixture() {
             agentId?: string;
             agentType?: string;
             enabled?: boolean;
+            captureEnabled?: boolean;
             dbPath?: string;
             writeInjection?: () => boolean;
         } = {},
     ) => {
         if (options.enabled === false) setSetting('memory-plus', 'false', configPath);
+        if (options.captureEnabled === false) setSetting('capture-claude-code', 'false', configPath);
         return runUserPromptSubmit(
             JSON.stringify({
                 session_id: 'chat-1',
@@ -79,7 +99,7 @@ function fixture() {
 }
 
 it.each([
-    { enabled: false },
+    { captureEnabled: false },
     { agentType: 'review' },
     { sourcePath: null },
     { sourcePath: '' },
@@ -87,7 +107,7 @@ it.each([
     { sourcePath: 'other-chat.jsonl' },
     { prompt: ' ' },
 ])('does no database or receipt work for an ineligible Claude payload (case %#)', async (options) => {
-    const f = fixture();
+    const f = await fixture();
     expect(await f.run(options)).toEqual({ reason: 'not_command' });
     expect(f.databaseOpen).not.toHaveBeenCalled();
     expect(await f.run({ ...options, dbPath: path.join(f.directory, 'missing.db') })).toEqual({ reason: 'not_command' });
@@ -97,7 +117,7 @@ it.each([
 });
 
 it('asks one verified Claude main chat for a task-state report and preserves its pending request', async () => {
-    const f = fixture();
+    const f = await fixture();
     const first = await f.run();
     expect(first).toHaveProperty('output');
     const body = JSON.stringify(first);
@@ -113,22 +133,22 @@ it('asks one verified Claude main chat for a task-state report and preserves its
     expect(f.injectionCount()).toBe(1);
 });
 
-it('does not ask from a command, child, disabled setting, or missing session', async () => {
-    const f = fixture();
+it('does not ask from a command, child, disabled capture, or missing session', async () => {
+    const f = await fixture();
     expect(await f.run({ prompt: 'elepha:help' })).toHaveProperty('output');
     expect(await f.run({ agentId: 'child-1' })).toEqual({ reason: 'subagent_context' });
     expect(await f.run({ sourcePath: path.join(path.dirname(f.sourcePath), 'parent', 'subagents', 'agent-child.jsonl') })).toEqual({
         reason: 'not_command',
     });
     expect(f.requestCount()).toBe(0);
-    f.db.prepare("DELETE FROM sessions WHERE tool = 'claude-code' AND native_id = 'chat-1'").run();
+    f.db.prepare("UPDATE sessions SET native_id = 'other-chat' WHERE tool = 'claude-code' AND native_id = 'chat-1'").run();
     expect(await f.run()).toEqual({ reason: 'not_command' });
-    expect(await f.run({ enabled: false })).toEqual({ reason: 'not_command' });
+    expect(await f.run({ captureEnabled: false })).toEqual({ reason: 'not_command' });
     expect(f.requestCount()).toBe(0);
 });
 
 it('rolls back the task-state injection when request issuance fails after its write', async () => {
-    const f = fixture();
+    const f = await fixture();
     vi.spyOn(TaskStateRequestStore.prototype, 'issuePrepared').mockReturnValue(false);
     expect(await f.run()).toEqual({ reason: 'not_command' });
     expect(f.requestCount()).toBe(0);
@@ -136,7 +156,7 @@ it('rolls back the task-state injection when request issuance fails after its wr
 });
 
 it('rejects a substituted Claude source with the same native chat filename', async () => {
-    const f = fixture();
+    const f = await fixture();
     const substitute = path.join(path.dirname(path.dirname(f.sourcePath)), 'other', 'chat-1.jsonl');
     mkdirSync(path.dirname(substitute), { recursive: true });
     writeFileSync(substitute, '');
@@ -145,18 +165,18 @@ it('rejects a substituted Claude source with the same native chat filename', asy
     expect(f.injectionCount()).toBe(0);
 });
 
-it('does not issue a request when Memory-Plus is disabled during source verification', async () => {
-    const f = fixture();
+it('does not issue a request when capture is disabled during source verification', async () => {
+    const f = await fixture();
     let classifications = 0;
     vi.spyOn(ClaudeCodeAdapter.prototype, 'classifySession').mockImplementation(async () => {
         classifications += 1;
-        if (classifications === 2) {
-            setSetting('memory-plus', 'false', f.configPath);
+        if (classifications === 1) {
+            setSetting('capture-claude-code', 'false', f.configPath);
         }
         return { kind: 'primary' };
     });
     expect(await f.run()).toEqual({ reason: 'not_command' });
-    expect(classifications).toBe(2);
+    expect(classifications).toBe(1);
     expect(f.requestCount()).toBe(0);
     expect(f.injectionCount()).toBe(0);
 });

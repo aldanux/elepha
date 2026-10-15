@@ -4,19 +4,19 @@
 import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
 import {
+    CURRENT_CHAT_EVIDENCE_MAX_ID_BYTES,
     CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
     ELEPHA_LIST_DEFAULT_LIMIT,
     ELEPHA_LIST_MAX_LIMIT,
     HOOK_WATCHDOG_TIMEOUT_MS,
     RESUME_CHAR_BUDGET,
+    TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS,
 } from '../config/constants.js';
 import { getSetting } from '../config/settings.js';
 import { readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
-import { openProviderTranscript, validateOpenedProviderTranscriptIdentitySync } from '../security/provider-transcript.js';
 import {
     DISPLAY_VERBATIM_INSTRUCTIONS,
     HELP,
@@ -25,7 +25,6 @@ import {
     RESUME_RECAP_INSTRUCTIONS,
     SELECT_HINT,
     servedContextInstructions,
-    TASK_STATE_REQUEST_INSTRUCTIONS,
 } from '../serving/instructions.js';
 import { lexicalRecall, tokenizeRecallQuery } from '../serving/lexical-recall.js';
 import { renderSemanticUnion, semanticRecall } from '../serving/semantic-recall.js';
@@ -38,16 +37,16 @@ import {
     type StandingRulesCommand,
     standingRulesCommandBody,
 } from '../serving/standing-rules.js';
+import { requestTaskState } from '../serving/task-state-request.js';
 import { type ConsentRoot, ConsentStore } from '../storage/consent-store.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
 import { MemoryStore } from '../storage/memory-store.js';
 import { LOCKED_MEMORY_MESSAGE, withMemoryReadGenerationAsync } from '../storage/paranoid-gate.js';
 import { ProjectResolver, type ProjectSet } from '../storage/project-resolver.js';
-import { newTaskStateRequestId, TaskStateRequestStore, taskStateRequestMarker } from '../storage/task-state-request-store.js';
 import type { ToolName } from '../types/index.js';
 import { relativeTime } from '../util/relative-time.js';
 import { consentedProject, type HookTool, parsePayload, readStdin, type UserPromptSubmitPayload } from './common.js';
-import { appendHookLog } from './hook-log.js';
+import { appendHookLog, TASK_STATE_HOOK_STAGE, taskStateHookDiagnostic } from './hook-log.js';
 import { recordHookOutput } from './output.js';
 import { withDaemonHealthWarning, withUpdateNotice } from './session-start.js';
 
@@ -280,25 +279,33 @@ export async function runUserPromptSubmit(
     if (
         ordinaryPrompt &&
         (!payload.prompt.trim() ||
-            tool !== 'claude-code' ||
-            !getSetting('memory-plus', {}, dependencies.configPath).value ||
+            Buffer.byteLength(payload.session_id) > CURRENT_CHAT_EVIDENCE_MAX_ID_BYTES ||
+            Buffer.byteLength(payload.cwd) > CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES ||
+            tool === 'opencode' ||
+            !getSetting(`capture-${tool}`, {}, dependencies.configPath).value ||
             payload.agent_type !== undefined ||
-            !payload.transcript_path ||
-            Buffer.byteLength(payload.transcript_path) > CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES ||
-            path.basename(payload.transcript_path) !== `${payload.session_id}.jsonl`)
+            (payload.transcript_path != null &&
+                (!payload.transcript_path || Buffer.byteLength(payload.transcript_path) > CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES)) ||
+            (tool === 'claude-code' &&
+                (!payload.transcript_path || path.basename(payload.transcript_path) !== `${payload.session_id}.jsonl`)))
     ) {
+        if (tool !== 'opencode') {
+            taskStateHookDiagnostic(log, tool, payload.session_id)(TASK_STATE_HOOK_STAGE.eligibility);
+        }
         return { reason: 'not_command' };
     }
+    const taskDeadline = ordinaryPrompt ? AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS) : undefined;
+    const diagnostic = taskStateHookDiagnostic(log, tool, payload.session_id);
     let db: Database.Database;
     try {
         const dbPath = dependencies.dbPath ?? defaultDbPath();
         if (!existsSync(dbPath)) {
-            log(promptLogLine(tool, payload, 'failed reason=database_unavailable'));
+            diagnostic(TASK_STATE_HOOK_STAGE.databasePath);
             return { reason: 'database_unavailable' };
         }
-        db = await (dependencies.openDatabase ?? openDb)(dbPath);
-    } catch {
-        log(promptLogLine(tool, payload, 'failed reason=database_unavailable'));
+        db = await (dependencies.openDatabase ?? openDb)(dbPath, taskDeadline === undefined ? undefined : { signal: taskDeadline });
+    } catch (error) {
+        diagnostic(TASK_STATE_HOOK_STAGE.databaseOpen, error);
         return { reason: 'database_unavailable' };
     }
     try {
@@ -320,109 +327,10 @@ export async function runUserPromptSubmit(
             }
             return { output: envelope(output) };
         };
-        const addClaudeTaskRequest = async (result: UserPromptSubmitResult): Promise<UserPromptSubmitResult> => {
-            if (
-                tool !== 'claude-code' ||
-                !getSetting('memory-plus', {}, dependencies.configPath).value ||
-                payload.agent_type !== undefined ||
-                !payload.transcript_path ||
-                Buffer.byteLength(payload.transcript_path) > CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES
-            ) {
-                return result;
-            }
-            const transcriptPath = payload.transcript_path;
-            const session = store.findSession('claude-code', payload.session_id);
-            if (
-                session?.kind !== 'main' ||
-                session.source_format !== 'native' ||
-                path.basename(transcriptPath) !== `${payload.session_id}.jsonl` ||
-                (await new ClaudeCodeAdapter().classifySession(transcriptPath)).kind !== 'primary'
-            ) {
-                return result;
-            }
-            const requests = new TaskStateRequestStore(db);
-            const opened = await openProviderTranscript('claude-code', transcriptPath);
-            if ('reason' in opened) {
-                return result;
-            }
-            try {
-                const classification = await new ClaudeCodeAdapter().classifySession(opened.resolvedPath);
-                const identity = validateOpenedProviderTranscriptIdentitySync('claude-code', transcriptPath, opened);
-                if (
-                    'reason' in identity ||
-                    realpathSync(session.source_path) !== identity.resolvedPath ||
-                    classification.kind !== 'primary'
-                ) {
-                    return result;
-                }
-                if (!getSetting('memory-plus', {}, dependencies.configPath).value) {
-                    return result;
-                }
-                const pending = requests.currentPendingOutput({
-                    tool,
-                    nativeSessionId: payload.session_id,
-                    cwd: payload.cwd,
-                    mode: 'precompact_manifest',
-                });
-                if (pending !== undefined) {
-                    if ('output' in result) {
-                        const hook = result.output.hookSpecificOutput as { additionalContext: string };
-                        return { output: envelope(`${hook.additionalContext}\n\n${pending.output}`) };
-                    }
-                    return { output: envelope(pending.output) };
-                }
-                const requestId = newTaskStateRequestId();
-                const body = `${taskStateRequestMarker('precompact_manifest', requestId)}\n${TASK_STATE_REQUEST_INSTRUCTIONS}`;
-                const prepared = requests.prepareIssue({
-                    tool,
-                    nativeSessionId: payload.session_id,
-                    cwd: payload.cwd,
-                    mode: 'precompact_manifest',
-                    requestId,
-                });
-                if (prepared === undefined) {
-                    return result;
-                }
-                let requestOutput: string;
-                try {
-                    requestOutput = db.transaction(() => {
-                        const output = recordHookOutput({
-                            store,
-                            tool,
-                            nativeSessionId: payload.session_id,
-                            injectedAt: new Date(clock()).toISOString(),
-                            body,
-                            kind: 'brief',
-                            writeInjection: (memory, injection) => {
-                                const written = (dependencies.writeInjection ?? ((target, value) => target.recordInjection(value)))(
-                                    memory,
-                                    injection,
-                                );
-                                return written && requests.issuePrepared(prepared, injection.injectionId);
-                            },
-                        });
-                        if (output === undefined) {
-                            throw new Error('Task-state request injection failed.');
-                        }
-                        return output;
-                    })();
-                } catch {
-                    return result;
-                }
-                if ('output' in result) {
-                    const hook = result.output.hookSpecificOutput as Record<string, unknown>;
-                    return { output: envelope(`${hook.additionalContext}\n\n${requestOutput}`) };
-                }
-                return { output: envelope(requestOutput) };
-            } catch {
-                return result;
-            } finally {
-                await opened.handle.close().catch(() => undefined);
-            }
-        };
         let completedRuleCommand = false;
         const locked = (): UserPromptSubmitResult => {
             if (ordinaryPrompt) {
+                diagnostic(TASK_STATE_HOOK_STAGE.memoryRead);
                 return { reason: 'not_command' };
             }
             // The outer read gate can change after a rule mutation and its
@@ -439,10 +347,28 @@ export async function runUserPromptSubmit(
         };
         return await withMemoryReadGenerationAsync(db, locked, async () => {
             if (ordinaryPrompt) {
-                if (!payload.prompt.trim() || consentedProject(db, payload.cwd) === undefined) {
+                if (!payload.prompt.trim()) {
                     return { reason: 'not_command' };
                 }
-                return addClaudeTaskRequest({ reason: 'not_command' });
+                if (tool === 'opencode') {
+                    return { reason: 'not_command' };
+                }
+                const output = await requestTaskState(
+                    db,
+                    store,
+                    {
+                        tool,
+                        nativeSessionId: payload.session_id,
+                        cwd: payload.cwd,
+                        transcriptPath: payload.transcript_path,
+                        configPath: dependencies.configPath,
+                        signal: taskDeadline ?? AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS),
+                        onRejected: diagnostic,
+                    },
+                    new Date(clock()).toISOString(),
+                    dependencies.writeInjection,
+                );
+                return output === undefined ? { reason: 'not_command' } : { output: envelope(output) };
             }
             const reader = new SessionReader(db);
             const projectResolver = dependencies.projectResolver ?? ((database: Database.Database) => new ProjectResolver(database));
@@ -587,8 +513,12 @@ export async function runUserPromptSubmit(
             log(promptLogLine(tool, payload, command?.kind ?? 'help'));
             return result;
         });
-    } catch {
-        log(promptLogLine(tool, payload, 'failed reason=hook_error'));
+    } catch (error) {
+        if (ordinaryPrompt) {
+            diagnostic(TASK_STATE_HOOK_STAGE.hook, error);
+        } else {
+            log(promptLogLine(tool, payload, 'failed reason=hook_error'));
+        }
         return { reason: 'hook_error' };
     } finally {
         db.close();
@@ -603,9 +533,9 @@ export async function runUserPromptSubmitCli(tool: HookTool): Promise<void> {
         const payload = parsePayload(input, tool, 'UserPromptSubmit');
         // Bound ordinary-prompt task-state verification to one process lifetime.
         // Explicit commands retain their existing behavior.
-        if (payload && !payload.prompt.trim().startsWith('elepha:') && getSetting('memory-plus', {}).value) {
+        if (payload && !payload.prompt.trim().startsWith('elepha:')) {
             watchdog = setTimeout(() => {
-                logLine(promptLogLine(tool, payload, 'failed reason=hook_error'));
+                taskStateHookDiagnostic(logLine, tool, payload.session_id)(TASK_STATE_HOOK_STAGE.watchdog);
                 process.exit(0);
             }, HOOK_WATCHDOG_TIMEOUT_MS);
         }

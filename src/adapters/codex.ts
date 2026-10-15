@@ -29,8 +29,16 @@
 // warnUnknownLine() instead of silently falling through - the exact failure
 // mode that let the apply_patch envelope bug ship unnoticed.
 
-import type { FileHandle } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { lstatSync, realpathSync } from 'node:fs';
+import { type FileHandle, lstat, opendir, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import {
+    CODEX_TASK_SOURCE_KIND,
+    CODEX_TASK_SOURCE_LOOKUP_CODE,
+    CODEX_TASK_SOURCE_LOOKUP_MAX_DEPTH,
+    CODEX_TASK_SOURCE_LOOKUP_MAX_ENTRIES,
+} from '../config/codex.js';
 import {
     ELEPHA_MCP_CALL_ID_MAX_BYTES,
     ELEPHA_MCP_NAMESPACE,
@@ -40,12 +48,21 @@ import {
     TASK_STATE_REPORT_TOOL,
 } from '../config/constants.js';
 import { codexHome, codexSessionsRoot, isWithin, toPosix } from '../config/paths.js';
-import type { EmptySessionAnalysis, ParsedToolCall, ParseTurnsOptions, SessionAdapterTool, SessionClassification } from '../types/index.js';
+import type {
+    EmptySessionAnalysis,
+    ParsedToolCall,
+    ParseTurnsOptions,
+    SessionAdapterTool,
+    SessionClassification,
+    TaskStateNativeSourceProof,
+    TaskStateReport,
+} from '../types/index.js';
 import {
     boundedMcpResult,
     canonicalTimestamp,
     classifyEmptyJsonlSession,
     consumeTaskStateReportResult,
+    createTurnBuilderState,
     type EmptySessionSignals,
     isTaskStateReportCallId,
     JsonlTurnAdapter,
@@ -57,15 +74,28 @@ import {
     rememberUnmatchedElephaMcpResult,
     resolveAbsolute,
     safeDiscriminator,
+    TranscriptReadBudgetError,
     type TurnBuilderState,
     type TurnLifecycleSignal,
+    taskStateReportOutcome,
     textValues,
 } from './base.js';
 import { INTERNAL_COMMAND_NAME, INTERNAL_COMMAND_TAGS } from './internal-command.js';
+import { sameTaskStateReportInput } from './task-state-report.js';
 
 const ROLLOUT_ID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
 const EXTERNAL_IMPORT_TURN_PREFIX = 'external-import-turn-';
 const ELEPHA_MCP_SERVER = ELEPHA_MCP_NAMESPACE.slice('mcp__'.length);
+
+type TaskSourceLookup =
+    | { sourcePath: string; current: () => boolean }
+    | { code: (typeof CODEX_TASK_SOURCE_LOOKUP_CODE)[keyof typeof CODEX_TASK_SOURCE_LOOKUP_CODE]; cause?: unknown };
+
+type NativeTaskSourceReadOptions = Pick<ParseTurnsOptions, 'handle' | 'readBudget' | 'signal'> & {
+    authorizeCwd: (cwd: string) => boolean;
+    reportCallId?: string;
+    onSource?: (text: string, proof: TaskStateNativeSourceProof, timestampMs?: number) => void;
+};
 
 // Top-level line types this adapter has observed and deliberately ignores
 // (none carry turn content; session_meta/turn_context are mined for cwd only).
@@ -149,6 +179,8 @@ interface CodexPayload {
         status?: unknown;
         result?: unknown;
     };
+    started_at_ms?: unknown;
+    completed_at_ms?: unknown;
     error?: unknown;
     turn_id?: string;
     source?: { subagent?: { thread_spawn?: unknown } };
@@ -171,6 +203,16 @@ interface CodexSessionIndexLine {
 // McpToolCall item names the server and tool separately.
 function isTaskStateReportFunctionCall(payload: CodexPayload): boolean {
     return payload.type === 'function_call' && payload.namespace === ELEPHA_MCP_NAMESPACE && payload.name === TASK_STATE_REPORT_TOOL;
+}
+
+function desktopElephaMcpItem(line: CodexLine): CodexPayload['item'] {
+    const item = line.payload?.item;
+    return line.type === 'event_msg' &&
+        line.payload?.type === 'item_completed' &&
+        item?.type === 'McpToolCall' &&
+        item.server === ELEPHA_MCP_SERVER
+        ? item
+        : undefined;
 }
 
 function hasToolCall(payloadType: string | undefined): boolean {
@@ -298,15 +340,18 @@ export async function readCodexKindPreamble(
     filePath: string,
     handle: FileHandle,
     authorizeHeader: (cwd: string, nativeId: string) => boolean,
+    options?: Pick<ParseTurnsOptions, 'readBudget' | 'signal'>,
 ): Promise<{
     nativeId: string;
     cwd: string;
     guardian: boolean;
     malformed: boolean;
+    root: boolean;
 }> {
     let meta: (CodexSessionMeta & { id: string; cwd: string }) | undefined;
     let malformed = false;
     for await (const { text } of readBoundedLines(filePath, {
+        ...options,
         handle,
         maxReadBytes: SESSION_KIND_PREAMBLE_MAX_BYTES,
         maxRecordBytes: SESSION_KIND_PREAMBLE_MAX_BYTES,
@@ -341,7 +386,16 @@ export async function readCodexKindPreamble(
                 throw new Error('session metadata cwd is not currently authorized');
             }
             if (!isCodexGuardianMetadata(meta) || nonemptyString(meta.forked_from_id)) {
-                return { nativeId: meta.id, cwd: meta.cwd, guardian: false, malformed };
+                return {
+                    nativeId: meta.id,
+                    cwd: meta.cwd,
+                    guardian: false,
+                    malformed,
+                    root:
+                        !nonemptyString(meta.parent_thread_id) &&
+                        meta.thread_source !== 'subagent' &&
+                        !(meta.source !== null && typeof meta.source === 'object' && 'subagent' in meta.source),
+                };
             }
         }
         if (line.type === 'event_msg' && 'turn_id' in payload && typeof payload.turn_id === 'string' && payload.turn_id !== '') {
@@ -350,6 +404,7 @@ export async function readCodexKindPreamble(
                 cwd: meta.cwd,
                 guardian: !payload.turn_id.startsWith(EXTERNAL_IMPORT_TURN_PREFIX),
                 malformed,
+                root: false,
             };
         }
     }
@@ -462,6 +517,305 @@ export class CodexAdapter extends JsonlTurnAdapter {
     nativeSessionId(filePath: string): string {
         const m = ROLLOUT_ID_RE.exec(path.basename(filePath));
         return m ? m[1] : path.basename(filePath, '.jsonl');
+    }
+
+    async authenticateTaskStateMetadataTail(
+        filePath: string,
+        indexedCursor: string,
+        observedCursor: string,
+        options: Pick<ParseTurnsOptions, 'handle' | 'readBudget'>,
+    ): Promise<boolean> {
+        if (!options.handle || !options.readBudget) {
+            return false;
+        }
+        const indexed = await this.authenticateCursor(indexedCursor, options.handle, options.readBudget);
+        const observed = await this.authenticateCursor(observedCursor, options.handle, options.readBudget);
+        if (!indexed || !observed || indexed.nextTurnIndex !== observed.nextTurnIndex || indexed.byteOffset >= observed.byteOffset) {
+            return false;
+        }
+        let offset = indexed.byteOffset;
+        for await (const record of readBoundedLines(filePath, { ...options, start: offset, maxReadBytes: observed.byteOffset - offset })) {
+            if (!record.terminated) {
+                return false;
+            }
+            let line: CodexLine;
+            try {
+                line = JSON.parse(record.text) as CodexLine;
+            } catch {
+                return false;
+            }
+            // This exact native record cannot contribute conversation, cwd,
+            // report calls/results, or lifecycle closure. Other tails abstain.
+            if (line.type !== 'event_msg' || line.payload?.type !== 'thread_settings_applied') {
+                return false;
+            }
+            offset += record.byteLength;
+            if (offset === observed.byteOffset) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async readInitialTaskContext(filePath: string, options: NativeTaskSourceReadOptions): Promise<boolean> {
+        let byteStart = 0;
+        for await (const record of readBoundedLines(filePath, { ...options, maxReadBytes: SESSION_KIND_PREAMBLE_MAX_BYTES })) {
+            if (!record.terminated) {
+                return false;
+            }
+            const line = JSON.parse(record.text) as CodexLine;
+            const payload = line.payload;
+            if (this.isCompactionBoundaryLine(line)) {
+                return true;
+            }
+            const cwd = this.cwdOf(line);
+            if ((line.type === 'session_meta' || line.type === 'turn_context') && (!cwd || !options.authorizeCwd(cwd))) {
+                return false;
+            }
+            if (line.type === 'response_item' && payload?.type === 'message' && payload.role === 'user') {
+                if (!this.isResumeMarkerLine(line)) {
+                    return true;
+                }
+                // The native initial package has separate instruction and
+                // environment items. A heading in a conversation is no proof.
+                const content = payload.content ?? [];
+                const environment = content.some(
+                    (block) =>
+                        block.type === 'input_text' &&
+                        block.text?.trim().startsWith('<environment_context>') &&
+                        block.text.trim().endsWith('</environment_context>'),
+                );
+                if (environment && options.onSource) {
+                    content.forEach((block, contentIndex) => {
+                        const text = block.text?.trim();
+                        const opening = '\n\n<INSTRUCTIONS>';
+                        const start = text?.indexOf(opening) ?? -1;
+                        if (
+                            block.type !== 'input_text' ||
+                            !text?.startsWith('# AGENTS.md instructions for ') ||
+                            start < 0 ||
+                            !text.endsWith('</INSTRUCTIONS>')
+                        ) {
+                            return;
+                        }
+                        options.onSource?.(text.slice(start + opening.length, -'</INSTRUCTIONS>'.length), {
+                            kind: CODEX_TASK_SOURCE_KIND.projectInstructions,
+                            byteStart,
+                            byteEnd: byteStart + record.byteLength,
+                            recordDigest: createHash('sha256').update(record.text).digest('hex'),
+                            contentIndex,
+                        });
+                    });
+                }
+            }
+            if (
+                (line.type === 'event_msg' && payload?.type === 'user_message') ||
+                (line.type === 'response_item' &&
+                    (payload?.role === 'assistant' || payload?.type === 'function_call' || payload?.type === 'custom_tool_call'))
+            ) {
+                return true;
+            }
+            byteStart += record.byteLength;
+        }
+        return !options.signal?.aborted;
+    }
+
+    async readAssistantBeforeTaskReport(
+        filePath: string,
+        options: NativeTaskSourceReadOptions & { start: number; end: number; reportCallId: string; report: TaskStateReport },
+    ): Promise<false | { assistantBeforeMs?: number }> {
+        let byteStart = options.start;
+        for await (const record of readBoundedLines(filePath, { ...options, maxReadBytes: options.end - options.start })) {
+            if (!record.terminated) {
+                return false;
+            }
+            const line = JSON.parse(record.text) as CodexLine;
+            const payload = line.payload;
+            const cwd = this.cwdOf(line);
+            if (cwd && !options.authorizeCwd(cwd)) {
+                return false;
+            }
+            if (
+                line.type === 'response_item' &&
+                payload &&
+                isTaskStateReportFunctionCall(payload) &&
+                payload.call_id === options.reportCallId
+            ) {
+                return {};
+            }
+            const desktop = desktopElephaMcpItem(line);
+            if (desktop?.tool === TASK_STATE_REPORT_TOOL && desktop.id === options.reportCallId) {
+                const started = payload?.started_at_ms;
+                const completed = payload?.completed_at_ms;
+                if (
+                    typeof started !== 'number' ||
+                    !Number.isFinite(started) ||
+                    started < 0 ||
+                    typeof completed !== 'number' ||
+                    !Number.isFinite(completed) ||
+                    completed < started
+                ) {
+                    return false;
+                }
+                const state = createTurnBuilderState();
+                this.observeElephaMcp(state, line);
+                const outcome = taskStateReportOutcome(state);
+                if (
+                    !outcome ||
+                    !('report' in outcome) ||
+                    outcome.report.callId !== options.reportCallId ||
+                    !sameTaskStateReportInput(outcome.report, options.report)
+                ) {
+                    return false;
+                }
+                return { assistantBeforeMs: started };
+            }
+            if (line.type === 'response_item' && payload?.type === 'message' && payload.role === 'assistant') {
+                (payload.content ?? []).forEach((block, contentIndex) => {
+                    if ((block.type === 'output_text' || block.type === 'text') && typeof block.text === 'string') {
+                        options.onSource?.(
+                            block.text,
+                            {
+                                kind: CODEX_TASK_SOURCE_KIND.assistantBeforeReport,
+                                byteStart,
+                                byteEnd: byteStart + record.byteLength,
+                                recordDigest: createHash('sha256').update(record.text).digest('hex'),
+                                contentIndex,
+                            },
+                            line.timestamp === undefined ? undefined : Date.parse(line.timestamp),
+                        );
+                    }
+                });
+            }
+            byteStart += record.byteLength;
+            if (byteStart >= options.end) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    async resolveTaskStateSource(nativeId: string, signal: AbortSignal): Promise<TaskSourceLookup> {
+        if (nativeId.length !== 36 || !ROLLOUT_ID_RE.test(`${nativeId}.jsonl`)) {
+            return { code: CODEX_TASK_SOURCE_LOOKUP_CODE.invalidId };
+        }
+        const configuredRoot = codexSessionsRoot();
+        const snapshots = new Map<string, Awaited<ReturnType<typeof lstat>>>();
+        let root: string;
+        let entries = 0;
+        let candidate: string | undefined;
+        const unchanged = (before: Awaited<ReturnType<typeof lstat>>, after: Awaited<ReturnType<typeof lstat>>): boolean =>
+            after.isDirectory() &&
+            before.dev === after.dev &&
+            before.ino === after.ino &&
+            before.mtimeMs === after.mtimeMs &&
+            before.ctimeMs === after.ctimeMs;
+        const current = (): boolean => {
+            try {
+                if (signal.aborted || realpathSync(configuredRoot) !== root) {
+                    return false;
+                }
+                for (const [directory, before] of snapshots) {
+                    if (signal.aborted || !unchanged(before, lstatSync(directory))) {
+                        return false;
+                    }
+                }
+                return true;
+            } catch {
+                return false;
+            }
+        };
+        const walk = async (directory: string, depth: number): Promise<void> => {
+            if (signal.aborted) {
+                throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.incomplete };
+            }
+            const before = await lstat(directory);
+            if (!before.isDirectory()) {
+                throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.unreadable };
+            }
+            snapshots.set(directory, before);
+            const opened = await opendir(directory);
+            try {
+                while (!signal.aborted) {
+                    const entry = await opened.read();
+                    if (!entry) {
+                        break;
+                    }
+                    if (++entries > CODEX_TASK_SOURCE_LOOKUP_MAX_ENTRIES) {
+                        throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.incomplete };
+                    }
+                    const entryPath = path.join(directory, entry.name);
+                    const locator = entry.name.endsWith('.zst') ? entry.name.slice(0, -'.zst'.length) : entry.name;
+                    if (entry.name.startsWith('rollout-') && this.nativeSessionId(locator) === nativeId) {
+                        if (!entry.isFile() && !entry.isSymbolicLink()) {
+                            throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.unreadable };
+                        }
+                        if (candidate) {
+                            throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.ambiguous };
+                        }
+                        candidate = entryPath;
+                    } else if (entry.isDirectory()) {
+                        if (depth >= CODEX_TASK_SOURCE_LOOKUP_MAX_DEPTH) {
+                            throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.incomplete };
+                        }
+                        await walk(entryPath, depth + 1);
+                    } else if (!entry.isFile()) {
+                        // An unreadable or linked branch cannot prove uniqueness.
+                        throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.unreadable };
+                    }
+                }
+                if (signal.aborted) {
+                    throw { code: CODEX_TASK_SOURCE_LOOKUP_CODE.incomplete };
+                }
+            } finally {
+                await opened.close();
+            }
+        };
+        const lookup = async (): Promise<TaskSourceLookup> => {
+            try {
+                try {
+                    root = await realpath(configuredRoot);
+                } catch (cause) {
+                    return {
+                        code:
+                            (cause as NodeJS.ErrnoException).code === 'ENOENT'
+                                ? CODEX_TASK_SOURCE_LOOKUP_CODE.missing
+                                : CODEX_TASK_SOURCE_LOOKUP_CODE.unreadable,
+                        cause,
+                    };
+                }
+                await walk(root, 0);
+                if (!current()) {
+                    return { code: CODEX_TASK_SOURCE_LOOKUP_CODE.changed };
+                }
+                return candidate ? { sourcePath: candidate, current } : { code: CODEX_TASK_SOURCE_LOOKUP_CODE.missing };
+            } catch (cause) {
+                const code = (cause as NodeJS.ErrnoException).code;
+                return {
+                    code:
+                        code === 'ENOENT'
+                            ? CODEX_TASK_SOURCE_LOOKUP_CODE.changed
+                            : (Object.values(CODEX_TASK_SOURCE_LOOKUP_CODE).find((value) => value === code) ??
+                              CODEX_TASK_SOURCE_LOOKUP_CODE.unreadable),
+                    cause,
+                };
+            }
+        };
+        // Directory reads have no AbortSignal support. Return on the shared
+        // deadline; a late read stops traversing and closes its owned handles.
+        let abort: () => void = () => {};
+        const cancelled = new Promise<TaskSourceLookup>((resolve) => {
+            abort = () => resolve({ code: CODEX_TASK_SOURCE_LOOKUP_CODE.incomplete });
+            signal.addEventListener('abort', abort, { once: true });
+            if (signal.aborted) {
+                abort();
+            }
+        });
+        try {
+            return await Promise.race([lookup(), cancelled]);
+        } finally {
+            signal.removeEventListener('abort', abort);
+        }
     }
 
     // Codex keeps the AI-generated thread name in its session index, separate
@@ -585,8 +939,11 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // - Codex 0.150.1 changed guardian thread_source from 'subagent' to
     //   'guardian_review'. Both formats retain source.subagent.other equal
     //   to 'guardian'; these are approval evidence, not human sessions.
-    async classifySession(filePath: string, options?: Pick<ParseTurnsOptions, 'handle'>): Promise<SessionClassification> {
-        const { first, firstAtStart, externalAgentImport } = await this.readClassificationPreamble(filePath, options?.handle);
+    async classifySession(
+        filePath: string,
+        options?: Pick<ParseTurnsOptions, 'handle' | 'maxReadBytes' | 'signal' | 'readBudget'>,
+    ): Promise<SessionClassification> {
+        const { first, firstAtStart, externalAgentImport } = await this.readClassificationPreamble(filePath, options);
         if (!first) {
             return { kind: 'primary' };
         }
@@ -644,13 +1001,18 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // prompt, tool payload, or instruction block must never exclude a session.
     private async readClassificationPreamble(
         filePath: string,
-        handle?: FileHandle,
+        options?: Pick<ParseTurnsOptions, 'handle' | 'maxReadBytes' | 'signal' | 'readBudget'>,
     ): Promise<{ first: CodexLine | undefined; firstAtStart: boolean; externalAgentImport: boolean }> {
         let first: CodexLine | undefined;
         let firstAtStart = true;
 
         try {
-            for await (const { text } of readBoundedLines(filePath, { handle })) {
+            for await (const { text } of readBoundedLines(filePath, {
+                handle: options?.handle,
+                maxReadBytes: options?.maxReadBytes,
+                signal: options?.signal,
+                readBudget: options?.readBudget,
+            })) {
                 let line: CodexLine;
                 try {
                     line = JSON.parse(text) as CodexLine;
@@ -668,7 +1030,10 @@ export class CodexAdapter extends JsonlTurnAdapter {
                 }
             }
         } catch (error) {
-            if (error instanceof OversizedTranscriptRecordError) {
+            if (
+                error instanceof OversizedTranscriptRecordError ||
+                (options?.maxReadBytes !== undefined && error instanceof TranscriptReadBudgetError)
+            ) {
                 throw error;
             }
             // The daemon's file-level readability guard owns the visible alert.
@@ -717,6 +1082,11 @@ export class CodexAdapter extends JsonlTurnAdapter {
     // a content item directly or is appended after a reloaded instruction block
     // in that same item. Matching the complete closing tag avoids treating
     // ordinary prose that merely mentions "environment_context" as a marker.
+    protected isCompactionBoundaryLine(line: unknown): boolean {
+        const value = line as CodexLine;
+        return value.type === 'compacted' || (value.type === 'event_msg' && value.payload?.type === 'context_compacted');
+    }
+
     protected isResumeMarkerLine(line: unknown): boolean {
         const l = line as CodexLine;
         if (l.type !== 'response_item' || l.payload?.type !== 'message' || l.payload.role !== 'user') {
@@ -823,8 +1193,8 @@ export class CodexAdapter extends JsonlTurnAdapter {
             return;
         }
         if (l.type === 'event_msg' && payload.type === 'item_completed') {
-            const item = payload.item;
-            if (item?.type !== 'McpToolCall' || item.server !== ELEPHA_MCP_SERVER) {
+            const item = desktopElephaMcpItem(l);
+            if (!item) {
                 return;
             }
             if (item.tool === TASK_STATE_REPORT_TOOL) {

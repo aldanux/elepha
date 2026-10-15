@@ -30,12 +30,15 @@ vi.mock('node:child_process', () => ({
 
 const {
     gitRemoteGetUrlOrigin,
+    gitRemoteGetUrlOriginAsync,
     gitRootCommit,
+    gitRootCommitAsync,
     gitRevListCountHead,
     gitRevListCountHeadAsync,
     gitRevParseAbbrevRefHead,
     gitRevParseAbbrevRefHeadAsync,
     gitRevParseShowToplevel,
+    gitRevParseShowToplevelAsync,
     launchctl,
     npmInvocationForBackend,
     npmViewElephaLatest,
@@ -103,12 +106,18 @@ describe('git subprocess cwd hardening (E-1)', () => {
     it('uses the sync probes executable, hardened argv, cwd, and environment for async probes', async () => {
         gitRevParseAbbrevRefHead('/some/cwd');
         gitRevListCountHead('/some/cwd');
+        gitRevParseShowToplevel('/some/cwd');
+        gitRemoteGetUrlOrigin('/some/cwd');
+        gitRootCommit('/some/cwd');
         const controller = new AbortController();
 
         await expect(gitRevParseAbbrevRefHeadAsync('/some/cwd', controller.signal)).resolves.toBe('/some/toplevel');
         await expect(gitRevListCountHeadAsync('/some/cwd', controller.signal)).resolves.toBeNull();
+        await expect(gitRevParseShowToplevelAsync('/some/cwd', controller.signal)).resolves.toBe('/some/toplevel');
+        await expect(gitRemoteGetUrlOriginAsync('/some/cwd', controller.signal)).resolves.toBe('/some/toplevel');
+        await expect(gitRootCommitAsync('/some/cwd', controller.signal)).resolves.toBe('/some/toplevel');
 
-        expect(execFileMock).toHaveBeenCalledTimes(2);
+        expect(execFileMock).toHaveBeenCalledTimes(5);
         for (const [index, asyncCall] of execFileMock.mock.calls.entries()) {
             const syncCall = execFileSyncMock.mock.calls[index]!;
             expect(asyncCall[0]).toBe(syncCall[0]);

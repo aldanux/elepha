@@ -383,8 +383,16 @@ export function gitRevParseShowToplevel(cwd: string): string | null {
     return runGit(['rev-parse', '--show-toplevel'], cwd);
 }
 
+export function gitRevParseShowToplevelAsync(cwd: string, signal: AbortSignal): Promise<string | null> {
+    return runGitAsync(['rev-parse', '--show-toplevel'], cwd, signal);
+}
+
 export function gitRemoteGetUrlOrigin(cwd: string): string | null {
     return runGit(['remote', 'get-url', 'origin'], cwd);
+}
+
+export function gitRemoteGetUrlOriginAsync(cwd: string, signal: AbortSignal): Promise<string | null> {
+    return runGitAsync(['remote', 'get-url', 'origin'], cwd, signal);
 }
 
 // Current branch for a consent-checked, stored project directory only.
@@ -411,7 +419,14 @@ export async function gitRevListCountHeadAsync(cwd: string, signal: AbortSignal)
 
 // Stable repository identity when an origin remote is absent or changes.
 export function gitRootCommit(cwd: string): string | null {
-    const value = runGit(['rev-list', '--max-parents=0', 'HEAD'], cwd);
+    return rootCommitHashes(runGit(['rev-list', '--max-parents=0', 'HEAD'], cwd));
+}
+
+export async function gitRootCommitAsync(cwd: string, signal: AbortSignal): Promise<string | null> {
+    return rootCommitHashes(await runGitAsync(['rev-list', '--max-parents=0', 'HEAD'], cwd, signal));
+}
+
+function rootCommitHashes(value: string | null): string | null {
     if (value === null) {
         return null;
     }

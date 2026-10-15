@@ -36,7 +36,10 @@ function keyringRuntime(secrets: Map<string, Buffer>, installationId: string): D
         randomBytes: () => Buffer.from(FIXED_KEY),
         randomUUID: () => installationId,
         createKeyringEntry: async (_service, account) => ({
-            getSecret: async () => secrets.get(account),
+            getSecret: async () => {
+                const secret = secrets.get(account);
+                return secret === undefined ? null : Array.from(secret);
+            },
             setSecret: async (secret) => {
                 secrets.set(account, Buffer.from(secret));
             },

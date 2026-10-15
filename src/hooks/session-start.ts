@@ -3,14 +3,16 @@
 
 import { existsSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
-import { HOOK_WATCHDOG_TIMEOUT_MS, PACKAGE_VERSION } from '../config/constants.js';
+import { HOOK_WATCHDOG_TIMEOUT_MS, PACKAGE_VERSION, TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS } from '../config/constants.js';
 import { codexWorktreeRootContaining, updateAvailablePath } from '../config/paths.js';
 import { isNewerVersion, readUpdateAvailable, type UpdateAvailable } from '../daemon/update-check.js';
 import { daemonHealth as classifyDaemonHealth } from '../install/health-checks.js';
 import { terminalHandoff } from '../markers.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
 import { prepareStandingRulesDelivery } from '../serving/standing-rules.js';
+import { prepareTaskStateContinuation } from '../serving/task-state-continuation.js';
 import { defaultDbPath, openDb } from '../storage/db.js';
+import { InjectionStore } from '../storage/injection-store.js';
 import { LIVE_MEMORY_WARNING_POLICY, type LiveMemoryWarningPolicy } from '../storage/live-memory-warning.js';
 import { MemoryStore } from '../storage/memory-store.js';
 import {
@@ -24,6 +26,7 @@ import { chatOpeningLiveMemoryWarning } from './live-memory-warning.js';
 import { recordHookOutput } from './output.js';
 
 export interface SessionStartDependencies {
+    configPath?: string;
     dbPath?: string;
     openDatabase?: typeof openDb;
     now?: () => number;
@@ -123,6 +126,7 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         return { reason: 'subagent_context' };
     }
     const clock = dependencies.now ?? Date.now;
+    const taskDeadline = AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS);
     const now = clock();
     let body = withDaemonHealthWarning('', now, dependencies.daemonHealth ?? classifyDaemonHealth);
     body = withUpdateNotice(body, dependencies.readUpdateAvailable ?? readUpdateAvailable);
@@ -138,6 +142,7 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
     } catch {
         return { reason: 'database_unavailable' };
     }
+    let continuation: Awaited<ReturnType<typeof prepareTaskStateContinuation>> | undefined;
     try {
         const store = new MemoryStore(db);
         const generation = withMemoryReadGeneration<AuthenticatedReadGeneration | undefined>(
@@ -156,6 +161,25 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                   );
         // Filesystem validation stays outside the write transaction; the claim inside it is DB-only.
         const worktreeRoot = tool === 'opencode' ? undefined : codexWorktreeRootContaining(payload.cwd);
+        if (
+            generation !== undefined &&
+            tool !== 'opencode' &&
+            payload.agent_type === undefined &&
+            (payload.source === 'compact' || payload.source === 'resume')
+        ) {
+            continuation = await prepareTaskStateContinuation(db, {
+                tool,
+                nativeSessionId: payload.session_id,
+                cwd: payload.cwd,
+                transcriptPath: payload.transcript_path,
+                source: payload.source,
+                signal: taskDeadline,
+                configPath: dependencies.configPath,
+            });
+            if ('reason' in continuation) {
+                log(sessionLogLine(tool, payload, `skipped reason=${continuation.reason}`));
+            }
+        }
         dependencies.beforeDelivery?.(db);
         const recordFailed = new Error('injection_record_failed');
         const record = (text: string, kind: 'rules' | 'notify'): string => {
@@ -188,6 +212,11 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                     const delivery = readable ? readRules() : undefined;
                     invalidRulesReason = delivery === undefined ? undefined : 'reason' in delivery ? delivery.reason : delivery.chatReason;
                     const rules = delivery !== undefined && 'body' in delivery ? delivery.body : undefined;
+                    const task =
+                        readable && continuation !== undefined && 'body' in continuation && continuation.current()
+                            ? continuation
+                            : undefined;
+                    const duplicateTask = task !== undefined && new InjectionStore(db).hasContinuationDelivery(task.deliveryKey);
                     // A failed record below rolls this claim back, so the one-time notice is not consumed.
                     const nudgedAt = new Date(now).toISOString();
                     const worktreeNotice =
@@ -204,10 +233,27 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
                         (outcome) => log(sessionLogLine(tool, payload, outcome)),
                     );
                     const notices = [body, worktreeNotice, warningNotice].filter((notice) => !!notice).join('\n');
-                    if (rules === undefined && !notices) {
+                    if (rules === undefined && !notices && (task === undefined || duplicateTask)) {
                         return { reason: invalidRulesReason ?? 'no_notice' };
                     }
-                    const additionalContext = rules === undefined ? undefined : record(rules, 'rules');
+                    const ruleOutput = rules === undefined ? undefined : record(rules, 'rules');
+                    const taskOutput =
+                        task === undefined || duplicateTask
+                            ? undefined
+                            : recordHookOutput({
+                                  store,
+                                  tool,
+                                  nativeSessionId: payload.session_id,
+                                  injectedAt: new Date(now).toISOString(),
+                                  body: task.body,
+                                  kind: 'brief',
+                                  deliveryKey: task.deliveryKey,
+                                  writeInjection: dependencies.writeInjection,
+                              });
+                    if (task !== undefined && !duplicateTask && (taskOutput === undefined || !task.current())) {
+                        throw recordFailed;
+                    }
+                    const additionalContext = [ruleOutput, taskOutput].filter((channel) => channel !== undefined).join('\n\n') || undefined;
                     const systemMessage = notices ? record(notices, 'notify') : undefined;
                     if (additionalContext === undefined && systemMessage === undefined) {
                         return { reason: 'no_notice' };
@@ -234,6 +280,9 @@ export async function runSessionStart(rawStdin: string, tool: HookTool, dependen
         log(sessionLogLine(tool, payload, (error as Error).message));
         return { reason: 'hook_error' };
     } finally {
+        if (continuation !== undefined && 'close' in continuation) {
+            await continuation.close().catch(() => undefined);
+        }
         db.close();
     }
 }

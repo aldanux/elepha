@@ -75,6 +75,15 @@ export type TaskStateReportInput =
 
 export type TaskStateReport = TaskStateReportInput & { callId: string };
 
+// Native-only proof; excluded instruction records never become conversation.
+export interface TaskStateNativeSourceProof {
+    kind: 'project_instructions' | 'assistant_before_report';
+    byteStart: number;
+    byteEnd: number;
+    recordDigest: string;
+    contentIndex: number;
+}
+
 // Why a report call observed in a turn yielded no report. The turn keeps its
 // ordinary content; only the report is withheld.
 export type TaskStateReportFailureReason =
@@ -165,6 +174,9 @@ export interface ParsedTurn {
     taskStateReport?: TaskStateReport;
     // Present instead of taskStateReport when a report call could not be verified.
     taskStateReportFailure?: TaskStateReportFailureReason;
+    // Derived only from an invalid call with explicit rejection, followed by
+    // one acknowledged correction. Allows proof against pre-fix capture.
+    taskStateReportRejectedRetry?: true;
     sourceKey?: string;
     provenance?: { protocolVersion: string; producerVersion: string; modelAliases: string[] };
     // Validated synchronously again inside the ingestion transaction.
@@ -212,6 +224,12 @@ export type ResumeContextDerivationResult =
     | { state: 'partial'; progress: ResumeContextDerivation };
 
 export interface ParseTurnsOptions {
+    // Read-only observation of a still-open source turn; never canonical capture.
+    onPendingTurn?: (turn: ParsedTurn) => void;
+    // Native evidence reads do not need unrelated provider title indexes.
+    skipSessionTitle?: boolean;
+    // Native boundary position only; compacted payloads stay opaque.
+    onCompactionBoundary?: (byteOffset: number) => void;
     // When true, a trailing buffered turn with no subsequent turn-boundary line
     // (i.e. still open at EOF) is treated as structurally complete and emitted.
     // Set by the daemon once a file has been idle past its debounce window.
@@ -238,6 +256,9 @@ export interface ParseTurnsOptions {
     maxReadBytes?: number;
     // Replay an authenticated historical prefix using the opened source handle.
     endByteOffset?: number;
+    // Observe the following structural boundary when the pinned prefix cannot
+    // close on its own. Its content is never folded into the replayed turn.
+    includeClosingBoundary?: boolean;
     // Receives a failed lifecycle held open at EOF. It is deliberately not an
     // item in the ParsedTurn iterator: canonical consumers see final turns only.
     onOpenTail?: (observation: OpenTailObservation) => void;
@@ -325,7 +346,10 @@ export interface SessionAdapter {
     // signals: on both tools the "obvious" per-line marker proved unreliable
     // (Codex's thread_source is set on genuine subagents too; Claude Code's
     // isSidechain/sessionId are absent on a quarter of lines).
-    classifySession(filePath: string, options?: Pick<ParseTurnsOptions, 'handle'>): Promise<SessionClassification>;
+    classifySession(
+        filePath: string,
+        options?: Pick<ParseTurnsOptions, 'handle' | 'maxReadBytes' | 'signal'>,
+    ): Promise<SessionClassification>;
     // Distinguishes known empty transcripts from a changed format that yielded no turns.
     classifyEmptySession(filePath: string): Promise<EmptySessionAnalysis | undefined>;
     // Returns the user-set session title when the transcript format records
@@ -347,6 +371,14 @@ export interface SessionAdapter {
     // bytes that were read when the cursor was issued; undefined once the
     // source was truncated or rewritten before it.
     authenticateCursor?(cursor: string, handle: FileHandle, readBudget?: SourceReadBudget): Promise<SourceCursorPosition | undefined>;
+    // Proves that an observed completed turn extends its indexed boundary
+    // only through host-owned metadata, authenticating both cursor fingerprints.
+    authenticateTaskStateMetadataTail?(
+        filePath: string,
+        indexedCursor: string,
+        observedCursor: string,
+        options: Pick<ParseTurnsOptions, 'handle' | 'readBudget'>,
+    ): Promise<boolean>;
     // True when a turn's working directory or provenance can come from
     // records before its boundary, so resuming at a cursor needs that cursor's
     // resumeContext to reconstruct the same turn.

@@ -357,9 +357,13 @@ describe('staged elepha init', () => {
                         renameSync(f.beta, `${f.beta}-old`);
                         symlinkSync(elsewhere, f.beta);
                     } else {
-                        rmdirSync(f.beta);
-                        mkdirSync(path.join(f.directory, 'placeholder'));
+                        const original = statSync(f.beta);
+                        const renamed = `${f.beta}-old`;
+                        renameSync(f.beta, renamed);
                         mkdirSync(f.beta);
+                        expect(statSync(renamed)).toMatchObject({ dev: original.dev, ino: original.ino });
+                        const replacement = statSync(f.beta);
+                        expect([replacement.dev, replacement.ino]).not.toEqual([original.dev, original.ino]);
                     }
                 },
             });
@@ -560,10 +564,13 @@ describe('init apply recovery', () => {
                 renameSync(f.beta, `${f.beta}-old`);
                 symlinkSync(elsewhere, f.beta);
             } else {
-                rmdirSync(f.beta);
-                // Hold the freed inode so the new directory cannot reuse it.
-                mkdirSync(path.join(f.directory, 'placeholder'));
+                const original = statSync(f.beta);
+                const renamed = `${f.beta}-old`;
+                renameSync(f.beta, renamed);
                 mkdirSync(f.beta);
+                expect(statSync(renamed)).toMatchObject({ dev: original.dev, ino: original.ino });
+                const replacement = statSync(f.beta);
+                expect([replacement.dev, replacement.ino]).not.toEqual([original.dev, original.ino]);
             }
             const next = fakePrompts('folder', []);
 

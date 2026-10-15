@@ -6,6 +6,7 @@ import { wrap } from '../security/sentinel.js';
 import type { TaskStateReportMode, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
 import { isRetentionRemoved } from './live-memory-retention-schema.js';
+import { prepareTaskStateProjectScope, type TaskStateProjectScope, taskStateProjectScopeCurrent } from './task-state-project-scope.js';
 import { newUlid } from './ulid.js';
 
 interface PhysicalCheckout {
@@ -17,6 +18,7 @@ interface PhysicalCheckout {
 interface AuthorizedCheckout extends PhysicalCheckout {
     consentUlid: string;
     consentDecidedAt: string;
+    project: TaskStateProjectScope;
 }
 
 export interface PreparedTaskStateRequest {
@@ -30,6 +32,7 @@ export interface PreparedTaskStateRequest {
 
 interface CurrentSession {
     id: number;
+    project_id: number;
     kind: string | null;
     source_format: string;
     source_path: string;
@@ -113,7 +116,7 @@ export class TaskStateRequestStore {
 
     private currentSession(tool: ToolName, nativeSessionId: string): CurrentSession | undefined {
         return this.db
-            .prepare(`SELECT s.id, s.kind, s.source_format, s.source_path, p.path AS project_path,
+            .prepare(`SELECT s.id, s.project_id, s.kind, s.source_format, s.source_path, p.path AS project_path,
                 COALESCE(g.generation, 0) AS source_generation,
                 COALESCE((SELECT MAX(m.turn_index) FROM memories m
                     JOIN sessions prior ON prior.id = m.session_id
@@ -125,16 +128,19 @@ export class TaskStateRequestStore {
             .get(tool, nativeSessionId) as CurrentSession | undefined;
     }
 
-    private allowedCheckout(cwd: string): AuthorizedCheckout | undefined {
+    private allowedCheckout(cwd: string, session: CurrentSession | undefined): AuthorizedCheckout | undefined {
         if (this.consent.consentState(cwd) !== 'approved' || this.consent.isRefusedForCapture(cwd)) {
             return undefined;
         }
         const checkout = physicalCheckout(cwd);
-        if (checkout === undefined) {
+        if (checkout === undefined || session === undefined) {
             return undefined;
         }
+        const project = prepareTaskStateProjectScope(this.db, session.project_id, session.project_path, checkout.path);
         const decision = this.consent.approvedDecisionForCanonicalPath(checkout.path);
-        return decision === undefined ? undefined : { ...checkout, consentUlid: decision.ulid, consentDecidedAt: decision.decided_at };
+        return decision === undefined || project === undefined
+            ? undefined
+            : { ...checkout, consentUlid: decision.ulid, consentDecidedAt: decision.decided_at, project };
     }
 
     // Resolve the physical checkout before acquiring the injection write lock.
@@ -148,7 +154,7 @@ export class TaskStateRequestStore {
         if (input.tool === 'opencode' || !validMode(input.mode) || !TASK_STATE_REQUEST_ID_PATTERN.test(input.requestId)) {
             return undefined;
         }
-        const checkout = this.allowedCheckout(input.cwd);
+        const checkout = this.allowedCheckout(input.cwd, this.currentSession(input.tool, input.nativeSessionId));
         if (checkout === undefined) {
             return undefined;
         }
@@ -165,7 +171,9 @@ export class TaskStateRequestStore {
             if (
                 session?.kind !== 'main' ||
                 session.source_format !== 'native' ||
-                !samePath(session.project_path, checkout.path) ||
+                session.project_id !== checkout.project.projectId ||
+                session.project_path !== checkout.project.projectPath ||
+                !taskStateProjectScopeCurrent(this.db, checkout.project) ||
                 this.db
                     .prepare('SELECT 1 FROM purged_transcripts WHERE tool = ? AND native_id = ?')
                     .get(input.tool, input.nativeSessionId) !== undefined ||
@@ -271,8 +279,8 @@ export class TaskStateRequestStore {
         cwd: string;
         mode: TaskStateReportMode;
     }): { requestId: string; output: string } | undefined {
-        const checkout = this.allowedCheckout(input.cwd);
         const session = this.currentSession(input.tool, input.nativeSessionId);
+        const checkout = this.allowedCheckout(input.cwd, session);
         if (checkout === undefined || session === undefined) {
             return undefined;
         }
@@ -309,11 +317,19 @@ export class TaskStateRequestStore {
     // This is an inexpensive admission check, not authorization. Consumption
     // repeats every durable condition in a transaction after source proof.
     canConsume(input: TaskStateRequestScope): boolean {
+        return this.prepareConsumption(input) !== undefined;
+    }
+
+    // Prepare physical identity outside the write lock; the returned check
+    // repeats request, consent, ownership and generation conditions inside it.
+    prepareConsumption(input: TaskStateRequestScope): (() => boolean) | undefined {
         if (input.tool === 'opencode' || !TASK_STATE_REQUEST_ID_PATTERN.test(input.requestId)) {
-            return false;
+            return undefined;
         }
-        const checkout = this.allowedCheckout(input.cwd);
-        return checkout !== undefined && this.matchesDatabaseState(input, checkout);
+        const checkout = this.allowedCheckout(input.cwd, this.currentSession(input.tool, input.nativeSessionId));
+        return checkout !== undefined && this.matchesDatabaseState(input, checkout)
+            ? () => this.matchesDatabaseState(input, checkout)
+            : undefined;
     }
 
     private matchesDatabaseState(input: TaskStateRequestScope, checkout: AuthorizedCheckout): boolean {
@@ -332,7 +348,9 @@ export class TaskStateRequestStore {
             session.id === input.sessionId &&
             session.kind === 'main' &&
             session.source_format === 'native' &&
-            samePath(session.project_path, checkout.path) &&
+            session.project_id === checkout.project.projectId &&
+            session.project_path === checkout.project.projectPath &&
+            taskStateProjectScopeCurrent(this.db, checkout.project) &&
             samePath(request.physical_checkout, checkout.path) &&
             request.checkout_dev === checkout.dev &&
             request.checkout_ino === checkout.ino &&
@@ -360,15 +378,12 @@ export class TaskStateRequestStore {
     consumeForVerifiedManifest(input: TaskStateRequestScope, insert: () => boolean): boolean {
         // Filesystem identity must be read before SQLite's write lock. The
         // daemon separately revalidates the opened transcript handle.
-        if (input.tool === 'opencode' || !TASK_STATE_REQUEST_ID_PATTERN.test(input.requestId)) {
-            return false;
-        }
-        const checkout = this.allowedCheckout(input.cwd);
-        if (checkout === undefined || !this.matchesDatabaseState(input, checkout)) {
+        const current = this.prepareConsumption(input);
+        if (current === undefined) {
             return false;
         }
         return this.db.transaction(() => {
-            if (!this.matchesDatabaseState(input, checkout)) {
+            if (!current()) {
                 return false;
             }
             if (!insert()) {

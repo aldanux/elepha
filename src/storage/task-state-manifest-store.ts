@@ -1,12 +1,13 @@
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { parseTaskStateReportInput } from '../adapters/task-state-report.js';
+import { CODEX_TASK_SOURCE_KIND } from '../config/codex.js';
 import {
     TASK_STATE_MANIFEST_TIMESTAMP_MAX_BYTES,
     TASK_STATE_REPORT_INPUT_MAX_BYTES,
     TASK_STATE_REPORT_ITEM_MAX_CHARS,
 } from '../config/constants.js';
 import { escapeShellSyntax } from '../security/sanitize.js';
-import type { TaskStateReportInput, TaskStateReportPrecompactItem } from '../types/index.js';
+import type { TaskStateNativeSourceProof, TaskStateReportInput, TaskStateReportPrecompactItem } from '../types/index.js';
 import { runSessionLiveMemoryWrite } from './live-memory-retention.js';
 
 export type TaskStateManifestSection = 'objective' | 'decisions' | 'constraints' | 'pending_items';
@@ -34,6 +35,7 @@ export interface TaskStateManifestSourceLocator {
     role: 'user' | 'assistant';
     projectionEncoding: typeof TASK_STATE_MANIFEST_PROJECTION_ENCODING;
     evidenceSource: 'durable' | 'transcript';
+    nativeSource?: TaskStateNativeSourceProof;
     start: number;
     end: number;
 }
@@ -138,7 +140,7 @@ export function validateTaskStateManifest(input: TaskStateManifestInput): void {
         throw new Error('Invalid task-state verification state');
     }
     if (
-        (input.coverage.state === 'verified' && (total === 0 || input.coverage.resolvedSourceCount !== total)) ||
+        (input.coverage.state === 'verified' && input.coverage.resolvedSourceCount !== total) ||
         (input.coverage.state === 'incomplete' &&
             (typeof input.coverage.reason !== 'string' ||
                 !input.coverage.reason.trim() ||
@@ -150,6 +152,30 @@ export function validateTaskStateManifest(input: TaskStateManifestInput): void {
     for (const locator of input.sourceLocators) {
         const quote = itemAt(input.report, locator.section, locator.itemIndex)?.sources[locator.quoteIndex];
         const coordinate = `${locator.section}:${locator.itemIndex}:${locator.quoteIndex}`;
+        const native = locator.nativeSource;
+        if (
+            native !== undefined &&
+            (native === null ||
+                typeof native !== 'object' ||
+                locator.evidenceSource !== 'transcript' ||
+                locator.sourceMemoryId !== input.memoryId ||
+                locator.sourceSessionId !== source.sessionId ||
+                locator.sourceTurnIndex !== source.turnIndex ||
+                locator.sourceGeneration !== source.sourceGeneration ||
+                locator.sourceDigest !== source.sourceDigest ||
+                !wholeNumber(native.byteStart, 0) ||
+                !wholeNumber(native.byteEnd, native.byteStart + 1) ||
+                !wholeNumber(native.contentIndex, 0) ||
+                !validDigest(native.recordDigest) ||
+                !(
+                    (native.kind === CODEX_TASK_SOURCE_KIND.projectInstructions &&
+                        locator.section === 'constraints' &&
+                        locator.role === 'user') ||
+                    (native.kind === CODEX_TASK_SOURCE_KIND.assistantBeforeReport && locator.role === 'assistant')
+                ))
+        ) {
+            throw new Error('Invalid task-state native source locator');
+        }
         if (
             !quote ||
             coordinates.has(coordinate) ||
@@ -212,6 +238,17 @@ function preparedInput(input: TaskStateManifestInput): TaskStateManifestInput {
                 role: locator.role,
                 projectionEncoding: locator.projectionEncoding,
                 evidenceSource: locator.evidenceSource,
+                ...(locator.nativeSource === undefined
+                    ? {}
+                    : {
+                          nativeSource: {
+                              kind: locator.nativeSource.kind,
+                              byteStart: locator.nativeSource.byteStart,
+                              byteEnd: locator.nativeSource.byteEnd,
+                              recordDigest: locator.nativeSource.recordDigest,
+                              contentIndex: locator.nativeSource.contentIndex,
+                          },
+                      }),
                 start: locator.start,
                 end: locator.end,
             }))

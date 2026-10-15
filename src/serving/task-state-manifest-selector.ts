@@ -1,6 +1,8 @@
 import { statSync } from 'node:fs';
 import type Database from 'better-sqlite3-multiple-ciphers';
 import { ClaudeCodeAdapter } from '../adapters/claude-code.js';
+import { defaultAdapters } from '../adapters/index.js';
+import { CODEX_TASK_SOURCE_KIND } from '../config/codex.js';
 import {
     CURRENT_CHAT_EVIDENCE_MAX_ID_BYTES,
     CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
@@ -20,11 +22,20 @@ import {
     TaskStateManifestStore,
     validateTaskStateManifest,
 } from '../storage/task-state-manifest-store.js';
+import {
+    prepareTaskStateProjectScope,
+    type TaskStateProjectScope,
+    taskStateProjectScopeCurrent,
+} from '../storage/task-state-project-scope.js';
+import type { SessionAdapterTool } from '../types/index.js';
 import { SessionReader } from './session-reader.js';
+import type { authenticateTaskStateChat } from './task-state-chat.js';
+import { readTaskStateNativeSources } from './task-state-manifest-verifier.js';
 
 interface CapturedTurn {
     memoryId: number;
     sessionId: number;
+    projectId: number;
     segmentIndex: number;
     turnIndex: number;
     sourceCursor: string | null;
@@ -42,6 +53,7 @@ export const CLAUDE_HISTORICAL_CHECKPOINT_VERSION = 1;
 export type ClaudeHistoricalCheckpointSelection =
     | {
           state: 'available';
+          revalidate: () => boolean;
           checkpoint: {
               version: typeof CLAUDE_HISTORICAL_CHECKPOINT_VERSION;
               kind: 'historical_precompact';
@@ -65,6 +77,28 @@ function physicalCheckout(value: string): string | undefined {
     }
 }
 
+function projectAuthorization(db: Database.Database, cwd: string) {
+    const scopes = new Map<number, TaskStateProjectScope>();
+    return (turn: CapturedTurn): boolean => {
+        if (turn.projectPath === null) {
+            return false;
+        }
+        let scope = scopes.get(turn.projectId);
+        if (scope === undefined) {
+            scope = prepareTaskStateProjectScope(db, turn.projectId, turn.projectPath, cwd);
+            if (scope === undefined) {
+                return false;
+            }
+            scopes.set(turn.projectId, scope);
+        }
+        return (
+            scope.projectPath === turn.projectPath &&
+            samePath(physicalCheckout(turn.projectPath) ?? '', scope.canonicalPaths.get(turn.projectPath) ?? '') &&
+            taskStateProjectScopeCurrent(db, scope)
+        );
+    };
+}
+
 function cursorOffset(cursor: string | null): number | undefined {
     if (cursor === null || !/^(0|[1-9]\d*)\|\d+\|[a-f0-9]+$/.test(cursor)) {
         return undefined;
@@ -77,6 +111,7 @@ function sameCaptured(left: CapturedTurn, right: CapturedTurn): boolean {
     return (
         left.memoryId === right.memoryId &&
         left.sessionId === right.sessionId &&
+        left.projectId === right.projectId &&
         left.segmentIndex === right.segmentIndex &&
         left.turnIndex === right.turnIndex &&
         left.sourceCursor === right.sourceCursor &&
@@ -99,7 +134,7 @@ function sourceQuote(
 }
 
 const CAPTURED_SELECT = `SELECT m.id AS memoryId, s.id AS sessionId, s.segment_index AS segmentIndex,
-        m.turn_index AS turnIndex,
+        s.project_id AS projectId, m.turn_index AS turnIndex,
         CASE WHEN length(CAST(tsi.source_cursor AS BLOB)) <= ? THEN tsi.source_cursor END AS sourceCursor,
         tsi.source_digest AS sourceDigest, COALESCE(g.generation, 0) AS sourceGeneration,
         CASE WHEN length(CAST(p.path AS BLOB)) <= ? THEN p.path END AS projectPath,
@@ -109,14 +144,15 @@ const CAPTURED_SELECT = `SELECT m.id AS memoryId, s.id AS sessionId, s.segment_i
         JOIN memories m ON m.session_id = s.id
         LEFT JOIN turn_search_index tsi ON tsi.memory_id = m.id
         LEFT JOIN source_generations g ON g.tool = s.tool AND g.native_id = s.native_id
-        WHERE s.tool = 'claude-code' AND s.native_id = ?
+        WHERE s.tool = ? AND s.native_id = ?
           AND NOT EXISTS (SELECT 1 FROM purged_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id) AND NOT ${retentionRemovedSql('s.tool', 's.native_id')}
           AND NOT EXISTS (SELECT 1 FROM incognito_transcripts t WHERE t.tool = s.tool AND t.native_id = s.native_id)`;
 
-const capturedArgs = (nativeSessionId: string): [number, number, number, string] => [
+const capturedArgs = (nativeSessionId: string, tool: SessionAdapterTool = 'claude-code'): [number, number, number, string, string] => [
     CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
     CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
     CURRENT_CHAT_EVIDENCE_MAX_PATH_BYTES,
+    tool,
     nativeSessionId,
 ];
 
@@ -124,12 +160,19 @@ const capturedArgs = (nativeSessionId: string): [number, number, number, string]
 // deliver the report; callers must treat every unavailable result as abstention.
 export async function selectFreshClaudePrecompactManifest(
     db: Database.Database,
-    input: { nativeSessionId: string; cwd: string; transcriptPath: string; configPath?: string },
+    input: {
+        nativeSessionId: string;
+        cwd: string;
+        transcriptPath: string;
+        configPath?: string;
+        tool?: SessionAdapterTool;
+        signal?: AbortSignal;
+    },
     reader: Pick<SessionReader, 'serveState' | 'indexedTurnEvidence'> = new SessionReader(db),
 ): Promise<ClaudePrecompactSelection> {
     const unavailable = (reason: string): ClaudePrecompactSelection => ({ state: 'unavailable', reason });
-    if (!getSetting('memory-plus', {}, input.configPath).value) {
-        return unavailable('memory_plus_disabled');
+    if (!getSetting(`capture-${input.tool ?? 'claude-code'}`, {}, input.configPath).value) {
+        return unavailable('capture_disabled');
     }
     if (reader.serveState() === 'locked') {
         return unavailable('locked');
@@ -142,6 +185,10 @@ export async function selectFreshClaudePrecompactManifest(
     ) {
         return unavailable('invalid_request');
     }
+    const deadline = input.signal ?? AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS);
+    if (deadline.aborted) {
+        return unavailable('deadline');
+    }
     const adapter = new ClaudeCodeAdapter();
     if (!adapter.matches(input.transcriptPath) || adapter.nativeSessionId(input.transcriptPath) !== input.nativeSessionId) {
         return unavailable('transcript_identity_mismatch');
@@ -151,7 +198,8 @@ export async function selectFreshClaudePrecompactManifest(
     if (checkout === undefined || consent.consentState(input.cwd) !== 'approved' || consent.isRefusedForCapture(input.cwd)) {
         return unavailable('checkout_not_consented');
     }
-    const compact = await adapter.readLatestCompactSummary(input.transcriptPath);
+    const compact = await adapter.readLatestCompactSummary(input.transcriptPath, deadline);
+    const authorizedProject = projectAuthorization(db, checkout);
     if (compact.status !== 'available') {
         return unavailable(compact.reason);
     }
@@ -172,7 +220,7 @@ export async function selectFreshClaudePrecompactManifest(
             turn.kind !== 'main' ||
             turn.sourcePath !== input.transcriptPath ||
             turn.projectPath === null ||
-            !samePath(physicalCheckout(turn.projectPath) ?? '', checkout) ||
+            !authorizedProject(turn) ||
             consent.consentState(turn.projectPath) !== 'approved' ||
             consent.isRefusedForCapture(turn.projectPath)
         ) {
@@ -216,13 +264,12 @@ export async function selectFreshClaudePrecompactManifest(
     ) {
         return unavailable('manifest_not_for_latest_compact');
     }
-    const gap = await adapter.verifyEmptyPrecompactGap(input.transcriptPath, reportOffset, compact.boundaryByteStart);
+    const gap = await adapter.verifyEmptyPrecompactGap(input.transcriptPath, reportOffset, compact.boundaryByteStart, deadline);
     if (gap !== 'clear') {
         return unavailable(gap);
     }
     if (
         manifest.coverage.state !== 'verified' ||
-        manifest.coverage.totalSourceCount === 0 ||
         manifest.coverage.resolvedSourceCount !== manifest.coverage.totalSourceCount ||
         manifest.sourceLocators.length !== manifest.coverage.totalSourceCount
     ) {
@@ -254,16 +301,15 @@ export async function selectFreshClaudePrecompactManifest(
         return unavailable('reporting_source_changed');
     }
     const sourceIds = [...new Set(manifest.sourceLocators.map((locator) => locator.sourceMemoryId))];
-    if (
-        sourceIds.length === 0 ||
-        sourceIds.length > TASK_STATE_MANIFEST_MAX_SOURCE_TURNS ||
-        sourceIds.some((id) => !Number.isSafeInteger(id) || id < 1)
-    ) {
+    if (sourceIds.length > TASK_STATE_MANIFEST_MAX_SOURCE_TURNS || sourceIds.some((id) => !Number.isSafeInteger(id) || id < 1)) {
         return unavailable('source_locator_limit');
     }
-    const sourceRows = db
-        .prepare(`${CAPTURED_SELECT} AND m.id IN (${sourceIds.map(() => '?').join(',')})`)
-        .all(...capturedArgs(input.nativeSessionId), ...sourceIds) as CapturedTurn[];
+    const sourceRows =
+        sourceIds.length === 0
+            ? []
+            : (db
+                  .prepare(`${CAPTURED_SELECT} AND m.id IN (${sourceIds.map(() => '?').join(',')})`)
+                  .all(...capturedArgs(input.nativeSessionId), ...sourceIds) as CapturedTurn[]);
     const byId = new Map(sourceRows.map((turn) => [turn.memoryId, turn]));
     for (const locator of manifest.sourceLocators) {
         const source = byId.get(locator.sourceMemoryId);
@@ -280,7 +326,7 @@ export async function selectFreshClaudePrecompactManifest(
             source.sourcePath === null ||
             source.kind !== 'main' ||
             source.sourcePath !== input.transcriptPath ||
-            !samePath(physicalCheckout(source.projectPath) ?? '', checkout) ||
+            !authorizedProject(source) ||
             consent.consentState(source.projectPath) !== 'approved' ||
             consent.isRefusedForCapture(source.projectPath) ||
             locator.projectionEncoding !== TASK_STATE_MANIFEST_PROJECTION_ENCODING ||
@@ -297,6 +343,7 @@ export async function selectFreshClaudePrecompactManifest(
                 expectedProjectPath: source.projectPath,
             },
             source.turnIndex,
+            deadline,
         );
         if (evidence.state !== 'available') {
             return unavailable(`source_evidence_${evidence.reason}`);
@@ -310,7 +357,7 @@ export async function selectFreshClaudePrecompactManifest(
         }
     }
     if (
-        !getSetting('memory-plus', {}, input.configPath).value ||
+        !getSetting(`capture-${input.tool ?? 'claude-code'}`, {}, input.configPath).value ||
         reader.serveState() === 'locked' ||
         consent.consentState(input.cwd) !== 'approved' ||
         consent.isRefusedForCapture(input.cwd) ||
@@ -318,7 +365,7 @@ export async function selectFreshClaudePrecompactManifest(
     ) {
         return unavailable('authorization_changed');
     }
-    const latest = await adapter.readLatestCompactSummary(input.transcriptPath);
+    const latest = await adapter.readLatestCompactSummary(input.transcriptPath, deadline);
     if (latest.status !== 'available' || latest.boundaryByteStart !== compact.boundaryByteStart || latest.byteEnd !== compact.byteEnd) {
         return unavailable('compact_source_changed');
     }
@@ -343,32 +390,40 @@ export async function selectFreshClaudePrecompactManifest(
                 turn.projectPath === null ||
                 consent.consentState(turn.projectPath) !== 'approved' ||
                 consent.isRefusedForCapture(turn.projectPath) ||
-                !samePath(physicalCheckout(turn.projectPath) ?? '', checkout)
+                !authorizedProject(turn)
             );
         }) ||
         interveningRead.get(...interveningArgs) !== undefined ||
         JSON.stringify(currentManifest) !== JSON.stringify(manifest) ||
-        !getSetting('memory-plus', {}, input.configPath).value ||
+        !getSetting(`capture-${input.tool ?? 'claude-code'}`, {}, input.configPath).value ||
         consent.consentState(input.cwd) !== 'approved' ||
         consent.isRefusedForCapture(input.cwd) ||
         !samePath(physicalCheckout(input.cwd) ?? '', checkout)
     ) {
         return unavailable('source_state_changed');
     }
-    return { state: 'available', manifest };
+    return deadline.aborted ? unavailable('deadline') : { state: 'available', manifest };
 }
 
 // A historical checkpoint says what the verified report recorded at its turn.
 // Later indexed turns are deliberately left unreviewed, and the transcript may
 // contain newer turns that ingestion has not indexed yet.
-async function readHistoricalClaudePrecompactCheckpoint(
+async function readTaskStateCheckpoint(
     db: Database.Database,
-    input: { nativeSessionId: string; cwd: string; transcriptPath: string; configPath?: string },
+    input: {
+        nativeSessionId: string;
+        cwd: string;
+        transcriptPath: string;
+        configPath?: string;
+        tool?: SessionAdapterTool;
+        signal?: AbortSignal;
+        nativeChat?: NonNullable<Awaited<ReturnType<typeof authenticateTaskStateChat>>>;
+    },
     reader: Pick<SessionReader, 'serveState' | 'indexedTurnEvidence'> = new SessionReader(db),
 ): Promise<ClaudeHistoricalCheckpointSelection> {
     const unavailable = (reason: string): ClaudeHistoricalCheckpointSelection => ({ state: 'unavailable', reason });
-    if (!getSetting('memory-plus', {}, input.configPath).value) {
-        return unavailable('memory_plus_disabled');
+    if (!getSetting(`capture-${input.tool ?? 'claude-code'}`, {}, input.configPath).value) {
+        return unavailable('capture_disabled');
     }
     if (reader.serveState() === 'locked') {
         return unavailable('locked');
@@ -381,7 +436,8 @@ async function readHistoricalClaudePrecompactCheckpoint(
     ) {
         return unavailable('invalid_request');
     }
-    const adapter = new ClaudeCodeAdapter();
+    const tool = input.tool ?? 'claude-code';
+    const adapter = defaultAdapters()[tool];
     if (!adapter.matches(input.transcriptPath) || adapter.nativeSessionId(input.transcriptPath) !== input.nativeSessionId) {
         return unavailable('transcript_identity_mismatch');
     }
@@ -390,20 +446,21 @@ async function readHistoricalClaudePrecompactCheckpoint(
     if (checkout === undefined || consent.consentState(input.cwd) !== 'approved' || consent.isRefusedForCapture(input.cwd)) {
         return unavailable('checkout_not_consented');
     }
+    const authorizedProject = projectAuthorization(db, checkout);
     const authorized = (turn: CapturedTurn): boolean =>
         turn.kind === 'main' &&
         turn.sourcePath === input.transcriptPath &&
         turn.projectPath !== null &&
-        samePath(physicalCheckout(turn.projectPath) ?? '', checkout) &&
+        authorizedProject(turn) &&
         consent.consentState(turn.projectPath) === 'approved' &&
         !consent.isRefusedForCapture(turn.projectPath);
     const stillAllowed = (): boolean =>
-        getSetting('memory-plus', {}, input.configPath).value &&
+        getSetting(`capture-${input.tool ?? 'claude-code'}`, {}, input.configPath).value &&
         reader.serveState() !== 'locked' &&
         consent.consentState(input.cwd) === 'approved' &&
         !consent.isRefusedForCapture(input.cwd) &&
         samePath(physicalCheckout(input.cwd) ?? '', checkout);
-    const args = capturedArgs(input.nativeSessionId);
+    const args = capturedArgs(input.nativeSessionId, tool);
     const latestManifestTurn = db
         .prepare(`${CAPTURED_SELECT}
             AND EXISTS (SELECT 1 FROM task_state_manifests tsm WHERE tsm.memory_id = m.id)
@@ -432,7 +489,6 @@ async function readHistoricalClaudePrecompactCheckpoint(
     if (
         manifest === undefined ||
         manifest.coverage.state !== 'verified' ||
-        manifest.coverage.totalSourceCount === 0 ||
         manifest.coverage.resolvedSourceCount !== manifest.coverage.totalSourceCount ||
         manifest.sourceLocators.length !== manifest.coverage.totalSourceCount
     ) {
@@ -447,22 +503,21 @@ async function readHistoricalClaudePrecompactCheckpoint(
         return unavailable('reporting_source_changed');
     }
     const sourceIds = [...new Set(manifest.sourceLocators.map((locator) => locator.sourceMemoryId))];
-    if (
-        sourceIds.length === 0 ||
-        sourceIds.length > TASK_STATE_MANIFEST_MAX_SOURCE_TURNS ||
-        sourceIds.some((id) => !Number.isSafeInteger(id) || id < 1)
-    ) {
+    if (sourceIds.length > TASK_STATE_MANIFEST_MAX_SOURCE_TURNS || sourceIds.some((id) => !Number.isSafeInteger(id) || id < 1)) {
         return unavailable('source_locator_limit');
     }
-    const sourceRows = db
-        .prepare(`${CAPTURED_SELECT} AND m.id IN (${sourceIds.map(() => '?').join(',')})`)
-        .all(...args, ...sourceIds) as CapturedTurn[];
+    const sourceRows =
+        sourceIds.length === 0
+            ? []
+            : (db
+                  .prepare(`${CAPTURED_SELECT} AND m.id IN (${sourceIds.map(() => '?').join(',')})`)
+                  .all(...args, ...sourceIds) as CapturedTurn[]);
     const byId = new Map(sourceRows.map((turn) => [turn.memoryId, turn]));
-    const deadline = AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS);
+    const deadline = input.signal ?? AbortSignal.timeout(TASK_STATE_MANIFEST_VERIFY_DEADLINE_MS);
     const reportingEvidence = await reader.indexedTurnEvidence(
         {
             id: latestManifestTurn.sessionId,
-            tool: 'claude-code',
+            tool,
             native_id: input.nativeSessionId,
             source_path: input.transcriptPath,
             expectedProjectPath: reportingProjectPath,
@@ -472,6 +527,51 @@ async function readHistoricalClaudePrecompactCheckpoint(
     );
     if (reportingEvidence.state !== 'available') {
         return unavailable(`reporting_evidence_${reportingEvidence.reason}`);
+    }
+    const nativeLocators = manifest.sourceLocators.filter((locator) => locator.nativeSource !== undefined);
+    const verifiedNative = new Map<(typeof nativeLocators)[number], number | undefined>();
+    if (nativeLocators.length > 0) {
+        if (tool !== 'codex') {
+            return unavailable('source_locator_changed');
+        }
+        const complete = await readTaskStateNativeSources(
+            db,
+            {
+                memoryId: manifest.memoryId,
+                nativeId: input.nativeSessionId,
+                cwd: input.cwd,
+                report: manifest.report,
+                sourceDigest: manifest.reportingSource.sourceDigest,
+            },
+            deadline,
+            (text, proof, timestampMs) => {
+                for (const locator of nativeLocators) {
+                    const quote = sourceQuote(manifest, locator.section, locator.itemIndex, locator.quoteIndex);
+                    if (
+                        JSON.stringify(proof) === JSON.stringify(locator.nativeSource) &&
+                        escapeShellSyntax(text).slice(locator.start, locator.end) === quote?.quote
+                    ) {
+                        verifiedNative.set(locator, timestampMs);
+                    }
+                }
+            },
+            input.nativeChat,
+        );
+        if (complete.state === 'unavailable') {
+            return unavailable(`source_evidence_${complete.reason}`);
+        }
+        for (const [locator, timestampMs] of verifiedNative) {
+            if (
+                locator.nativeSource?.kind === CODEX_TASK_SOURCE_KIND.assistantBeforeReport &&
+                complete.assistantBeforeMs !== undefined &&
+                (timestampMs === undefined || !Number.isFinite(timestampMs) || timestampMs >= complete.assistantBeforeMs)
+            ) {
+                verifiedNative.delete(locator);
+            }
+        }
+        if (verifiedNative.size !== nativeLocators.length) {
+            return unavailable('source_quote_changed');
+        }
     }
     for (const locator of manifest.sourceLocators) {
         if (deadline.aborted) {
@@ -490,14 +590,22 @@ async function readHistoricalClaudePrecompactCheckpoint(
             !authorized(source) ||
             source.projectPath === null ||
             locator.projectionEncoding !== TASK_STATE_MANIFEST_PROJECTION_ENCODING ||
-            (source.memoryId === latestManifestTurn.memoryId && locator.role === 'assistant')
+            (source.memoryId === latestManifestTurn.memoryId &&
+                locator.role === 'assistant' &&
+                locator.nativeSource?.kind !== CODEX_TASK_SOURCE_KIND.assistantBeforeReport)
         ) {
             return unavailable('source_locator_changed');
+        }
+        if (locator.nativeSource !== undefined) {
+            if (!verifiedNative.has(locator)) {
+                return unavailable('source_quote_changed');
+            }
+            continue;
         }
         const evidence = await reader.indexedTurnEvidence(
             {
                 id: source.sessionId,
-                tool: 'claude-code',
+                tool,
                 native_id: input.nativeSessionId,
                 source_path: input.transcriptPath,
                 expectedProjectPath: source.projectPath,
@@ -536,7 +644,7 @@ async function readHistoricalClaudePrecompactCheckpoint(
         const evidence = await reader.indexedTurnEvidence(
             {
                 id: latestIndexed.sessionId,
-                tool: 'claude-code',
+                tool,
                 native_id: input.nativeSessionId,
                 source_path: input.transcriptPath,
                 expectedProjectPath: latestProjectPath,
@@ -550,40 +658,47 @@ async function readHistoricalClaudePrecompactCheckpoint(
     }
     const expected = new Map([latestManifestTurn, ...sourceRows, latestIndexed].map((turn) => [turn.memoryId, turn]));
     const currentIds = [...expected.keys()];
-    const currentRows = db
-        .prepare(`${CAPTURED_SELECT} AND m.id IN (${currentIds.map(() => '?').join(',')})`)
-        .all(...args, ...currentIds) as CapturedTurn[];
-    let currentManifest: TaskStateManifestRow | undefined;
-    try {
-        currentManifest = manifests.get(latestManifestTurn.memoryId);
-    } catch {
-        return unavailable('source_state_changed');
-    }
-    const currentLatest = db.prepare(`${CAPTURED_SELECT} ORDER BY s.segment_index DESC, m.turn_index DESC LIMIT 1`).get(...args) as
-        | CapturedTurn
-        | undefined;
-    const currentTail = tailRead.all(...tailArgs, TASK_STATE_HISTORICAL_MAX_TAIL_ROWS + 1) as CapturedTurn[];
-    if (
-        deadline.aborted ||
-        !stillAllowed() ||
-        currentRows.length !== expected.size ||
-        currentRows.some((turn) => {
-            const original = expected.get(turn.memoryId);
-            return original === undefined || !sameCaptured(turn, original) || !authorized(turn);
-        }) ||
-        currentTail.length !== tail.length ||
-        currentTail.some((turn, index) => {
-            const original = tail[index];
-            return original === undefined || !sameCaptured(turn, original);
-        }) ||
-        currentLatest === undefined ||
-        !sameCaptured(currentLatest, latestIndexed) ||
-        JSON.stringify(currentManifest) !== JSON.stringify(manifest)
-    ) {
+    const revalidate = (): boolean => {
+        const currentRows = db
+            .prepare(`${CAPTURED_SELECT} AND m.id IN (${currentIds.map(() => '?').join(',')})`)
+            .all(...args, ...currentIds) as CapturedTurn[];
+        let currentManifest: TaskStateManifestRow | undefined;
+        try {
+            currentManifest = manifests.get(latestManifestTurn.memoryId);
+        } catch {
+            return false;
+        }
+        const currentLatest = db.prepare(`${CAPTURED_SELECT} ORDER BY s.segment_index DESC, m.turn_index DESC LIMIT 1`).get(...args) as
+            | CapturedTurn
+            | undefined;
+        const currentTail = tailRead.all(...tailArgs, TASK_STATE_HISTORICAL_MAX_TAIL_ROWS + 1) as CapturedTurn[];
+        if (
+            deadline.aborted ||
+            !stillAllowed() ||
+            currentRows.length !== expected.size ||
+            currentRows.some((turn) => {
+                const original = expected.get(turn.memoryId);
+                return original === undefined || !sameCaptured(turn, original) || !authorized(turn);
+            }) ||
+            currentTail.length !== tail.length ||
+            currentTail.some((turn, index) => {
+                const original = tail[index];
+                return original === undefined || !sameCaptured(turn, original);
+            }) ||
+            currentLatest === undefined ||
+            !sameCaptured(currentLatest, latestIndexed) ||
+            JSON.stringify(currentManifest) !== JSON.stringify(manifest)
+        ) {
+            return false;
+        }
+        return true;
+    };
+    if (!revalidate()) {
         return unavailable(deadline.aborted ? 'deadline' : 'source_state_changed');
     }
     return {
         state: 'available',
+        revalidate,
         checkpoint: {
             version: CLAUDE_HISTORICAL_CHECKPOINT_VERSION,
             kind: 'historical_precompact',
@@ -599,14 +714,25 @@ async function readHistoricalClaudePrecompactCheckpoint(
     };
 }
 
-export async function selectHistoricalClaudePrecompactCheckpoint(
+export async function selectTaskStateCheckpoint(
     db: Database.Database,
-    input: { nativeSessionId: string; cwd: string; transcriptPath: string; configPath?: string },
+    input: {
+        nativeSessionId: string;
+        cwd: string;
+        transcriptPath: string;
+        configPath?: string;
+        tool?: SessionAdapterTool;
+        signal?: AbortSignal;
+        nativeChat?: NonNullable<Awaited<ReturnType<typeof authenticateTaskStateChat>>>;
+    },
     reader: Pick<SessionReader, 'serveState' | 'indexedTurnEvidence'> = new SessionReader(db),
 ): Promise<ClaudeHistoricalCheckpointSelection> {
     try {
-        return await readHistoricalClaudePrecompactCheckpoint(db, input, reader);
+        return await readTaskStateCheckpoint(db, input, reader);
     } catch {
         return { state: 'unavailable', reason: 'checkpoint_read_error' };
     }
 }
+
+// Preserve the existing Claude selector boundary for its callers.
+export const selectHistoricalClaudePrecompactCheckpoint = selectTaskStateCheckpoint;

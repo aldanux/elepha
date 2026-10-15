@@ -5,6 +5,7 @@ import { statSync } from 'node:fs';
 import { stat as fsStat } from 'node:fs/promises';
 import { TranscriptReadBudgetError } from '../adapters/base.js';
 import { sessionAdapterFor } from '../adapters/index.js';
+import { sameTaskStateReportInput } from '../adapters/task-state-report.js';
 import { DURABLE_CAPTURE_FILTER_VERSION } from '../config/constants.js';
 import { canonicalizeExisting, samePath } from '../config/paths.js';
 import { getSetting } from '../config/settings.js';
@@ -20,15 +21,24 @@ import {
 } from '../security/provider-transcript.js';
 import { manifestSourcesStillCurrent, verifyTaskStateManifest } from '../serving/task-state-manifest-verifier.js';
 import { NOT_CURRENT_COPY_SQL } from '../storage/durable-capture-store.js';
-import type { MemoryStore } from '../storage/memory-store.js';
+import { hydrateTurnDecisions, type MemoryStore } from '../storage/memory-store.js';
+import { memoryReadAuthorityMatchesGenerationInTransaction, withMemoryReadGeneration } from '../storage/paranoid-gate.js';
 import { SERVED_SESSION_KIND_ELIGIBILITY } from '../storage/session-read-model.js';
 
 import { decodeResumeContext } from '../storage/source-resume-context.js';
-import { sourceTurnDigest } from '../storage/source-turn-digest.js';
+import { sourceTurnDigest, sourceTurnDigests } from '../storage/source-turn-digest.js';
 import { TaskStateManifestStore } from '../storage/task-state-manifest-store.js';
 import { TaskStateRequestStore } from '../storage/task-state-request-store.js';
 import { TURN_SEARCH_INDEX_TABLE } from '../storage/turn-search-index.js';
-import type { ParsedTurn, ResumeContext, SessionAdapter, SessionAdapterMap, SourceReadBudget, ToolName } from '../types/index.js';
+import type {
+    ParsedTurn,
+    ResumeContext,
+    SessionAdapter,
+    SessionAdapterMap,
+    SourceReadBudget,
+    SummarizerStatus,
+    ToolName,
+} from '../types/index.js';
 
 export interface TaskStateManifestRecoveryBudget {
     requests: number;
@@ -76,6 +86,23 @@ interface ReportingSource {
     start: ReadStart;
     readBytes: number;
     pass: RecoveryPass;
+    pinnedBoundary?: true;
+}
+
+function reportingSourceSnapshotCurrent(source: ReportingSource): boolean {
+    try {
+        const current = statSync(source.opened.resolvedPath);
+        const original = source.opened.stat;
+        return (
+            current.dev === original.dev &&
+            current.ino === original.ino &&
+            current.size === original.size &&
+            current.mtimeMs === original.mtimeMs &&
+            current.ctimeMs === original.ctimeMs
+        );
+    } catch {
+        return false;
+    }
 }
 
 interface RecoveryPass {
@@ -147,8 +174,13 @@ export class TaskStateManifestPublisher {
             return;
         }
         try {
-            if (!getSetting('memory-plus').value) {
-                unavailable('Memory-Plus disabled');
+            const generation = withMemoryReadGeneration(
+                db,
+                () => undefined,
+                (token) => token,
+            );
+            if (generation === undefined || !getSetting(`capture-${turn.tool}`).value) {
+                unavailable('capture disabled');
                 return;
             }
             const memory = db.prepare('SELECT id FROM memories WHERE session_id = ? AND turn_index = ?').get(sessionDbId, turn.turnIndex) as
@@ -178,7 +210,23 @@ export class TaskStateManifestPublisher {
                 return;
             }
             const { callId: _callId, ...report } = turn.taskStateReport;
-            const prepared = await verifyTaskStateManifest(db, { reportingMemoryId: memory.id, report, cwd: turn.projectPath });
+            const prepared = await verifyTaskStateManifest(
+                db,
+                { reportingMemoryId: memory.id, report, cwd: turn.projectPath },
+                undefined,
+                undefined,
+                source === undefined
+                    ? undefined
+                    : {
+                          turn,
+                          adapter: source.adapter,
+                          opened: source.opened,
+                          sourcePath: source.opened.resolvedPath,
+                          readBudget: source.pass.budget,
+                          current: () =>
+                              turn.validateSource?.() === true && this.reportingTurnCovered(turn) && reportingSourceSnapshotCurrent(source),
+                      },
+            );
             if (prepared.state !== 'prepared') {
                 unavailable(prepared.reason);
                 return;
@@ -201,9 +249,10 @@ export class TaskStateManifestPublisher {
             for (const row of prepared.checkpoint.rows) {
                 const sourceCheckout = canonicalizeExisting(row.projectPath);
                 const sourceStat = await fsStat(sourceCheckout).catch(() => undefined);
+                const project = prepared.checkpoint.projects.find((scope) => scope.projectId === row.projectId);
                 if (
                     !sourceStat?.isDirectory() ||
-                    !samePath(sourceCheckout, physicalCheckout) ||
+                    !samePath(sourceCheckout, project?.canonicalPaths.get(row.projectPath) ?? '') ||
                     store.consent.isRefusedForCapture(row.projectPath)
                 ) {
                     unavailable('source checkout changed');
@@ -216,13 +265,32 @@ export class TaskStateManifestPublisher {
                 unavailable('reporting source changed');
                 return;
             }
-            const memoryPlusEnabled = getSetting('memory-plus').value;
+            if (
+                source !== undefined &&
+                (source.pinnedBoundary || prepared.manifest.sourceLocators.some((locator) => locator.nativeSource !== undefined)) &&
+                !reportingSourceSnapshotCurrent(source)
+            ) {
+                unavailable('reporting source changed');
+                return;
+            }
+            if (
+                !withMemoryReadGeneration(
+                    db,
+                    () => false,
+                    () => true,
+                    generation,
+                )
+            ) {
+                unavailable('memory generation changed');
+                return;
+            }
             const manifests = new TaskStateManifestStore(db);
             // Every decisive database fact is repeated inside the request's
             // consumption transaction, including the reporting-turn coverage.
             const outcome = requests.consumeForVerifiedManifest(requestScope, () => {
                 if (
-                    !memoryPlusEnabled ||
+                    !memoryReadAuthorityMatchesGenerationInTransaction(db, generation) ||
+                    !getSetting(`capture-${turn.tool}`).value ||
                     store.consent.consentStateForCanonicalPath(physicalCheckout) !== 'approved' ||
                     store.isTranscriptCaptureBlocked(turn.tool, turn.sessionId) ||
                     store.isTranscriptIncognito(turn.tool, turn.sessionId) ||
@@ -284,6 +352,21 @@ export class TaskStateManifestPublisher {
             return;
         }
         this.options.enqueue(() => this.recover());
+    }
+
+    // Request issuance keeps one request per chat and mode. A live source
+    // append retries that request even when its idle turn was already captured.
+    async recoverForChat(tool: ToolName, nativeSessionId: string): Promise<void> {
+        const requests = this.options.store.database
+            .prepare(`SELECT request_id FROM task_state_requests
+                WHERE tool = ? AND native_session_id = ? AND mode = 'precompact_manifest' AND consumed_at IS NULL LIMIT 2`)
+            .all(tool, nativeSessionId) as Array<{ request_id: string }>;
+        if (requests.length === 1) {
+            const request = requests[0];
+            if (request !== undefined) {
+                await this.recover(request.request_id);
+            }
+        }
     }
 
     private pending(
@@ -417,7 +500,17 @@ export class TaskStateManifestPublisher {
                 return 'done';
             }
             reporting.validateSource = validateSource;
-            await this.publish(reporting, session, { adapter, opened, start, readBytes, pass });
+            const source: ReportingSource = { adapter, opened, start, readBytes, pass };
+            if (!this.reportingTurnCovered(reporting)) {
+                const pinned = await this.pinCompletedReportingTurn(reporting, session, source);
+                if (pinned) {
+                    reporting = pinned;
+                    source.pinnedBoundary = true;
+                } else {
+                    await this.completeIdleReportingTurn(reporting, session, source);
+                }
+            }
+            await this.publish(reporting, session, source);
             return 'done';
         } finally {
             await opened.handle.close();
@@ -460,13 +553,14 @@ export class TaskStateManifestPublisher {
     // bytes that read consumed; the replay is charged to the pass too. The
     // turn must still parse to the same index, report and end cursor, and
     // match the digest its retained coverage pinned.
-    private async reportingSourceCurrent(turn: ParsedTurn, source: ReportingSource): Promise<boolean> {
+    private async reportingSourceCurrent(turn: ParsedTurn, source: ReportingSource, requireCoverage = true): Promise<boolean> {
         const start = cursorOffset(source.adapter, source.start.cursor);
         const end = cursorOffset(source.adapter, turn.cursor);
-        if (start === undefined || end === undefined || end <= start) {
+        if (start === undefined || end === undefined || end <= start || source.pass.budget.remaining < source.readBytes) {
             return false;
         }
         const replay: SourceReadBudget = { remaining: source.readBytes };
+        let invalid = false;
         try {
             for await (const fresh of source.adapter.parseTurns(source.opened.resolvedPath, source.start.cursor, {
                 closeTrailingOnIdle: true,
@@ -475,12 +569,26 @@ export class TaskStateManifestPublisher {
                 resumeContext: source.start.context,
                 endByteOffset: end,
                 readBudget: replay,
+                onDesync: () => {
+                    invalid = true;
+                },
+                onMalformedRecords: () => {
+                    invalid = true;
+                },
+                onUnrecognizedRecords: () => {
+                    invalid = true;
+                },
             })) {
                 if (fresh.turnIndex === turn.turnIndex) {
                     return (
+                        !invalid &&
                         fresh.cursor === turn.cursor &&
-                        fresh.taskStateReport?.request_id === turn.taskStateReport?.request_id &&
-                        this.reportingTurnCovered(fresh)
+                        fresh.taskStateReport !== undefined &&
+                        turn.taskStateReport !== undefined &&
+                        fresh.taskStateReport.callId === turn.taskStateReport.callId &&
+                        sameTaskStateReportInput(fresh.taskStateReport, turn.taskStateReport) &&
+                        sourceTurnDigest(fresh) === sourceTurnDigest(turn) &&
+                        (!requireCoverage || this.reportingTurnCovered(fresh))
                     );
                 }
             }
@@ -490,19 +598,191 @@ export class TaskStateManifestPublisher {
         }
     }
 
+    private async pinCompletedReportingTurn(turn: ParsedTurn, sessionId: number, source: ReportingSource): Promise<ParsedTurn | undefined> {
+        if (
+            turn.provisionalIdle ||
+            turn.droppedReason !== undefined ||
+            !turn.taskStateReport ||
+            !source.adapter.authenticateTaskStateMetadataTail
+        ) {
+            return undefined;
+        }
+        const retained = this.options.store.database
+            .prepare(`SELECT tsi.source_cursor AS cursor, tsi.source_digest AS digest
+            FROM memories m JOIN ${TURN_SEARCH_INDEX_TABLE} tsi ON tsi.memory_id = m.id
+            WHERE m.session_id = ? AND m.turn_index = ?`)
+            .get(sessionId, turn.turnIndex) as { cursor: string; digest: string } | undefined;
+        if (!retained?.cursor || sourceTurnDigest(turn) !== retained.digest) {
+            return undefined;
+        }
+        try {
+            if (
+                !(await source.adapter.authenticateTaskStateMetadataTail(source.opened.resolvedPath, retained.cursor, turn.cursor, {
+                    handle: source.opened.handle,
+                    readBudget: source.pass.budget,
+                }))
+            ) {
+                return undefined;
+            }
+        } catch (error) {
+            if (!(error instanceof TranscriptReadBudgetError)) {
+                throw error;
+            }
+            return undefined;
+        }
+        const pinned = { ...turn, cursor: retained.cursor };
+        return this.reportingTurnCovered(pinned) ? pinned : undefined;
+    }
+
+    // An idle capture pins a prefix, not the completed reporting turn. Replay
+    // exactly that prefix against its retained digest, then re-read the full
+    // turn before replacing the copy. If the prefix already acknowledges a
+    // report, the completed turn must carry that exact report and call ID.
+    // A rewrite, exclusion or ambiguous report cannot acquire new coverage.
+    private async completeIdleReportingTurn(turn: ParsedTurn, sessionId: number, source: ReportingSource): Promise<void> {
+        const { store } = this.options;
+        const db = store.database;
+        const generation = withMemoryReadGeneration(
+            db,
+            () => undefined,
+            (token) => token,
+        );
+        if (generation === undefined || !getSetting(`capture-${turn.tool}`).value) {
+            return;
+        }
+        const retained = db
+            .prepare(`SELECT tsi.source_cursor AS cursor, tsi.source_digest AS digest,
+                m.project_id AS projectId, m.decisions, m.pending_items AS pendingItems, m.summarizer_status AS status
+                FROM memories m JOIN ${TURN_SEARCH_INDEX_TABLE} tsi ON tsi.memory_id = m.id
+                WHERE m.session_id = ? AND m.turn_index = ?`)
+            .get(sessionId, turn.turnIndex) as
+            | {
+                  cursor: string | null;
+                  digest: string;
+                  projectId: number;
+                  decisions: string;
+                  pendingItems: string;
+                  status: SummarizerStatus;
+              }
+            | undefined;
+        const end = cursorOffset(source.adapter, retained?.cursor ?? undefined);
+        const completeEnd = cursorOffset(source.adapter, turn.cursor);
+        if (
+            retained?.cursor === null ||
+            retained === undefined ||
+            end === undefined ||
+            end <= (cursorOffset(source.adapter, source.start.cursor) ?? Infinity) ||
+            completeEnd === undefined ||
+            end >= completeEnd ||
+            turn.taskStateReport === undefined ||
+            turn.droppedReason !== undefined
+        ) {
+            return;
+        }
+        let prefix: ParsedTurn | undefined;
+        try {
+            for await (const candidate of source.adapter.parseTurns(source.opened.resolvedPath, source.start.cursor, {
+                closeTrailingOnIdle: true,
+                handle: source.opened.handle,
+                resumeContext: source.start.context,
+                endByteOffset: end,
+                readBudget: source.pass.budget,
+            })) {
+                if (candidate.turnIndex === turn.turnIndex) {
+                    prefix = candidate;
+                    break;
+                }
+            }
+        } catch (error) {
+            if (!(error instanceof TranscriptReadBudgetError)) {
+                throw error;
+            }
+            return;
+        }
+        if (
+            prefix?.provisionalIdle !== true ||
+            prefix.cursor !== retained.cursor ||
+            prefix.tool !== turn.tool ||
+            prefix.sessionId !== turn.sessionId ||
+            prefix.projectPath !== turn.projectPath ||
+            (prefix.taskStateReport !== undefined &&
+                (prefix.taskStateReport.callId !== turn.taskStateReport.callId ||
+                    !sameTaskStateReportInput(prefix.taskStateReport, turn.taskStateReport))) ||
+            prefix.droppedReason !== undefined ||
+            sourceTurnDigest(prefix) !== retained.digest ||
+            !this.reportingTurnCovered(prefix) ||
+            source.pass.budget.remaining < source.readBytes * 2
+        ) {
+            return;
+        }
+        const requests = new TaskStateRequestStore(db);
+        const scope = {
+            requestId: turn.taskStateReport.request_id,
+            mode: turn.taskStateReport.mode,
+            tool: turn.tool,
+            nativeSessionId: turn.sessionId,
+            sessionId,
+            cwd: turn.projectPath,
+            sourcePath: turn.sourcePath,
+            turnIndex: turn.turnIndex,
+        };
+        if (!requests.canConsume(scope) || !(await this.reportingSourceCurrent(turn, source, false))) {
+            return;
+        }
+        const currentRequest = requests.prepareConsumption(scope);
+        if (currentRequest === undefined) {
+            return;
+        }
+        const verifiedPrefix = prefix;
+        store.reingestTurn(
+            turn,
+            sessionId,
+            retained.projectId,
+            {
+                decisions: hydrateTurnDecisions(retained.decisions),
+                pending_items: JSON.parse(retained.pendingItems),
+                status: retained.status,
+            },
+            false,
+            true,
+            {
+                previousCursor: retained.cursor,
+                current: () =>
+                    getSetting(`capture-${turn.tool}`).value === true &&
+                    memoryReadAuthorityMatchesGenerationInTransaction(db, generation) &&
+                    currentRequest() &&
+                    db
+                        .prepare(`SELECT 1 FROM ${TURN_SEARCH_INDEX_TABLE} tsi JOIN memories m ON m.id = tsi.memory_id
+                        WHERE m.session_id = ? AND m.turn_index = ? AND m.project_id = ? AND tsi.source_cursor = ? AND tsi.source_digest = ?`)
+                        .get(sessionId, turn.turnIndex, retained.projectId, retained.cursor, retained.digest) !== undefined &&
+                    this.reportingTurnCovered(verifiedPrefix),
+            },
+        );
+    }
+
     // The coverage row pins the digest of the exact source turn retained at
-    // capture, report included. Claude Code and Codex turns carry no stable
+    // capture, with the pre-fix rejected-retry shape supported explicitly.
+    // Claude Code and Codex turns carry no stable
     // source key, so this is the only content proof for a re-read turn.
     private reportingTurnCovered(turn: ParsedTurn): boolean {
+        const digests = sourceTurnDigests(turn);
         const rows = this.options.store.database
             .prepare(`SELECT m.project_id = s.project_id AND ${SERVED_SESSION_KIND_ELIGIBILITY}
-                AND NOT ${NOT_CURRENT_COPY_SQL} AND tsi.source_digest = ? AND tsi.filter_version = ? AS current
+                AND NOT ${NOT_CURRENT_COPY_SQL} AND tsi.source_digest IN (?, ?) AND tsi.filter_version = ? AS current
                 FROM memories m JOIN sessions s ON s.id = m.session_id
                 JOIN projects p ON p.id = m.project_id
                 LEFT JOIN filtered_turns ft ON ft.memory_id = m.id
                 LEFT JOIN ${TURN_SEARCH_INDEX_TABLE} tsi ON tsi.memory_id = m.id
-                WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ? LIMIT 2`)
-            .all(sourceTurnDigest(turn), DURABLE_CAPTURE_FILTER_VERSION, turn.tool, turn.sessionId, turn.turnIndex) as Array<{
+                WHERE s.tool = ? AND s.native_id = ? AND m.turn_index = ? AND tsi.source_cursor = ? LIMIT 2`)
+            .all(
+                digests[0],
+                digests[1] ?? null,
+                DURABLE_CAPTURE_FILTER_VERSION,
+                turn.tool,
+                turn.sessionId,
+                turn.turnIndex,
+                turn.cursor,
+            ) as Array<{
             current: number;
         }>;
         return rows.length === 1 && rows[0]?.current === 1;

@@ -2139,6 +2139,14 @@ export class IngestionDaemon {
             // coverage to withdraw; a transcript that is not captured has none.
             this.recordLiveParseGap(adapter.tool, nativeId, { malformed: malformedRecords ?? 0, unrecognized: unrecognizedRecords ?? 0 });
 
+            // A legacy idle cursor can precede a later report in that same
+            // turn. Resuming beyond it sees no new user boundary; recovery
+            // re-reads only this chat's pending request and authenticates the
+            // captured prefix before extending its retained coverage.
+            if ((adapter.tool === 'claude-code' || adapter.tool === 'codex') && classification.kind === 'primary') {
+                await this.taskStateManifests.recoverForChat(adapter.tool, nativeId);
+            }
+
             if (openTail !== undefined) {
                 await this.handleOpenTail(
                     adapter,

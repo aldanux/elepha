@@ -42,6 +42,8 @@ export function injectionBodyHash(body: string, attribution: InjectionAttributio
 }
 
 export interface RecordInjectionInput {
+    // Continuation delivery identity is separate from body deduplication.
+    deliveryKey?: string;
     tool: ToolName;
     nativeSessionId: string;
     injectedAt: string;
@@ -86,7 +88,10 @@ export class InjectionStore {
         retainedTotals: Statement;
     };
 
-    constructor(db: Database, options: { includePersistedMcp?: boolean; now?: () => number } = {}) {
+    constructor(
+        private readonly db: Database,
+        options: { includePersistedMcp?: boolean; now?: () => number } = {},
+    ) {
         this.includePersistedMcp = options.includePersistedMcp ?? true;
         this.now = options.now ?? Date.now;
         this.stmts = {
@@ -147,7 +152,8 @@ export class InjectionStore {
     // Explicit user rules use namespaced exact identity so case/punctuation
     // edits remain separately attributable without changing legacy bodies.
     recordInjection(input: RecordInjectionInput): boolean {
-        const bodyHash = injectionBodyHash(input.body, input.attribution);
+        const bodyHash =
+            input.deliveryKey === undefined ? injectionBodyHash(input.body, input.attribution) : `continuation:${input.deliveryKey}`;
         const result = this.stmts.insertInjection.run({
             tool: input.tool,
             native_session_id: input.nativeSessionId,
@@ -165,6 +171,10 @@ export class InjectionStore {
         return this.injectionsForSession(input.tool, input.nativeSessionId, input.injectedAt).some(
             (row) => row.body_hash === bodyHash && row.body === input.body,
         );
+    }
+
+    hasContinuationDelivery(deliveryKey: string): boolean {
+        return this.db.prepare('SELECT 1 FROM injections WHERE body_hash = ? LIMIT 1').get(`continuation:${deliveryKey}`) !== undefined;
     }
 
     currentSourceGeneration(tool: ToolName, nativeSessionId: string): number {

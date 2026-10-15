@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { parseTaskStateReportInput } from '../adapters/task-state-report.js';
+import { parseTaskStateReportInput, taskStateReportErrorText, taskStateReportValidationError } from '../adapters/task-state-report.js';
 import {
     AUTO_BRIEF_CHAR_BUDGET,
     CHARS_PER_TOKEN,
@@ -87,20 +87,72 @@ const reportItemSchema = z.union([precompactItemSchema, postcompactItemSchema]);
 
 // The SDK parses the object before calling the handler. Strict objects keep
 // unknown keys visible as errors instead of silently stripping them.
-export const taskStateReportSchema = z.strictObject({
-    mode: z.enum(TASK_STATE_REPORT_MODES),
-    request_id: z.string().length(TASK_STATE_REQUEST_ID_CHARS).regex(TASK_STATE_REQUEST_ID_PATTERN),
-    objective: reportItemSchema.nullable().describe('The active objective, or null when there is no active task.'),
-    decisions: z.array(reportItemSchema).max(TASK_STATE_REPORT_LIST_MAX_ITEMS),
-    constraints: z.array(reportItemSchema).max(TASK_STATE_REPORT_LIST_MAX_ITEMS),
-    pending_items: z.array(reportItemSchema).max(TASK_STATE_REPORT_LIST_MAX_ITEMS),
-});
+const advertisedTaskStateReportSchema = z
+    .strictObject({
+        mode: z.enum(TASK_STATE_REPORT_MODES),
+        request_id: z.string().length(TASK_STATE_REQUEST_ID_CHARS).regex(TASK_STATE_REQUEST_ID_PATTERN),
+        objective: reportItemSchema.nullable().describe('The active objective, or null when there is no active task.'),
+        decisions: z.array(reportItemSchema).max(TASK_STATE_REPORT_LIST_MAX_ITEMS),
+        constraints: z.array(reportItemSchema).max(TASK_STATE_REPORT_LIST_MAX_ITEMS),
+        pending_items: z.array(reportItemSchema).max(TASK_STATE_REPORT_LIST_MAX_ITEMS),
+    })
+    .meta({
+        // The MCP SDK advertises object schemas only. These alternatives keep
+        // its published schema aligned with the parser's mode and empty-state contracts.
+        anyOf: [
+            ...TASK_STATE_REPORT_MODES.map((mode) => {
+                const item = z.toJSONSchema(mode === 'precompact_manifest' ? precompactItemSchema : postcompactItemSchema, {
+                    target: 'draft-7',
+                });
+                return {
+                    properties: {
+                        mode: { const: mode },
+                        objective: item,
+                        decisions: { type: 'array', items: item },
+                        constraints: { type: 'array', items: item },
+                        pending_items: { type: 'array', items: item },
+                    },
+                };
+            }),
+            {
+                properties: {
+                    objective: { type: 'null' },
+                    decisions: { type: 'array', maxItems: 0 },
+                    constraints: { type: 'array', maxItems: 0 },
+                    pending_items: { type: 'array', maxItems: 0 },
+                },
+            },
+        ],
+    });
+
+// Keep the SDK's object schema, but validate the original keys and selected
+// mode with the same bounded parser as capture. No item-union fallback can
+// replace a provenance limit failure with a text-only shape error.
+export const taskStateReportSchema = z
+    .strictObject(
+        {
+            mode: z.unknown(),
+            request_id: z.unknown(),
+            objective: z.unknown(),
+            decisions: z.unknown(),
+            constraints: z.unknown(),
+            pending_items: z.unknown(),
+        },
+        { error: taskStateReportErrorText('malformed-input') },
+    )
+    .superRefine((input, context) => {
+        const parsed = parseTaskStateReportInput(input);
+        if (parsed.state === 'incomplete') {
+            context.addIssue({ code: 'custom', message: taskStateReportValidationError(input, parsed.reason) });
+        }
+    })
+    .meta(z.toJSONSchema(advertisedTaskStateReportSchema, { target: 'draft-7' }));
 
 function reportTaskState(input: unknown): McpToolResult {
     const parsed = parseTaskStateReportInput(input);
     if (parsed.state === 'incomplete') {
         return {
-            content: [{ type: 'text', text: `task_state_report_${parsed.reason.replace('-', '_')}` }],
+            content: [{ type: 'text', text: taskStateReportErrorText(parsed.reason) }],
             isError: true,
         };
     }
@@ -728,7 +780,11 @@ export function mcpToolDefinitions(handlers: McpToolHandlers) {
     return {
         reportTaskState: {
             name: TASK_STATE_REPORT_TOOL,
-            configuration: { description: TASK_STATE_REPORT_DESCRIPTION, inputSchema: taskStateReportSchema },
+            configuration: {
+                description: TASK_STATE_REPORT_DESCRIPTION,
+                inputSchema: taskStateReportSchema,
+                annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+            },
             handler: reportTaskState,
         },
         listProjects: {

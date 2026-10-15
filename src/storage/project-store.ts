@@ -2,7 +2,14 @@ import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Database, Statement } from 'better-sqlite3-multiple-ciphers';
 import { expandUserPath, samePath } from '../config/paths.js';
-import { gitRemoteGetUrlOrigin, gitRevParseShowToplevel, gitRootCommit } from '../security/subprocess-allowlist.js';
+import {
+    gitRemoteGetUrlOrigin,
+    gitRemoteGetUrlOriginAsync,
+    gitRevParseShowToplevel,
+    gitRevParseShowToplevelAsync,
+    gitRootCommit,
+    gitRootCommitAsync,
+} from '../security/subprocess-allowlist.js';
 import type { ConsentStore } from './consent-store.js';
 
 export interface ProjectRow {
@@ -61,7 +68,7 @@ export class ProjectStore {
 
     constructor(
         private readonly db: Database,
-        options: ProjectStoreOptions = {},
+        private readonly options: ProjectStoreOptions = {},
     ) {
         this.resolveGitRoot = options.resolveGitRoot ?? gitRevParseShowToplevel;
         this.resolveGitRemote = options.resolveGitRemote ?? gitRemoteGetUrlOrigin;
@@ -135,6 +142,33 @@ export class ProjectStore {
             gitRemote: gitRoot ? this.resolveGitRemote(gitRoot) : null,
             gitRootCommit: gitRoot ? this.resolveGitRootCommit(gitRoot) : null,
         };
+    }
+
+    // First-prompt registration shares capture's grouping and identity rules,
+    // but every uncached Git probe must finish within the hook's deadline.
+    async resolveProjectIdentityAsync(projectPath: string, signal: AbortSignal): Promise<ResolvedProjectIdentity> {
+        const byPath = this.stmts.findProjectByPath.get(projectPath) as ProjectRow | undefined;
+        if (byPath?.git_root) {
+            this.gitRootsByCwd.set(projectPath, byPath.git_root);
+            return this.identityFromProject(byPath);
+        }
+        const gitRoot = this.gitRootsByCwd.has(projectPath)
+            ? (this.gitRootsByCwd.get(projectPath) ?? null)
+            : this.options.resolveGitRoot
+              ? this.options.resolveGitRoot(projectPath)
+              : await gitRevParseShowToplevelAsync(projectPath, signal);
+        this.gitRootsByCwd.set(projectPath, gitRoot);
+        const existing = gitRoot ? ((this.stmts.findProjectByGitRoot.get(gitRoot) as ProjectRow | undefined) ?? undefined) : byPath;
+        if (existing) {
+            return this.identityFromProject(existing);
+        }
+        const [gitRemote, gitRootCommit] = gitRoot
+            ? await Promise.all([
+                  this.options.resolveGitRemote ? this.options.resolveGitRemote(gitRoot) : gitRemoteGetUrlOriginAsync(gitRoot, signal),
+                  this.options.resolveGitRootCommit ? this.options.resolveGitRootCommit(gitRoot) : gitRootCommitAsync(gitRoot, signal),
+              ])
+            : [null, null];
+        return { gitRoot, gitRemote, gitRootCommit };
     }
 
     getProjectById(id: number): ProjectRow | undefined {
