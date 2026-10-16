@@ -23,15 +23,54 @@ export async function requestTaskState(
     let stage: TaskStateHookStage = TASK_STATE_HOOK_STAGE.pendingRequest;
     try {
         const requests = new TaskStateRequestStore(db);
-        const pending = requests.currentPendingOutput({
+        const pendingInput = {
             tool: input.tool,
             nativeSessionId: input.nativeSessionId,
             cwd: input.cwd,
-            mode: 'precompact_manifest',
-        });
+            mode: 'precompact_manifest' as const,
+        };
+        const pending = requests.currentPendingOutput(pendingInput, TASK_STATE_REQUEST_INSTRUCTIONS);
         if (pending) {
             stage = TASK_STATE_HOOK_STAGE.currentState;
-            return chat.current() ? pending.output : reportTaskStateHookRejection(input.onRejected, stage);
+            if (!chat.current()) {
+                return reportTaskStateHookRejection(input.onRejected, stage);
+            }
+            if (!pending.needsRefresh) {
+                return pending.output;
+            }
+            const refreshed = db.transaction(() => {
+                stage = TASK_STATE_HOOK_STAGE.currentState;
+                if (!chat.current()) {
+                    return undefined;
+                }
+                const current = requests.currentPendingOutput(pendingInput, TASK_STATE_REQUEST_INSTRUCTIONS);
+                if (current?.requestId !== pending.requestId) {
+                    return undefined;
+                }
+                if (!current.needsRefresh) {
+                    return current.output;
+                }
+                stage = TASK_STATE_HOOK_STAGE.injectionWrite;
+                const output = recordHookOutput({
+                    store,
+                    tool: input.tool,
+                    nativeSessionId: input.nativeSessionId,
+                    injectedAt,
+                    body: `${taskStateRequestMarker(pendingInput.mode, pending.requestId)}\n${TASK_STATE_REQUEST_INSTRUCTIONS}`,
+                    kind: 'brief',
+                    attribution: 'exact',
+                    writeInjection,
+                });
+                if (output === undefined) {
+                    throw new Error('Task-state request refresh injection failed.');
+                }
+                const recorded = requests.currentPendingOutput(pendingInput, TASK_STATE_REQUEST_INSTRUCTIONS);
+                if (recorded?.requestId !== pending.requestId || recorded.needsRefresh) {
+                    throw new Error('Task-state request refresh was not recorded.');
+                }
+                return recorded.output;
+            })();
+            return refreshed === undefined ? reportTaskStateHookRejection(input.onRejected, stage) : refreshed;
         }
         const requestId = newTaskStateRequestId();
         stage = TASK_STATE_HOOK_STAGE.requestPreparation;

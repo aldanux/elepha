@@ -5,6 +5,7 @@ import { canonicalizeExisting, samePath } from '../config/paths.js';
 import { wrap } from '../security/sentinel.js';
 import type { TaskStateReportMode, ToolName } from '../types/index.js';
 import { ConsentStore } from './consent-store.js';
+import { injectionBodyHash } from './injection-store.js';
 import { isRetentionRemoved } from './live-memory-retention-schema.js';
 import { prepareTaskStateProjectScope, type TaskStateProjectScope, taskStateProjectScopeCurrent } from './task-state-project-scope.js';
 import { newUlid } from './ulid.js';
@@ -271,14 +272,18 @@ export class TaskStateRequestStore {
             .get(requestId) as RequestRow | undefined;
     }
 
-    // Reuse the exact recorded wrapper while a model report is pending. The
-    // hook independently revalidates the opened provider source first.
-    currentPendingOutput(input: {
-        tool: ToolName;
-        nativeSessionId: string;
-        cwd: string;
-        mode: TaskStateReportMode;
-    }): { requestId: string; output: string } | undefined {
+    // Reuse a recorded wrapper while a model report is pending. The hook
+    // independently revalidates the opened provider source first. The original
+    // request injection remains the authority for an in-flight report.
+    currentPendingOutput(
+        input: {
+            tool: ToolName;
+            nativeSessionId: string;
+            cwd: string;
+            mode: TaskStateReportMode;
+        },
+        instructions: string,
+    ): { requestId: string; output: string; needsRefresh: boolean } | undefined {
         const session = this.currentSession(input.tool, input.nativeSessionId);
         const checkout = this.allowedCheckout(input.cwd, session);
         if (checkout === undefined || session === undefined) {
@@ -309,9 +314,24 @@ export class TaskStateRequestStore {
             return undefined;
         }
         const request = this.request(pending.request_id);
-        return request === undefined
-            ? undefined
-            : { requestId: pending.request_id, output: wrap('brief', request.injection_id, request.injection_body) };
+        if (request === undefined) {
+            return undefined;
+        }
+        const body = `${taskStateRequestMarker(input.mode, pending.request_id)}\n${instructions}`;
+        const refreshed =
+            request.injection_body === body
+                ? { injection_id: request.injection_id, body: request.injection_body }
+                : (this.db
+                      .prepare(`SELECT injection_id, body FROM injections
+                      WHERE tool = ? AND native_session_id = ? AND body_hash = ? AND body = ? AND id > ? LIMIT 1`)
+                      .get(input.tool, input.nativeSessionId, injectionBodyHash(body, 'exact'), body, request.injection_row_id) as
+                      | { injection_id: string; body: string }
+                      | undefined);
+        return {
+            requestId: pending.request_id,
+            output: wrap('brief', refreshed?.injection_id ?? request.injection_id, refreshed?.body ?? request.injection_body),
+            needsRefresh: refreshed === undefined,
+        };
     }
 
     // This is an inexpensive admission check, not authorization. Consumption

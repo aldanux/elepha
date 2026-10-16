@@ -8,7 +8,8 @@ import * as providers from '../../src/embeddings/provider-config.js';
 import { runUserPromptSubmit } from '../../src/hooks/user-prompt-submit.js';
 import { TASK_STATE_REQUEST_INSTRUCTIONS } from '../../src/serving/instructions.js';
 import { openDb, type openUnmanagedDb } from '../../src/storage/db.js';
-import { TaskStateRequestStore } from '../../src/storage/task-state-request-store.js';
+import { injectionBodyHash } from '../../src/storage/injection-store.js';
+import { TaskStateRequestStore, taskStateRequestMarker } from '../../src/storage/task-state-request-store.js';
 import { createTestDb, seedConsentRoot, seedProject } from '../helpers/db.js';
 
 afterEach(() => {
@@ -125,12 +126,57 @@ it('asks one verified Claude main chat for a task-state report and preserves its
     expect(body).toContain(TASK_STATE_REQUEST_INSTRUCTIONS);
     expect(f.requestCount()).toBe(1);
     expect(f.injectionCount()).toBe(1);
+    const request = f.db
+        .prepare(`SELECT request_id, injection_row_id, session_id, source_path, after_turn_index
+            FROM task_state_requests`)
+        .get() as {
+        request_id: string;
+        injection_row_id: number;
+        session_id: number;
+        source_path: string;
+        after_turn_index: number;
+    };
+    const legacyBody = `${taskStateRequestMarker('precompact_manifest', request.request_id)}\nLegacy instruction.`;
+    f.db
+        .prepare('UPDATE injections SET body = ?, body_hash = ? WHERE id = ?')
+        .run(legacyBody, injectionBodyHash(legacyBody), request.injection_row_id);
+    const canConsume = () =>
+        new TaskStateRequestStore(f.db).canConsume({
+            requestId: request.request_id,
+            mode: 'precompact_manifest',
+            tool: 'claude-code',
+            nativeSessionId: 'chat-1',
+            sessionId: request.session_id,
+            cwd: f.project.path,
+            sourcePath: request.source_path,
+            turnIndex: request.after_turn_index + 1,
+        });
+    expect(canConsume()).toBe(true);
     expect(f.provider).not.toHaveBeenCalled();
     const second = await f.run();
     expect(second).toHaveProperty('output');
-    expect(JSON.stringify(second)).toBe(body);
+    const refreshed = JSON.stringify(second);
+    expect(refreshed).toContain(`request_id=${request.request_id}`);
+    expect(refreshed).toContain(TASK_STATE_REQUEST_INSTRUCTIONS);
+    expect(refreshed).not.toContain('Legacy instruction.');
     expect(f.requestCount()).toBe(1);
-    expect(f.injectionCount()).toBe(1);
+    expect(f.injectionCount()).toBe(2);
+    const replacement = f.db.prepare('SELECT injection_id, body FROM injections WHERE id != ?').get(request.injection_row_id) as {
+        injection_id: string;
+        body: string;
+    };
+    expect(replacement.body).toBe(
+        `${taskStateRequestMarker('precompact_manifest', request.request_id)}\n${TASK_STATE_REQUEST_INSTRUCTIONS}`,
+    );
+    expect(refreshed).toContain(replacement.injection_id);
+    expect(f.db.prepare('SELECT body FROM injections WHERE id = ?').get(request.injection_row_id)).toEqual({ body: legacyBody });
+    expect(f.db.prepare('SELECT injection_row_id FROM task_state_requests WHERE request_id = ?').get(request.request_id)).toEqual({
+        injection_row_id: request.injection_row_id,
+    });
+    expect(canConsume()).toBe(true);
+    expect(JSON.stringify(await f.run())).toBe(refreshed);
+    expect(f.requestCount()).toBe(1);
+    expect(f.injectionCount()).toBe(2);
 });
 
 it('does not ask from a command, child, disabled capture, or missing session', async () => {

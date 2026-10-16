@@ -925,6 +925,111 @@ it('diagnoses Codex task-state rejection stages without logging protected conten
     ).toEqual({ reason: 'database_unavailable' });
 });
 
+it('authenticates Claude API request metadata while keeping nested message and tool copies inert', async () => {
+    const f = fixture('claude-code');
+    const objective = 'Build the dispatcher.';
+    const metadataTypes = ['api-request', 'api-request-blob'];
+    const lines = (records: unknown[]) => `${records.map((record) => JSON.stringify(record)).join('\n')}\n`;
+    const parse = async () => {
+        const turns: ParsedTurn[] = [];
+        for await (const turn of f.adapter.parseTurns(f.sourcePath, undefined, { closeTrailingOnIdle: true, skipSessionTitle: true })) {
+            turns.push(turn);
+        }
+        return turns;
+    };
+    f.appendTurn(objective);
+    const canonical = await parse();
+    const initial = readFileSync(f.sourcePath, 'utf8').trimEnd().split('\n');
+    writeFileSync(
+        f.sourcePath,
+        `${initial[0]}\n${lines(metadataTypes.map((type) => ({ type, message: { role: 'user', content: 'Copied request prompt.' } })))}${initial[1]}\n`,
+    );
+    await f.capture();
+    const indexed = () => f.db.prepare('SELECT memory_id, source_cursor, source_digest FROM turn_search_index ORDER BY memory_id').all();
+    const originalIndex = indexed();
+    const parsed = await parse();
+    expect(parsed.map(sourceTurnDigest)).toEqual(canonical.map(sourceTurnDigest));
+    expect(originalIndex).toEqual([
+        { memory_id: expect.any(Number), source_cursor: parsed[0]?.cursor, source_digest: sourceTurnDigest(canonical[0]!) },
+    ]);
+    const request = await f.request();
+    expect(request, f.logs.join('\n')).toHaveProperty('output');
+    expect(context(request)).toContain(f.requestId());
+    expect(indexed()).toEqual(originalIndex);
+
+    f.appendTurn('Continue.', f.state(objective));
+    const withReport = await parse();
+    const records = readFileSync(f.sourcePath, 'utf8')
+        .trimEnd()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+    const reportCall = records.at(-3);
+    const reportResult = records.at(-2);
+    const copies = metadataTypes.flatMap((type) => [
+        { ...reportCall, type },
+        { ...reportResult, type },
+        {
+            type,
+            message: {
+                role: 'assistant',
+                content: [
+                    { type: 'text', text: 'Copied request response.' },
+                    { type: 'tool_use', id: 'copied-retrieval', name: 'mcp__elepha__get_session', input: {} },
+                    { type: 'tool_result', tool_use_id: 'copied-retrieval', content: 'Copied retrieval result.' },
+                    { type: 'tool_use', id: 'copied-open-tool', name: 'Read', input: {} },
+                ],
+            },
+        },
+    ]);
+    records.splice(-1, 0, ...copies);
+    writeFileSync(f.sourcePath, lines(records));
+    const withCopies = await parse();
+    // Adding bytes moves the cursor, but not canonical content, turn identity,
+    // report correlation, receipts, or whether the native turn closes on idle.
+    const withoutCursor = (turn: ParsedTurn) => {
+        const { cursor: _cursor, ...content } = turn;
+        return content;
+    };
+    expect(withCopies.map(withoutCursor)).toEqual(withReport.map(withoutCursor));
+    await f.capture();
+    const captured = indexed();
+    expect(captured.at(-1)).toEqual({
+        memory_id: expect.any(Number),
+        source_cursor: withCopies.at(-1)?.cursor,
+        source_digest: sourceTurnDigest(withReport.at(-1)!),
+    });
+    expect(await f.request()).toEqual(request);
+    expect(indexed()).toEqual(captured);
+
+    f.appendPendingPrompt('Read the dispatcher.');
+    appendFileSync(
+        f.sourcePath,
+        lines([
+            {
+                type: 'assistant',
+                message: { role: 'assistant', content: [{ type: 'tool_use', id: 'native-open-tool', name: 'Read', input: {} }] },
+            },
+        ]),
+    );
+    const withOpenTool = await parse();
+    expect(withOpenTool).toHaveLength(withCopies.length);
+    appendFileSync(
+        f.sourcePath,
+        lines(
+            metadataTypes.map((type) => ({
+                type,
+                message: {
+                    role: 'user',
+                    content: [
+                        { type: 'tool_result', tool_use_id: 'native-open-tool', content: 'Copied result cannot close a native call.' },
+                    ],
+                },
+            })),
+        ),
+    );
+    expect(await parse()).toEqual(withOpenTool);
+});
+
 it('delivers the verified Claude cancellation after a compact boundary closes a user-only turn', async () => {
     const f = fixture('claude-code');
     f.appendTurn('Build the dispatcher.');

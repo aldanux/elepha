@@ -74,6 +74,10 @@ const KNOWN_SKIP_TYPES = new Set([
     'queue-operation',
     'pr-link',
     'fork-context-ref',
+    // API request snapshots contain message copies, not canonical conversation
+    // or native tool events. The tool and MCP observers must ignore them too.
+    'api-request',
+    'api-request-blob',
     // UI decoration: links an Artifact frame, carries no turn or session
     // memory. Explicit so format drift cannot hide behind generic skip.
     'frame-link',
@@ -574,7 +578,11 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
     }
 
     protected observeToolCallState(state: TurnBuilderState, line: unknown): void {
-        const content = (line as CCLine).message?.content;
+        const l = line as CCLine;
+        if (l.type === 'api-request' || l.type === 'api-request-blob') {
+            return;
+        }
+        const content = l.message?.content;
         if (!Array.isArray(content)) {
             return;
         }
@@ -595,6 +603,9 @@ export class ClaudeCodeAdapter extends JsonlTurnAdapter {
 
     protected observeElephaMcp(state: TurnBuilderState, line: unknown): void {
         const l = line as CCLine;
+        if (l.type === 'api-request' || l.type === 'api-request-blob') {
+            return;
+        }
         const content = l.message?.content;
         if (!Array.isArray(content)) {
             return;
